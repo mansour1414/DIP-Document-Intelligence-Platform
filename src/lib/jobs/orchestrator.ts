@@ -7,9 +7,11 @@ import { validateUpload } from "@/lib/uploads/validation";
 import { logger } from "@/lib/logging";
 
 type Upload = { filename: string; mimeType: string; bytes: Uint8Array };
-export async function createMergePdfJob(input: { userId: string; uploads: Upload[]; idempotencyKey: string; correlationId?: string }) {
-  const tool = getToolDefinition("merge-pdf");
-  if (input.uploads.length < 2 || input.uploads.length > tool.limits.maxFiles) throw new Error("INPUT_FILE_COUNT_INVALID");
+export async function createToolJob(input: { userId: string; toolId: string; uploads: Upload[]; options?: Record<string, string | number | boolean>; idempotencyKey: string; correlationId?: string }) {
+  const tool = getToolDefinition(input.toolId);
+  const minimumFiles = input.toolId === "merge-pdf" ? 2 : 1;
+  if (input.uploads.length < minimumFiles || input.uploads.length > tool.limits.maxFiles) throw new Error("INPUT_FILE_COUNT_INVALID");
+  if (input.uploads.reduce((total, upload) => total + upload.bytes.byteLength, 0) > tool.limits.maxBytes) throw new Error("TOTAL_SIZE_LIMIT_EXCEEDED");
   const correlationId = input.correlationId ?? randomUUID();
   const existing = await db.job.findUnique({ where: { toolId_idempotencyKey: { toolId: tool.toolId, idempotencyKey: input.idempotencyKey } }, select: { id: true, status: true } });
   if (existing) return { ...existing, reused: true };
@@ -21,10 +23,14 @@ export async function createMergePdfJob(input: { userId: string; uploads: Upload
     const job = await db.$transaction(async (tx) => {
       const document = await tx.document.create({ data: { userId: input.userId, title: "Merge PDF input" } });
       const files = await Promise.all(stored.map(async (item) => { const file = await tx.file.create({ data: { document: { connect: { id: document.id } }, originalName: item.upload.filename.slice(0, 255), mimeType: item.validation.mimeType, size: BigInt(item.upload.bytes.byteLength), storageKey: item.key, checksum: item.validation.checksum, pageCount: item.validation.pageCount, storageObject: { connectOrCreate: { where: { provider_bucket_objectKey: { provider: "s3", bucket: item.bucket, objectKey: item.key } }, create: { provider: "s3", bucket: item.bucket, objectKey: item.key, size: BigInt(item.upload.bytes.byteLength), checksum: item.validation.checksum } } } } }); await tx.fileVersion.create({ data: { fileId: file.id, ownerId: input.userId, version: 1, storageKey: item.key, checksum: item.validation.checksum } }); return file; }));
-      return tx.job.create({ data: { toolId: tool.toolId, idempotencyKey: input.idempotencyKey, requesterId: input.userId, inputFileId: files[0].id, status: "QUEUED", params: { inputFileIds: files.map((file) => file.id) }, correlationId, steps: { create: { name: "merge-pdf", idempotencyKey: `${input.idempotencyKey}:merge`, status: "QUEUED", correlationId } } }, select: { id: true, status: true } });
+      return tx.job.create({ data: { toolId: tool.toolId, idempotencyKey: input.idempotencyKey, requesterId: input.userId, inputFileId: files[0].id, status: "QUEUED", params: { inputFileIds: files.map((file) => file.id), options: input.options ?? {} }, correlationId, steps: { create: { name: tool.toolId, idempotencyKey: `${input.idempotencyKey}:${tool.toolId}`, status: "QUEUED", correlationId } } }, select: { id: true, status: true } });
     });
     await enqueueJob({ jobId: job.id, toolId: tool.toolId, idempotencyKey: input.idempotencyKey, correlationId });
     logger.info("job.queued", { job_id: job.id, correlation_id: correlationId, tool_id: tool.toolId });
     return { ...job, reused: false };
   } catch (error) { await Promise.all(stored.map((object) => storage.deleteObject(object.key).catch(() => undefined))); throw error; }
+}
+
+export function createMergePdfJob(input: { userId: string; uploads: Upload[]; idempotencyKey: string; correlationId?: string }) {
+  return createToolJob({ ...input, toolId: "merge-pdf" });
 }
