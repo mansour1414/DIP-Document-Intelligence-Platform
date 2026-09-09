@@ -1,0 +1,483 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ==================== IDENTITY ====================
+
+model User {
+  id            String    @id @default(uuid()) @db.Uuid
+  email         String    @unique @db.VarChar(255)
+  passwordHash  String?   @map("password_hash") @db.VarChar(255)
+  externalAuthId String?  @map("external_auth_id") @db.VarChar(255)
+  displayName   String?   @map("display_name") @db.VarChar(100)
+  locale        String    @default("en") @db.VarChar(5)
+  status        UserStatus @default(ACTIVE)
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+
+  memberships   Membership[]
+  apiKeys       ApiKey[]
+  jobs          Job[]       @relation("RequesterJobs")
+  documents     Document[]
+  aiConversations AiConversation[]
+  aiUsage        AiUsage[]
+  subscriptions  Subscription[]
+
+  @@index([status])
+  @@map("users")
+}
+
+model Organization {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String   @db.VarChar(100)
+  slug      String   @unique @db.VarChar(100)
+  plan      Plan     @default(FREE)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  memberships Membership[]
+  teams       Team[]
+  documents   Document[]
+
+  @@map("organizations")
+}
+
+model Team {
+  id             String       @id @default(uuid()) @db.Uuid
+  name           String       @db.VarChar(100)
+  organizationId String       @map("organization_id") @db.Uuid
+  createdAt      DateTime     @default(now()) @map("created_at")
+  updatedAt      DateTime     @updatedAt @map("updated_at")
+
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  memberships    Membership[]
+
+  @@index([organizationId])
+  @@map("teams")
+}
+
+model Membership {
+  id             String       @id @default(uuid()) @db.Uuid
+  userId         String       @map("user_id") @db.Uuid
+  organizationId String       @map("organization_id") @db.Uuid
+  teamId         String?      @map("team_id") @db.Uuid
+  role           MemberRole   @default(MEMBER)
+  createdAt      DateTime     @default(now()) @map("created_at")
+
+  user           User         @relation(fields: [userId], references: [id])
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  team           Team?        @relation(fields: [teamId], references: [id])
+
+  @@unique([userId, organizationId])
+  @@index([organizationId])
+  @@index([teamId])
+  @@map("memberships")
+}
+
+model ApiKey {
+  id             String   @id @default(uuid()) @db.Uuid
+  userId         String   @map("user_id") @db.Uuid
+  name           String   @db.VarChar(100)
+  keyHash        String   @map("key_hash") @db.VarChar(255)
+  scopes         Json     @default("[]")
+  expiresAt      DateTime? @map("expires_at")
+  lastUsedAt     DateTime? @map("last_used_at")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  user           User     @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@map("api_keys")
+}
+
+// ==================== DOCUMENTS ====================
+
+model Document {
+  id             String       @id @default(uuid()) @db.Uuid
+  userId         String       @map("user_id") @db.Uuid
+  organizationId String?      @map("organization_id") @db.Uuid
+  title          String       @db.VarChar(255)
+  status         DocumentStatus @default(ACTIVE)
+  createdAt      DateTime     @default(now()) @map("created_at")
+  updatedAt      DateTime     @updatedAt @map("updated_at")
+
+  user           User         @relation(fields: [userId], references: [id])
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+  files          File[]
+  aiConversations AiConversation[]
+
+  @@index([userId])
+  @@index([organizationId])
+  @@index([status])
+  @@map("documents")
+}
+
+model File {
+  id             String        @id @default(uuid()) @db.Uuid
+  documentId     String        @map("document_id") @db.Uuid
+  originalName   String        @map("original_name") @db.VarChar(255)
+  mimeType       String        @map("mime_type") @db.VarChar(100)
+  size           BigInt        @db.BigInt
+  storageKey     String        @map("storage_key") @db.VarChar(500)
+  storageObjectId String?      @map("storage_object_id") @db.Uuid
+  checksum       String?       @db.VarChar(64)
+  pageCount      Int?          @map("page_count")
+  version        Int           @default(1)
+  createdAt      DateTime      @default(now()) @map("created_at")
+
+  document       Document      @relation(fields: [documentId], references: [id])
+  storageObject  StorageObject? @relation(fields: [storageObjectId], references: [id])
+  jobInputs      Job[]         @relation("InputFiles")
+  jobOutputs     Job[]         @relation("OutputFiles")
+
+  @@index([documentId])
+  @@index([storageObjectId])
+  @@map("files")
+}
+
+model StorageObject {
+  id             String   @id @default(uuid()) @db.Uuid
+  provider       String   @db.VarChar(50)
+  bucket         String   @db.VarChar(255)
+  objectKey      String   @map("object_key") @db.VarChar(500)
+  region         String?  @db.VarChar(100)
+  size           BigInt
+  checksum       String?  @db.VarChar(64)
+  createdAt      DateTime @default(now()) @map("created_at")
+  deletedAt      DateTime? @map("deleted_at")
+  files          File[]
+
+  @@unique([provider, bucket, objectKey])
+  @@map("storage_objects")
+}
+
+// ==================== PROCESSING ====================
+
+model Job {
+  id             String        @id @default(uuid()) @db.Uuid
+  toolId         String        @map("tool_id") @db.VarChar(50)
+  idempotencyKey String        @map("idempotency_key") @db.VarChar(255)
+  requesterId    String?       @map("requester_id") @db.Uuid
+  inputFileId    String?       @map("input_file_id") @db.Uuid
+  outputFileId   String?       @map("output_file_id") @db.Uuid
+  status         JobStatus     @default(QUEUED)
+  params         Json          @default("{}")
+  result         Json?
+  error          Json?
+  startedAt      DateTime?     @map("started_at")
+  completedAt    DateTime?     @map("completed_at")
+  createdAt      DateTime      @default(now()) @map("created_at")
+  updatedAt      DateTime      @updatedAt @map("updated_at")
+
+  requester      User?         @relation("RequesterJobs", fields: [requesterId], references: [id])
+  inputFile      File?         @relation("InputFiles", fields: [inputFileId], references: [id])
+  outputFile     File?         @relation("OutputFiles", fields: [outputFileId], references: [id])
+  steps          JobStep[]
+  events         JobEvent[]
+  toolExecutions ToolExecution[]
+
+  @@index([requesterId])
+  @@index([status])
+  @@index([toolId])
+  @@index([createdAt])
+  @@unique([toolId, idempotencyKey])
+  @@map("jobs")
+}
+
+model JobStep {
+  id             String    @id @default(uuid()) @db.Uuid
+  jobId          String    @map("job_id") @db.Uuid
+  idempotencyKey String?   @map("idempotency_key") @db.VarChar(255)
+  name           String    @db.VarChar(100)
+  status         JobStatus @default(QUEUED)
+  input          Json?
+  output         Json?
+  error          Json?
+  startedAt      DateTime? @map("started_at")
+  completedAt    DateTime? @map("completed_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+
+  job            Job       @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@index([jobId])
+  @@unique([jobId, idempotencyKey])
+  @@map("job_steps")
+}
+
+model JobEvent {
+  id             String    @id @default(uuid()) @db.Uuid
+  jobId          String    @map("job_id") @db.Uuid
+  type           String    @db.VarChar(50)
+  data           Json      @default("{}")
+  createdAt      DateTime  @default(now()) @map("created_at")
+
+  job            Job       @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@index([jobId])
+  @@map("job_events")
+}
+
+model ToolExecution {
+  id             String    @id @default(uuid()) @db.Uuid
+  jobId          String    @map("job_id") @db.Uuid
+  toolId         String    @map("tool_id") @db.VarChar(50)
+  mode           ExecutionMode
+  input          Json?
+  output         Json?
+  durationMs     Int?      @map("duration_ms")
+  createdAt      DateTime  @default(now()) @map("created_at")
+
+  job            Job       @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@index([jobId])
+  @@index([toolId])
+  @@map("tool_executions")
+}
+
+// ==================== AI ====================
+
+model AiConversation {
+  id             String    @id @default(uuid()) @db.Uuid
+  documentId     String    @map("document_id") @db.Uuid
+  userId         String    @map("user_id") @db.Uuid
+  title          String?   @db.VarChar(255)
+  createdAt      DateTime  @default(now()) @map("created_at")
+
+  user           User      @relation(fields: [userId], references: [id])
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  document       Document  @relation(fields: [documentId], references: [id])
+  messages       AiMessage[]
+
+  @@index([documentId])
+  @@index([userId])
+  @@map("ai_conversations")
+}
+
+model AiMessage {
+  id             String    @id @default(uuid()) @db.Uuid
+  conversationId String    @map("conversation_id") @db.Uuid
+  role           AiRole
+  content        String    @db.Text
+  model          String    @db.VarChar(100)
+  tokensInput    Int?      @map("tokens_input")
+  tokensOutput   Int?      @map("tokens_output")
+  cost           Decimal?  @db.Decimal(10, 6)
+  createdAt      DateTime  @default(now()) @map("created_at")
+
+  conversation   AiConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId])
+  @@map("ai_messages")
+}
+
+model AiUsage {
+  id             String    @id @default(uuid()) @db.Uuid
+  userId         String    @map("user_id") @db.Uuid
+  jobId          String?   @map("job_id") @db.Uuid
+  provider       String    @db.VarChar(50)
+  model          String    @db.VarChar(100)
+  taskType       String    @map("task_type") @db.VarChar(50)
+  tokensInput    Int       @map("tokens_input")
+  tokensOutput   Int       @map("tokens_output")
+  cost           Decimal   @db.Decimal(10, 6)
+  createdAt      DateTime  @default(now()) @map("created_at")
+
+  user           User      @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@index([provider, model])
+  @@index([createdAt])
+  @@map("ai_usage")
+}
+
+model CreditLedger {
+  id             String    @id @default(uuid()) @db.Uuid
+  userId         String    @map("user_id") @db.Uuid
+  type           CreditType
+  amount         Decimal   @db.Decimal(10, 2)
+  balance        Decimal   @db.Decimal(10, 2)
+  reference      String?   @db.VarChar(255)
+  createdAt      DateTime  @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@index([createdAt])
+  @@map("credit_ledger")
+}
+
+// ==================== BILLING ====================
+
+model Subscription {
+  id             String    @id @default(uuid()) @db.Uuid
+  userId         String    @map("user_id") @db.Uuid
+  plan           Plan      @default(FREE)
+  status         SubscriptionStatus @default(ACTIVE)
+  currentPeriodStart DateTime? @map("current_period_start")
+  currentPeriodEnd   DateTime? @map("current_period_end")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  user           User      @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@map("subscriptions")
+}
+
+// ==================== SEO / CONTENT ====================
+
+model ToolPage {
+  id             String    @id @default(uuid()) @db.Uuid
+  slug           String    @unique @db.VarChar(100)
+  locale         String    @db.VarChar(5)
+  title          String    @db.VarChar(255)
+  description    String    @db.VarChar(500)
+  h1             String    @db.VarChar(255)
+  content        Json      @default("{}")
+  faq            Json      @default("[]")
+  metadata       Json      @default("{}")
+  published      Boolean   @default(false)
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  @@unique([slug, locale])
+  @@map("tool_pages")
+}
+
+model Redirect {
+  id             String    @id @default(uuid()) @db.Uuid
+  from           String    @db.VarChar(500)
+  to             String    @db.VarChar(500)
+  type           RedirectType @default(MOVED_PERMANENTLY)
+  createdAt      DateTime  @default(now()) @map("created_at")
+
+  @@unique([from])
+  @@map("redirects")
+}
+
+// ==================== SECURITY / AUDIT ====================
+
+model AuditLog {
+  id             String    @id @default(uuid()) @db.Uuid
+  userId         String?   @map("user_id") @db.Uuid
+  action         String    @db.VarChar(100)
+  resource       String    @db.VarChar(100)
+  resourceId     String?   @map("resource_id") @db.Uuid
+  details        Json      @default("{}")
+  ipAddress      String?   @map("ip_address") @db.VarChar(45)
+  userAgent      String?   @map("user_agent") @db.VarChar(500)
+  createdAt      DateTime  @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@index([action])
+  @@index([resource, resourceId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+model SecurityEvent {
+  id             String    @id @default(uuid()) @db.Uuid
+  type           String    @db.VarChar(50)
+  severity       Severity @default(INFO)
+  details        Json      @default("{}")
+  ipAddress      String?   @map("ip_address") @db.VarChar(45)
+  createdAt      DateTime  @default(now()) @map("created_at")
+
+  @@index([type])
+  @@index([severity])
+  @@index([createdAt])
+  @@map("security_events")
+}
+
+// ==================== SYSTEM ====================
+
+model FeatureFlag {
+  id             String    @id @default(uuid()) @db.Uuid
+  key            String    @unique @db.VarChar(100)
+  enabled        Boolean   @default(false)
+  description    String?   @db.VarChar(500)
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  @@map("feature_flags")
+}
+
+// ==================== ENUMS ====================
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  DELETED
+}
+
+enum Plan {
+  FREE
+  PRO
+  BUSINESS
+}
+
+enum MemberRole {
+  OWNER
+  ADMIN
+  MEMBER
+}
+
+enum DocumentStatus {
+  ACTIVE
+  ARCHIVED
+  DELETED
+}
+
+enum JobStatus {
+  QUEUED
+  RUNNING
+  RETRYING
+  SUCCEEDED
+  FAILED
+  CANCELLED
+  EXPIRED
+}
+
+enum ExecutionMode {
+  CLIENT
+  SERVER
+  AI
+}
+
+enum AiRole {
+  SYSTEM
+  USER
+  ASSISTANT
+}
+
+enum CreditType {
+  PURCHASE
+  USAGE
+  REFUND
+  BONUS
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  CANCELLED
+  PAST_DUE
+  INACTIVE
+}
+
+enum RedirectType {
+  MOVED_PERMANENTLY
+  FOUND
+  TEMPORARY_REDIRECT
+}
+
+enum Severity {
+  DEBUG
+  INFO
+  WARNING
+  ERROR
+  CRITICAL
+}

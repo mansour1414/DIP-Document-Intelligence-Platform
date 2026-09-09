@@ -1,0 +1,32 @@
+export default {
+  "app.name": "DIP",
+  "app.title": "Document Intelligence Platform",
+  "app.description":
+    "Global document processing platform with AI-powered tools.",
+  "nav.home": "Home",
+  "nav.tools": "Tools",
+  "nav.pricing": "Pricing",
+  "nav.login": "Login",
+  "nav.signup": "Sign Up",
+  "hero.title": "Document Intelligence Platform",
+  "hero.subtitle":
+    "Process, convert, and understand your documents with AI-powered tools. Privacy-first, fast, and supports Arabic & English.",
+  "hero.cta": "Start for Free",
+  "tools.title": "PDF Tools",
+  "tools.subtitle": "Everything you need to work with PDF files",
+  "tools.merge": "Merge PDF",
+  "tools.split": "Split PDF",
+  "tools.compress": "Compress PDF",
+  "tools.rotate": "Rotate PDF",
+  "footer.rights": "All rights reserved.",
+  "upload.drag": "Drag & drop your files here",
+  "upload.or": "or",
+  "upload.browse": "Browse files",
+  "upload.maxSize": "Maximum file size: {size}MB",
+  "processing": "Processing...",
+  "download": "Download",
+  "error": "Something went wrong",
+  "privacy.title": "Your files stay private",
+  "privacy.description":
+    "We process your files securely. Most tools work directly in your browser — your files never leave your device.",
+} as const;

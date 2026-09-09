@@ -1,0 +1,176 @@
+import Link from "next/link";
+import { toolsConfig } from "@/config";
+
+export default function Home() {
+  return (
+    <div className="flex flex-col min-h-screen">
+      {/* Header */}
+      <header className="border-b bg-white/80 backdrop-blur-sm sticky top-0 z-50">
+        <div className="container mx-auto px-4 h-16 flex items-center justify-between">
+          <Link href="/" className="flex items-center gap-2 font-bold text-xl">
+            <span className="bg-blue-600 text-white px-2 py-1 rounded-lg text-sm">
+              DIP
+            </span>
+            <span className="hidden sm:inline">Document Intelligence</span>
+          </Link>
+          <nav className="flex items-center gap-6">
+            <Link
+              href="#tools"
+              className="text-sm text-gray-600 hover:text-gray-900"
+            >
+              Tools
+            </Link>
+            <Link
+              href="#pricing"
+              className="text-sm text-gray-600 hover:text-gray-900"
+            >
+              Pricing
+            </Link>
+            <Link
+              href="/login"
+              className="text-sm text-gray-600 hover:text-gray-900"
+            >
+              Login
+            </Link>
+            <Link
+              href="/signup"
+              className="text-sm bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 transition-colors"
+            >
+              Get Started
+            </Link>
+          </nav>
+        </div>
+      </header>
+
+      {/* Hero */}
+      <section className="py-20 px-4">
+        <div className="container mx-auto text-center max-w-3xl">
+          <h1 className="text-4xl md:text-6xl font-bold tracking-tight mb-6">
+            Document Intelligence
+            <span className="text-blue-600 block">Platform</span>
+          </h1>
+          <p className="text-lg text-gray-600 mb-8 max-w-xl mx-auto">
+            Process, convert, and understand your documents with AI-powered
+            tools. Privacy-first, fast, and supports Arabic & English.
+          </p>
+          <div className="flex gap-4 justify-center">
+            <Link
+              href="#tools"
+              className="bg-blue-600 text-white px-8 py-3 rounded-lg font-medium hover:bg-blue-700 transition-colors"
+            >
+              Start for Free
+            </Link>
+            <Link
+              href="#features"
+              className="border border-gray-300 px-8 py-3 rounded-lg font-medium hover:bg-gray-50 transition-colors"
+            >
+              Learn More
+            </Link>
+          </div>
+        </div>
+      </section>
+
+      {/* Privacy Banner */}
+      <section className="bg-green-50 border-y">
+        <div className="container mx-auto px-4 py-6 text-center">
+          <p className="text-green-800 font-medium">
+            🔒 Your files stay private — Most tools work directly in your
+            browser. Your files never leave your device.
+          </p>
+        </div>
+      </section>
+
+      {/* Tools Grid */}
+      <section id="tools" className="py-20 px-4">
+        <div className="container mx-auto">
+          <div className="text-center mb-12">
+            <h2 className="text-3xl font-bold mb-4">PDF Tools</h2>
+            <p className="text-gray-600">
+              Everything you need to work with PDF files
+            </p>
+          </div>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 max-w-5xl mx-auto">
+            {toolsConfig.map((tool) => (
+              <Link
+                key={tool.id}
+                href={tool.href}
+                className="group p-6 rounded-xl border bg-white hover:shadow-lg hover:border-blue-200 transition-all text-center"
+              >
+                <div className="text-3xl mb-3">
+                  {tool.category === "ai"
+                    ? "✨"
+                    : tool.category === "convert"
+                      ? "🔄"
+                      : tool.category === "edit"
+                        ? "✏️"
+                        : "📄"}
+                </div>
+                <h3 className="font-semibold text-sm group-hover:text-blue-600 transition-colors">
+                  {tool.name}
+                </h3>
+                <p className="text-xs text-gray-500 mt-1">{tool.description}</p>
+              </Link>
+            ))}
+          </div>
+        </div>
+      </section>
+
+      {/* Features */}
+      <section id="features" className="py-20 px-4 bg-gray-50">
+        <div className="container mx-auto">
+          <div className="text-center mb-12">
+            <h2 className="text-3xl font-bold mb-4">Why DIP?</h2>
+          </div>
+          <div className="grid md:grid-cols-3 gap-8 max-w-4xl mx-auto">
+            <div className="text-center p-6">
+              <div className="text-4xl mb-4">🤖</div>
+              <h3 className="font-semibold mb-2">AI-Powered</h3>
+              <p className="text-sm text-gray-600">
+                Summarize, chat with, and extract data from your documents using
+                advanced AI.
+              </p>
+            </div>
+            <div className="text-center p-6">
+              <div className="text-4xl mb-4">🔒</div>
+              <h3 className="font-semibold mb-2">Privacy First</h3>
+              <p className="text-sm text-gray-600">
+                Most processing happens in your browser. Your files never leave
+                your device.
+              </p>
+            </div>
+            <div className="text-center p-6">
+              <div className="text-4xl mb-4">🌍</div>
+              <h3 className="font-semibold mb-2">Arabic & English</h3>
+              <p className="text-sm text-gray-600">
+                Full support for Arabic and English with RTL layout and
+                localized tools.
+              </p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* Footer */}
+      <footer className="border-t py-8 px-4 mt-auto">
+        <div className="container mx-auto flex flex-col md:flex-row items-center justify-between gap-4">
+          <div className="flex items-center gap-2 font-bold">
+            <span className="bg-blue-600 text-white px-2 py-1 rounded-lg text-xs">
+              DIP
+            </span>
+            <span className="text-sm text-gray-500">
+              © 2026 All rights reserved.
+            </span>
+          </div>
+          <div className="flex gap-6 text-sm text-gray-500">
+            <Link href="/privacy" className="hover:text-gray-900">
+              Privacy
+            </Link>
+            <Link href="/terms" className="hover:text-gray-900">
+              Terms
+            </Link>
+          </div>
+        </div>
+      </footer>
+    </div>
+  );
+}

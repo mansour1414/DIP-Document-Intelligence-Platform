@@ -1,0 +1,32 @@
+export default {
+  "app.name": "DIP",
+  "app.title": "منصة ذكاء المستندات",
+  "app.description":
+    "منصة عالمية لمعالجة المستندات بأدوات مدعومة بالذكاء الاصطناعي.",
+  "nav.home": "الرئيسية",
+  "nav.tools": "الأدوات",
+  "nav.pricing": "الأسعار",
+  "nav.login": "تسجيل الدخول",
+  "nav.signup": "إنشاء حساب",
+  "hero.title": "منصة ذكاء المستندات",
+  "hero.subtitle":
+    "معالجة وتحويل وفهم مستنداتك بأدوات مدعومة بالذكاء الاصطناعي. خصوصية أولاً، سريعة، وتدعم العربية والإنجليزية.",
+  "hero.cta": "ابدأ مجاناً",
+  "tools.title": "أدوات PDF",
+  "tools.subtitle": "كل ما تحتاجه للعمل مع ملفات PDF",
+  "tools.merge": "دمج PDF",
+  "tools.split": "تقسيم PDF",
+  "tools.compress": "ضغط PDF",
+  "tools.rotate": "تدوير PDF",
+  "footer.rights": "جميع الحقوق محفوظة.",
+  "upload.drag": "اسحب ملفاتك هنا",
+  "upload.or": "أو",
+  "upload.browse": "اختر ملفات",
+  "upload.maxSize": "الحد الأقصى لحجم الملف: {size} ميجابايت",
+  "processing": "جاري المعالجة...",
+  "download": "تحميل",
+  "error": "حدث خطأ ما",
+  "privacy.title": "ملفاتك تبقى خاصة",
+  "privacy.description":
+    "نعالج ملفاتك بأمان. معظم الأدوات تعمل مباشرة في متصفحك — ملفاتك لا تغ dispositivos جهازك أبداً.",
+} as const;
