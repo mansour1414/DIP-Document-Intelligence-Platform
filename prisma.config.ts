@@ -10,6 +10,8 @@ export default defineConfig({
     path: "prisma/migrations",
   },
   datasource: {
-    url: process.env.DATABASE_URL ?? "",
+    // Prisma CLI operations (migrate/introspect) require Neon's direct endpoint.
+    // Runtime application queries continue to use pooled DATABASE_URL via PrismaPg.
+    url: process.env.DATABASE_URL_UNPOOLED ?? process.env.DATABASE_URL ?? "",
   },
 });

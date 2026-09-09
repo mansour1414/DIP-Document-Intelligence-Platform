@@ -29,6 +29,7 @@ model User {
   accounts       Account[]
   sessions       Session[]
   creditLedger   CreditLedger[]
+  fileVersions   FileVersion[]
 
   @@index([status])
   @@map("users")
@@ -168,10 +169,28 @@ model File {
   storageObject  StorageObject? @relation(fields: [storageObjectId], references: [id])
   jobInputs      Job[]         @relation("InputFiles")
   jobOutputs     Job[]         @relation("OutputFiles")
+  versions       FileVersion[]
 
   @@index([documentId])
   @@index([storageObjectId])
   @@map("files")
+}
+
+model FileVersion {
+  id         String   @id @default(uuid()) @db.Uuid
+  fileId     String   @map("file_id") @db.Uuid
+  ownerId    String   @map("owner_id") @db.Uuid
+  version    Int
+  storageKey String   @map("storage_key") @db.VarChar(500)
+  checksum   String?  @db.VarChar(64)
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  file       File     @relation(fields: [fileId], references: [id], onDelete: Cascade)
+  owner      User     @relation(fields: [ownerId], references: [id])
+
+  @@unique([fileId, version])
+  @@index([ownerId, createdAt])
+  @@map("file_versions")
 }
 
 model StorageObject {
@@ -203,6 +222,10 @@ model Job {
   params         Json          @default("{}")
   result         Json?
   error          Json?
+  correlationId  String?       @map("correlation_id") @db.Uuid
+  errorCode      String?       @map("error_code") @db.VarChar(100)
+  engine         String?       @db.VarChar(100)
+  engineVersion  String?       @map("engine_version") @db.VarChar(100)
   startedAt      DateTime?     @map("started_at")
   completedAt    DateTime?     @map("completed_at")
   createdAt      DateTime      @default(now()) @map("created_at")
@@ -219,6 +242,7 @@ model Job {
   @@index([status])
   @@index([toolId])
   @@index([createdAt])
+  @@index([requesterId, correlationId])
   @@unique([toolId, idempotencyKey])
   @@map("jobs")
 }
@@ -232,9 +256,14 @@ model JobStep {
   input          Json?
   output         Json?
   error          Json?
+  correlationId  String?   @map("correlation_id") @db.Uuid
+  errorCode      String?   @map("error_code") @db.VarChar(100)
+  engine         String?   @db.VarChar(100)
+  engineVersion  String?   @map("engine_version") @db.VarChar(100)
   startedAt      DateTime? @map("started_at")
   completedAt    DateTime? @map("completed_at")
   createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
 
   job            Job       @relation(fields: [jobId], references: [id], onDelete: Cascade)
 
@@ -248,7 +277,9 @@ model JobEvent {
   jobId          String    @map("job_id") @db.Uuid
   type           String    @db.VarChar(50)
   data           Json      @default("{}")
+  correlationId  String?   @map("correlation_id") @db.Uuid
   createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
 
   job            Job       @relation(fields: [jobId], references: [id], onDelete: Cascade)
 
@@ -263,8 +294,13 @@ model ToolExecution {
   mode           ExecutionMode
   input          Json?
   output         Json?
+  correlationId  String?   @map("correlation_id") @db.Uuid
+  errorCode      String?   @map("error_code") @db.VarChar(100)
+  engine         String?   @db.VarChar(100)
+  engineVersion  String?   @map("engine_version") @db.VarChar(100)
   durationMs     Int?      @map("duration_ms")
   createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
 
   job            Job       @relation(fields: [jobId], references: [id], onDelete: Cascade)
 

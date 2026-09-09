@@ -1,6 +1,6 @@
 # DIP worker boundary
 
-Workers consume `document-jobs` from Redis and execute only the capabilities
+Workers consume the BullMQ queue `dip.document-processing.v1` from Redis and execute only the capabilities
 declared by the Tool Registry. They must run separately from the web process
 and use an isolated, resource-limited runtime for untrusted documents.
 
@@ -20,3 +20,12 @@ Install LibreOffice (`soffice`) for Office conversion and OCRmyPDF
 (`ocrmypdf`) with Arabic/English Tesseract language data for OCR. Production
 deployments should move this exact capability into the isolated worker runtime
 described above, with storage and queue persistence, before public rollout.
+
+## Runtime processing (current)
+
+`npm run worker:documents` starts the modular-monolith worker. It loads jobs using
+the `Job → JobStep → ToolExecution` model, reads/writes only object keys in
+S3-compatible storage, and emits structured `job_id` / `correlation_id` logs.
+BullMQ retries three times with exponential backoff; a stable output key based on
+the job id means retries cannot create duplicate output objects. Run
+`npm run jobs:cleanup` from the platform scheduler to expire work older than 24h.
