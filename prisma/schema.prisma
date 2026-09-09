@@ -26,6 +26,9 @@ model User {
   aiConversations AiConversation[]
   aiUsage        AiUsage[]
   subscriptions  Subscription[]
+  accounts       Account[]
+  sessions       Session[]
+  creditLedger   CreditLedger[]
 
   @@index([status])
   @@map("users")
@@ -92,6 +95,38 @@ model ApiKey {
 
   @@index([userId])
   @@map("api_keys")
+}
+
+model Account {
+  id                String   @id @default(uuid()) @db.Uuid
+  userId            String   @map("user_id") @db.Uuid
+  provider          String   @db.VarChar(50)
+  providerAccountId String   @map("provider_account_id") @db.VarChar(255)
+  accessToken       String?  @map("access_token") @db.Text
+  refreshToken      String?  @map("refresh_token") @db.Text
+  expiresAt         DateTime? @map("expires_at")
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+  @@map("accounts")
+}
+
+model Session {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  tokenHash String   @unique @map("token_hash") @db.VarChar(64)
+  expiresAt DateTime @map("expires_at")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("sessions")
 }
 
 // ==================== DOCUMENTS ====================
@@ -303,6 +338,8 @@ model CreditLedger {
   balance        Decimal   @db.Decimal(10, 2)
   reference      String?   @db.VarChar(255)
   createdAt      DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
   @@index([createdAt])

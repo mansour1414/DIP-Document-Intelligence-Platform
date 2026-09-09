@@ -50,13 +50,20 @@ export function PdfToolWorkspace({ tool }: Props) {
 
   const process = async () => {
     setStatus("processing"); setMessage("Reading and validating your files…"); setOutputs([]); setProgress({ completed: 0, total: 0 });
+    let jobId: string | undefined;
     try {
+      const authorization = await fetch("/api/usage", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ toolId: operation, filename: files.map((file) => file.name).join(", "), size: files.reduce((total, file) => total + file.size, 0), mimeType: files[0]?.type }) });
+      const authorized = await authorization.json() as { jobId?: string; code?: string; message?: string };
+      if (!authorization.ok || !authorized.jobId) throw new Error(`${authorized.code ?? "AUTH_REQUIRED"}: ${authorized.message ?? "Sign in to process documents."}`);
+      jobId = authorized.jobId;
       const result = await runPdfOperation(operation, files, { pages, rotation, watermark, quality, onProgress: (completed, total) => {
         setProgress({ completed, total });
         setMessage(`Rendering page ${completed} of ${total}…`);
       } });
+      await fetch("/api/usage", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ jobId, success: true }) });
       setOutputs(result); setStatus("done"); setMessage(`${result.length} file${result.length === 1 ? "" : "s"} ready to download.`);
     } catch (error) {
+      if (jobId) await fetch("/api/usage", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ jobId, success: false, error: error instanceof Error ? error.message : "Processing failed" }) });
       const known = error instanceof PdfToolError;
       setStatus("error"); setMessage(known ? `${error.code}: ${error.message}` : "INTERNAL_ERROR: The document could not be processed.");
     }
