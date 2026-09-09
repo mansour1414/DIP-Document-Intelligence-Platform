@@ -20,6 +20,8 @@ export function PdfToolWorkspace({ tool }: Props) {
   const [pages, setPages] = useState("");
   const [rotation, setRotation] = useState<90 | 180 | 270>(90);
   const [watermark, setWatermark] = useState("");
+  const [quality, setQuality] = useState(operation === "compress-pdf" ? 0.72 : 0.9);
+  const [progress, setProgress] = useState({ completed: 0, total: 0 });
   const [status, setStatus] = useState<"idle" | "processing" | "done" | "error">("idle");
   const [message, setMessage] = useState("");
   const [outputs, setOutputs] = useState<OutputFile[]>([]);
@@ -44,9 +46,12 @@ export function PdfToolWorkspace({ tool }: Props) {
   });
 
   const process = async () => {
-    setStatus("processing"); setMessage("Reading and validating your files…"); setOutputs([]);
+    setStatus("processing"); setMessage("Reading and validating your files…"); setOutputs([]); setProgress({ completed: 0, total: 0 });
     try {
-      const result = await runPdfOperation(operation, files, { pages, rotation, watermark });
+      const result = await runPdfOperation(operation, files, { pages, rotation, watermark, quality, onProgress: (completed, total) => {
+        setProgress({ completed, total });
+        setMessage(`Rendering page ${completed} of ${total}…`);
+      } });
       setOutputs(result); setStatus("done"); setMessage(`${result.length} file${result.length === 1 ? "" : "s"} ready to download.`);
     } catch (error) {
       const known = error instanceof PdfToolError;
@@ -83,7 +88,9 @@ export function PdfToolWorkspace({ tool }: Props) {
             {pageInputTools.has(operation) && <label className="block text-sm font-medium">{operation === "organize-pdf" ? "New page order" : "Pages"}<Input className="mt-2" value={pages} onChange={(event) => setPages(event.target.value)} placeholder={operation === "organize-pdf" ? "3, 1, 2, 4-6" : "1-3, 5"} /></label>}
             {operation === "rotate-pdf" && <label className="block text-sm font-medium">Rotation<Input className="mt-2" type="number" min={90} max={270} step={90} value={rotation} onChange={(event) => setRotation(Number(event.target.value) as 90 | 180 | 270)} /></label>}
             {operation === "watermark-pdf" && <label className="block text-sm font-medium">Watermark text<Input className="mt-2" value={watermark} maxLength={80} onChange={(event) => setWatermark(event.target.value)} placeholder="Confidential" /></label>}
+            {(operation === "compress-pdf" || operation === "pdf-to-jpg") && <label className="block text-sm font-medium">Image quality: {Math.round(quality * 100)}%<input className="mt-3 block w-full accent-blue-700" type="range" min="0.45" max="0.95" step="0.05" value={quality} onChange={(event) => setQuality(Number(event.target.value))} /></label>}
             <Button className="min-h-12 w-full" size="lg" disabled={!files.length || status === "processing" || (operation === "merge-pdf" && files.length < 2)} onClick={process}>{status === "processing" ? "Processing…" : `Process ${files.length || ""} file${files.length === 1 ? "" : "s"}`}</Button>
+            {status === "processing" && progress.total > 0 && <div aria-label={`Processed ${progress.completed} of ${progress.total} pages`} className="h-2 overflow-hidden rounded-full bg-slate-200"><div className="h-full rounded-full bg-blue-700 transition-[width]" style={{ width: `${(progress.completed / progress.total) * 100}%` }} /></div>}
             {message && <div role={status === "error" ? "alert" : "status"} className={`rounded-lg px-4 py-3 text-sm ${status === "error" ? "bg-red-50 text-red-800" : status === "done" ? "bg-emerald-50 text-emerald-800" : "bg-blue-50 text-blue-800"}`}>{status === "done" && <CheckCircle2 aria-hidden="true" className="mr-2 inline h-4 w-4" />}{message}</div>}
             {outputs.length > 0 && <div className="grid gap-2 sm:grid-cols-2">{outputs.map((output) => <Button key={output.name} variant="outline" onClick={() => downloadOutput(output)}><Download aria-hidden="true" className="h-4 w-4" />{output.name}</Button>)}</div>}
           </CardContent>
