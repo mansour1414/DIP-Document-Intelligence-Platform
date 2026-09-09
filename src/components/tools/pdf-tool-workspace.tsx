@@ -13,6 +13,18 @@ import type { ToolDefinition } from "@/config";
 type Props = { tool: ToolDefinition };
 
 const pageInputTools = new Set(["split-pdf", "organize-pdf", "delete-pages", "extract-pages"]);
+const workerBatch2Tools = new Set(["compress-pdf", "pdf-to-jpg", "watermark-pdf"]);
+
+async function waitForWorkerJob(jobId: string) {
+  for (let attempt = 0; attempt < 240; attempt += 1) {
+    const response = await fetch(`/api/jobs/status/${jobId}`, { cache: "no-store" }); const job = await response.json() as { status?: string; result?: { outputFileIds?: string[] }; errorCode?: string; error?: { message?: string } };
+    if (!response.ok) throw new Error(job.errorCode ?? "JOB_STATUS_FAILED");
+    if (job.status === "succeeded") return job.result?.outputFileIds ?? [];
+    if (["failed", "cancelled", "expired"].includes(job.status ?? "")) throw new Error(`${job.errorCode ?? "PROCESSING_FAILED"}: ${job.error?.message ?? "The worker could not process this document."}`);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  throw new Error("PROCESSING_TIMEOUT: The worker did not finish in time.");
+}
 
 export function PdfToolWorkspace({ tool }: Props) {
   const { locale } = useLocale();
@@ -52,6 +64,14 @@ export function PdfToolWorkspace({ tool }: Props) {
     setStatus("processing"); setMessage("Reading and validating your files…"); setOutputs([]); setProgress({ completed: 0, total: 0 });
     let jobId: string | undefined;
     try {
+      if (workerBatch2Tools.has(operation)) {
+        const form = new FormData(); files.forEach((file) => form.append("files", file)); form.set("options", JSON.stringify({ quality, watermark }));
+        const queued = await fetch(`/api/jobs/${operation}`, { method: "POST", headers: { "Idempotency-Key": crypto.randomUUID() }, body: form }); const accepted = await queued.json() as { jobId?: string; code?: string; message?: string };
+        if (!queued.ok || !accepted.jobId) throw new Error(`${accepted.code ?? "QUEUE_FAILED"}: ${accepted.message ?? "The job could not be queued."}`);
+        setMessage("Processing securely in the document worker…"); const outputFileIds = await waitForWorkerJob(accepted.jobId);
+        const workerOutputs = await Promise.all(outputFileIds.map(async (fileId, index) => { const response = await fetch(`/api/files/${fileId}`); if (!response.ok) throw new Error("OUTPUT_DOWNLOAD_FAILED"); const disposition = response.headers.get("content-disposition") ?? ""; return { name: disposition.match(/filename="?([^";]+)"?/)?.[1] ?? `output-${index + 1}`, bytes: new Uint8Array(await response.arrayBuffer()), mimeType: response.headers.get("content-type") ?? "application/octet-stream" }; }));
+        setOutputs(workerOutputs); setStatus("done"); setMessage(`${workerOutputs.length} file${workerOutputs.length === 1 ? "" : "s"} ready to download.`); return;
+      }
       const authorization = await fetch("/api/usage", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ toolId: operation, filename: files.map((file) => file.name).join(", "), size: files.reduce((total, file) => total + file.size, 0), mimeType: files[0]?.type }) });
       const authorized = await authorization.json() as { jobId?: string; code?: string; message?: string };
       if (!authorization.ok || !authorized.jobId) throw new Error(`${authorized.code ?? "AUTH_REQUIRED"}: ${authorized.message ?? "Sign in to process documents."}`);

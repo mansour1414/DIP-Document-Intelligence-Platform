@@ -11,7 +11,7 @@ export const plans = {
   BUSINESS: { name: "Enterprise", monthlyCredits: 2_000 },
 } as const;
 
-export class CreditError extends Error { constructor(message: string) { super(message); } }
+export class CreditError extends Error { readonly code = "INSUFFICIENT_CREDITS"; constructor(message: string) { super(message); } }
 
 export async function creditBalance(userId: string) {
   const latest = await db.creditLedger.findFirst({ where: { userId }, orderBy: { createdAt: "desc" }, select: { balance: true } });
@@ -25,6 +25,21 @@ export async function consumeCredits(userId: string, toolId: string, reference: 
     const balance = Number(latest?.balance ?? 0);
     if (balance < cost) throw new CreditError("INSUFFICIENT_CREDITS");
     return tx.creditLedger.create({ data: { userId, type: "USAGE", amount: -cost, balance: balance - cost, reference }, select: { balance: true } });
+  }, { isolationLevel: "Serializable" });
+}
+
+/** Idempotent AI debit. The advisory lock prevents concurrent retries from double charging. */
+export async function consumeCreditsOnce(userId: string, toolId: string, reference: string) {
+  const cost = toolCredits[toolId] ?? 1;
+  return db.$transaction(async (tx) => {
+    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`ai-credit:${userId}`}, 0))`;
+    const prior = await tx.creditLedger.findFirst({ where: { userId, reference }, orderBy: { createdAt: "desc" }, select: { balance: true } });
+    if (prior) return { balance: prior.balance, reused: true };
+    const latest = await tx.creditLedger.findFirst({ where: { userId }, orderBy: { createdAt: "desc" }, select: { balance: true } });
+    const balance = Number(latest?.balance ?? 0);
+    if (balance < cost) throw new CreditError("INSUFFICIENT_CREDITS");
+    const debit = await tx.creditLedger.create({ data: { userId, type: "USAGE", amount: -cost, balance: balance - cost, reference }, select: { balance: true } });
+    return { ...debit, reused: false };
   }, { isolationLevel: "Serializable" });
 }
 
