@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { Inter } from "next/font/google";
+import { LocaleProvider } from "@/components/i18n/locale-provider";
 import "./globals.css";
 
 const inter = Inter({
@@ -21,7 +22,7 @@ export default function RootLayout({
   return (
     <html lang="en" className={`${inter.variable} h-full`}>
       <body className="min-h-full flex flex-col font-sans antialiased">
-        {children}
+        <LocaleProvider>{children}</LocaleProvider>
       </body>
     </html>
   );

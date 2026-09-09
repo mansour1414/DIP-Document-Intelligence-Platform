@@ -11,6 +11,8 @@ export type ToolId =
   | "watermark-pdf"
   | "word-to-pdf"
   | "pdf-to-word"
+  | "excel-to-pdf"
+  | "powerpoint-to-pdf"
   | "ocr-pdf"
   | "summarize-pdf"
   | "chat-with-pdf"

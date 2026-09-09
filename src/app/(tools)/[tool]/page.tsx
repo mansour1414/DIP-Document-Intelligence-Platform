@@ -8,7 +8,7 @@ const phaseOneTools = new Set<PdfOperation>([
   "merge-pdf", "split-pdf", "compress-pdf", "organize-pdf", "rotate-pdf",
   "delete-pages", "extract-pages", "jpg-to-pdf", "pdf-to-jpg", "watermark-pdf",
 ]);
-const phaseTwoTools = new Set(["word-to-pdf", "pdf-to-word", "ocr-pdf"]);
+const phaseTwoTools = new Set(["word-to-pdf", "pdf-to-word", "excel-to-pdf", "powerpoint-to-pdf", "ocr-pdf"]);
 
 export default async function PdfToolPage({ params }: { params: Promise<{ tool: string }> }) {
   const { tool: toolId } = await params;

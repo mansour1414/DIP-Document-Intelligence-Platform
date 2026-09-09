@@ -4,7 +4,7 @@ import { DocumentProcessingError, processServerDocument, type ServerToolId } fro
 export const runtime = "nodejs";
 export const maxDuration = 130;
 
-const serverTools = new Set<ServerToolId>(["word-to-pdf", "pdf-to-word", "ocr-pdf"]);
+const serverTools = new Set<ServerToolId>(["word-to-pdf", "pdf-to-word", "excel-to-pdf", "powerpoint-to-pdf", "ocr-pdf"]);
 
 export async function POST(request: NextRequest, { params }: { params: Promise<{ tool: string }> }) {
   const { tool } = await params;

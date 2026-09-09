@@ -6,6 +6,7 @@ import { ArrowDown, ArrowUp, CheckCircle2, Download, FileText, Lock, Upload, X }
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { LanguageToggle, useLocale } from "@/components/i18n/locale-provider";
 import { downloadOutput, PdfToolError, runPdfOperation, type OutputFile, type PdfOperation } from "@/lib/pdf/client";
 import type { ToolDefinition } from "@/config";
 
@@ -14,6 +15,8 @@ type Props = { tool: ToolDefinition };
 const pageInputTools = new Set(["split-pdf", "organize-pdf", "delete-pages", "extract-pages"]);
 
 export function PdfToolWorkspace({ tool }: Props) {
+  const { locale } = useLocale();
+  const isArabic = locale === "ar";
   const operation = tool.id as PdfOperation;
   const inputRef = useRef<HTMLInputElement>(null);
   const [files, setFiles] = useState<File[]>([]);
@@ -64,14 +67,14 @@ export function PdfToolWorkspace({ tool }: Props) {
       <header className="border-b border-slate-200 bg-white">
         <div className="mx-auto flex h-16 max-w-5xl items-center gap-3 px-4 sm:px-6">
           <Link href="/" className="rounded-lg bg-blue-700 px-2.5 py-1.5 text-sm font-bold text-white">DIP</Link>
-          <span aria-hidden="true" className="text-slate-300">/</span><span className="font-semibold">{tool.name}</span>
+          <span aria-hidden="true" className="text-slate-300">/</span><span className="flex-1 font-semibold">{isArabic ? tool.nameAr : tool.name}</span><LanguageToggle />
         </div>
       </header>
       <div className="mx-auto max-w-3xl px-4 py-10 sm:px-6">
         <div className="mb-7">
           <div className="mb-3 inline-flex items-center gap-2 rounded-full bg-emerald-50 px-3 py-1 text-sm font-medium text-emerald-800"><Lock aria-hidden="true" className="h-4 w-4" />Private browser processing</div>
-          <h1 className="text-3xl font-bold tracking-tight sm:text-4xl">{tool.name}</h1>
-          <p className="mt-3 text-base leading-7 text-slate-600">{tool.description}. Files stay on this device for supported browser operations.</p>
+          <h1 className="text-3xl font-bold tracking-tight sm:text-4xl">{isArabic ? tool.nameAr : tool.name}</h1>
+          <p className="mt-3 text-base leading-7 text-slate-600">{isArabic ? tool.descriptionAr : tool.description}. {isArabic ? "تبقى الملفات على هذا الجهاز في الأدوات التي تعمل من المتصفح." : "Files stay on this device for supported browser operations."}</p>
         </div>
         <Card>
           <CardHeader><CardTitle>Select {acceptsImages ? "images" : "PDF files"}</CardTitle></CardHeader>
