@@ -27,6 +27,13 @@ test("heavy CI keeps bilingual OCR corpus enabled and verifies the approved runt
   assert.match(workflow, /FULL_PROCESSING_E2E: "1"/);
   assert.doesNotMatch(verifier, /\["ocrmypdf", "--help"\]/);
   assert.match(verifier, /\["ocrmypdf", "--version"\]/);
+  assert.match(verifier, /cli_version_result\.stdout/);
+  assert.match(verifier, /cli_version_result\.stderr/);
+  assert.match(verifier, /cli_version_result\.returncode/);
+  assert.match(verifier, /version\("ocrmypdf"\)/);
+  assert.match(verifier, /cli_versions and ocrmypdf_version not in cli_versions/);
+  assert.match(verifier, /path=\{executable_paths\['ocrmypdf'\]!r\}/);
+  assert.match(verifier, /def sanitized/);
   assert.match(verifier, /TemporaryDirectory/);
   assert.match(verifier, /"--output-type",\s+"pdf"/);
   assert.match(verifier, /"--optimize",\s+"0"/);

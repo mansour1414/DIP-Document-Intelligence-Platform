@@ -2,6 +2,7 @@
 
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+import re
 from shutil import which
 from subprocess import run
 from tempfile import TemporaryDirectory
@@ -15,9 +16,18 @@ def fail(message: str) -> None:
     raise SystemExit(1)
 
 
+def sanitized(value: str) -> str:
+    """Bound CLI diagnostics and remove terminal/control characters."""
+    clean = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "?", value).strip()
+    return clean[-1000:]
+
+
+executable_paths: dict[str, str] = {}
 for executable in ("ocrmypdf", "tesseract"):
-    if which(executable) is None:
+    executable_path = which(executable)
+    if executable_path is None:
         fail(f"required executable '{executable}' was not found")
+    executable_paths[executable] = executable_path
 
 if which("gs") is not None:
     fail("Ghostscript executable 'gs' is present in the approved OCR runtime")
@@ -33,16 +43,30 @@ if ocrmypdf_version != "17.10.0":
 if pdfium_version != "5.13.0":
     fail(f"pypdfium2 must be 5.13.0, found {pdfium_version}")
 
-cli_version = run(
+cli_version_result = run(
     ["ocrmypdf", "--version"],
-    check=True,
     capture_output=True,
     text=True,
-).stdout.strip()
-if cli_version != ocrmypdf_version:
+)
+version_diagnostic = (
+    f"path={executable_paths['ocrmypdf']!r}, "
+    f"returncode={cli_version_result.returncode}, "
+    f"stdout={sanitized(cli_version_result.stdout)!r}, "
+    f"stderr={sanitized(cli_version_result.stderr)!r}, "
+    f"package={ocrmypdf_version!r}"
+)
+if cli_version_result.returncode != 0:
+    fail(f"OCRmyPDF CLI version command failed: {version_diagnostic}")
+
+# OCRmyPDF may write version information to stderr depending on its console
+# backend. Package metadata is authoritative; compare a CLI version only when
+# the successful command emitted a parseable one.
+cli_output = f"{cli_version_result.stdout}\n{cli_version_result.stderr}"
+cli_versions = set(re.findall(r"(?<!\d)\d+\.\d+\.\d+(?!\d)", cli_output))
+if cli_versions and ocrmypdf_version not in cli_versions:
     fail(
         "OCRmyPDF CLI/package version mismatch: "
-        f"CLI={cli_version!r}, package={ocrmypdf_version!r}"
+        f"detected={sorted(cli_versions)!r}, {version_diagnostic}"
     )
 
 languages = run(
