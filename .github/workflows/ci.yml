@@ -148,9 +148,9 @@ jobs:
       - name: Install LibreOffice, Tesseract and fonts
         run: sudo apt-get install --no-install-recommends -y libreoffice-writer libreoffice-calc libreoffice-impress tesseract-ocr tesseract-ocr-eng tesseract-ocr-ara fonts-noto-core
       - name: Install corpus and Ghostscript-free OCR dependencies
-        run: python -m pip install python-docx openpyxl python-pptx pillow "ocrmypdf==17.10.0" pypdfium2
-      - name: Verify Ghostscript is not in the OCR test image
-        run: test -z "$(command -v gs || true)"
+        run: python -m pip install python-docx openpyxl python-pptx pillow "ocrmypdf==17.10.0" "pypdfium2==5.13.0"
+      - name: Verify approved Ghostscript-free OCR production path
+        run: python scripts/verify-ocr-runtime.py
       - name: Generate safe processing corpus
         run: python scripts/generate-processing-corpus.py
       - name: Start local S3-compatible storage

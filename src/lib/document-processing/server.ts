@@ -4,6 +4,7 @@ import { basename, extname, join } from "path";
 import { spawn } from "child_process";
 import { runtimeLimits, timeoutFor } from "@/lib/runtime/config";
 import { recordMetric } from "@/lib/observability/metrics";
+import { APPROVED_OCR_EXECUTABLE, approvedOcrArguments } from "@/lib/document-processing/ocr-policy";
 import { PDFDocument } from "pdf-lib";
 
 export type ServerToolId = "word-to-pdf" | "pdf-to-word" | "excel-to-pdf" | "powerpoint-to-pdf" | "ocr-pdf";
@@ -73,7 +74,7 @@ export async function processServerDocument(tool: ServerToolId, file: File, lang
     if (tool === "ocr-pdf") {
       // Standard PDF output plus optimize=0 avoids the Ghostscript PDF/A and
       // optimization paths. Production images must still verify the resolved chain.
-      await run("ocrmypdf", ["--skip-text", "--rotate-pages", "--deskew", "--output-type", "pdf", "--optimize", "0", "--language", language, inputPath, join(directory, outputName(name, ".pdf"))], directory, timeoutFor("ocr"));
+      await run(APPROVED_OCR_EXECUTABLE, [...approvedOcrArguments(language, inputPath, join(directory, outputName(name, ".pdf")))], directory, timeoutFor("ocr"));
     } else {
       // LibreOffice is isolated behind this server-only boundary. It handles DOC/DOCX reliably;
       // PDF-to-DOCX quality depends on the LibreOffice/PDF import filter installed by the host.

@@ -31,7 +31,11 @@ LibreOffice is discovered at runtime by spawning the fixed `soffice` executable.
 
 ## Licensing gate
 
-LibreOffice, OCRmyPDF, Ghostscript and all transitive/subprocess dependencies require deployment-distribution and commercial-use review. Installing an executable does not approve it. No new OCR engine or open model was adopted in Phase 6.
+The approved OCR runtime is OCRmyPDF 17.10.0 + Tesseract + pypdfium2 5.13.0 with Arabic and English language data. The worker explicitly requests standard PDF output, optimization level 0, the pypdfium rasterizer and the Tesseract engine. It does not request PDF/A.
+
+Ghostscript must be absent from the approved production OCR image: `gs` must not resolve. `scripts/verify-ocr-runtime.py` is a fail-closed image/CI check for the required executables, package versions, language packs, command options and Ghostscript absence. Every production image build must run it after system/Python package installation. Base-image or package changes must not reintroduce Ghostscript transitively.
+
+The Product Owner closed this gate on 2026-09-10 by approving the Ghostscript-free path. Any future proposal to use Ghostscript for PDF/A, optimization, rasterization, conversion, repair or another subprocess role requires a separate Change Request and Licensing Gate. This is engineering documentation, not legal advice; no new OCR engine or paid dependency was adopted.
 
 ## Open-model evaluation gate
 
