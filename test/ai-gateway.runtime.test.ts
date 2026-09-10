@@ -8,6 +8,7 @@ import { validateProviderResponse } from "../src/lib/ai/gateway/validation";
 import { workerToolIds, toolRegistry } from "../src/lib/tools/registry";
 import { extractPdfTextServer, serializePdfPages } from "../src/lib/pdf/text-server";
 import { PDFDocument } from "pdf-lib";
+import { normalizePdfJsData } from "../src/lib/pdf/pdfjs-data";
 
 const baseTask: AiTask = { toolId: "summarize-pdf", locale: "en", documentId: "11111111-1111-1111-1111-111111111111", documentText: "[PAGE 1]\nDIP contract\n[/PAGE 1]", pageCount: 1 };
 
@@ -19,6 +20,14 @@ test("AI worker extracts page-scoped text server-side without browser Canvas", a
   const pdf = await PDFDocument.create(); pdf.addPage().drawText("first scoped page"); pdf.addPage().drawText("second scoped page");
   const pages = await extractPdfTextServer(await pdf.save());
   assert.equal(pages.length, 2); assert.match(serializePdfPages(pages), /\[PAGE 1\][\s\S]*first scoped page[\s\S]*\[PAGE 2\]/);
+});
+
+test("server PDF.js boundary accepts Buffer and preserves its exact byte range", async () => {
+  const pdf = await PDFDocument.create(); pdf.addPage().drawText("buffer boundary text"); const saved = await pdf.save();
+  const padded = Buffer.alloc(saved.byteLength + 14, 0x7f); Buffer.from(saved).copy(padded, 7); const slicedBuffer = padded.subarray(7, 7 + saved.byteLength);
+  const normalized = normalizePdfJsData(slicedBuffer); assert.equal(Buffer.isBuffer(normalized), false); assert.equal(normalized.byteLength, saved.byteLength); assert.deepEqual(normalized, saved);
+  const fromBuffer = await extractPdfTextServer(slicedBuffer); const fromUint8Array = await extractPdfTextServer(new Uint8Array(saved));
+  assert.match(fromBuffer[0].text, /buffer boundary text/); assert.deepEqual(fromBuffer, fromUint8Array);
 });
 
 test("gateway executes policy before routing/provider and accounts once", async () => {

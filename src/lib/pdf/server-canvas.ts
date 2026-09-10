@@ -3,6 +3,7 @@ import { dirname, join } from "node:path";
 import { createCanvas, GlobalFonts } from "@napi-rs/canvas";
 import { runtimeLimits } from "@/lib/runtime/config";
 import { recordMetric } from "@/lib/observability/metrics";
+import { normalizePdfJsData } from "@/lib/pdf/pdfjs-data";
 
 const require = createRequire(import.meta.url);
 const pdfJsRoot = dirname(require.resolve("pdfjs-dist/package.json"));
@@ -19,7 +20,7 @@ function registerWatermarkFonts() {
 export async function renderPdfToJpegs(bytes: Uint8Array, quality = 0.9) {
   const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
   // PDF.js transfers the backing buffer to its worker; copy it so retries/callers retain input bytes.
-  const loadingOptions = { data: bytes.slice(), isEvalSupported: false, useSystemFonts: false, standardFontDataUrl } as unknown as Parameters<typeof pdfjs.getDocument>[0];
+  const loadingOptions = { data: normalizePdfJsData(bytes), isEvalSupported: false, useSystemFonts: false, standardFontDataUrl } as unknown as Parameters<typeof pdfjs.getDocument>[0];
   const task = pdfjs.getDocument(loadingOptions);
   try {
     const document = await task.promise;

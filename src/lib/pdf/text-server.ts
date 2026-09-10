@@ -1,9 +1,10 @@
+import { normalizePdfJsData } from "@/lib/pdf/pdfjs-data";
 export type PdfTextPage = { page: number; text: string };
 
 /** Text-only PDF parsing for Node workers; it does not initialize Canvas or a browser worker. */
 export async function extractPdfTextServer(bytes: Uint8Array): Promise<PdfTextPage[]> {
   const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
-  const loadingTask = pdfjs.getDocument({ data: bytes.slice(), isEvalSupported: false, useSystemFonts: true } as DocumentInitParameters);
+  const loadingTask = pdfjs.getDocument({ data: normalizePdfJsData(bytes), isEvalSupported: false, useSystemFonts: true } as DocumentInitParameters);
   const document = await loadingTask.promise;
   try {
     const pages: PdfTextPage[] = [];
