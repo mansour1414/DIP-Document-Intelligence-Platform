@@ -27,7 +27,7 @@ integration("orchestrator to DB, Redis, worker, S3 and multi-output is idempoten
     const office = await createToolJob({ userId, toolId: "word-to-pdf", idempotencyKey: "office-e2e", correlationId: randomUUID(), uploads: [{ filename: "word-en.docx", mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", bytes: wordBytes }] });
     const convertedOffice = await wait(office.id); assert.equal(convertedOffice.status, "SUCCEEDED"); assert.equal(convertedOffice.toolExecutions.length, 1); assert.ok(convertedOffice.outputFileId);
   } finally {
-    await documentWorker.close(); await aiWorker.close(); const { getAiJobQueue, getJobQueue, getQueueConnection } = await import("../src/lib/queue/index"); await getJobQueue().close(); await getAiJobQueue().close(); await getQueueConnection().quit();
+    await documentWorker.close(); await aiWorker.close(); const { closeQueueResources } = await import("../src/lib/queue/index"); await closeQueueResources();
     const docs = await db.document.findMany({ where: { userId }, include: { files: true } }); for (const doc of docs) for (const file of doc.files) await storage.deleteObject(file.storageKey).catch(() => undefined);
     await db.$disconnect();
   }

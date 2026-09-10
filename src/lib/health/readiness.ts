@@ -1,9 +1,11 @@
 import { db } from "@/lib/db";
-import { getQueueConnection } from "@/lib/queue";
+import { pingQueueConnection } from "@/lib/queue";
+import { logger } from "@/lib/logging";
 
 export async function checkReadiness() {
   const started = performance.now();
-  try { await Promise.all([getQueueConnection().ping(), db.$queryRaw`SELECT 1`]); return { ready: true, durationMs: performance.now() - started }; }
-  catch { return { ready: false, durationMs: performance.now() - started }; }
+  const [redis, postgres] = await Promise.allSettled([pingQueueConnection(), db.$queryRaw`SELECT 1`]);
+  const ready = redis.status === "fulfilled" && postgres.status === "fulfilled";
+  if (!ready) logger.warn("readiness.failed", { redis: redis.status, postgres: postgres.status });
+  return { ready, durationMs: performance.now() - started };
 }
-

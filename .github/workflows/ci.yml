@@ -97,6 +97,11 @@ jobs:
         run: psql "$DATABASE_URL" --set=ON_ERROR_STOP=1 --command="ALTER ROLE dip_app PASSWORD 'dip_test_runtime'"
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dip_test
+      - name: Verify application dependencies are ready
+        run: node scripts/wait-for-dependencies.mjs
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dip_test
+          REDIS_URL: redis://localhost:6379
       - run: npm test
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dip_test
@@ -172,6 +177,15 @@ jobs:
         run: psql "$DATABASE_URL" --set=ON_ERROR_STOP=1 --file=prisma/bootstrap/dip_app.sql
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dip_processing
+      - name: Configure ephemeral runtime role
+        run: psql "$DATABASE_URL" --set=ON_ERROR_STOP=1 --command="ALTER ROLE dip_app PASSWORD 'dip_processing_runtime'"
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dip_processing
+      - name: Verify application dependencies are ready
+        run: node scripts/wait-for-dependencies.mjs
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dip_processing
+          REDIS_URL: redis://localhost:6379
       - name: Run real processing integrations
         run: npm test
         env:
@@ -182,6 +196,8 @@ jobs:
           STORAGE_REGION: us-east-1
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dip_processing
           REDIS_URL: redis://localhost:6379
+          DIP_RLS_TEST_OWNER_URL: postgresql://postgres:postgres@localhost:5432/dip_processing
+          DIP_RLS_TEST_DATABASE_URL: postgresql://dip_app:dip_processing_runtime@localhost:5432/dip_processing
           RUN_STORAGE_E2E: "1"
           RUN_PROCESSING_CORPUS: "1"
           FULL_PROCESSING_E2E: "1"
