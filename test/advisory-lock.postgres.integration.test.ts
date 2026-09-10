@@ -9,7 +9,8 @@ integration("real PostgreSQL advisory locks serialize usage, credit and AI idemp
   const { enforceJobCreation } = await import("../src/lib/usage/enforcement");
   const { recordAiUsageOnce } = await import("../src/lib/ai/gateway/usage");
   const userId = randomUUID(); const jobId = randomUUID(); const idempotencyKey = `advisory-${randomUUID()}`;
-  await db.user.create({ data: { id: userId, email: `advisory-${userId}@example.invalid`, creditLedger: { create: { type: "BONUS", amount: 100, balance: 100, idempotencyKey: "seed", reason: "PROMOTIONAL_GRANT" } } } });
+  try {
+    await db.user.create({ data: { id: userId, email: `advisory-${userId}@example.invalid`, creditLedger: { create: { type: "BONUS", amount: 100, balance: 100, idempotencyKey: "seed", reason: "PROMOTIONAL_GRANT" } } } });
 
   const attempts = await Promise.all(Array.from({ length: 4 }, () => enforceJobCreation({ userId, toolId: "merge-pdf", idempotencyKey, files: [{ size: 1 }, { size: 1 }] })));
   assert.equal(attempts.length, 4);
@@ -21,5 +22,5 @@ integration("real PostgreSQL advisory locks serialize usage, credit and AI idemp
   const accounting = await Promise.all(Array.from({ length: 4 }, () => recordAiUsageOnce(context, response)));
   assert.equal(accounting.filter((entry) => !entry.reused).length, 1);
   assert.equal(await db.aiUsage.count({ where: { userId, jobId } }), 1);
-  await db.$disconnect();
+  } finally { await db.$disconnect(); }
 });

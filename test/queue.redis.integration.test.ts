@@ -26,6 +26,8 @@ test("real Redis queue reaches terminal states and retry side effects remain ide
     await assert.rejects(() => failure.waitUntilFinished(events, 10_000), /fixture failure/);
     assert.equal(attempts.get("retry"), 2); assert.equal(outputs.size, 2); assert.equal(outputs.get("retry"), "output/retry");
   } finally {
-    await worker.close(); await events.close(); await queue.obliterate({ force: true }); await queue.close(); await connection.quit();
+    await queue.obliterate({ force: true }).catch(() => undefined);
+    await Promise.allSettled([worker.close(), events.close(), queue.close()]);
+    if (connection.status === "ready") await connection.quit(); else connection.disconnect();
   }
 });

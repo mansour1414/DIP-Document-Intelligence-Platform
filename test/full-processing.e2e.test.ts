@@ -27,20 +27,22 @@ integration("orchestrator to DB, Redis, worker, S3 and multi-output is idempoten
     const office = await createToolJob({ userId, toolId: "word-to-pdf", idempotencyKey: "office-e2e", correlationId: randomUUID(), uploads: [{ filename: "word-en.docx", mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", bytes: wordBytes }] });
     const convertedOffice = await wait(office.id); assert.equal(convertedOffice.status, "SUCCEEDED"); assert.equal(convertedOffice.toolExecutions.length, 1); assert.ok(convertedOffice.outputFileId);
   } finally {
-    await documentWorker.close(); await aiWorker.close(); const { closeQueueResources } = await import("../src/lib/queue/index"); await closeQueueResources();
-    const docs = await db.document.findMany({ where: { userId }, include: { files: true } }); for (const doc of docs) for (const file of doc.files) await storage.deleteObject(file.storageKey).catch(() => undefined);
-    await db.$disconnect();
+    const { closeQueueResources } = await import("../src/lib/queue/index"); const { closeStorage } = await import("../src/lib/storage/index");
+    await Promise.allSettled([documentWorker.close(), aiWorker.close()]);
+    try { const docs = await db.document.findMany({ where: { userId }, include: { files: true } }); for (const doc of docs) for (const file of doc.files) await storage.deleteObject(file.storageKey).catch(() => undefined); }
+    finally { await Promise.allSettled([closeQueueResources(), closeStorage(), db.$disconnect()]); }
   }
 });
 
 integration("retention scheduler deletes expired storage, preserves running inputs and retries idempotently", { timeout: 30_000 }, async () => {
   const { db } = await import("../src/lib/db/index"); const { runRetentionCleanup } = await import("../src/lib/retention/service"); const userId = randomUUID(); const old = new Date("2020-01-01T00:00:00Z");
-  await db.user.create({ data: { id: userId, email: `retention-${userId}@example.invalid` } });
+  try { await db.user.create({ data: { id: userId, email: `retention-${userId}@example.invalid` } });
   const expired = await db.document.create({ data: { userId, title: "expired", createdAt: old, files: { create: { originalName: "expired.pdf", mimeType: "application/pdf", size: 1, storageKey: `expired/${userId}`, createdAt: old, storageObject: { create: { provider: "s3", bucket: "test", objectKey: `expired/${userId}`, size: 1, createdAt: old } } } } }, include: { files: true } });
   const active = await db.document.create({ data: { userId, title: "protected", createdAt: old, files: { create: { originalName: "active.pdf", mimeType: "application/pdf", size: 1, storageKey: `active/${userId}`, createdAt: old, storageObject: { create: { provider: "s3", bucket: "test", objectKey: `active/${userId}`, size: 1, createdAt: old } } } } }, include: { files: true } });
   await db.job.create({ data: { toolId: "merge-pdf", idempotencyKey: `protected-${userId}`, requesterId: userId, inputFileId: active.files[0].id, status: "RUNNING" } });
-  const deleted: string[] = []; const fakeStorage = { createUploadKey: () => "", put: async () => ({ key: "", bucket: "", contentType: "", size: 0 }), get: async () => new Uint8Array(), head: async () => ({ key: "", bucket: "", contentType: "", size: 0 }), exists: async () => true, deleteObject: async (key: string) => { deleted.push(key); } };
+  const deleted: string[] = []; const fakeStorage = { createUploadKey: () => "", put: async () => ({ key: "", bucket: "", contentType: "", size: 0 }), get: async () => new Uint8Array(), head: async () => ({ key: "", bucket: "", contentType: "", size: 0 }), exists: async () => true, deleteObject: async (key: string) => { deleted.push(key); }, close: async () => undefined };
   const first = await runRetentionCleanup({ now: new Date("2026-09-10T00:00:00Z"), dryRun: false, storage: fakeStorage }); assert.equal(first.deletedDocuments, 1); assert.deepEqual(deleted, [`expired/${userId}`]);
   assert.equal((await db.document.findUniqueOrThrow({ where: { id: expired.id } })).status, "DELETED"); assert.equal((await db.document.findUniqueOrThrow({ where: { id: active.id } })).status, "ACTIVE");
-  const second = await runRetentionCleanup({ now: new Date("2026-09-10T00:00:00Z"), dryRun: false, storage: fakeStorage }); assert.equal(second.deletedDocuments, 0); assert.deepEqual(deleted, [`expired/${userId}`]); await db.$disconnect();
+  const second = await runRetentionCleanup({ now: new Date("2026-09-10T00:00:00Z"), dryRun: false, storage: fakeStorage }); assert.equal(second.deletedDocuments, 0); assert.deepEqual(deleted, [`expired/${userId}`]);
+  } finally { await db.$disconnect(); }
 });

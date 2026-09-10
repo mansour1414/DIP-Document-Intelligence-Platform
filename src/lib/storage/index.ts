@@ -13,6 +13,7 @@ export interface ObjectStorage {
   head(key: string): Promise<StoredObject | undefined>;
   exists(key: string): Promise<boolean>;
   deleteObject(key: string): Promise<void>;
+  close(): Promise<void>;
 }
 
 function safeName(filename: string) { return filename.replace(/[^a-zA-Z0-9._-]/g, "_").slice(-160) || "file"; }
@@ -46,7 +47,9 @@ export function createS3Storage(): ObjectStorage {
     head: headObject,
     async exists(key) { return Boolean(await headObject(key)); },
     async deleteObject(key) { await withAbort("delete", (abortSignal) => client.send(new DeleteObjectCommand({ Bucket: config.bucket, Key: key }), { abortSignal })); },
+    async close() { client.destroy(); },
   };
 }
 let configuredStorage: ObjectStorage | undefined;
 export function getStorage() { return configuredStorage ??= createS3Storage(); }
+export async function closeStorage() { const storage = configuredStorage; configuredStorage = undefined; await storage?.close(); }
