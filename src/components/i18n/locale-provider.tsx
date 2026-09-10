@@ -6,8 +6,8 @@ import { Languages } from "lucide-react";
 type Locale = "en" | "ar";
 const LocaleContext = createContext<{ locale: Locale; toggleLocale: () => void }>({ locale: "en", toggleLocale: () => undefined });
 
-export function LocaleProvider({ children }: { children: React.ReactNode }) {
-  const [locale, setLocale] = useState<Locale>("en");
+export function LocaleProvider({ children, initialLocale = "en" }: { children: React.ReactNode; initialLocale?: Locale }) {
+  const [locale, setLocale] = useState<Locale>(initialLocale);
   useEffect(() => {
     document.documentElement.lang = locale;
     document.documentElement.dir = locale === "ar" ? "rtl" : "ltr";

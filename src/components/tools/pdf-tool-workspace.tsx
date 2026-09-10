@@ -10,7 +10,7 @@ import { LanguageToggle, useLocale } from "@/components/i18n/locale-provider";
 import { downloadOutput, PdfToolError, runPdfOperation, type OutputFile, type PdfOperation } from "@/lib/pdf/client";
 import type { ToolDefinition } from "@/config";
 
-type Props = { tool: ToolDefinition };
+type Props = { tool: ToolDefinition; embedded?: boolean };
 
 const pageInputTools = new Set(["split-pdf", "organize-pdf", "delete-pages", "extract-pages"]);
 const workerBatch2Tools = new Set(["compress-pdf", "pdf-to-jpg", "watermark-pdf"]);
@@ -26,7 +26,8 @@ async function waitForWorkerJob(jobId: string) {
   throw new Error("PROCESSING_TIMEOUT: The worker did not finish in time.");
 }
 
-export function PdfToolWorkspace({ tool }: Props) {
+export function PdfToolWorkspace({ tool, embedded: _embedded = false }: Props) {
+  void _embedded;
   const { locale } = useLocale();
   const isArabic = locale === "ar";
   const operation = tool.id as PdfOperation;
@@ -61,6 +62,7 @@ export function PdfToolWorkspace({ tool }: Props) {
   });
 
   const process = async () => {
+    window.dispatchEvent(new CustomEvent("dip:analytics", { detail: { name: "tool_started" } }));
     setStatus("processing"); setMessage("Reading and validating your files…"); setOutputs([]); setProgress({ completed: 0, total: 0 });
     let jobId: string | undefined;
     try {
@@ -70,7 +72,7 @@ export function PdfToolWorkspace({ tool }: Props) {
         if (!queued.ok || !accepted.jobId) throw new Error(`${accepted.code ?? "QUEUE_FAILED"}: ${accepted.message ?? "The job could not be queued."}`);
         setMessage("Processing securely in the document worker…"); const outputFileIds = await waitForWorkerJob(accepted.jobId);
         const workerOutputs = await Promise.all(outputFileIds.map(async (fileId, index) => { const response = await fetch(`/api/files/${fileId}`); if (!response.ok) throw new Error("OUTPUT_DOWNLOAD_FAILED"); const disposition = response.headers.get("content-disposition") ?? ""; return { name: disposition.match(/filename="?([^";]+)"?/)?.[1] ?? `output-${index + 1}`, bytes: new Uint8Array(await response.arrayBuffer()), mimeType: response.headers.get("content-type") ?? "application/octet-stream" }; }));
-        setOutputs(workerOutputs); setStatus("done"); setMessage(`${workerOutputs.length} file${workerOutputs.length === 1 ? "" : "s"} ready to download.`); return;
+        setOutputs(workerOutputs); setStatus("done"); setMessage(`${workerOutputs.length} file${workerOutputs.length === 1 ? "" : "s"} ready to download.`); window.dispatchEvent(new CustomEvent("dip:analytics", { detail: { name: "tool_completed" } })); return;
       }
       const authorization = await fetch("/api/usage", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ toolId: operation, filename: files.map((file) => file.name).join(", "), size: files.reduce((total, file) => total + file.size, 0), mimeType: files[0]?.type }) });
       const authorized = await authorization.json() as { jobId?: string; code?: string; message?: string };
@@ -81,11 +83,11 @@ export function PdfToolWorkspace({ tool }: Props) {
         setMessage(`Rendering page ${completed} of ${total}…`);
       } });
       await fetch("/api/usage", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ jobId, success: true }) });
-      setOutputs(result); setStatus("done"); setMessage(`${result.length} file${result.length === 1 ? "" : "s"} ready to download.`);
+      setOutputs(result); setStatus("done"); setMessage(`${result.length} file${result.length === 1 ? "" : "s"} ready to download.`); window.dispatchEvent(new CustomEvent("dip:analytics", { detail: { name: "tool_completed" } }));
     } catch (error) {
       if (jobId) await fetch("/api/usage", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ jobId, success: false, error: error instanceof Error ? error.message : "Processing failed" }) });
       const known = error instanceof PdfToolError;
-      setStatus("error"); setMessage(known ? `${error.code}: ${error.message}` : "INTERNAL_ERROR: The document could not be processed.");
+      setStatus("error"); setMessage(known ? `${error.code}: ${error.message}` : "INTERNAL_ERROR: The document could not be processed."); window.dispatchEvent(new CustomEvent("dip:analytics", { detail: { name: "tool_failed", error_code: known ? error.code : "INTERNAL_ERROR" } }));
     }
   };
 

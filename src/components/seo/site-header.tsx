@@ -1,0 +1,4 @@
+import Link from "next/link";
+import type { Locale } from "@/lib/seo/tool-content";
+export function SiteHeader({ locale }: { locale: Locale }) { const ar = locale === "ar"; return <header className="border-b bg-white"><div className="mx-auto flex min-h-16 max-w-6xl flex-wrap items-center gap-4 px-4 py-2 sm:px-6"><Link href={`/${locale}`} className="rounded-lg bg-blue-700 px-2.5 py-1.5 text-sm font-bold text-white">DIP</Link><nav aria-label={ar ? "التنقل الرئيسي" : "Main navigation"} className="ms-auto flex items-center gap-4 text-sm font-semibold"><Link href={`/${locale}/tools`}>{ar ? "الأدوات" : "Tools"}</Link><Link href={`/${locale}/pricing`}>{ar ? "الخطط" : "Pricing"}</Link><Link href={ar ? "/en" : "/ar"} hrefLang={ar ? "en" : "ar"} lang={ar ? "en" : "ar"}>{ar ? "English" : "العربية"}</Link></nav></div></header>; }
+
