@@ -19,9 +19,18 @@ test("approved OCR command is explicit, standard-PDF, unoptimized and Ghostscrip
 
 test("heavy CI keeps bilingual OCR corpus enabled and verifies the approved runtime", async () => {
   const workflow = await readFile(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8");
+  const verifier = await readFile(new URL("../scripts/verify-ocr-runtime.py", import.meta.url), "utf8");
 
   assert.match(workflow, /tesseract-ocr-eng tesseract-ocr-ara/);
   assert.match(workflow, /python scripts\/verify-ocr-runtime\.py/);
   assert.match(workflow, /RUN_PROCESSING_CORPUS: "1"/);
   assert.match(workflow, /FULL_PROCESSING_E2E: "1"/);
+  assert.doesNotMatch(verifier, /\["ocrmypdf", "--help"\]/);
+  assert.match(verifier, /\["ocrmypdf", "--version"\]/);
+  assert.match(verifier, /TemporaryDirectory/);
+  assert.match(verifier, /"--output-type",\s+"pdf"/);
+  assert.match(verifier, /"--optimize",\s+"0"/);
+  assert.match(verifier, /"--rasterizer",\s+"pypdfium"/);
+  assert.match(verifier, /"--ocr-engine",\s+"tesseract"/);
+  assert.match(verifier, /startswith\(b"%PDF-"\)/);
 });
