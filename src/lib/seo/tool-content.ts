@@ -5,7 +5,7 @@ export type Locale = (typeof locales)[number];
 
 export const mvpToolIds = [
   "merge-pdf", "split-pdf", "compress-pdf", "organize-pdf", "rotate-pdf", "delete-pages", "extract-pages",
-  "jpg-to-pdf", "pdf-to-jpg", "watermark-pdf", "word-to-pdf", "pdf-to-word", "ocr-pdf",
+  "jpg-to-pdf", "pdf-to-jpg", "watermark-pdf", "word-to-pdf", "pdf-to-word", "excel-to-pdf", "powerpoint-to-pdf", "ocr-pdf",
   "summarize-pdf", "chat-with-pdf", "extract-data",
 ] as const;
 export type MvpToolId = (typeof mvpToolIds)[number];
@@ -23,7 +23,8 @@ const related: Record<MvpToolId, MvpToolId[]> = {
   "rotate-pdf": ["organize-pdf", "delete-pages"], "delete-pages": ["organize-pdf", "extract-pages"],
   "extract-pages": ["split-pdf", "delete-pages"], "jpg-to-pdf": ["pdf-to-jpg", "merge-pdf"],
   "pdf-to-jpg": ["jpg-to-pdf", "compress-pdf"], "watermark-pdf": ["organize-pdf", "compress-pdf"],
-  "word-to-pdf": ["pdf-to-word", "merge-pdf"], "pdf-to-word": ["word-to-pdf", "ocr-pdf"],
+  "word-to-pdf": ["pdf-to-word", "excel-to-pdf"], "pdf-to-word": ["word-to-pdf", "ocr-pdf"],
+  "excel-to-pdf": ["word-to-pdf", "powerpoint-to-pdf"], "powerpoint-to-pdf": ["word-to-pdf", "excel-to-pdf"],
   "ocr-pdf": ["extract-data", "summarize-pdf"], "summarize-pdf": ["chat-with-pdf", "ocr-pdf"],
   "chat-with-pdf": ["summarize-pdf", "extract-data"], "extract-data": ["ocr-pdf", "summarize-pdf"],
 };
@@ -41,6 +42,8 @@ const enDetails: Record<MvpToolId, { intent: string; result: string; use: string
   "watermark-pdf": { intent: "apply a text watermark to PDF pages", result: "a marked PDF", use: "draft, confidential, or ownership labels", caveat: "Preview wording and placement before distribution." },
   "word-to-pdf": { intent: "convert Word documents to a consistent PDF", result: "a shareable PDF", use: "contracts, reports, and final copies", caveat: "Complex fonts or layouts can render differently from Word." },
   "pdf-to-word": { intent: "convert PDF content into an editable Word document", result: "a DOCX file", use: "reusing text from straightforward PDFs", caveat: "This beta works best on simple layouts; complex formatting may need correction." },
+  "excel-to-pdf": { intent: "convert Excel spreadsheets into shareable PDF documents", result: "a PDF rendered from the workbook", use: "reports, tables, and spreadsheet distribution", caveat: "Wide sheets, print areas, charts, fonts, and page breaks may render differently and should be reviewed." },
+  "powerpoint-to-pdf": { intent: "convert PowerPoint presentations into PDF documents", result: "a PDF rendered from the slides", use: "sharing decks, handouts, and stable presentation copies", caveat: "Transitions, animations, media, custom fonts, and complex layouts may not be preserved exactly." },
   "ocr-pdf": { intent: "add searchable text to scanned documents in Arabic and English", result: "a searchable PDF", use: "scans, photographed pages, and archives", caveat: "Accuracy depends on scan quality, resolution, language, and source layout." },
   "summarize-pdf": { intent: "create an AI-assisted summary of a PDF", result: "a concise document overview", use: "long reports, policies, and research reading", caveat: "Review important facts against the source and its page references." },
   "chat-with-pdf": { intent: "ask focused questions about one PDF", result: "AI-generated answers grounded in the document", use: "finding clauses, facts, and explanations", caveat: "Answers can be incomplete; verify them against cited source pages when available." },
@@ -60,6 +63,8 @@ const arDetails: Record<MvpToolId, { intent: string; result: string; use: string
   "watermark-pdf": { intent: "إضافة علامة مائية نصية إلى الصفحات", result: "ملف PDF موسوم", use: "تمييز المسودات والمحتوى السري والملكية", caveat: "راجع النص وموضعه قبل توزيع الملف." },
   "word-to-pdf": { intent: "تحويل مستند Word إلى PDF ثابت", result: "ملف PDF سهل المشاركة", use: "العقود والتقارير والنسخ النهائية", caveat: "قد تختلف الخطوط أو التخطيطات المعقدة عن Word." },
   "pdf-to-word": { intent: "تحويل محتوى PDF إلى مستند Word قابل للتحرير", result: "ملف DOCX", use: "إعادة استخدام نصوص الملفات البسيطة", caveat: "هذه نسخة تجريبية تناسب التخطيطات البسيطة؛ وقد تحتاج التنسيقات المعقدة إلى تصحيح." },
+  "excel-to-pdf": { intent: "تحويل جداول Excel إلى مستندات PDF قابلة للمشاركة", result: "ملف PDF منشأ من المصنف", use: "التقارير والجداول وتوزيع بيانات جداول البيانات", caveat: "قد تختلف الأوراق العريضة ومناطق الطباعة والمخططات والخطوط وفواصل الصفحات، لذا راجع الناتج." },
+  "powerpoint-to-pdf": { intent: "تحويل عروض PowerPoint إلى مستندات PDF", result: "ملف PDF منشأ من الشرائح", use: "مشاركة العروض والنشرات والنسخ الثابتة", caveat: "قد لا تُحفظ الانتقالات والحركات والوسائط والخطوط المخصصة والتخطيطات المعقدة كما هي تمامًا." },
   "ocr-pdf": { intent: "إضافة نص قابل للبحث للمستندات الممسوحة بالعربية والإنجليزية", result: "ملف PDF قابل للبحث", use: "المسوح والصور والأرشيف", caveat: "تعتمد الدقة على جودة المسح والدقة واللغة وتخطيط المصدر." },
   "summarize-pdf": { intent: "إنشاء ملخص بمساعدة الذكاء الاصطناعي", result: "نظرة موجزة على المستند", use: "التقارير الطويلة والسياسات والبحوث", caveat: "راجع المعلومات المهمة مع المصدر وإشارات الصفحات." },
   "chat-with-pdf": { intent: "طرح أسئلة محددة حول ملف PDF واحد", result: "إجابات مولّدة بالذكاء الاصطناعي ومستندة إلى الملف", use: "العثور على البنود والحقائق والتفسيرات", caveat: "قد تكون الإجابات ناقصة؛ تحقق منها عبر صفحات المصدر المشار إليها عند توفرها." },
@@ -74,6 +79,8 @@ function privacy(mode: ExecutionMode, locale: Locale) {
 function build(toolId: MvpToolId, locale: Locale): ToolSeoContent {
   const tool = getTool(toolId)!; const d = locale === "ar" ? arDetails[toolId] : enDetails[toolId]; const name = locale === "ar" ? tool.nameAr : tool.name;
   const beta = toolId === "pdf-to-word";
+  const officeWorker = ["excel-to-pdf", "powerpoint-to-pdf"].includes(toolId);
+  const processingNote = officeWorker ? (locale === "ar" ? "يُرفع الملف إلى عامل LibreOffice خادمي داخل مساحة معالجة مؤقتة ومعزولة لإنشاء ملف PDF. راجع الناتج لأن التخطيطات والخطوط والوسائط المعقدة قد تختلف." : "The file is uploaded to a server-side LibreOffice worker in a temporary isolated workspace to create the PDF. Review the result because complex layouts, fonts, and media can differ.") : privacy(tool.execution, locale);
   return {
     toolId, slug: toolId, locale,
     title: locale === "ar" ? `${name} أونلاين${beta ? " — تجريبي" : ""} | DIP` : `${name} Online${beta ? " — Beta" : ""} | DIP`,
@@ -84,18 +91,18 @@ function build(toolId: MvpToolId, locale: Locale): ToolSeoContent {
     benefits: locale === "ar" ? [`ناتج واضح: ${d.result}.`, `مناسب لـ${d.use}.`, d.caveat] : [`A clear output: ${d.result}.`, `Designed for ${d.use}.`, d.caveat],
     faq: locale === "ar" ? [
       { question: `ماذا تفعل أداة ${name}؟`, answer: `تساعدك على ${d.intent}، وتنتج ${d.result}.` },
-      { question: "أين تتم معالجة الملف؟", answer: privacy(tool.execution, "ar") },
+      { question: "أين تتم معالجة الملف؟", answer: processingNote },
       { question: "ما الذي يؤثر في النتيجة؟", answer: d.caveat },
       ...(toolId === "ocr-pdf" ? [{ question: "هل يدعم OCR العربية؟", answer: "نعم، يدعم التعرّف على العربية والإنجليزية. تعتمد الدقة على جودة المسح والدقة وتخطيط الصفحة، ولا يمكن ضمان دقة كاملة." }] : []),
       ...(beta ? [{ question: "هل التحويل إلى Word نهائي؟", answer: "الأداة في مرحلة تجريبية. راجع الجداول والخطوط والتخطيطات المعقدة بعد التحويل." }] : []),
     ] : [
       { question: `What does ${name} do?`, answer: `It lets you ${d.intent} and produces ${d.result}.` },
-      { question: "Where is my file processed?", answer: privacy(tool.execution, "en") },
+      { question: "Where is my file processed?", answer: processingNote },
       { question: "What affects the result?", answer: d.caveat },
       ...(toolId === "ocr-pdf" ? [{ question: "Does OCR support Arabic?", answer: "Yes. Recognition supports Arabic and English. Accuracy depends on scan quality, resolution, and layout; perfect accuracy is not guaranteed." }] : []),
       ...(beta ? [{ question: "Is PDF to Word production-ready?", answer: "It is a beta. Review tables, fonts, and complex layouts after conversion." }] : []),
     ],
-    relatedTools: related[toolId], privacyNote: privacy(tool.execution, locale), status: beta ? "beta" : "stable", indexability: "index",
+    relatedTools: related[toolId], privacyNote: processingNote, status: beta ? "beta" : "stable", indexability: "index",
   };
 }
 

@@ -11,7 +11,7 @@ const nextConfig: NextConfig = {
     },
   },
   async redirects() {
-    const tools = ["merge-pdf", "split-pdf", "compress-pdf", "organize-pdf", "rotate-pdf", "delete-pages", "extract-pages", "jpg-to-pdf", "pdf-to-jpg", "watermark-pdf", "word-to-pdf", "pdf-to-word", "ocr-pdf", "summarize-pdf", "chat-with-pdf", "extract-data"];
+    const tools = ["merge-pdf", "split-pdf", "compress-pdf", "organize-pdf", "rotate-pdf", "delete-pages", "extract-pages", "jpg-to-pdf", "pdf-to-jpg", "watermark-pdf", "word-to-pdf", "pdf-to-word", "excel-to-pdf", "powerpoint-to-pdf", "ocr-pdf", "summarize-pdf", "chat-with-pdf", "extract-data"];
     return [
       { source: "/", destination: "/en", permanent: false },
       { source: "/pricing", destination: "/en/pricing", permanent: true },
