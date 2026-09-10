@@ -1,0 +1,3 @@
+import Link from "next/link";
+import { cn } from "@/lib/utils";
+export function BrandMark({ href = "/", className }: { href?: string; className?: string }) { return <Link href={href} aria-label="DIP home" className={cn("group inline-flex min-h-11 items-center gap-2 rounded-xl focus-visible:ring-2 focus-visible:ring-ring", className)}><span aria-hidden="true" className="grid h-9 w-9 place-items-center rounded-xl bg-primary text-sm font-black tracking-tight text-primary-foreground shadow-sm transition-colors group-hover:bg-primary-hover">D</span><span className="text-base font-bold tracking-tight text-foreground">DIP</span></Link>; }

@@ -1,0 +1,14 @@
+"use client";
+import * as React from "react";
+import * as DialogPrimitive from "@radix-ui/react-dialog";
+import { X } from "lucide-react";
+import { cn } from "@/lib/utils";
+import { DialogOverlay } from "./dialog";
+export const Sheet = DialogPrimitive.Root;
+export const SheetTrigger = DialogPrimitive.Trigger;
+export const SheetClose = DialogPrimitive.Close;
+export const SheetPortal = DialogPrimitive.Portal;
+export const SheetTitle = DialogPrimitive.Title;
+export const SheetDescription = DialogPrimitive.Description;
+export const SheetContent = React.forwardRef<React.ElementRef<typeof DialogPrimitive.Content>, React.ComponentPropsWithoutRef<typeof DialogPrimitive.Content> & { side?: "start" | "end" }>(({ side = "end", className, children, ...props }, ref) => <DialogPrimitive.Portal><DialogOverlay /><DialogPrimitive.Content ref={ref} className={cn("fixed inset-y-0 z-50 flex w-[min(88vw,24rem)] flex-col gap-5 border bg-popover p-6 text-popover-foreground shadow-elevated outline-none", side === "end" ? "end-0 border-s" : "start-0 border-e", className)} {...props}>{children}<DialogPrimitive.Close className="absolute end-4 top-4 inline-flex h-10 w-10 items-center justify-center rounded-lg text-muted-foreground hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring"><X className="h-4 w-4" /><span className="sr-only">Close</span></DialogPrimitive.Close></DialogPrimitive.Content></DialogPrimitive.Portal>);
+SheetContent.displayName = "SheetContent";

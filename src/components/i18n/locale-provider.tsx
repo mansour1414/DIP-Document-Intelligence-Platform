@@ -2,6 +2,7 @@
 
 import { createContext, useContext, useEffect, useState } from "react";
 import { Languages } from "lucide-react";
+import { Button } from "@/components/ui/button";
 
 type Locale = "en" | "ar";
 const LocaleContext = createContext<{ locale: Locale; toggleLocale: () => void }>({ locale: "en", toggleLocale: () => undefined });
@@ -21,5 +22,5 @@ export function useLocale() { return useContext(LocaleContext); }
 export function LanguageToggle() {
   const { locale, toggleLocale } = useLocale();
   const next = locale === "en" ? "العربية" : "English";
-  return <button type="button" onClick={toggleLocale} aria-label={`Switch language to ${next}`} className="inline-flex min-h-10 items-center gap-1.5 rounded-lg border border-slate-300 px-3 text-sm font-semibold text-slate-700 transition-colors hover:border-blue-500 hover:bg-blue-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-600" aria-pressed={locale === "ar"}><Languages aria-hidden="true" className="h-4 w-4" />{next}</button>;
+  return <Button type="button" variant="outline" onClick={toggleLocale} aria-label={`Switch language to ${next}`} aria-pressed={locale === "ar"}><Languages aria-hidden="true" />{next}</Button>;
 }

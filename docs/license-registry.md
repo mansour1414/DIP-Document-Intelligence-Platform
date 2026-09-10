@@ -23,6 +23,9 @@ Reviewed 2026-09-10. Versions are installed/lockfile versions; host executables 
 | OCRmyPDF Python runtime dependencies | resolved by the pinned 17.10.0 wheel and frozen in the production image manifest | transitive Python packages, including pikepdf, fpdf2, uharfbuzz and Pillow | per-package licenses/notices; [official OCRmyPDF dependency metadata](https://github.com/ocrmypdf/OCRmyPDF/blob/v17.10.0/pyproject.toml) | retain bundled notices, vulnerability/license scan the frozen image, and review any dependency-set change | cleared subject to immutable image inventory |
 | Ghostscript | not installed | excluded optional subprocess | AGPL-3.0 or Artifex commercial, [official Artifex licensing](https://www.ghostscript.com/licensing/) | **NOT APPROVED FOR DIP COMMERCIAL OCR PRODUCTION PATH**; current path avoids it. Future use requires a separate Change Request and Licensing Gate | prohibited in approved OCR runtime |
 | Gemini REST | configured provider | external service | Google service/data terms | account, region, processing and retention controls | provider account gate |
+| Motion for React | 13.2.0 | direct UI animation runtime | MIT, [official Motion repository](https://github.com/motiondivision/motion) | retain copyright/license notice; open package only, no Motion+ features | cleared |
+| Framer Motion | 13.2.0 | transitive runtime of `motion` | MIT, [official Motion repository](https://github.com/motiondivision/motion) | retain copyright/license notice | cleared |
+| motion-dom / motion-utils | 13.2.0 / 13.0.0 | transitive runtime utilities | MIT, [official Motion repository](https://github.com/motiondivision/motion) | retain copyright/license notice | cleared |
 
 ## OCR/Ghostscript conclusion
 

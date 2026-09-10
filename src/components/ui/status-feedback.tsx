@@ -1,0 +1,3 @@
+import { AlertCircle, CheckCircle2, Info, TriangleAlert } from "lucide-react";
+import { Alert } from "./alert";
+export function StatusFeedback({ status, children }: { status: "info" | "success" | "warning" | "error"; children: React.ReactNode }) { const Icon = status === "success" ? CheckCircle2 : status === "error" ? AlertCircle : status === "warning" ? TriangleAlert : Info; return <Alert role={status === "error" ? "alert" : "status"} aria-live={status === "error" ? "assertive" : "polite"} variant={status === "error" ? "destructive" : status}><span className="flex items-start gap-2.5"><Icon aria-hidden="true" className="mt-1 h-4 w-4 shrink-0"/><span>{children}</span></span></Alert>; }

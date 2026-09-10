@@ -1,17 +1,130 @@
 @import "tailwindcss";
+@import "@fontsource/noto-sans-arabic/400.css";
+@import "@fontsource/noto-sans-arabic/500.css";
+@import "@fontsource/noto-sans-arabic/600.css";
+@import "@fontsource/noto-sans-arabic/700.css";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --background: #fcfafa;
+  --foreground: #24191d;
+  --card: #ffffff;
+  --card-foreground: #24191d;
+  --popover: #ffffff;
+  --popover-foreground: #24191d;
+  --primary: #6f1938;
+  --primary-hover: #571229;
+  --primary-foreground: #ffffff;
+  --secondary: #f3e9ec;
+  --secondary-foreground: #4c1d2d;
+  --muted: #f5f1f2;
+  --muted-foreground: #685b60;
+  --accent: #efe1e6;
+  --accent-foreground: #571229;
+  --border: #ddd3d6;
+  --input: #cfc3c7;
+  --ring: #8f3151;
+  --destructive: #b42318;
+  --destructive-hover: #912018;
+  --destructive-foreground: #ffffff;
+  --success: #19715f;
+  --success-foreground: #ffffff;
+  --success-surface: #eaf7f2;
+  --warning: #9a6508;
+  --warning-surface: #fff7df;
+  --info: #4657a6;
+  --info-surface: #eef0fb;
+  --radius-sm: 0.5rem;
+  --radius-md: 0.75rem;
+  --radius-lg: 1rem;
+  --shadow-card: 0 1px 2px rgb(36 25 29 / 0.04), 0 8px 24px rgb(36 25 29 / 0.04);
+  --shadow-elevated: 0 18px 50px rgb(36 25 29 / 0.14);
+  --duration-fast: 140ms;
+  --duration-base: 200ms;
 }
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-hover: var(--primary-hover);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-destructive: var(--destructive);
+  --color-destructive-hover: var(--destructive-hover);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-success-surface: var(--success-surface);
+  --color-warning: var(--warning);
+  --color-warning-surface: var(--warning-surface);
+  --color-info: var(--info);
+  --color-info-surface: var(--info-surface);
   --font-sans: var(--font-inter);
+  --shadow-card: var(--shadow-card);
+  --shadow-elevated: var(--shadow-elevated);
+}
+
+* {
+  border-color: var(--border);
+}
+
+html {
+  background: var(--background);
 }
 
 body {
   color: var(--foreground);
   background: var(--background);
+  text-rendering: optimizeLegibility;
+}
+
+html[dir="rtl"] body {
+  font-family: "Noto Sans Arabic", var(--font-inter), system-ui, sans-serif;
+  line-height: 1.7;
+}
+
+::selection {
+  background: var(--accent);
+  color: var(--accent-foreground);
+}
+
+:where(a, button, input, textarea, select, summary):focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 3px;
+}
+
+.dip-container {
+  width: min(100% - 2rem, 72rem);
+  margin-inline: auto;
+}
+
+.dip-page-header {
+  max-width: 48rem;
+}
+
+.dip-grid-pattern {
+  background-image: linear-gradient(rgb(111 25 56 / 0.045) 1px, transparent 1px), linear-gradient(90deg, rgb(111 25 56 / 0.045) 1px, transparent 1px);
+  background-size: 32px 32px;
+  mask-image: linear-gradient(to bottom, black, transparent 90%);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }
