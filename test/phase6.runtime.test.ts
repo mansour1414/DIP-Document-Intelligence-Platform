@@ -6,6 +6,10 @@ import { withTimeout } from "../src/lib/runtime/timeout";
 import { redactLogContext } from "../src/lib/logging";
 import { selectExpiredCandidates, selectOrphans } from "../src/lib/retention/policy";
 import { runtimeLimits } from "../src/lib/runtime/config";
+import { recordMetric, setMetricSink, type MetricPoint } from "../src/lib/observability/metrics";
+import { scrubSentryEvent } from "../src/lib/observability/sentry-scrub";
+import { estimateJobCost } from "../src/lib/cost/model";
+import { retentionPolicy, RETENTION_POLICY_VERSION } from "../src/lib/retention/config";
 
 async function pdfFixture(pages = 1) { const pdf = await PDFDocument.create(); for (let index = 0; index < pages; index += 1) pdf.addPage().drawText(`generated page ${index + 1}`); return pdf.save(); }
 
@@ -40,3 +44,20 @@ test("structured logs redact sensitive fields", () => {
   assert.deepEqual(redactLogContext({ prompt: "secret document", api_key: "key", job_id: "safe", input_tokens: 4 }), { prompt: "[REDACTED]", api_key: "[REDACTED]", job_id: "safe", input_tokens: 4 });
 });
 
+test("metrics foundation emits exact names without high-cardinality user labels", () => {
+  const points: MetricPoint[] = []; setMetricSink((point) => points.push(point));
+  recordMetric("jobs_success_total", 1, "count", { tool_id: "merge-pdf", engine: "pdf-lib", engine_version: "1", status: "succeeded", user_id: "must-not-leak" }); setMetricSink();
+  assert.equal(points[0].name, "jobs_success_total"); assert.equal(points[0].labels.user_id, undefined); assert.equal(points[0].labels.tool_id, "merge-pdf");
+});
+
+test("Sentry scrub removes request bodies and sensitive nested fields", () => {
+  const fixture = { request: { data: "document", cookies: { session: "secret" }, headers: { authorization: "bearer", accept: "json" } }, extra: { prompt: "private", correlation_id: "safe" } } as unknown as Parameters<typeof scrubSentryEvent>[0];
+  const event = scrubSentryEvent(fixture);
+  assert.equal(event.request?.data, undefined); assert.equal(event.request?.cookies, undefined); assert.equal(event.request?.headers?.authorization, "[REDACTED]"); assert.equal(event.extra?.prompt, "[REDACTED]"); assert.equal(event.extra?.correlation_id, "safe");
+});
+
+test("retention and cost models are versioned and deterministic", () => {
+  assert.match(RETENTION_POLICY_VERSION, /^2026-09-provisional-v\d+$/); assert.equal(retentionPolicy.plans.FREE.inputDays, 7); assert.equal(retentionPolicy.plans.PRO.outputDays, 30);
+  const cost = estimateJobCost({ cpuDurationMs: 10, memoryClassMb: 256, storageBytes: 100, storageOperations: 2, aiInputTokens: 0, aiOutputTokens: 0, ocrPages: 0, officeDurationMs: 0, succeeded: true }, { cpuPerMs: 1, memoryMbMs: 0, storageByte: 0.1, storageOperation: 2, aiInputToken: 0, aiOutputToken: 0, ocrPage: 0, officeMs: 0 });
+  assert.equal(cost.estimatedTotal, 24); assert.equal(cost.costPerSuccessfulJob, 24);
+});

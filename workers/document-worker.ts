@@ -1,3 +1,4 @@
+import "../sentry.server.config";
 import { Worker } from "bullmq";
 import { createHash } from "crypto";
 import { db } from "@/lib/db";
@@ -12,6 +13,8 @@ import { runtimeLimits, timeoutFor } from "@/lib/runtime/config";
 import { withTimeout } from "@/lib/runtime/timeout";
 import { validateWorkerOutputs } from "@/lib/outputs/validation";
 import { recordMetric } from "@/lib/observability/metrics";
+import { captureOperationalError } from "@/lib/observability/errors";
+import { configuredCostRates, estimateJobCost } from "@/lib/cost/model";
 
 async function processDocumentJob(message: QueuedJob) {
   const job = await db.job.findUnique({ where: { id: message.jobId }, include: { steps: true } });
@@ -38,7 +41,7 @@ async function processDocumentJob(message: QueuedJob) {
     else throw Object.assign(new Error("Tool is not enabled on this worker"), { code: "TOOL_NOT_WORKER_ENABLED" });
     const preservePages = ["compress-pdf", "rotate-pdf", "watermark-pdf", "ocr-pdf"].includes(job.toolId) ? files[0]?.pageCount ?? undefined : undefined;
     const validated = await validateWorkerOutputs(outputs, preservePages);
-    recordMetric("tool_output_size", validated.totalBytes, "bytes", { tool_id: job.toolId, engine, engine_version: engineVersion });
+    recordMetric("storage_bytes_out", validated.totalBytes, "bytes", { tool_id: job.toolId, engine, engine_version: engineVersion, status: "succeeded" });
     if (job.toolId === "compress-pdf") recordMetric("compression_ratio", validated.totalBytes / bytes[0].byteLength, "ratio", { tool_id: job.toolId, engine, engine_version: engineVersion });
     const storage = getStorage();
     const storedOutputs = await Promise.all(outputs.map(async (output, index) => { const key = `output/${job.requesterId ?? "system"}/${job.id}/${index}-${output.name.replace(/[^a-zA-Z0-9._-]/g, "_")}`; const checksum = createHash("sha256").update(output.bytes).digest("base64"); const object = await storage.put({ key, bytes: output.bytes, contentType: output.mimeType, checksum }); return { output, object, checksum }; }));
@@ -54,21 +57,26 @@ async function processDocumentJob(message: QueuedJob) {
       });
     } catch (error) { throw error; }
     const durationMs = Date.now() - started;
-    recordMetric("job_duration", durationMs, "ms", { ...context, engine, engine_version: engineVersion, status: "succeeded" });
-    recordMetric("jobs_succeeded", 1, "count", { ...context, engine, engine_version: engineVersion });
+    recordMetric("job_duration_ms", durationMs, "ms", { tool_id: job.toolId, engine, engine_version: engineVersion, status: "succeeded" });
+    recordMetric("tool_execution_duration_ms", durationMs, "ms", { tool_id: job.toolId, engine, engine_version: engineVersion, status: "succeeded" });
+    recordMetric("jobs_success_total", 1, "count", { tool_id: job.toolId, engine, engine_version: engineVersion, status: "succeeded" });
+    const memoryClassMb = job.toolId === "ocr-pdf" ? 1024 : documentTools.has(job.toolId) ? 512 : 256;
+    const estimatedCost = estimateJobCost({ cpuDurationMs: durationMs, memoryClassMb, storageBytes: validated.totalBytes, storageOperations: outputs.length, aiInputTokens: 0, aiOutputTokens: 0, ocrPages: job.toolId === "ocr-pdf" ? files[0]?.pageCount ?? 0 : 0, officeDurationMs: documentTools.has(job.toolId) && job.toolId !== "ocr-pdf" ? durationMs : 0, succeeded: true }, configuredCostRates());
+    recordMetric("cost_per_successful_job", estimatedCost.costPerSuccessfulJob ?? 0, "ratio", { tool_id: job.toolId, engine, engine_version: engineVersion, status: "succeeded" });
     logger.info("job.succeeded", { ...context, engine, engine_version: engineVersion, duration_ms: durationMs, status: "succeeded" });
   } catch (error) {
     const errorCode = typeof error === "object" && error && "code" in error ? String(error.code) : "PROCESSING_FAILED";
     await db.job.update({ where: { id: job.id }, data: { status: "FAILED", errorCode, error: { message: error instanceof Error ? error.message : "Processing failed" }, completedAt: new Date() } });
     if (step) await db.jobStep.update({ where: { id: step.id }, data: { status: "FAILED", errorCode, error: { message: error instanceof Error ? error.message : "Processing failed" }, completedAt: new Date() } });
-    recordMetric("jobs_failed", 1, "count", { ...context, error_code: errorCode });
+    recordMetric("jobs_failure_total", 1, "count", { tool_id: job.toolId, status: "failed" });
     logger.error("job.failed", { ...context, error_code: errorCode, status: "failed" }); throw error;
   }
 }
 
-export const documentWorker = new Worker<QueuedJob>(JOB_QUEUE_NAME, async (message) => { recordMetric("queue_wait_time", Math.max(0, Date.now() - message.timestamp), "ms", { tool_id: message.data.toolId, queue: "document" }); return processDocumentJob(message.data); }, { connection: getQueueConnection(), concurrency: runtimeLimits.documentConcurrency, stalledInterval: runtimeLimits.stalledIntervalMs, maxStalledCount: runtimeLimits.maxStalledCount, lockDuration: Math.min(runtimeLimits.jobTimeoutMs, 10 * 60_000) });
-documentWorker.on("failed", async (message) => { if (message && message.attemptsMade < (message.opts.attempts ?? 1)) await db.job.update({ where: { id: message.data.jobId }, data: { status: "RETRYING" } }); });
-documentWorker.on("error", (error) => logger.error("worker.error", { error: error.message }));
+export const documentWorker = new Worker<QueuedJob>(JOB_QUEUE_NAME, async (message) => { recordMetric("queue_wait_ms", Math.max(0, Date.now() - message.timestamp), "ms", { tool_id: message.data.toolId, queue: "document" }); return processDocumentJob(message.data); }, { connection: getQueueConnection(), concurrency: runtimeLimits.documentConcurrency, stalledInterval: runtimeLimits.stalledIntervalMs, maxStalledCount: runtimeLimits.maxStalledCount, lockDuration: Math.min(runtimeLimits.jobTimeoutMs, 10 * 60_000) });
+documentWorker.on("failed", async (message) => { if (message && message.attemptsMade < (message.opts.attempts ?? 1)) { recordMetric("retry_total", 1, "count", { tool_id: message.data.toolId, status: "retrying" }); await db.job.update({ where: { id: message.data.jobId }, data: { status: "RETRYING" } }); } });
+documentWorker.on("stalled", () => recordMetric("stalled_jobs_total", 1, "count", { status: "stalled" }));
+documentWorker.on("error", (error) => { captureOperationalError(error, { worker: "document" }); logger.error("worker.error", { error: error.message }); });
 
 const aiTools = new Set<AiTool>(["summarize-pdf", "chat-with-pdf", "extract-data"]);
 
@@ -116,7 +124,7 @@ export async function processAiJob(message: QueuedJob) {
   }
 }
 
-export const aiWorker = new Worker<QueuedJob>(AI_JOB_QUEUE_NAME, async (message) => { recordMetric("queue_wait_time", Math.max(0, Date.now() - message.timestamp), "ms", { tool_id: message.data.toolId, queue: "ai" }); return withTimeout(message.data.toolId, timeoutFor("ai") + 30_000, processAiJob(message.data)); }, {
+export const aiWorker = new Worker<QueuedJob>(AI_JOB_QUEUE_NAME, async (message) => { recordMetric("queue_wait_ms", Math.max(0, Date.now() - message.timestamp), "ms", { tool_id: message.data.toolId, queue: "ai" }); return withTimeout(message.data.toolId, timeoutFor("ai") + 30_000, processAiJob(message.data)); }, {
   connection: getQueueConnection(),
   concurrency: runtimeLimits.aiConcurrency,
   limiter: { max: runtimeLimits.aiRatePerMinute, duration: 60_000 },
@@ -124,5 +132,6 @@ export const aiWorker = new Worker<QueuedJob>(AI_JOB_QUEUE_NAME, async (message)
   maxStalledCount: runtimeLimits.maxStalledCount,
   lockDuration: Math.min(runtimeLimits.jobTimeoutMs, 10 * 60_000),
 });
-aiWorker.on("failed", async (message) => { if (message && message.attemptsMade < (message.opts.attempts ?? 1)) await db.job.update({ where: { id: message.data.jobId }, data: { status: "RETRYING" } }); });
-aiWorker.on("error", (error) => logger.error("ai.worker.error", { error: error.message }));
+aiWorker.on("failed", async (message) => { if (message && message.attemptsMade < (message.opts.attempts ?? 1)) { recordMetric("retry_total", 1, "count", { tool_id: message.data.toolId, status: "retrying" }); await db.job.update({ where: { id: message.data.jobId }, data: { status: "RETRYING" } }); } });
+aiWorker.on("stalled", () => recordMetric("stalled_jobs_total", 1, "count", { status: "stalled" }));
+aiWorker.on("error", (error) => { captureOperationalError(error, { worker: "ai" }); logger.error("ai.worker.error", { error: error.message }); });

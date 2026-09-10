@@ -94,6 +94,7 @@ integrationTest("dip_app pooled RLS isolates tenants and fails closed", async ()
 
     const role = (await owner.query(`SELECT rolsuper,rolbypassrls,rolcreaterole,rolcreatedb FROM pg_roles WHERE rolname='dip_app'`)).rows[0];
     assert.deepEqual(role, { rolsuper: false, rolbypassrls: false, rolcreaterole: false, rolcreatedb: false });
+    await assert.rejects(() => runtime.$executeRawUnsafe(`CREATE TABLE phase6_must_fail(id integer)`), /permission denied/i);
   } finally {
     await runtime.$disconnect();
     await cleanup();

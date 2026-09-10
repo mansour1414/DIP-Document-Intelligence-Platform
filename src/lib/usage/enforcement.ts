@@ -6,6 +6,7 @@ import { resolvePlan } from "@/lib/entitlements/service";
 import { MonetizationError } from "./errors";
 import { logger } from "@/lib/logging";
 import { withTenant } from "@/lib/db/tenant";
+import { recordMetric } from "@/lib/observability/metrics";
 
 const running=["QUEUED","RUNNING","RETRYING"] as const;
 export async function enforceJobCreation(input:{userId:string;toolId:string;idempotencyKey:string;files:readonly {size:number;pageCount?:number}[];options?:Record<string,unknown>;correlationId?:string}){
@@ -26,6 +27,7 @@ export async function enforceJobCreation(input:{userId:string;toolId:string;idem
  });
  const cost=creditCost(input.toolId);if(tool.aiFlag&&cost>resolved.entitlements.maxAiCreditsPerRequest)throw new MonetizationError("PLAN_LIMIT_EXCEEDED");
  try{await consumeCreditsOnce(input.userId,input.toolId,`job:${input.toolId}:${input.idempotencyKey}`)}catch(error){if(error instanceof Error&&error.message==="INSUFFICIENT_CREDITS")throw new MonetizationError("INSUFFICIENT_CREDITS");throw error}
+ recordMetric("credits_consumed",cost,"count",{tool_id:input.toolId});
  logger.info("monetization.job_authorized",{user_id:input.userId,tool_id:input.toolId,plan:resolved.code,cost,correlation_id:input.correlationId});return resolved;
 }
 

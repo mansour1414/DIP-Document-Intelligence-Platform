@@ -4,6 +4,7 @@ import { basename, extname, join } from "path";
 import { spawn } from "child_process";
 import { runtimeLimits, timeoutFor } from "@/lib/runtime/config";
 import { recordMetric } from "@/lib/observability/metrics";
+import { PDFDocument } from "pdf-lib";
 
 export type ServerToolId = "word-to-pdf" | "pdf-to-word" | "excel-to-pdf" | "powerpoint-to-pdf" | "ocr-pdf";
 
@@ -70,19 +71,23 @@ export async function processServerDocument(tool: ServerToolId, file: File, lang
 
     const started = performance.now();
     if (tool === "ocr-pdf") {
-      await run("ocrmypdf", ["--skip-text", "--rotate-pages", "--deskew", "--output-type", "pdf", "--language", language, inputPath, join(directory, outputName(name, ".pdf"))], directory, timeoutFor("ocr"));
+      // Standard PDF output plus optimize=0 avoids the Ghostscript PDF/A and
+      // optimization paths. Production images must still verify the resolved chain.
+      await run("ocrmypdf", ["--skip-text", "--rotate-pages", "--deskew", "--output-type", "pdf", "--optimize", "0", "--language", language, inputPath, join(directory, outputName(name, ".pdf"))], directory, timeoutFor("ocr"));
     } else {
       // LibreOffice is isolated behind this server-only boundary. It handles DOC/DOCX reliably;
       // PDF-to-DOCX quality depends on the LibreOffice/PDF import filter installed by the host.
       const profile = join(directory, "lo-profile").replaceAll("\\", "/");
       await run("soffice", [`-env:UserInstallation=file:///${profile}`, "--headless", "--nologo", "--nodefault", "--nolockcheck", "--norestore", "--convert-to", outputExtension === ".pdf" ? "pdf" : "docx", "--outdir", directory, inputPath], directory, timeoutFor("office"));
     }
-    recordMetric(tool === "ocr-pdf" ? "ocr_duration" : "libreoffice_conversion_time", performance.now() - started, "ms", { tool_id: tool });
+    const duration = performance.now() - started;
 
     const expected = outputName(name, outputExtension);
     const generated = (await readdir(directory)).find((item) => item.toLowerCase() === expected.toLowerCase());
     if (!generated) throw new DocumentProcessingError("NO_OUTPUT", "The processing engine finished without creating an output file.");
     const bytes = await readFile(join(directory, generated));
+    const metricDuration = tool === "ocr-pdf" ? duration / Math.max(1, (await PDFDocument.load(bytes)).getPageCount()) : duration;
+    recordMetric(tool === "ocr-pdf" ? "ocr_duration_per_page" : "tool_execution_duration_ms", metricDuration, "ms", { tool_id: tool, engine: tool === "ocr-pdf" ? "ocrmypdf" : "libreoffice", engine_version: "host", status: "succeeded" });
     return { bytes, filename: generated, contentType: outputExtension === ".pdf" ? "application/pdf" : "application/vnd.openxmlformats-officedocument.wordprocessingml.document" };
   } finally {
     await rm(directory, { recursive: true, force: true });

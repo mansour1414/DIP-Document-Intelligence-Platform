@@ -1,0 +1,27 @@
+name: Retention Cleanup
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx prisma generate
+      - run: npm run jobs:cleanup
+        env:
+          DATABASE_URL: ${{ secrets.RETENTION_DATABASE_URL }}
+          STORAGE_ENDPOINT: ${{ secrets.RETENTION_STORAGE_ENDPOINT }}
+          STORAGE_BUCKET: ${{ secrets.RETENTION_STORAGE_BUCKET }}
+          STORAGE_ACCESS_KEY: ${{ secrets.RETENTION_STORAGE_ACCESS_KEY }}
+          STORAGE_SECRET_KEY: ${{ secrets.RETENTION_STORAGE_SECRET_KEY }}
+          STORAGE_REGION: ${{ vars.RETENTION_STORAGE_REGION }}
+          RETENTION_APPLY: ${{ vars.RETENTION_APPLY }}

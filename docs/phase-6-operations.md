@@ -10,7 +10,7 @@
 - Output signature/container/parseability, count, size and selected page-preservation validation before a job succeeds.
 - Deterministic output keys, SHA-256 metadata, transactional output registration, idempotent job/credit/usage guards.
 - Vendor-neutral structured metric events and redacted structured logging with job/tool/engine/version context.
-- Lightweight liveness at `/api/health` and Redis readiness at `/api/readiness`.
+- Lightweight liveness at `/api/health` and Redis+PostgreSQL readiness at `/api/readiness`.
 - Retention/orphan selection policy that excludes active jobs and already-deleted objects. Final deletion periods remain provisional.
 
 ## Required at deployment/container layer

@@ -1,36 +1,40 @@
-# Phase 6 — Optimization report
+# Phase 6 Completion — Production Readiness Gates
 
 Date: 2026-09-10
 
-1. **Phase 6 status — Partially Completed.** Application-level optimization/hardening is implemented and local quality gates pass. Production-provider and host-engine gates remain.
-2. **Performance baseline.** Methodology and adjustable budgets are in `phase-6-performance-baseline.md`. On the final local synthetic two-page run, PDF rendering was 204.9/56.1 ms for PDF→JPG and 52.2/49.2 ms for compression; full related tests were 2.61 s and 153.6 ms respectively. These are host observations, not SLOs.
-3. **Queue optimization.** Both BullMQ queues retain bounded attempts/backoff/history; document and AI concurrency, limiter, stalled interval/count and lock duration are centralized environment settings. Queue depth helper and queue-wait metrics are available.
-4. **Job reliability.** Terminal failure classification, worker timeout, retry state, cancelled/expired checks and idempotent succeeded-job skips remain in place. Full cooperative cancellation inside PDF.js is still limited.
-5. **Resource limits.** Central limits cover input bytes, pages, rendered pixels/page, output count/bytes, extracted text, AI output tokens and concurrency.
-6. **Timeouts.** Separate PDF/job, LibreOffice, OCR, storage and AI limits are configurable. Storage uses abort signals; subprocesses receive TERM then KILL escalation.
-7. **Temp filesystem/cleanup.** Unique `mkdtemp` directory, sanitized basename, dedicated LibreOffice profile and unconditional recursive cleanup are implemented. Failure cleanup regression coverage exists at the policy/unit boundary.
-8. **Output validation.** PDF signature/parseability/page semantics, JPEG signature, Office ZIP signature, output count and total bytes are checked before success; failures use `OUTPUT_VALIDATION_FAILED`.
-9. **PDF rendering.** Sequential rendering, page/pixel bounds, per-page cleanup/task destruction and render timing are implemented. One PDF.js transfer copy remains intentional to preserve retry-safe input.
-10. **LibreOffice.** Non-shell controlled spawn, private profile, timeout and expected-output checks are implemented. Turbopack warning was a false-positive trace on the unique temp-path join; a narrowly scoped documented ignore fixes it. Final build emits no warning.
-11. **OCR.** Language selection, distinct timeout and duration instrumentation exist. Host corpus execution is blocked locally because OCRmyPDF/Tesseract are absent; commercial licensing is not approved.
-12. **Corpora.** Generated PDF/security cases and AI fake-provider cases are automated. The repository contains corpus rules; real Arabic/English Office and OCR smoke execution awaits approved host engines. No personal documents are stored.
-13. **Storage/retention.** Deterministic output keys, checksum/content type, abortable timed operations, cleanup selection and orphan idempotency policy exist. Final retention deletion periods and production scheduler remain Decision Gates.
-14. **Database performance.** The hot idempotency lookup is timed and already uses the `(toolId,idempotencyKey)` unique index. Existing status/requester/time indexes match observed polling/dashboard/accounting patterns; no speculative index was added. No production `EXPLAIN ANALYZE` was run.
-15. **Idempotency/retry.** Job uniqueness, deterministic object keys, transactional output registration, credit ledger uniqueness and AI usage advisory locking remain. Redis retry test verifies one logical output.
-16. **Logging.** Structured JSON logging redacts content/prompt/credential/secret/token/signed-URL fields and records safe job/tool/engine/version/duration/status/error context.
-17. **Metrics/observability.** Vendor-neutral metric events cover job totals/success/failure/duration, queue wait/depth, render/Office/OCR/storage latency, sizes, compression ratio and existing AI tokens/latency/cost. Dashboard vendor is not selected.
-18. **Cost accounting.** AI estimated cost and tokens, storage bytes, duration and resource class foundations exist. Infrastructure cost per successful job awaits approved unit-cost inputs.
-19. **AI cost routing.** Pipeline order remains Task → Policy → Routing → Adapter → Validation → Accounting. Internal `high_accuracy`, `balanced`, and `economy` route classes can select environment-configured Gemini models without exposing a new user feature.
-20. **Open models.** No open model adopted: current evidence does not justify quality/cost/license risk. Evaluation criteria are documented.
-21. **Security regression.** Existing document-scope, forced-RLS, least-privilege bootstrap, billing idempotency, upload validation and no-direct-Gemini tests pass or remain CI integration checks.
-22. **License review.** Registry added for direct/native/subprocess components. Ghostscript remains a blocking commercial licensing gate if selected in the production OCR chain.
-23. **Dependency security.** `npm audit`: 0 critical/high/moderate/low across 805 dependencies; no forced upgrade applied.
-24. **Real Redis queue E2E.** Added success/retry/failure/idempotent-output integration using real BullMQ/Redis. It runs in GitHub CI; local execution was skipped because Redis/Docker is unavailable.
-25. **Tests.** 61 total; 57 passed; 0 failed; 4 skipped (visual artifact opt-in, external Object Storage, Redis CI integration, pooled-RLS integration).
-26. **Lint/typecheck/build.** ESLint passed; TypeScript passed; Next.js 16.3.4 Turbopack production build passed and generated 59 pages.
-27. **CI status.** Workflow retains Node 22, PostgreSQL 16, Redis 7, roles bootstrap, `prisma migrate deploy`, grants reconciliation, lint/typecheck/build/test. Remote run status was not available from this workspace.
-28. **Official MVP scope.** Registry and SEO tests confirm 18 official tools and 36 localized SEO pages, including Excel→PDF and PowerPoint→PDF.
-29. **Decision Gates.** Production Redis/worker sizing, monitoring vendor and alert thresholds, Sentry SDK/project/DSN, open-model adoption, OCR/Ghostscript licensing, final retention periods/scheduler, production SLOs and concurrency sizing.
-30. **Remaining Phase 6 work.** Run Office/OCR corpora on the approved image; run PostgreSQL/Redis/Object Storage integrations in CI/production-like infrastructure; implement approved retention scheduler/deletion transaction; attach approved Sentry/metrics backend; measure P50/P95 and cost with production-class fixtures.
-31. **Baseline conflicts.** None found. CR-002 and the 18-tool product scope are preserved; no Phase 7–9 features, provider, payment system, Kubernetes or microservices were added.
+1. **PHASE 6 FINAL STATUS — BLOCKED.** All repository-level technical foundations are implemented and local gates pass. Completion cannot be claimed until the new required CI integration job passes and the Product Owner approves one OCR launch/licensing option.
+2. **Remaining gates before this run.** Office/OCR execution, real Redis/Postgres/S3 integration, full/failure E2E, executable retention, Sentry, complete metrics, sizing/SLOs/alerts/cost/security/backup documentation, and final license analysis.
+3. **Office corpus results.** Safe generator covers English, Arabic RTL, mixed Word with tables/images; multi-sheet/print-area/Arabic/chart Excel; English/Arabic/images/common-layout PowerPoint. Real LibreOffice validation is mandatory in `Integration / Processing`; it records duration, pages, validity and non-pixel-perfect smoke status. This Windows host has no LibreOffice, so no local execution result is claimed.
+4. **OCR corpus results.** Safe generated English, Arabic, mixed, clean/blurred and multi-page scans are processed by real OCRmyPDF/Tesseract in the heavy CI job. Tests require searchable text, preserved page count and valid PDF. No 100% accuracy claim. This host lacks OCR binaries, so execution evidence must come from CI.
+5. **OCR/Ghostscript licensing.** Command is fixed to standard PDF and optimization 0; CI installs pypdfium2 and fails if `gs` exists. **LICENSING GATE: Blocked pending Product Owner decision.** Recommendation: approve the defined Ghostscript-free Option B after CI and legal/image-manifest review.
+6. **Redis/BullMQ.** Real Redis 7 tests cover enqueue, pickup, terminal success/failure, retry and idempotent output; application-worker E2E uses the same Redis service. Priority/stalled policy remains bounded and instrumented.
+7. **PostgreSQL.** CI uses PostgreSQL 16, roles bootstrap → `prisma migrate deploy` → grants reconciliation. Runtime URLs now activate RLS integration, including no BYPASSRLS/no DDL/fail-closed/cross-tenant checks.
+8. **Object Storage.** Heavy CI starts isolated MinIO, creates a bucket, and runs real Put/Head/Get/Delete/checksum/content-type plus worker multi-output storage tests. No production secrets.
+9. **Full worker E2E.** Upload/orchestrator → DB → Redis → document worker → PDF/LibreOffice → S3 → DB output/ToolExecution → terminal result for Merge PDF, PDF→JPG and Word→PDF.
+10. **Failure/retry E2E.** Redis integration covers real retry/failure terminal behavior; validation/timeout/storage/engine tests cover classified failures. Successful retries use deterministic keys and one logical side effect.
+11. **Retention policy.** `2026-09-provisional-v2`: Free inputs/outputs 7 days, Pro 30 days, failed jobs 7/30 days, temp 1 hour, audit 365 days, billing 2555 days. Values are existing/provisional rather than new commercial promises.
+12. **Deletion scheduler.** Daily GitHub scheduler and manual dispatch call the existing monolith script. It defaults to dry-run unless `RETENTION_APPLY=1`, deletes storage first, marks metadata, retries partial failures and protects all active-job file IDs including params.
+13. **Cleanup.** Integration verifies expired deletion, storage call, metadata status, active/running protection and idempotent retry. Failures remain eligible and increment `cleanup_failure_total`.
+14. **Sentry.** Official `@sentry/nextjs` 10.74.0 is wired through Next instrumentation and workers. It is disabled without DSN, excludes PII/request bodies/cookies/query strings/error messages, recursively redacts sensitive keys and attaches only safe job/tool/correlation context.
+15. **Metrics.** Vendor-neutral sink/log events cover required job, queue, retry/stall, tool duration, storage bytes/failures, OCR, AI tokens/latency/cost, credits, cleanup and cost-model dimensions. User IDs are removed from metric labels.
+16. **Health/readiness.** Liveness is process-only. Readiness performs lightweight Redis PING + DB SELECT 1, returns 503 on failure and exposes no endpoints/credentials. The same check is reusable by workers.
+17. **Production sizing.** Development, MVP Production and Growth Threshold profiles are documented in `production-readiness.md`; no Kubernetes or provider-specific compute was introduced.
+18. **Engineering SLOs.** Provisional availability/success, queue P95, processing-class P95, stuck threshold and 24-hour cleanup targets are documented and explicitly not an SLA.
+19. **Alerts.** Low-cardinality, environment-configurable thresholds cover job/AI/storage failures, queue depth, stuck jobs, readiness, cleanup, temp disk and optional cost.
+20. **Cost model.** Configurable CPU-ms, memory MB-ms, storage bytes/operations, AI tokens, OCR pages and Office duration produce components, total and cost per successful job without invented cloud prices.
+21. **Production security controls.** Non-root, CPU/RAM/PID/disk quotas, read-only root, isolated temp, secret manager, encryption and restore testing are deployment requirements—not claimed Node controls.
+22. **Network egress.** Deterministic workers only DB/Redis/S3; AI additionally approved Gemini. Container/firewall enforcement is required.
+23. **Malware scanning.** Recommended before anonymous/public Office uploads, positioned validation → scan → storage/job. Scanner choice is a Product/Security gate; scanning is not claimed active.
+24. **Backup/restore.** Neon restore window/snapshot plus quarterly isolated restore drill and object/checksum reconciliation are documented; exact plan capability must be confirmed before launch.
+25. **License registry.** Final registry includes version, relationship, source, SaaS obligations and gate for direct/native/subprocess/provider components.
+26. **Security regression.** Local unit/security suite passes; RLS and infrastructure-backed cases are mandatory in CI. Path sanitization, magic/MIME, pixels, timeouts, output validation, AI isolation and credit idempotency remain covered.
+27. **Dependency security.** `npm audit`: 0 findings across 940 dependencies. No force fix or major upgrade.
+28. **Test results.** Local: 69 total, 60 passed, 0 failed, 9 skipped because this host lacks Redis/Postgres/S3/Office/OCR. Heavy tests are required—not optional—in CI.
+29. **CI results.** Workflow definition now contains required `Integration / Processing`; it has not run for these uncommitted changes because this environment has no Docker or GitHub CLI and no push was authorized. Therefore CI green is not claimed.
+30. **Official MVP scope.** Confirmed: 18 tools, including Excel→PDF and PowerPoint→PDF.
+31. **SEO status.** Confirmed: 36 localized tool pages; regression passes locally.
+32. **BLOCKERS.** (1) CI integration evidence is not yet available. (2) OCR production launch requires Product Owner selection among A commercial Ghostscript, B frozen Ghostscript-free path, C replacement engine, or D temporary launch disablement.
+33. **Decision gates.** Approve OCR Option B (recommended) or another option; configure Sentry account/DSN and monitoring sink; set `RETENTION_APPLY=1` only after reviewing dry-run; choose malware scanner before public Office uploads; confirm backup plan/restore window.
+34. **Remaining Phase 6 work.** Run the committed CI workflow and resolve its findings; record Product Owner OCR decision. These are the only gates to Completion.
+35. **Baseline conflicts.** None. No Phase 7 workflow, Agent, Public API, new tool, microservice or Kubernetes work was added.
 

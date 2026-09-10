@@ -33,7 +33,7 @@ export async function createToolJob(input: { userId: string; toolId: string; upl
     const queueOptions = { priority: monetization.entitlements.processingPriority === "high" ? 1 : 5 };
     if (tool.aiFlag) await enqueueAiJob(queuedJob, queueOptions); else await enqueueJob(queuedJob, queueOptions);
     logger.info("job.queued", { job_id: job.id, correlation_id: correlationId, tool_id: tool.toolId });
-    recordMetric("api_job_creation_latency", performance.now() - apiStarted, "ms", { job_id: job.id, correlation_id: correlationId, tool_id: tool.toolId });
+    recordMetric("api_job_creation_latency_ms", performance.now() - apiStarted, "ms", { tool_id: tool.toolId });
     recordMetric("jobs_total", 1, "count", { tool_id: tool.toolId });
     return { ...job, reused: false };
   } catch (error) { await Promise.all(stored.map((object) => storage.deleteObject(object.key).catch(() => undefined))); throw error; }

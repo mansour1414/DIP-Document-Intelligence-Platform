@@ -10,9 +10,14 @@ test("Neon Object Storage supports real put/get/delete", { skip: process.env.RUN
   const storage = getStorage();
   const key = `temporary/e2e/${crypto.randomUUID()}.txt`;
   const bytes = new TextEncoder().encode("dip-object-storage-e2e");
-  await storage.put({ key, bytes, contentType: "text/plain", checksum: createHash("sha256").update(bytes).digest("base64") });
+  const checksum = createHash("sha256").update(bytes).digest("base64");
+  await storage.put({ key, bytes, contentType: "text/plain", checksum });
   try {
     assert.equal(await storage.exists(key), true);
+    const metadata = await storage.head(key);
+    assert.equal(metadata?.contentType, "text/plain");
+    assert.equal(metadata?.size, bytes.byteLength);
+    if (metadata?.checksum) assert.equal(metadata.checksum, checksum);
     assert.deepEqual(await storage.get(key), bytes);
   } finally {
     await storage.deleteObject(key);
