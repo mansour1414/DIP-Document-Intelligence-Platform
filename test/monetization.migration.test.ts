@@ -7,3 +7,5 @@ test("ledger is append-only",()=>assert.match(sql,/prevent_credit_ledger_mutatio
 test("invoice totals are database checked",()=>assert.match(sql,/total_minor=subtotal_minor\+COALESCE\(tax_minor,0\)/));
 test("duplicate provider events are constrained",()=>assert.match(sql,/UNIQUE\("provider","external_event_id"\)/));
 test("migration preserves legacy subscription data",()=>{assert.match(sql,/legacy_plan/);assert.match(sql,/legacy_status/);assert.doesNotMatch(sql,/DROP COLUMN/)});
+test("runtime role bootstrap is password-free and least privilege",()=>{const roles=readFileSync(new URL("../prisma/bootstrap/roles.sql",import.meta.url),"utf8");assert.match(roles,/IF NOT EXISTS/);for(const attribute of ["LOGIN","NOINHERIT","NOSUPERUSER","NOBYPASSRLS","NOCREATEDB","NOCREATEROLE","NOREPLICATION"])assert.match(roles,new RegExp(attribute));assert.doesNotMatch(roles,/PASSWORD\s+'/i)});
+test("CI bootstraps role before migrate deploy",()=>{const ci=readFileSync(new URL("../.github/workflows/ci.yml",import.meta.url),"utf8");assert.ok(ci.indexOf("prisma/bootstrap/roles.sql")<ci.indexOf("prisma migrate deploy"))});

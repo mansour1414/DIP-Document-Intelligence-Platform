@@ -1,9 +1,10 @@
--- Run as neondb_owner on the target branch after Neon creates the login role.
--- Password creation/rotation remains in Neon and never appears in source control.
+-- Run after migrations as the database owner to reconcile runtime grants.
+-- `roles.sql` deterministically creates/hardens the role before migrations.
+-- Password creation/rotation remains environment-owned and never appears here.
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'dip_app') THEN
-    RAISE EXCEPTION 'dip_app must be created by the Neon infrastructure bootstrap first';
+    RAISE EXCEPTION 'run prisma/bootstrap/roles.sql before migrations';
   END IF;
 
   IF EXISTS (
@@ -36,12 +37,20 @@ BEGIN
 END
 $$;
 
-REVOKE ALL PRIVILEGES ON DATABASE neondb FROM dip_app;
+DO $revoke_database$
+BEGIN
+  EXECUTE format('REVOKE ALL PRIVILEGES ON DATABASE %I FROM dip_app', current_database());
+END
+$revoke_database$;
 REVOKE ALL PRIVILEGES ON SCHEMA public FROM dip_app;
 REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM dip_app;
 REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public FROM dip_app;
 
-GRANT CONNECT ON DATABASE neondb TO dip_app;
+DO $grant_database$
+BEGIN
+  EXECUTE format('GRANT CONNECT ON DATABASE %I TO dip_app', current_database());
+END
+$grant_database$;
 GRANT USAGE ON SCHEMA public TO dip_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON
   documents,
@@ -52,4 +61,15 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON
   tool_executions,
   job_events,
   ai_usage
+TO dip_app;
+
+GRANT SELECT ON plans, plan_entitlements, ai_provider_prices TO dip_app;
+GRANT SELECT, INSERT ON credit_ledger TO dip_app;
+GRANT SELECT, INSERT, UPDATE ON
+  subscriptions,
+  invoices,
+  payments,
+  credit_purchases,
+  usage_events,
+  billing_events
 TO dip_app;

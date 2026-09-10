@@ -46,8 +46,15 @@ A global document processing platform combining PDF tools with AI, OCR, and work
 
 5. Run database migrations:
    ```bash
+   psql "$DATABASE_URL_UNPOOLED" --set=ON_ERROR_STOP=1 --file=prisma/bootstrap/roles.sql
    npm run db:migrate
+   psql "$DATABASE_URL_UNPOOLED" --set=ON_ERROR_STOP=1 --file=prisma/bootstrap/dip_app.sql
    ```
+
+   `roles.sql` is an idempotent, password-free provisioning step that must run
+   before migrations containing grants to the `dip_app` runtime role. Passwords
+   are supplied separately by the target environment. `dip_app.sql` runs after
+   migrations to reconcile least-privilege table grants.
 
 6. Start the development server:
    ```bash

@@ -82,7 +82,15 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npx prisma generate
+      - name: Bootstrap database roles
+        run: psql "$DATABASE_URL" --set=ON_ERROR_STOP=1 --file=prisma/bootstrap/roles.sql
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dip_test
       - run: npx prisma migrate deploy
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dip_test
+      - name: Reconcile runtime grants
+        run: psql "$DATABASE_URL" --set=ON_ERROR_STOP=1 --file=prisma/bootstrap/dip_app.sql
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dip_test
       - run: npm test
