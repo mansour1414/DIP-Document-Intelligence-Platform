@@ -17,13 +17,20 @@ test("real Redis queue reaches terminal states and retry side effects remain ide
     return { outputKey: outputs.get(job.data.id) };
   }, { connection, concurrency: 1 });
   try {
+    await Promise.all([queue.waitUntilReady(), events.waitUntilReady(), worker.waitUntilReady()]);
+    const waitFor = async (job: Awaited<ReturnType<typeof queue.add>>) => {
+      try { return await job.waitUntilFinished(events, 10_000); }
+      catch (error) {
+        const [state, current] = await Promise.all([job.getState().catch(() => "unknown"), queue.getJob(job.id!).catch(() => undefined)]);
+        throw new Error(`${error instanceof Error ? error.message : String(error)}; diagnostics: state=${state}, failedReason=${current?.failedReason ?? "none"}, attemptsMade=${current?.attemptsMade ?? job.attemptsMade}, workerRunning=${worker.isRunning()}, queueEventsReady=true, queueReady=true`);
+      }
+    };
     const success = await queue.add("merge-pdf", { id: "success" }, { jobId: "success", attempts: 2, removeOnComplete: false });
+    assert.deepEqual(await waitFor(success), { outputKey: "output/success" });
     const retry = await queue.add("merge-pdf", { id: "retry", failOnce: true }, { jobId: "retry", attempts: 2, backoff: { type: "fixed", delay: 10 }, removeOnComplete: false });
+    assert.deepEqual(await waitFor(retry), { outputKey: "output/retry" });
     const failure = await queue.add("merge-pdf", { id: "failure", alwaysFail: true }, { jobId: "failure", attempts: 1, removeOnFail: false });
-    await events.waitUntilReady();
-    assert.deepEqual(await success.waitUntilFinished(events, 10_000), { outputKey: "output/success" });
-    assert.deepEqual(await retry.waitUntilFinished(events, 10_000), { outputKey: "output/retry" });
-    await assert.rejects(() => failure.waitUntilFinished(events, 10_000), /fixture failure/);
+    await assert.rejects(() => waitFor(failure), /fixture failure/);
     assert.equal(attempts.get("retry"), 2); assert.equal(outputs.size, 2); assert.equal(outputs.get("retry"), "output/retry");
   } finally {
     await queue.obliterate({ force: true }).catch(() => undefined);
