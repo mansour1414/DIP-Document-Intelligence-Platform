@@ -1,5 +1,6 @@
 import { db } from "@/lib/db";
 import type { AiRequestContext, ProviderResponse } from "./types";
+import { acquireTransactionAdvisoryLock } from "@/lib/db/advisory-lock";
 
 function envNumber(name: string, fallback: number) { const value = Number(process.env[name]); return Number.isFinite(value) && value >= 0 ? value : fallback; }
 
@@ -12,7 +13,7 @@ export function estimateAiCost(response: Pick<ProviderResponse, "inputTokens" | 
 export async function recordAiUsageOnce(context: AiRequestContext, response: ProviderResponse) {
   const cost = estimateAiCost(response);
   return db.$transaction(async (tx) => {
-    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`ai-usage:${context.jobId}`}, 0))`;
+    await acquireTransactionAdvisoryLock(tx, `ai-usage:${context.jobId}`);
     const existing = await tx.aiUsage.findFirst({ where: { jobId: context.jobId }, select: { id: true, cost: true } });
     if (existing) return { id: existing.id, cost: Number(existing.cost), reused: true };
     const usage = await tx.aiUsage.create({ data: { userId: context.userId, jobId: context.jobId, provider: response.provider, model: response.model, taskType: context.toolId, tokensInput: response.inputTokens, tokensOutput: response.outputTokens, cost }, select: { id: true, cost: true } });

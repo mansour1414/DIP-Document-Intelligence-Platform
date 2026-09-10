@@ -3,12 +3,13 @@ import { withTenant } from "@/lib/db/tenant";
 import { PLAN_POLICIES } from "@/lib/entitlements/policy";
 import { creditCost, creditReason } from "./credit-policy";
 import { randomUUID } from "node:crypto";
+import { acquireTransactionAdvisoryLock } from "@/lib/db/advisory-lock";
 
 export class CreditError extends Error { readonly code="INSUFFICIENT_CREDITS"; constructor(){super("INSUFFICIENT_CREDITS")} }
 export async function creditBalance(userId:string){return withTenant({userId},async tx=>{const latest=await tx.creditLedger.findFirst({where:{userId},orderBy:[{createdAt:"desc"},{id:"desc"}],select:{balance:true}});return Number(latest?.balance??0)})}
 
 async function append(input:{userId:string;amount:number;type:CreditType;reason:CreditReason;idempotencyKey:string;reference?:string;metadata?:Prisma.InputJsonValue}){
- return withTenant({userId:input.userId},async tx=>{await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`credit:${input.userId}`},0))`;
+ return withTenant({userId:input.userId},async tx=>{await acquireTransactionAdvisoryLock(tx,`credit:${input.userId}`);
   const prior=await tx.creditLedger.findUnique({where:{userId_idempotencyKey:{userId:input.userId,idempotencyKey:input.idempotencyKey}},select:{balance:true}});if(prior)return{balance:prior.balance,reused:true};
   const latest=await tx.creditLedger.findFirst({where:{userId:input.userId},orderBy:[{createdAt:"desc"},{id:"desc"}],select:{balance:true}});const balance=Number(latest?.balance??0);if(input.amount<0&&balance+input.amount<0)throw new CreditError();
   const entry=await tx.creditLedger.create({data:{userId:input.userId,type:input.type,reason:input.reason,amount:input.amount,balance:balance+input.amount,reference:input.reference,idempotencyKey:input.idempotencyKey,metadata:input.metadata??{}},select:{id:true,balance:true}});

@@ -7,6 +7,7 @@ import { MonetizationError } from "./errors";
 import { logger } from "@/lib/logging";
 import { withTenant } from "@/lib/db/tenant";
 import { recordMetric } from "@/lib/observability/metrics";
+import { acquireTransactionAdvisoryLock } from "@/lib/db/advisory-lock";
 
 const running=["QUEUED","RUNNING","RETRYING"] as const;
 export async function enforceJobCreation(input:{userId:string;toolId:string;idempotencyKey:string;files:readonly {size:number;pageCount?:number}[];options?:Record<string,unknown>;correlationId?:string}){
@@ -17,7 +18,7 @@ export async function enforceJobCreation(input:{userId:string;toolId:string;idem
  if(input.files.some(f=>f.size>limits.maxBytes))throw new MonetizationError("FILE_SIZE_PLAN_LIMIT_EXCEEDED");
  if(input.files.some(f=>(f.pageCount??0)>limits.maxPages))throw new MonetizationError("PAGE_LIMIT_EXCEEDED");
  const now=new Date(),day=new Date(now);day.setUTCHours(0,0,0,0);const month=new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),1));
- await withTenant({userId:input.userId},async tx=>{await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`usage:${input.userId}`},0))`;
+ await withTenant({userId:input.userId},async tx=>{await acquireTransactionAdvisoryLock(tx,`usage:${input.userId}`);
   const prior=await tx.usageEvent.findUnique({where:{userId_kind_reference:{userId:input.userId,kind:"job.created",reference:input.idempotencyKey}}});if(prior)return;
   const [daily,monthly,concurrent]=await Promise.all([tx.usageEvent.aggregate({_sum:{quantity:true},where:{userId:input.userId,kind:"job.created",occurredAt:{gte:day}}}),tx.usageEvent.aggregate({_sum:{quantity:true},where:{userId:input.userId,kind:"job.created",occurredAt:{gte:month}}}),tx.job.count({where:{requesterId:input.userId,status:{in:[...running]}}})]);
   if((daily._sum.quantity??0)>=resolved.entitlements.maxJobsPerDay)throw new MonetizationError("DAILY_JOB_LIMIT_EXCEEDED");
@@ -26,8 +27,8 @@ export async function enforceJobCreation(input:{userId:string;toolId:string;idem
   await tx.usageEvent.create({data:{userId:input.userId,kind:"job.created",reference:input.idempotencyKey,metadata:{toolId:input.toolId,plan:resolved.code}}});
  });
  const cost=creditCost(input.toolId);if(tool.aiFlag&&cost>resolved.entitlements.maxAiCreditsPerRequest)throw new MonetizationError("PLAN_LIMIT_EXCEEDED");
- try{await consumeCreditsOnce(input.userId,input.toolId,`job:${input.toolId}:${input.idempotencyKey}`)}catch(error){if(error instanceof Error&&error.message==="INSUFFICIENT_CREDITS")throw new MonetizationError("INSUFFICIENT_CREDITS");throw error}
- recordMetric("credits_consumed",cost,"count",{tool_id:input.toolId});
+ let creditReused=false;try{const credit=await consumeCreditsOnce(input.userId,input.toolId,`job:${input.toolId}:${input.idempotencyKey}`);creditReused=credit.reused}catch(error){if(error instanceof Error&&error.message==="INSUFFICIENT_CREDITS")throw new MonetizationError("INSUFFICIENT_CREDITS");throw error}
+ if(!creditReused)recordMetric("credits_consumed",cost,"count",{tool_id:input.toolId});
  logger.info("monetization.job_authorized",{user_id:input.userId,tool_id:input.toolId,plan:resolved.code,cost,correlation_id:input.correlationId});return resolved;
 }
 
