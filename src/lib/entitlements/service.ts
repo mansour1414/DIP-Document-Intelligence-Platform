@@ -1,0 +1,5 @@
+import { withTenant } from "@/lib/db/tenant";
+import { PLAN_POLICIES,type Entitlements,type PlanCode } from "./policy";
+const activeStatuses=["ACTIVE","TRIALING"] as const;
+export async function resolvePlan(userId:string,now=new Date()):Promise<{code:PlanCode;entitlements:Entitlements;subscriptionStatus:string|null}>{return withTenant({userId},async tx=>{const subscription=await tx.subscription.findFirst({where:{userId,status:{in:[...activeStatuses]},startsAt:{lte:now},OR:[{currentPeriodEnd:null},{currentPeriodEnd:{gt:now}}]},orderBy:{createdAt:"desc"},include:{plan:true}});const code:PlanCode=subscription?.plan.code==="PRO"?"PRO":"FREE";return{code,entitlements:PLAN_POLICIES[code],subscriptionStatus:subscription?.status??null}})}
+export function resolvePlanFromTrustedState(subscription:{planCode:string;status:string;startsAt:Date;currentPeriodEnd:Date|null}|null,now=new Date()):PlanCode{return subscription&&subscription.planCode==="PRO"&&activeStatuses.includes(subscription.status as typeof activeStatuses[number])&&subscription.startsAt<=now&&(!subscription.currentPeriodEnd||subscription.currentPeriodEnd>now)?"PRO":"FREE"}

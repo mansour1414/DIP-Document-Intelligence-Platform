@@ -9,27 +9,32 @@ datasource db {
 // ==================== IDENTITY ====================
 
 model User {
-  id            String    @id @default(uuid()) @db.Uuid
-  email         String    @unique @db.VarChar(255)
-  passwordHash  String?   @map("password_hash") @db.VarChar(255)
-  externalAuthId String?  @map("external_auth_id") @db.VarChar(255)
-  displayName   String?   @map("display_name") @db.VarChar(100)
-  locale        String    @default("en") @db.VarChar(5)
-  status        UserStatus @default(ACTIVE)
-  createdAt     DateTime  @default(now()) @map("created_at")
-  updatedAt     DateTime  @updatedAt @map("updated_at")
+  id             String     @id @default(uuid()) @db.Uuid
+  email          String     @unique @db.VarChar(255)
+  passwordHash   String?    @map("password_hash") @db.VarChar(255)
+  externalAuthId String?    @map("external_auth_id") @db.VarChar(255)
+  displayName    String?    @map("display_name") @db.VarChar(100)
+  locale         String     @default("en") @db.VarChar(5)
+  status         UserStatus @default(ACTIVE)
+  createdAt      DateTime   @default(now()) @map("created_at")
+  updatedAt      DateTime   @updatedAt @map("updated_at")
 
-  memberships   Membership[]
-  apiKeys       ApiKey[]
-  jobs          Job[]       @relation("RequesterJobs")
-  documents     Document[]
+  memberships     Membership[]
+  apiKeys         ApiKey[]
+  jobs            Job[]            @relation("RequesterJobs")
+  documents       Document[]
   aiConversations AiConversation[]
-  aiUsage        AiUsage[]
-  subscriptions  Subscription[]
-  accounts       Account[]
-  sessions       Session[]
-  creditLedger   CreditLedger[]
-  fileVersions   FileVersion[]
+  aiUsage         AiUsage[]
+  subscriptions   Subscription[]
+  invoices        Invoice[]
+  payments        Payment[]
+  creditPurchases CreditPurchase[]
+  usageEvents     UsageEvent[]
+  billingEvents   BillingEvent[]
+  accounts        Account[]
+  sessions        Session[]
+  creditLedger    CreditLedger[]
+  fileVersions    FileVersion[]
 
   @@index([status])
   @@map("users")
@@ -51,30 +56,30 @@ model Organization {
 }
 
 model Team {
-  id             String       @id @default(uuid()) @db.Uuid
-  name           String       @db.VarChar(100)
-  organizationId String       @map("organization_id") @db.Uuid
-  createdAt      DateTime     @default(now()) @map("created_at")
-  updatedAt      DateTime     @updatedAt @map("updated_at")
+  id             String   @id @default(uuid()) @db.Uuid
+  name           String   @db.VarChar(100)
+  organizationId String   @map("organization_id") @db.Uuid
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
 
-  organization   Organization @relation(fields: [organizationId], references: [id])
-  memberships    Membership[]
+  organization Organization @relation(fields: [organizationId], references: [id])
+  memberships  Membership[]
 
   @@index([organizationId])
   @@map("teams")
 }
 
 model Membership {
-  id             String       @id @default(uuid()) @db.Uuid
-  userId         String       @map("user_id") @db.Uuid
-  organizationId String       @map("organization_id") @db.Uuid
-  teamId         String?      @map("team_id") @db.Uuid
-  role           MemberRole   @default(MEMBER)
-  createdAt      DateTime     @default(now()) @map("created_at")
+  id             String     @id @default(uuid()) @db.Uuid
+  userId         String     @map("user_id") @db.Uuid
+  organizationId String     @map("organization_id") @db.Uuid
+  teamId         String?    @map("team_id") @db.Uuid
+  role           MemberRole @default(MEMBER)
+  createdAt      DateTime   @default(now()) @map("created_at")
 
-  user           User         @relation(fields: [userId], references: [id])
-  organization   Organization @relation(fields: [organizationId], references: [id])
-  team           Team?        @relation(fields: [teamId], references: [id])
+  user         User         @relation(fields: [userId], references: [id])
+  organization Organization @relation(fields: [organizationId], references: [id])
+  team         Team?        @relation(fields: [teamId], references: [id])
 
   @@unique([userId, organizationId])
   @@index([organizationId])
@@ -83,31 +88,31 @@ model Membership {
 }
 
 model ApiKey {
-  id             String   @id @default(uuid()) @db.Uuid
-  userId         String   @map("user_id") @db.Uuid
-  name           String   @db.VarChar(100)
-  keyHash        String   @map("key_hash") @db.VarChar(255)
-  scopes         Json     @default("[]")
-  expiresAt      DateTime? @map("expires_at")
-  lastUsedAt     DateTime? @map("last_used_at")
-  createdAt      DateTime @default(now()) @map("created_at")
+  id         String    @id @default(uuid()) @db.Uuid
+  userId     String    @map("user_id") @db.Uuid
+  name       String    @db.VarChar(100)
+  keyHash    String    @map("key_hash") @db.VarChar(255)
+  scopes     Json      @default("[]")
+  expiresAt  DateTime? @map("expires_at")
+  lastUsedAt DateTime? @map("last_used_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
 
-  user           User     @relation(fields: [userId], references: [id])
+  user User @relation(fields: [userId], references: [id])
 
   @@index([userId])
   @@map("api_keys")
 }
 
 model Account {
-  id                String   @id @default(uuid()) @db.Uuid
-  userId            String   @map("user_id") @db.Uuid
-  provider          String   @db.VarChar(50)
-  providerAccountId String   @map("provider_account_id") @db.VarChar(255)
-  accessToken       String?  @map("access_token") @db.Text
-  refreshToken      String?  @map("refresh_token") @db.Text
+  id                String    @id @default(uuid()) @db.Uuid
+  userId            String    @map("user_id") @db.Uuid
+  provider          String    @db.VarChar(50)
+  providerAccountId String    @map("provider_account_id") @db.VarChar(255)
+  accessToken       String?   @map("access_token") @db.Text
+  refreshToken      String?   @map("refresh_token") @db.Text
   expiresAt         DateTime? @map("expires_at")
-  createdAt         DateTime @default(now()) @map("created_at")
-  updatedAt         DateTime @updatedAt @map("updated_at")
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -133,17 +138,17 @@ model Session {
 // ==================== DOCUMENTS ====================
 
 model Document {
-  id             String       @id @default(uuid()) @db.Uuid
-  userId         String       @map("user_id") @db.Uuid
-  organizationId String?      @map("organization_id") @db.Uuid
-  title          String       @db.VarChar(255)
+  id             String         @id @default(uuid()) @db.Uuid
+  userId         String         @map("user_id") @db.Uuid
+  organizationId String?        @map("organization_id") @db.Uuid
+  title          String         @db.VarChar(255)
   status         DocumentStatus @default(ACTIVE)
-  createdAt      DateTime     @default(now()) @map("created_at")
-  updatedAt      DateTime     @updatedAt @map("updated_at")
+  createdAt      DateTime       @default(now()) @map("created_at")
+  updatedAt      DateTime       @updatedAt @map("updated_at")
 
-  user           User         @relation(fields: [userId], references: [id])
-  organization   Organization? @relation(fields: [organizationId], references: [id])
-  files          File[]
+  user            User             @relation(fields: [userId], references: [id])
+  organization    Organization?    @relation(fields: [organizationId], references: [id])
+  files           File[]
   aiConversations AiConversation[]
 
   @@index([userId])
@@ -153,23 +158,23 @@ model Document {
 }
 
 model File {
-  id             String        @id @default(uuid()) @db.Uuid
-  documentId     String        @map("document_id") @db.Uuid
-  originalName   String        @map("original_name") @db.VarChar(255)
-  mimeType       String        @map("mime_type") @db.VarChar(100)
-  size           BigInt        @db.BigInt
-  storageKey     String        @map("storage_key") @db.VarChar(500)
-  storageObjectId String?      @map("storage_object_id") @db.Uuid
-  checksum       String?       @db.VarChar(64)
-  pageCount      Int?          @map("page_count")
-  version        Int           @default(1)
-  createdAt      DateTime      @default(now()) @map("created_at")
+  id              String   @id @default(uuid()) @db.Uuid
+  documentId      String   @map("document_id") @db.Uuid
+  originalName    String   @map("original_name") @db.VarChar(255)
+  mimeType        String   @map("mime_type") @db.VarChar(100)
+  size            BigInt   @db.BigInt
+  storageKey      String   @map("storage_key") @db.VarChar(500)
+  storageObjectId String?  @map("storage_object_id") @db.Uuid
+  checksum        String?  @db.VarChar(64)
+  pageCount       Int?     @map("page_count")
+  version         Int      @default(1)
+  createdAt       DateTime @default(now()) @map("created_at")
 
-  document       Document      @relation(fields: [documentId], references: [id])
-  storageObject  StorageObject? @relation(fields: [storageObjectId], references: [id])
-  jobInputs      Job[]         @relation("InputFiles")
-  jobOutputs     Job[]         @relation("OutputFiles")
-  versions       FileVersion[]
+  document      Document       @relation(fields: [documentId], references: [id])
+  storageObject StorageObject? @relation(fields: [storageObjectId], references: [id])
+  jobInputs     Job[]          @relation("InputFiles")
+  jobOutputs    Job[]          @relation("OutputFiles")
+  versions      FileVersion[]
 
   @@index([documentId])
   @@index([storageObjectId])
@@ -185,8 +190,8 @@ model FileVersion {
   checksum   String?  @db.VarChar(64)
   createdAt  DateTime @default(now()) @map("created_at")
 
-  file       File     @relation(fields: [fileId], references: [id], onDelete: Cascade)
-  owner      User     @relation(fields: [ownerId], references: [id])
+  file  File @relation(fields: [fileId], references: [id], onDelete: Cascade)
+  owner User @relation(fields: [ownerId], references: [id])
 
   @@unique([fileId, version])
   @@index([ownerId, createdAt])
@@ -194,16 +199,16 @@ model FileVersion {
 }
 
 model StorageObject {
-  id             String   @id @default(uuid()) @db.Uuid
-  provider       String   @db.VarChar(50)
-  bucket         String   @db.VarChar(255)
-  objectKey      String   @map("object_key") @db.VarChar(500)
-  region         String?  @db.VarChar(100)
-  size           BigInt
-  checksum       String?  @db.VarChar(64)
-  createdAt      DateTime @default(now()) @map("created_at")
-  deletedAt      DateTime? @map("deleted_at")
-  files          File[]
+  id        String    @id @default(uuid()) @db.Uuid
+  provider  String    @db.VarChar(50)
+  bucket    String    @db.VarChar(255)
+  objectKey String    @map("object_key") @db.VarChar(500)
+  region    String?   @db.VarChar(100)
+  size      BigInt
+  checksum  String?   @db.VarChar(64)
+  createdAt DateTime  @default(now()) @map("created_at")
+  deletedAt DateTime? @map("deleted_at")
+  files     File[]
 
   @@unique([provider, bucket, objectKey])
   @@map("storage_objects")
@@ -212,38 +217,38 @@ model StorageObject {
 // ==================== PROCESSING ====================
 
 model Job {
-  id             String        @id @default(uuid()) @db.Uuid
-  toolId         String        @map("tool_id") @db.VarChar(50)
-  idempotencyKey String        @map("idempotency_key") @db.VarChar(255)
-  requesterId    String?       @map("requester_id") @db.Uuid
-  inputFileId    String?       @map("input_file_id") @db.Uuid
-  outputFileId   String?       @map("output_file_id") @db.Uuid
-  status         JobStatus     @default(QUEUED)
-  params         Json          @default("{}")
+  id             String    @id @default(uuid()) @db.Uuid
+  toolId         String    @map("tool_id") @db.VarChar(50)
+  idempotencyKey String    @map("idempotency_key") @db.VarChar(255)
+  requesterId    String?   @map("requester_id") @db.Uuid
+  inputFileId    String?   @map("input_file_id") @db.Uuid
+  outputFileId   String?   @map("output_file_id") @db.Uuid
+  status         JobStatus @default(QUEUED)
+  params         Json      @default("{}")
   result         Json?
   error          Json?
-  correlationId  String?       @map("correlation_id") @db.Uuid
-  errorCode      String?       @map("error_code") @db.VarChar(100)
-  engine         String?       @db.VarChar(100)
-  engineVersion  String?       @map("engine_version") @db.VarChar(100)
-  startedAt      DateTime?     @map("started_at")
-  completedAt    DateTime?     @map("completed_at")
-  createdAt      DateTime      @default(now()) @map("created_at")
-  updatedAt      DateTime      @updatedAt @map("updated_at")
+  correlationId  String?   @map("correlation_id") @db.Uuid
+  errorCode      String?   @map("error_code") @db.VarChar(100)
+  engine         String?   @db.VarChar(100)
+  engineVersion  String?   @map("engine_version") @db.VarChar(100)
+  startedAt      DateTime? @map("started_at")
+  completedAt    DateTime? @map("completed_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
 
-  requester      User?         @relation("RequesterJobs", fields: [requesterId], references: [id])
-  inputFile      File?         @relation("InputFiles", fields: [inputFileId], references: [id])
-  outputFile     File?         @relation("OutputFiles", fields: [outputFileId], references: [id])
+  requester      User?           @relation("RequesterJobs", fields: [requesterId], references: [id])
+  inputFile      File?           @relation("InputFiles", fields: [inputFileId], references: [id])
+  outputFile     File?           @relation("OutputFiles", fields: [outputFileId], references: [id])
   steps          JobStep[]
   events         JobEvent[]
   toolExecutions ToolExecution[]
 
+  @@unique([toolId, idempotencyKey])
   @@index([requesterId])
   @@index([status])
   @@index([toolId])
   @@index([createdAt])
   @@index([requesterId, correlationId])
-  @@unique([toolId, idempotencyKey])
   @@map("jobs")
 }
 
@@ -265,44 +270,44 @@ model JobStep {
   createdAt      DateTime  @default(now()) @map("created_at")
   updatedAt      DateTime  @updatedAt @map("updated_at")
 
-  job            Job       @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  job Job @relation(fields: [jobId], references: [id], onDelete: Cascade)
 
-  @@index([jobId])
   @@unique([jobId, idempotencyKey])
+  @@index([jobId])
   @@map("job_steps")
 }
 
 model JobEvent {
-  id             String    @id @default(uuid()) @db.Uuid
-  jobId          String    @map("job_id") @db.Uuid
-  type           String    @db.VarChar(50)
-  data           Json      @default("{}")
-  correlationId  String?   @map("correlation_id") @db.Uuid
-  createdAt      DateTime  @default(now()) @map("created_at")
-  updatedAt      DateTime  @updatedAt @map("updated_at")
+  id            String   @id @default(uuid()) @db.Uuid
+  jobId         String   @map("job_id") @db.Uuid
+  type          String   @db.VarChar(50)
+  data          Json     @default("{}")
+  correlationId String?  @map("correlation_id") @db.Uuid
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
 
-  job            Job       @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  job Job @relation(fields: [jobId], references: [id], onDelete: Cascade)
 
   @@index([jobId])
   @@map("job_events")
 }
 
 model ToolExecution {
-  id             String    @id @default(uuid()) @db.Uuid
-  jobId          String    @map("job_id") @db.Uuid
-  toolId         String    @map("tool_id") @db.VarChar(50)
-  mode           ExecutionMode
-  input          Json?
-  output         Json?
-  correlationId  String?   @map("correlation_id") @db.Uuid
-  errorCode      String?   @map("error_code") @db.VarChar(100)
-  engine         String?   @db.VarChar(100)
-  engineVersion  String?   @map("engine_version") @db.VarChar(100)
-  durationMs     Int?      @map("duration_ms")
-  createdAt      DateTime  @default(now()) @map("created_at")
-  updatedAt      DateTime  @updatedAt @map("updated_at")
+  id            String        @id @default(uuid()) @db.Uuid
+  jobId         String        @map("job_id") @db.Uuid
+  toolId        String        @map("tool_id") @db.VarChar(50)
+  mode          ExecutionMode
+  input         Json?
+  output        Json?
+  correlationId String?       @map("correlation_id") @db.Uuid
+  errorCode     String?       @map("error_code") @db.VarChar(100)
+  engine        String?       @db.VarChar(100)
+  engineVersion String?       @map("engine_version") @db.VarChar(100)
+  durationMs    Int?          @map("duration_ms")
+  createdAt     DateTime      @default(now()) @map("created_at")
+  updatedAt     DateTime      @updatedAt @map("updated_at")
 
-  job            Job       @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  job Job @relation(fields: [jobId], references: [id], onDelete: Cascade)
 
   @@index([jobId])
   @@index([toolId])
@@ -312,17 +317,17 @@ model ToolExecution {
 // ==================== AI ====================
 
 model AiConversation {
-  id             String    @id @default(uuid()) @db.Uuid
-  documentId     String    @map("document_id") @db.Uuid
-  userId         String    @map("user_id") @db.Uuid
-  title          String?   @db.VarChar(255)
-  createdAt      DateTime  @default(now()) @map("created_at")
+  id         String   @id @default(uuid()) @db.Uuid
+  documentId String   @map("document_id") @db.Uuid
+  userId     String   @map("user_id") @db.Uuid
+  title      String?  @db.VarChar(255)
+  createdAt  DateTime @default(now()) @map("created_at")
 
-  user           User      @relation(fields: [userId], references: [id])
-  updatedAt      DateTime  @updatedAt @map("updated_at")
+  user      User     @relation(fields: [userId], references: [id])
+  updatedAt DateTime @updatedAt @map("updated_at")
 
-  document       Document  @relation(fields: [documentId], references: [id])
-  messages       AiMessage[]
+  document Document    @relation(fields: [documentId], references: [id])
+  messages AiMessage[]
 
   @@index([documentId])
   @@index([userId])
@@ -330,35 +335,35 @@ model AiConversation {
 }
 
 model AiMessage {
-  id             String    @id @default(uuid()) @db.Uuid
-  conversationId String    @map("conversation_id") @db.Uuid
+  id             String   @id @default(uuid()) @db.Uuid
+  conversationId String   @map("conversation_id") @db.Uuid
   role           AiRole
-  content        String    @db.Text
-  model          String    @db.VarChar(100)
-  tokensInput    Int?      @map("tokens_input")
-  tokensOutput   Int?      @map("tokens_output")
-  cost           Decimal?  @db.Decimal(10, 6)
-  createdAt      DateTime  @default(now()) @map("created_at")
+  content        String   @db.Text
+  model          String   @db.VarChar(100)
+  tokensInput    Int?     @map("tokens_input")
+  tokensOutput   Int?     @map("tokens_output")
+  cost           Decimal? @db.Decimal(10, 6)
+  createdAt      DateTime @default(now()) @map("created_at")
 
-  conversation   AiConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  conversation AiConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
 
   @@index([conversationId])
   @@map("ai_messages")
 }
 
 model AiUsage {
-  id             String    @id @default(uuid()) @db.Uuid
-  userId         String    @map("user_id") @db.Uuid
-  jobId          String?   @map("job_id") @db.Uuid
-  provider       String    @db.VarChar(50)
-  model          String    @db.VarChar(100)
-  taskType       String    @map("task_type") @db.VarChar(50)
-  tokensInput    Int       @map("tokens_input")
-  tokensOutput   Int       @map("tokens_output")
-  cost           Decimal   @db.Decimal(10, 6)
-  createdAt      DateTime  @default(now()) @map("created_at")
+  id           String   @id @default(uuid()) @db.Uuid
+  userId       String   @map("user_id") @db.Uuid
+  jobId        String?  @map("job_id") @db.Uuid
+  provider     String   @db.VarChar(50)
+  model        String   @db.VarChar(100)
+  taskType     String   @map("task_type") @db.VarChar(50)
+  tokensInput  Int      @map("tokens_input")
+  tokensOutput Int      @map("tokens_output")
+  cost         Decimal  @db.Decimal(10, 6)
+  createdAt    DateTime @default(now()) @map("created_at")
 
-  user           User      @relation(fields: [userId], references: [id])
+  user User @relation(fields: [userId], references: [id])
 
   @@index([userId])
   @@index([provider, model])
@@ -367,16 +372,20 @@ model AiUsage {
 }
 
 model CreditLedger {
-  id             String    @id @default(uuid()) @db.Uuid
-  userId         String    @map("user_id") @db.Uuid
+  id             String       @id @default(uuid()) @db.Uuid
+  userId         String       @map("user_id") @db.Uuid
   type           CreditType
-  amount         Decimal   @db.Decimal(10, 2)
-  balance        Decimal   @db.Decimal(10, 2)
-  reference      String?   @db.VarChar(255)
-  createdAt      DateTime  @default(now()) @map("created_at")
+  amount         Decimal      @db.Decimal(10, 2)
+  balance        Decimal      @db.Decimal(10, 2)
+  reference      String?      @db.VarChar(255)
+  idempotencyKey String       @map("idempotency_key") @db.VarChar(255)
+  reason         CreditReason
+  metadata       Json         @default("{}")
+  createdAt      DateTime     @default(now()) @map("created_at")
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
+  @@unique([userId, idempotencyKey])
   @@index([userId])
   @@index([createdAt])
   @@map("credit_ledger")
@@ -384,48 +393,203 @@ model CreditLedger {
 
 // ==================== BILLING ====================
 
+model PlanCatalog {
+  id               String            @id @default(uuid()) @db.Uuid
+  code             String            @unique @db.VarChar(32)
+  name             String            @db.VarChar(100)
+  status           PlanStatus        @default(ACTIVE)
+  billingIntervals Json              @default("[]") @map("billing_intervals")
+  currencies       Json              @default("[]")
+  version          Int               @default(1)
+  effectiveFrom    DateTime          @default(now()) @map("effective_from")
+  effectiveTo      DateTime?         @map("effective_to")
+  createdAt        DateTime          @default(now()) @map("created_at")
+  updatedAt        DateTime          @updatedAt @map("updated_at")
+  entitlements     PlanEntitlement[]
+  subscriptions    Subscription[]
+
+  @@unique([code, version])
+  @@map("plans")
+}
+
+model PlanEntitlement {
+  id        String      @id @default(uuid()) @db.Uuid
+  planId    String      @map("plan_id") @db.Uuid
+  key       String      @db.VarChar(100)
+  value     Json
+  createdAt DateTime    @default(now()) @map("created_at")
+  updatedAt DateTime    @updatedAt @map("updated_at")
+  plan      PlanCatalog @relation(fields: [planId], references: [id], onDelete: Cascade)
+
+  @@unique([planId, key])
+  @@index([planId])
+  @@map("plan_entitlements")
+}
+
 model Subscription {
-  id             String    @id @default(uuid()) @db.Uuid
-  userId         String    @map("user_id") @db.Uuid
-  plan           Plan      @default(FREE)
-  status         SubscriptionStatus @default(ACTIVE)
-  currentPeriodStart DateTime? @map("current_period_start")
-  currentPeriodEnd   DateTime? @map("current_period_end")
-  createdAt      DateTime  @default(now()) @map("created_at")
-  updatedAt      DateTime  @updatedAt @map("updated_at")
+  id                 String             @id @default(uuid()) @db.Uuid
+  userId             String             @map("user_id") @db.Uuid
+  planId             String             @map("plan_id") @db.Uuid
+  status             SubscriptionStatus @default(ACTIVE)
+  externalReference  String?            @map("external_reference") @db.VarChar(255)
+  startsAt           DateTime           @default(now()) @map("starts_at")
+  currentPeriodStart DateTime?          @map("current_period_start")
+  currentPeriodEnd   DateTime?          @map("current_period_end")
+  cancelAtPeriodEnd  Boolean            @default(false) @map("cancel_at_period_end")
+  cancelledAt        DateTime?          @map("cancelled_at")
+  createdAt          DateTime           @default(now()) @map("created_at")
+  updatedAt          DateTime           @updatedAt @map("updated_at")
 
-  user           User      @relation(fields: [userId], references: [id])
+  user     User        @relation(fields: [userId], references: [id])
+  plan     PlanCatalog @relation(fields: [planId], references: [id])
+  invoices Invoice[]
 
+  @@unique([externalReference])
   @@index([userId])
+  @@index([userId, status, currentPeriodEnd])
   @@map("subscriptions")
+}
+
+model Invoice {
+  id                String           @id @default(uuid()) @db.Uuid
+  userId            String           @map("user_id") @db.Uuid
+  subscriptionId    String?          @map("subscription_id") @db.Uuid
+  number            String           @unique @db.VarChar(100)
+  status            InvoiceStatus    @default(DRAFT)
+  subtotalMinor     BigInt           @map("subtotal_minor")
+  taxMinor          BigInt?          @map("tax_minor")
+  totalMinor        BigInt           @map("total_minor")
+  currency          String           @db.Char(3)
+  issuedAt          DateTime         @default(now()) @map("issued_at")
+  dueAt             DateTime?        @map("due_at")
+  paidAt            DateTime?        @map("paid_at")
+  externalReference String?          @unique @map("external_reference") @db.VarChar(255)
+  createdAt         DateTime         @default(now()) @map("created_at")
+  user              User             @relation(fields: [userId], references: [id])
+  subscription      Subscription?    @relation(fields: [subscriptionId], references: [id])
+  payments          Payment[]
+  creditPurchases   CreditPurchase[]
+
+  @@index([userId, issuedAt])
+  @@map("invoices")
+}
+
+model Payment {
+  id                String           @id @default(uuid()) @db.Uuid
+  userId            String           @map("user_id") @db.Uuid
+  invoiceId         String?          @map("invoice_id") @db.Uuid
+  amountMinor       BigInt           @map("amount_minor")
+  currency          String           @db.Char(3)
+  status            PaymentStatus    @default(PENDING)
+  externalReference String?          @unique @map("external_reference") @db.VarChar(255)
+  failureCode       String?          @map("failure_code") @db.VarChar(100)
+  failureReason     String?          @map("failure_reason") @db.VarChar(500)
+  paidAt            DateTime?        @map("paid_at")
+  createdAt         DateTime         @default(now()) @map("created_at")
+  user              User             @relation(fields: [userId], references: [id])
+  invoice           Invoice?         @relation(fields: [invoiceId], references: [id])
+  creditPurchases   CreditPurchase[]
+
+  @@index([userId, createdAt])
+  @@map("payments")
+}
+
+model CreditPurchase {
+  id             String               @id @default(uuid()) @db.Uuid
+  userId         String               @map("user_id") @db.Uuid
+  invoiceId      String?              @map("invoice_id") @db.Uuid
+  paymentId      String?              @map("payment_id") @db.Uuid
+  credits        Decimal              @db.Decimal(12, 2)
+  amountMinor    BigInt               @map("amount_minor")
+  currency       String               @db.Char(3)
+  status         CreditPurchaseStatus @default(PENDING)
+  idempotencyKey String               @unique @map("idempotency_key") @db.VarChar(255)
+  grantedAt      DateTime?            @map("granted_at")
+  createdAt      DateTime             @default(now()) @map("created_at")
+  user           User                 @relation(fields: [userId], references: [id])
+  invoice        Invoice?             @relation(fields: [invoiceId], references: [id])
+  payment        Payment?             @relation(fields: [paymentId], references: [id])
+
+  @@index([userId, createdAt])
+  @@map("credit_purchases")
+}
+
+model UsageEvent {
+  id         String   @id @default(uuid()) @db.Uuid
+  userId     String   @map("user_id") @db.Uuid
+  kind       String   @db.VarChar(50)
+  quantity   Int      @default(1)
+  reference  String   @db.VarChar(255)
+  occurredAt DateTime @default(now()) @map("occurred_at")
+  metadata   Json     @default("{}")
+  user       User     @relation(fields: [userId], references: [id])
+
+  @@unique([userId, kind, reference])
+  @@index([userId, kind, occurredAt])
+  @@map("usage_events")
+}
+
+model AiProviderPrice {
+  id                    String    @id @default(uuid()) @db.Uuid
+  provider              String    @db.VarChar(50)
+  model                 String    @db.VarChar(100)
+  inputPricePerMillion  Decimal   @map("input_price_per_million") @db.Decimal(18, 6)
+  outputPricePerMillion Decimal   @map("output_price_per_million") @db.Decimal(18, 6)
+  currency              String    @db.Char(3)
+  effectiveFrom         DateTime  @map("effective_from")
+  effectiveTo           DateTime? @map("effective_to")
+  source                String?   @db.VarChar(255)
+  notes                 String?   @db.Text
+  createdAt             DateTime  @default(now()) @map("created_at")
+
+  @@unique([provider, model, effectiveFrom])
+  @@index([provider, model, effectiveFrom, effectiveTo])
+  @@map("ai_provider_prices")
+}
+
+model BillingEvent {
+  id              String             @id @default(uuid()) @db.Uuid
+  userId          String?            @map("user_id") @db.Uuid
+  provider        String             @db.VarChar(50)
+  externalEventId String             @map("external_event_id") @db.VarChar(255)
+  type            String             @db.VarChar(100)
+  status          BillingEventStatus @default(RECEIVED)
+  payload         Json               @default("{}")
+  processedAt     DateTime?          @map("processed_at")
+  createdAt       DateTime           @default(now()) @map("created_at")
+  user            User?              @relation(fields: [userId], references: [id])
+
+  @@unique([provider, externalEventId])
+  @@index([userId, createdAt])
+  @@map("billing_events")
 }
 
 // ==================== SEO / CONTENT ====================
 
 model ToolPage {
-  id             String    @id @default(uuid()) @db.Uuid
-  slug           String    @unique @db.VarChar(100)
-  locale         String    @db.VarChar(5)
-  title          String    @db.VarChar(255)
-  description    String    @db.VarChar(500)
-  h1             String    @db.VarChar(255)
-  content        Json      @default("{}")
-  faq            Json      @default("[]")
-  metadata       Json      @default("{}")
-  published      Boolean   @default(false)
-  createdAt      DateTime  @default(now()) @map("created_at")
-  updatedAt      DateTime  @updatedAt @map("updated_at")
+  id          String   @id @default(uuid()) @db.Uuid
+  slug        String   @unique @db.VarChar(100)
+  locale      String   @db.VarChar(5)
+  title       String   @db.VarChar(255)
+  description String   @db.VarChar(500)
+  h1          String   @db.VarChar(255)
+  content     Json     @default("{}")
+  faq         Json     @default("[]")
+  metadata    Json     @default("{}")
+  published   Boolean  @default(false)
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
 
   @@unique([slug, locale])
   @@map("tool_pages")
 }
 
 model Redirect {
-  id             String    @id @default(uuid()) @db.Uuid
-  from           String    @db.VarChar(500)
-  to             String    @db.VarChar(500)
-  type           RedirectType @default(MOVED_PERMANENTLY)
-  createdAt      DateTime  @default(now()) @map("created_at")
+  id        String       @id @default(uuid()) @db.Uuid
+  from      String       @db.VarChar(500)
+  to        String       @db.VarChar(500)
+  type      RedirectType @default(MOVED_PERMANENTLY)
+  createdAt DateTime     @default(now()) @map("created_at")
 
   @@unique([from])
   @@map("redirects")
@@ -434,15 +598,15 @@ model Redirect {
 // ==================== SECURITY / AUDIT ====================
 
 model AuditLog {
-  id             String    @id @default(uuid()) @db.Uuid
-  userId         String?   @map("user_id") @db.Uuid
-  action         String    @db.VarChar(100)
-  resource       String    @db.VarChar(100)
-  resourceId     String?   @map("resource_id") @db.Uuid
-  details        Json      @default("{}")
-  ipAddress      String?   @map("ip_address") @db.VarChar(45)
-  userAgent      String?   @map("user_agent") @db.VarChar(500)
-  createdAt      DateTime  @default(now()) @map("created_at")
+  id         String   @id @default(uuid()) @db.Uuid
+  userId     String?  @map("user_id") @db.Uuid
+  action     String   @db.VarChar(100)
+  resource   String   @db.VarChar(100)
+  resourceId String?  @map("resource_id") @db.Uuid
+  details    Json     @default("{}")
+  ipAddress  String?  @map("ip_address") @db.VarChar(45)
+  userAgent  String?  @map("user_agent") @db.VarChar(500)
+  createdAt  DateTime @default(now()) @map("created_at")
 
   @@index([userId])
   @@index([action])
@@ -452,12 +616,12 @@ model AuditLog {
 }
 
 model SecurityEvent {
-  id             String    @id @default(uuid()) @db.Uuid
-  type           String    @db.VarChar(50)
-  severity       Severity @default(INFO)
-  details        Json      @default("{}")
-  ipAddress      String?   @map("ip_address") @db.VarChar(45)
-  createdAt      DateTime  @default(now()) @map("created_at")
+  id        String   @id @default(uuid()) @db.Uuid
+  type      String   @db.VarChar(50)
+  severity  Severity @default(INFO)
+  details   Json     @default("{}")
+  ipAddress String?  @map("ip_address") @db.VarChar(45)
+  createdAt DateTime @default(now()) @map("created_at")
 
   @@index([type])
   @@index([severity])
@@ -468,12 +632,12 @@ model SecurityEvent {
 // ==================== SYSTEM ====================
 
 model FeatureFlag {
-  id             String    @id @default(uuid()) @db.Uuid
-  key            String    @unique @db.VarChar(100)
-  enabled        Boolean   @default(false)
-  description    String?   @db.VarChar(500)
-  createdAt      DateTime  @default(now()) @map("created_at")
-  updatedAt      DateTime  @updatedAt @map("updated_at")
+  id          String   @id @default(uuid()) @db.Uuid
+  key         String   @unique @db.VarChar(100)
+  enabled     Boolean  @default(false)
+  description String?  @db.VarChar(500)
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
 
   @@map("feature_flags")
 }
@@ -533,11 +697,58 @@ enum CreditType {
   BONUS
 }
 
+enum CreditReason {
+  TOOL_EXECUTION
+  AI_USAGE
+  SUBSCRIPTION_GRANT
+  PROMOTIONAL_GRANT
+  PURCHASE
+  REFUND_REVERSAL
+  ADMIN_ADJUSTMENT
+}
+
+enum PlanStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum InvoiceStatus {
+  DRAFT
+  OPEN
+  PAID
+  VOID
+  UNCOLLECTIBLE
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+  CANCELLED
+  REFUNDED
+}
+
+enum CreditPurchaseStatus {
+  PENDING
+  PAID
+  GRANTED
+  FAILED
+  CANCELLED
+}
+
+enum BillingEventStatus {
+  RECEIVED
+  PROCESSED
+  IGNORED
+  FAILED
+}
+
 enum SubscriptionStatus {
+  TRIALING
   ACTIVE
   CANCELLED
   PAST_DUE
-  INACTIVE
+  EXPIRED
 }
 
 enum RedirectType {

@@ -1,0 +1,3 @@
+import type { BillingProviderAdapter } from "./provider";
+import { withTenant } from "@/lib/db/tenant";
+export async function receiveVerifiedBillingEvent(adapter:BillingProviderAdapter,request:Request){const verified=await adapter.verifyWebhook(request);return withTenant({userId:verified.userId},tx=>tx.billingEvent.upsert({where:{provider_externalEventId:{provider:verified.provider,externalEventId:verified.externalEventId}},create:{userId:verified.userId,provider:verified.provider,externalEventId:verified.externalEventId,type:verified.type,payload:verified.payload as object},update:{},select:{id:true,status:true}}))}

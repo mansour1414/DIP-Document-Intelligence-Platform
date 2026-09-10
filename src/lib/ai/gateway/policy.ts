@@ -1,5 +1,4 @@
 import { db } from "@/lib/db";
-import { consumeCreditsOnce } from "@/lib/billing/credits";
 import { AiGatewayError, type AiRequestContext, type AiTask } from "./types";
 
 export function assertDocumentScope(input: { taskDocumentId: string; fileDocumentId: string; ownerId: string; requesterId: string; inputCount: number }) {
@@ -18,5 +17,5 @@ export async function enforceAiPolicy(task: AiTask, context: AiRequestContext) {
   if (task.toolId !== context.toolId) throw new AiGatewayError("AI_TOOL_SCOPE_VIOLATION", "The task does not match the queued tool.");
   const document = await db.document.findFirst({ where: { id: task.documentId, userId: context.userId }, select: { id: true } });
   if (!document) throw new AiGatewayError("DOCUMENT_SCOPE_VIOLATION", "The requested document is outside the job scope.");
-  await consumeCreditsOnce(context.userId, context.toolId, `ai-job:${context.jobId}`);
+  // Credits and commercial entitlements are reserved before enqueue by the orchestrator.
 }

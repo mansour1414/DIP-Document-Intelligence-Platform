@@ -18,7 +18,7 @@ export async function GET(request: Request) {
     const account = await db.account.findUnique({ where: { provider_providerAccountId: { provider: "github", providerAccountId: String(profile.id) } }, select: { userId: true } });
     let user: { id: string };
     if (account) user = { id: account.userId };
-    else { user = await db.user.create({ data: { email: profile.email?.toLowerCase() ?? `github-${profile.id}@users.noreply.github.com`, displayName: profile.name ?? profile.login, subscriptions: { create: { plan: "FREE", status: "ACTIVE" } }, accounts: { create: { provider: "github", providerAccountId: String(profile.id), accessToken: token.access_token } } }, select: { id: true } }); await grantSignupCredits(user.id); }
+    else { user = await db.user.create({ data: { email: profile.email?.toLowerCase() ?? `github-${profile.id}@users.noreply.github.com`, displayName: profile.name ?? profile.login, accounts: { create: { provider: "github", providerAccountId: String(profile.id), accessToken: token.access_token } } }, select: { id: true } }); await grantSignupCredits(user.id); }
     const response = NextResponse.redirect(new URL("/dashboard", request.url)); response.cookies.set(sessionCookie.name, createSessionToken(user.id), sessionCookie); response.cookies.set("dip_oauth_state", "", { httpOnly: true, sameSite: "lax", maxAge: 0, path: "/" }); return response;
   } catch { return NextResponse.redirect(new URL("/login?error=oauth_failed", request.url)); }
 }

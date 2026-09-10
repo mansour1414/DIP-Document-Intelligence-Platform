@@ -17,7 +17,7 @@ A global document processing platform combining PDF tools with AI, OCR, and work
 
 ### Prerequisites
 
-- Node.js 20+
+- Node.js 22.13+
 - Docker & Docker Compose
 - npm or pnpm
 
@@ -63,7 +63,6 @@ A global document processing platform combining PDF tools with AI, OCR, and work
 - `npm run start` — Start production server
 - `npm run lint` — Run ESLint
 - `npm run db:generate` — Generate Prisma client
-- `npm run db:push` — Push schema to database
 - `npm run db:migrate` — Run migrations (development)
 - `npm run db:studio` — Open Prisma Studio
 - `npm run docker:up` — Start Docker services

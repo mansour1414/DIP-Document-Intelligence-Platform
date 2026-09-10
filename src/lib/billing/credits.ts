@@ -1,48 +1,20 @@
-import { db } from "@/lib/db";
+import { Prisma, type CreditReason, type CreditType } from "@prisma/client";
+import { withTenant } from "@/lib/db/tenant";
+import { PLAN_POLICIES } from "@/lib/entitlements/policy";
+import { creditCost, creditReason } from "./credit-policy";
 
-export const toolCredits: Record<string, number> = {
-  "word-to-pdf": 1, "pdf-to-word": 1, "excel-to-pdf": 1, "powerpoint-to-pdf": 1,
-  "ocr-pdf": 3, "summarize-pdf": 5, "chat-with-pdf": 5, "extract-data": 5,
-};
+export class CreditError extends Error { readonly code="INSUFFICIENT_CREDITS"; constructor(){super("INSUFFICIENT_CREDITS")} }
+export async function creditBalance(userId:string){return withTenant({userId},async tx=>{const latest=await tx.creditLedger.findFirst({where:{userId},orderBy:[{createdAt:"desc"},{id:"desc"}],select:{balance:true}});return Number(latest?.balance??0)})}
 
-export const plans = {
-  FREE: { name: "Free", monthlyCredits: 20 },
-  PRO: { name: "Pro", monthlyCredits: 500 },
-  BUSINESS: { name: "Enterprise", monthlyCredits: 2_000 },
-} as const;
-
-export class CreditError extends Error { readonly code = "INSUFFICIENT_CREDITS"; constructor(message: string) { super(message); } }
-
-export async function creditBalance(userId: string) {
-  const latest = await db.creditLedger.findFirst({ where: { userId }, orderBy: { createdAt: "desc" }, select: { balance: true } });
-  return Number(latest?.balance ?? 0);
+async function append(input:{userId:string;amount:number;type:CreditType;reason:CreditReason;idempotencyKey:string;reference?:string;metadata?:Prisma.InputJsonValue}){
+ return withTenant({userId:input.userId},async tx=>{await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`credit:${input.userId}`},0))`;
+  const prior=await tx.creditLedger.findUnique({where:{userId_idempotencyKey:{userId:input.userId,idempotencyKey:input.idempotencyKey}},select:{balance:true}});if(prior)return{balance:prior.balance,reused:true};
+  const latest=await tx.creditLedger.findFirst({where:{userId:input.userId},orderBy:[{createdAt:"desc"},{id:"desc"}],select:{balance:true}});const balance=Number(latest?.balance??0);if(input.amount<0&&balance+input.amount<0)throw new CreditError();
+  const entry=await tx.creditLedger.create({data:{userId:input.userId,type:input.type,reason:input.reason,amount:input.amount,balance:balance+input.amount,reference:input.reference,idempotencyKey:input.idempotencyKey,metadata:input.metadata??{}},select:{id:true,balance:true}});
+  await tx.auditLog.create({data:{userId:input.userId,action:input.amount<0?"credits.consumed":input.reason==="REFUND_REVERSAL"?"credits.reversed":"credits.granted",resource:"credit_ledger",resourceId:entry.id,details:{reason:input.reason,amount:input.amount,idempotencyKey:input.idempotencyKey}}});return{balance:entry.balance,reused:false};
+ });
 }
-
-export async function consumeCredits(userId: string, toolId: string, reference: string) {
-  const cost = toolCredits[toolId] ?? 1;
-  return db.$transaction(async (tx) => {
-    const latest = await tx.creditLedger.findFirst({ where: { userId }, orderBy: { createdAt: "desc" }, select: { balance: true } });
-    const balance = Number(latest?.balance ?? 0);
-    if (balance < cost) throw new CreditError("INSUFFICIENT_CREDITS");
-    return tx.creditLedger.create({ data: { userId, type: "USAGE", amount: -cost, balance: balance - cost, reference }, select: { balance: true } });
-  }, { isolationLevel: "Serializable" });
-}
-
-/** Idempotent AI debit. The advisory lock prevents concurrent retries from double charging. */
-export async function consumeCreditsOnce(userId: string, toolId: string, reference: string) {
-  const cost = toolCredits[toolId] ?? 1;
-  return db.$transaction(async (tx) => {
-    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`ai-credit:${userId}`}, 0))`;
-    const prior = await tx.creditLedger.findFirst({ where: { userId, reference }, orderBy: { createdAt: "desc" }, select: { balance: true } });
-    if (prior) return { balance: prior.balance, reused: true };
-    const latest = await tx.creditLedger.findFirst({ where: { userId }, orderBy: { createdAt: "desc" }, select: { balance: true } });
-    const balance = Number(latest?.balance ?? 0);
-    if (balance < cost) throw new CreditError("INSUFFICIENT_CREDITS");
-    const debit = await tx.creditLedger.create({ data: { userId, type: "USAGE", amount: -cost, balance: balance - cost, reference }, select: { balance: true } });
-    return { ...debit, reused: false };
-  }, { isolationLevel: "Serializable" });
-}
-
-export async function grantSignupCredits(userId: string) {
-  return db.creditLedger.create({ data: { userId, type: "BONUS", amount: plans.FREE.monthlyCredits, balance: plans.FREE.monthlyCredits, reference: "signup-bonus" } });
-}
+export function consumeCreditsOnce(userId:string,toolId:string,reference:string){const cost=creditCost(toolId);return append({userId,amount:-cost,type:"USAGE",reason:creditReason(toolId),idempotencyKey:reference,reference,metadata:{toolId,policyVersion:"2026-09-provisional-v1"}})}
+export const consumeCredits=consumeCreditsOnce;
+export function grantSignupCredits(userId:string){return append({userId,amount:PLAN_POLICIES.FREE.creditAllowance,type:"BONUS",reason:"PROMOTIONAL_GRANT",idempotencyKey:"signup-free-onboarding-v1",reference:"signup-bonus",metadata:{provisional:true}})}
+export function reverseCredits(input:{userId:string;amount:number;originalReference:string;idempotencyKey:string}){if(input.amount<=0)throw new Error("REVERSAL_AMOUNT_INVALID");return append({userId:input.userId,amount:input.amount,type:"REFUND",reason:"REFUND_REVERSAL",idempotencyKey:input.idempotencyKey,reference:input.originalReference})}

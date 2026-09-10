@@ -1,7 +1,4 @@
-/** Provider-neutral billing seam. Attach Stripe checkout/webhooks here after keys are configured. */
-export type BillingCheckout = { userId: string; plan: "FREE" | "PRO" | "BUSINESS"; successUrl: string; cancelUrl: string };
-
-export async function createBillingCheckout(_input: BillingCheckout): Promise<{ url: string }> {
-  void _input;
-  throw new Error("BILLING_NOT_CONFIGURED");
-}
+export type BillingCheckout={userId:string;planCode:"PRO";successUrl:string;cancelUrl:string};
+export interface BillingProviderAdapter{createCheckout(input:BillingCheckout):Promise<{url:string}>;cancelSubscription(externalReference:string):Promise<void>;verifyWebhook(request:Request):Promise<{provider:string;userId:string;externalEventId:string;type:string;payload:unknown}>}
+export function billingProvider():BillingProviderAdapter{throw new Error("BILLING_PROVIDER_NOT_CONFIGURED")}
+export class TestBillingAdapter implements BillingProviderAdapter{constructor(environment=process.env.NODE_ENV){if(environment==="production")throw new Error("TEST_BILLING_ADAPTER_FORBIDDEN")}async createCheckout(){return{url:"http://localhost/test-checkout"}}async cancelSubscription(){}async verifyWebhook():Promise<{provider:string;userId:string;externalEventId:string;type:string;payload:unknown}>{throw new Error("TEST_WEBHOOK_VERIFICATION_NOT_IMPLEMENTED")}}

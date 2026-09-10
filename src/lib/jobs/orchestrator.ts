@@ -5,6 +5,7 @@ import { getStorage } from "@/lib/storage";
 import { getToolDefinition } from "@/lib/tools/registry";
 import { validateUpload } from "@/lib/uploads/validation";
 import { logger } from "@/lib/logging";
+import { enforceJobCreation } from "@/lib/usage/enforcement";
 
 type Upload = { filename: string; mimeType: string; bytes: Uint8Array };
 export async function createToolJob(input: { userId: string; toolId: string; uploads: Upload[]; options?: Record<string, string | number | boolean>; idempotencyKey: string; correlationId?: string }) {
@@ -17,6 +18,7 @@ export async function createToolJob(input: { userId: string; toolId: string; upl
   if (existing) return { ...existing, reused: true };
   const storage = getStorage();
   const prepared = await Promise.all(input.uploads.map(async (upload) => ({ upload, validation: await validateUpload({ toolId: tool.toolId, declaredMime: upload.mimeType, bytes: upload.bytes }) })));
+  const monetization = await enforceJobCreation({ userId: input.userId, toolId: tool.toolId, idempotencyKey: input.idempotencyKey, correlationId, options: input.options, files: prepared.map(({upload,validation})=>({size:upload.bytes.byteLength,pageCount:validation.pageCount})) });
   const stored: Array<{ key: string; bucket: string; upload: Upload; validation: Awaited<ReturnType<typeof validateUpload>> }> = [];
   try {
     for (const item of prepared) { const key = storage.createUploadKey({ userId: input.userId, filename: item.upload.filename }); const object = await storage.put({ key, bytes: item.upload.bytes, contentType: item.validation.mimeType, checksum: item.validation.checksum }); stored.push({ key: object.key, bucket: object.bucket, upload: item.upload, validation: item.validation }); }
@@ -26,7 +28,8 @@ export async function createToolJob(input: { userId: string; toolId: string; upl
       return tx.job.create({ data: { toolId: tool.toolId, idempotencyKey: input.idempotencyKey, requesterId: input.userId, inputFileId: files[0].id, status: "QUEUED", params: { inputFileIds: files.map((file) => file.id), options: input.options ?? {} }, correlationId, steps: { create: { name: tool.toolId, idempotencyKey: `${input.idempotencyKey}:${tool.toolId}`, status: "QUEUED", correlationId } } }, select: { id: true, status: true } });
     });
     const queuedJob = { jobId: job.id, toolId: tool.toolId, idempotencyKey: input.idempotencyKey, correlationId };
-    if (tool.aiFlag) await enqueueAiJob(queuedJob); else await enqueueJob(queuedJob);
+    const queueOptions = { priority: monetization.entitlements.processingPriority === "high" ? 1 : 5 };
+    if (tool.aiFlag) await enqueueAiJob(queuedJob, queueOptions); else await enqueueJob(queuedJob, queueOptions);
     logger.info("job.queued", { job_id: job.id, correlation_id: correlationId, tool_id: tool.toolId });
     return { ...job, reused: false };
   } catch (error) { await Promise.all(stored.map((object) => storage.deleteObject(object.key).catch(() => undefined))); throw error; }
