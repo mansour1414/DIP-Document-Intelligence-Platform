@@ -1,4 +1,5 @@
 import { AiGatewayError, type AiProviderAdapter, type ProviderRequest, type ProviderResponse } from "../types";
+import { timeoutFor } from "@/lib/runtime/config";
 
 type GeminiPayload = {
   candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
@@ -14,7 +15,7 @@ export class GeminiProviderAdapter implements AiProviderAdapter {
 
   async generate(request: ProviderRequest): Promise<ProviderResponse> {
     if (!this.apiKey) throw new AiGatewayError("AI_PROVIDER_NOT_CONFIGURED", "Gemini is not configured.");
-    const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), 60_000); const started = Date.now();
+    const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), timeoutFor("ai")); const started = Date.now();
     try {
       const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(request.model)}:generateContent?key=${encodeURIComponent(this.apiKey)}`, {
         method: "POST", signal: controller.signal, headers: { "Content-Type": "application/json" },

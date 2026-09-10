@@ -1,6 +1,8 @@
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { createCanvas, GlobalFonts } from "@napi-rs/canvas";
+import { runtimeLimits } from "@/lib/runtime/config";
+import { recordMetric } from "@/lib/observability/metrics";
 
 const require = createRequire(import.meta.url);
 const pdfJsRoot = dirname(require.resolve("pdfjs-dist/package.json"));
@@ -21,13 +23,18 @@ export async function renderPdfToJpegs(bytes: Uint8Array, quality = 0.9) {
   const task = pdfjs.getDocument(loadingOptions);
   try {
     const document = await task.promise;
+    if (document.numPages > runtimeLimits.maxPages) throw Object.assign(new Error("PDF exceeds the page limit"), { code: "PAGE_LIMIT_EXCEEDED" });
     const outputs: Array<{ bytes: Uint8Array; pageWidth: number; pageHeight: number }> = [];
     for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber += 1) {
       const page = await document.getPage(pageNumber); const pageSize = page.getViewport({ scale: 1 }); const viewport = page.getViewport({ scale: 1.5 });
-      if (viewport.width * viewport.height > 40_000_000) throw Object.assign(new Error("Rendered page exceeds the pixel limit"), { code: "PAGE_DIMENSION_LIMIT_EXCEEDED" });
+      const pixels = viewport.width * viewport.height;
+      if (pixels > runtimeLimits.maxRenderedPixelsPerPage) throw Object.assign(new Error("Rendered page exceeds the pixel limit"), { code: "PAGE_DIMENSION_LIMIT_EXCEEDED" });
       const canvas = createCanvas(Math.ceil(viewport.width), Math.ceil(viewport.height)); const context = canvas.getContext("2d"); context.fillStyle = "#ffffff"; context.fillRect(0, 0, canvas.width, canvas.height);
+      const started = performance.now();
       await page.render({ canvas: canvas as never, canvasContext: context as never, viewport }).promise;
-      outputs.push({ bytes: canvas.toBuffer("image/jpeg", Math.max(0, Math.min(100, Math.round(quality * 100)))), pageWidth: pageSize.width, pageHeight: pageSize.height }); page.cleanup();
+      outputs.push({ bytes: canvas.toBuffer("image/jpeg", Math.max(0, Math.min(100, Math.round(quality * 100)))), pageWidth: pageSize.width, pageHeight: pageSize.height });
+      recordMetric("pdf_page_render_time", performance.now() - started, "ms", { page: pageNumber, pixels });
+      page.cleanup();
     }
     return outputs;
   } catch (error) { if (typeof error === "object" && error && "code" in error) throw error; throw Object.assign(new Error(error instanceof Error ? error.message : "PDF rendering failed"), { code: "PDF_RENDER_FAILED" }); }

@@ -8,6 +8,10 @@ import { processServerDocument, type ServerToolId } from "@/lib/document-process
 import { logger } from "@/lib/logging";
 import { executeAiGateway, AiGatewayError, type AiTool } from "@/lib/ai/gateway";
 import { extractPdfTextServer, serializePdfPages } from "@/lib/pdf/text-server";
+import { runtimeLimits, timeoutFor } from "@/lib/runtime/config";
+import { withTimeout } from "@/lib/runtime/timeout";
+import { validateWorkerOutputs } from "@/lib/outputs/validation";
+import { recordMetric } from "@/lib/observability/metrics";
 
 async function processDocumentJob(message: QueuedJob) {
   const job = await db.job.findUnique({ where: { id: message.jobId }, include: { steps: true } });
@@ -29,9 +33,13 @@ async function processDocumentJob(message: QueuedJob) {
     const pdfTools = new Set(["merge-pdf", "split-pdf", "organize-pdf", "rotate-pdf", "delete-pages", "extract-pages", "jpg-to-pdf", "compress-pdf", "pdf-to-jpg", "watermark-pdf"]);
     const documentTools = new Set(["word-to-pdf", "pdf-to-word", "excel-to-pdf", "powerpoint-to-pdf", "ocr-pdf"]);
     let outputs: Array<{ name: string; mimeType: string; bytes: Uint8Array }>;
-    if (pdfTools.has(job.toolId)) { const pdfTool = job.toolId as PdfWorkerTool; outputs = await runPdfWorkerTool(pdfTool, bytes, options); ({ engine, engineVersion } = pdfWorkerEngine(pdfTool)); }
+    if (pdfTools.has(job.toolId)) { const pdfTool = job.toolId as PdfWorkerTool; outputs = await withTimeout(job.toolId, timeoutFor("pdf"), runPdfWorkerTool(pdfTool, bytes, options)); ({ engine, engineVersion } = pdfWorkerEngine(pdfTool)); }
     else if (documentTools.has(job.toolId)) { const input = inputById.get(ids[0])!; const result = await processServerDocument(job.toolId as ServerToolId, new File([bytes[0] as BlobPart], input.originalName, { type: input.mimeType }), typeof options.language === "string" ? options.language : "ara+eng"); outputs = [{ name: result.filename, mimeType: result.contentType, bytes: result.bytes }]; engine = job.toolId === "ocr-pdf" ? "ocrmypdf" : "libreoffice"; engineVersion = "host"; }
     else throw Object.assign(new Error("Tool is not enabled on this worker"), { code: "TOOL_NOT_WORKER_ENABLED" });
+    const preservePages = ["compress-pdf", "rotate-pdf", "watermark-pdf", "ocr-pdf"].includes(job.toolId) ? files[0]?.pageCount ?? undefined : undefined;
+    const validated = await validateWorkerOutputs(outputs, preservePages);
+    recordMetric("tool_output_size", validated.totalBytes, "bytes", { tool_id: job.toolId, engine, engine_version: engineVersion });
+    if (job.toolId === "compress-pdf") recordMetric("compression_ratio", validated.totalBytes / bytes[0].byteLength, "ratio", { tool_id: job.toolId, engine, engine_version: engineVersion });
     const storage = getStorage();
     const storedOutputs = await Promise.all(outputs.map(async (output, index) => { const key = `output/${job.requesterId ?? "system"}/${job.id}/${index}-${output.name.replace(/[^a-zA-Z0-9._-]/g, "_")}`; const checksum = createHash("sha256").update(output.bytes).digest("base64"); const object = await storage.put({ key, bytes: output.bytes, contentType: output.mimeType, checksum }); return { output, object, checksum }; }));
     try {
@@ -45,16 +53,20 @@ async function processDocumentJob(message: QueuedJob) {
         await tx.toolExecution.create({ data: { jobId: job.id, toolId: job.toolId, mode: "SERVER", input: { inputFileIds: ids }, output: { outputFileIds }, correlationId: job.correlationId, engine, engineVersion, durationMs: Date.now() - started } });
       });
     } catch (error) { throw error; }
-    logger.info("job.succeeded", context);
+    const durationMs = Date.now() - started;
+    recordMetric("job_duration", durationMs, "ms", { ...context, engine, engine_version: engineVersion, status: "succeeded" });
+    recordMetric("jobs_succeeded", 1, "count", { ...context, engine, engine_version: engineVersion });
+    logger.info("job.succeeded", { ...context, engine, engine_version: engineVersion, duration_ms: durationMs, status: "succeeded" });
   } catch (error) {
     const errorCode = typeof error === "object" && error && "code" in error ? String(error.code) : "PROCESSING_FAILED";
     await db.job.update({ where: { id: job.id }, data: { status: "FAILED", errorCode, error: { message: error instanceof Error ? error.message : "Processing failed" }, completedAt: new Date() } });
     if (step) await db.jobStep.update({ where: { id: step.id }, data: { status: "FAILED", errorCode, error: { message: error instanceof Error ? error.message : "Processing failed" }, completedAt: new Date() } });
-    logger.error("job.failed", { ...context, error_code: errorCode }); throw error;
+    recordMetric("jobs_failed", 1, "count", { ...context, error_code: errorCode });
+    logger.error("job.failed", { ...context, error_code: errorCode, status: "failed" }); throw error;
   }
 }
 
-export const documentWorker = new Worker<QueuedJob>(JOB_QUEUE_NAME, async (message) => processDocumentJob(message.data), { connection: getQueueConnection(), concurrency: 2, stalledInterval: 30_000, maxStalledCount: 1 });
+export const documentWorker = new Worker<QueuedJob>(JOB_QUEUE_NAME, async (message) => { recordMetric("queue_wait_time", Math.max(0, Date.now() - message.timestamp), "ms", { tool_id: message.data.toolId, queue: "document" }); return processDocumentJob(message.data); }, { connection: getQueueConnection(), concurrency: runtimeLimits.documentConcurrency, stalledInterval: runtimeLimits.stalledIntervalMs, maxStalledCount: runtimeLimits.maxStalledCount, lockDuration: Math.min(runtimeLimits.jobTimeoutMs, 10 * 60_000) });
 documentWorker.on("failed", async (message) => { if (message && message.attemptsMade < (message.opts.attempts ?? 1)) await db.job.update({ where: { id: message.data.jobId }, data: { status: "RETRYING" } }); });
 documentWorker.on("error", (error) => logger.error("worker.error", { error: error.message }));
 
@@ -104,13 +116,13 @@ export async function processAiJob(message: QueuedJob) {
   }
 }
 
-function boundedInteger(value: string | undefined, fallback: number, maximum: number) { const parsed = Number(value); return Number.isInteger(parsed) && parsed > 0 ? Math.min(parsed, maximum) : fallback; }
-export const aiWorker = new Worker<QueuedJob>(AI_JOB_QUEUE_NAME, async (message) => processAiJob(message.data), {
+export const aiWorker = new Worker<QueuedJob>(AI_JOB_QUEUE_NAME, async (message) => { recordMetric("queue_wait_time", Math.max(0, Date.now() - message.timestamp), "ms", { tool_id: message.data.toolId, queue: "ai" }); return withTimeout(message.data.toolId, timeoutFor("ai") + 30_000, processAiJob(message.data)); }, {
   connection: getQueueConnection(),
-  concurrency: boundedInteger(process.env.AI_WORKER_CONCURRENCY, 2, 8),
-  limiter: { max: boundedInteger(process.env.AI_RATE_LIMIT_PER_MINUTE, 10, 1_000), duration: 60_000 },
-  stalledInterval: 30_000,
-  maxStalledCount: 1,
+  concurrency: runtimeLimits.aiConcurrency,
+  limiter: { max: runtimeLimits.aiRatePerMinute, duration: 60_000 },
+  stalledInterval: runtimeLimits.stalledIntervalMs,
+  maxStalledCount: runtimeLimits.maxStalledCount,
+  lockDuration: Math.min(runtimeLimits.jobTimeoutMs, 10 * 60_000),
 });
 aiWorker.on("failed", async (message) => { if (message && message.attemptsMade < (message.opts.attempts ?? 1)) await db.job.update({ where: { id: message.data.jobId }, data: { status: "RETRYING" } }); });
 aiWorker.on("error", (error) => logger.error("ai.worker.error", { error: error.message }));

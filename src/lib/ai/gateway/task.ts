@@ -1,10 +1,11 @@
 import { AiGatewayError, type AiTask, type ProviderRequest } from "./types";
+import { runtimeLimits } from "@/lib/runtime/config";
 
 export const AI_LIMITS = {
   maxDocumentCharacters: 180_000,
   maxQuestionCharacters: 4_000,
   maxPages: 500,
-  maxOutputTokens: 8_192,
+  maxOutputTokens: runtimeLimits.maxAiOutputTokens,
 } as const;
 
 const citationSchema = {

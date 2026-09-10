@@ -6,15 +6,17 @@ import { getToolDefinition } from "@/lib/tools/registry";
 import { validateUpload } from "@/lib/uploads/validation";
 import { logger } from "@/lib/logging";
 import { enforceJobCreation } from "@/lib/usage/enforcement";
+import { measure, recordMetric } from "@/lib/observability/metrics";
 
 type Upload = { filename: string; mimeType: string; bytes: Uint8Array };
 export async function createToolJob(input: { userId: string; toolId: string; uploads: Upload[]; options?: Record<string, string | number | boolean>; idempotencyKey: string; correlationId?: string }) {
+  const apiStarted = performance.now();
   const tool = getToolDefinition(input.toolId);
   const minimumFiles = input.toolId === "merge-pdf" ? 2 : 1;
   if (input.uploads.length < minimumFiles || input.uploads.length > tool.limits.maxFiles) throw new Error("INPUT_FILE_COUNT_INVALID");
   if (input.uploads.reduce((total, upload) => total + upload.bytes.byteLength, 0) > tool.limits.maxBytes) throw new Error("TOTAL_SIZE_LIMIT_EXCEEDED");
   const correlationId = input.correlationId ?? randomUUID();
-  const existing = await db.job.findUnique({ where: { toolId_idempotencyKey: { toolId: tool.toolId, idempotencyKey: input.idempotencyKey } }, select: { id: true, status: true } });
+  const existing = await measure("db_job_idempotency_query", { tool_id: tool.toolId }, () => db.job.findUnique({ where: { toolId_idempotencyKey: { toolId: tool.toolId, idempotencyKey: input.idempotencyKey } }, select: { id: true, status: true } }));
   if (existing) return { ...existing, reused: true };
   const storage = getStorage();
   const prepared = await Promise.all(input.uploads.map(async (upload) => ({ upload, validation: await validateUpload({ toolId: tool.toolId, declaredMime: upload.mimeType, bytes: upload.bytes }) })));
@@ -31,6 +33,8 @@ export async function createToolJob(input: { userId: string; toolId: string; upl
     const queueOptions = { priority: monetization.entitlements.processingPriority === "high" ? 1 : 5 };
     if (tool.aiFlag) await enqueueAiJob(queuedJob, queueOptions); else await enqueueJob(queuedJob, queueOptions);
     logger.info("job.queued", { job_id: job.id, correlation_id: correlationId, tool_id: tool.toolId });
+    recordMetric("api_job_creation_latency", performance.now() - apiStarted, "ms", { job_id: job.id, correlation_id: correlationId, tool_id: tool.toolId });
+    recordMetric("jobs_total", 1, "count", { tool_id: tool.toolId });
     return { ...job, reused: false };
   } catch (error) { await Promise.all(stored.map((object) => storage.deleteObject(object.key).catch(() => undefined))); throw error; }
 }
