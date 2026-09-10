@@ -1,0 +1,4 @@
+import { randomUUID } from "crypto";
+import { requireUser } from "@/lib/auth/user";
+import { startWorkflowRun } from "@/lib/workflows/service";
+export async function POST(request: Request, { params }: { params: Promise<{ workflowId: string }> }) { try { const user = await requireUser(); const body = await request.json() as { inputs?: Record<string, string[]> }; const run = await startWorkflowRun(user.id, (await params).workflowId, body.inputs ?? {}, request.headers.get("x-correlation-id") ?? randomUUID()); return Response.json({ runId: run.id, status: run.status.toLowerCase(), correlationId: run.correlationId }, { status: 202 }); } catch (error) { const code = typeof error === "object" && error && "code" in error ? String(error.code) : error instanceof Error ? error.message : "INTERNAL_ERROR"; return Response.json({ code }, { status: code === "AUTH_REQUIRED" ? 401 : code === "NOT_FOUND" ? 404 : 422 }); } }

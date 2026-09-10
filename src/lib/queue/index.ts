@@ -7,7 +7,7 @@ import { recordMetric } from "@/lib/observability/metrics";
 export const JOB_QUEUE_NAME = "dip.document-processing.v1";
 export const AI_JOB_QUEUE_NAME = "dip.ai-processing.v1";
 
-export type QueuedJob = { jobId: string; toolId: string; idempotencyKey: string; correlationId: string };
+export type QueuedJob = { jobId: string; toolId: string; idempotencyKey: string; correlationId: string; userId?: string; workflowRunId?: string };
 let redis: Redis | undefined;
 let queue: Queue<QueuedJob> | undefined;
 let aiQueue: Queue<QueuedJob> | undefined;

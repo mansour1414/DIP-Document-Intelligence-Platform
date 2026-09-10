@@ -7,6 +7,7 @@ import { validateUpload } from "@/lib/uploads/validation";
 import { logger } from "@/lib/logging";
 import { enforceJobCreation } from "@/lib/usage/enforcement";
 import { measure, recordMetric } from "@/lib/observability/metrics";
+import { withTenant } from "@/lib/db/tenant";
 
 type Upload = { filename: string; mimeType: string; bytes: Uint8Array };
 export async function createToolJob(input: { userId: string; toolId: string; uploads: Upload[]; options?: Record<string, string | number | boolean>; idempotencyKey: string; correlationId?: string }) {
@@ -41,4 +42,22 @@ export async function createToolJob(input: { userId: string; toolId: string; upl
 
 export function createMergePdfJob(input: { userId: string; uploads: Upload[]; idempotencyKey: string; correlationId?: string }) {
   return createToolJob({ ...input, toolId: "merge-pdf" });
+}
+
+/** Trusted internal-file boundary used by workflows. Browser-provided storage keys are never accepted. */
+export async function createToolJobFromFiles(input: { userId: string; toolId: string; fileIds: string[]; options?: Record<string, string | number | boolean>; idempotencyKey: string; correlationId: string; workflowRunId: string; workflowNodeId: string }) {
+  const tool = getToolDefinition(input.toolId);
+  const existing = await withTenant({ userId: input.userId }, (tx) => tx.job.findUnique({ where: { toolId_idempotencyKey: { toolId: tool.toolId, idempotencyKey: input.idempotencyKey } }, select: { id: true, status: true } }));
+  if (existing) return { ...existing, reused: true };
+  const files = await withTenant({ userId: input.userId }, (tx) => tx.file.findMany({ where: { id: { in: input.fileIds }, document: { userId: input.userId } }, select: { id: true, size: true, pageCount: true, mimeType: true } }));
+  if (files.length !== input.fileIds.length) throw Object.assign(new Error("WORKFLOW_ARTIFACT_UNAUTHORIZED"), { code: "WORKFLOW_ARTIFACT_UNAUTHORIZED" });
+  if (input.fileIds.length < (input.toolId === "merge-pdf" ? 2 : 1) || input.fileIds.length > tool.limits.maxFiles) throw new Error("INPUT_FILE_COUNT_INVALID");
+  if (files.some((file) => !tool.mime.input.includes(file.mimeType))) throw Object.assign(new Error("WORKFLOW_MIME_INCOMPATIBLE"), { code: "WORKFLOW_MIME_INCOMPATIBLE" });
+  const monetization = await enforceJobCreation({ userId: input.userId, toolId: tool.toolId, idempotencyKey: input.idempotencyKey, correlationId: input.correlationId, options: input.options, files: files.map((file) => ({ size: Number(file.size), pageCount: file.pageCount ?? undefined })) });
+  const job = await withTenant({ userId: input.userId }, (tx) => tx.job.create({ data: { toolId: tool.toolId, idempotencyKey: input.idempotencyKey, requesterId: input.userId, inputFileId: input.fileIds[0], status: "QUEUED", params: { inputFileIds: input.fileIds, options: input.options ?? {} }, correlationId: input.correlationId, workflowRunId: input.workflowRunId, workflowNodeId: input.workflowNodeId, steps: { create: { name: tool.toolId, idempotencyKey: `${input.idempotencyKey}:${tool.toolId}`, status: "QUEUED", correlationId: input.correlationId } } }, select: { id: true, status: true } }));
+  const queued = { jobId: job.id, toolId: tool.toolId, idempotencyKey: input.idempotencyKey, correlationId: input.correlationId, userId: input.userId, workflowRunId: input.workflowRunId };
+  const queueOptions = { priority: monetization.entitlements.processingPriority === "high" ? 1 : 5 };
+  if (tool.aiFlag) await enqueueAiJob(queued, queueOptions); else await enqueueJob(queued, queueOptions);
+  logger.info("workflow.node.queued", { workflow_run_id: input.workflowRunId, workflow_node_id: input.workflowNodeId, job_id: job.id, correlation_id: input.correlationId, tool_id: tool.toolId });
+  return { ...job, reused: false };
 }

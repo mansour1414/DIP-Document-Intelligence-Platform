@@ -1,0 +1,7 @@
+import { requireUser } from "@/lib/auth/user";
+import { archiveWorkflow, getWorkflow, updateWorkflow } from "@/lib/workflows/service";
+const status = (code: string) => code === "AUTH_REQUIRED" ? 401 : code === "NOT_FOUND" ? 404 : code === "WORKFLOW_INVALID" ? 422 : 400;
+const fail = (error: unknown) => { const code = typeof error === "object" && error && "code" in error ? String(error.code) : error instanceof Error ? error.message : "INTERNAL_ERROR"; return Response.json({ code, issues: typeof error === "object" && error && "issues" in error ? error.issues : undefined }, { status: status(code) }); };
+export async function GET(_: Request, { params }: { params: Promise<{ workflowId: string }> }) { try { const user = await requireUser(); const workflow = await getWorkflow(user.id, (await params).workflowId); return workflow ? Response.json({ workflow }) : Response.json({ code: "NOT_FOUND" }, { status: 404 }); } catch (error) { return fail(error); } }
+export async function PUT(request: Request, { params }: { params: Promise<{ workflowId: string }> }) { try { const user = await requireUser(); return Response.json({ workflow: await updateWorkflow(user.id, (await params).workflowId, await request.json()) }); } catch (error) { return fail(error); } }
+export async function DELETE(_: Request, { params }: { params: Promise<{ workflowId: string }> }) { try { const user = await requireUser(); await archiveWorkflow(user.id, (await params).workflowId); return new Response(null, { status: 204 }); } catch (error) { return fail(error); } }

@@ -74,7 +74,9 @@ async function processDocumentJob(message: QueuedJob) {
 }
 
 export const documentWorker = new Worker<QueuedJob>(JOB_QUEUE_NAME, async (message) => { recordMetric("queue_wait_ms", Math.max(0, Date.now() - message.timestamp), "ms", { tool_id: message.data.toolId, queue: "document" }); return processDocumentJob(message.data); }, { connection: getQueueConnection(), concurrency: runtimeLimits.documentConcurrency, stalledInterval: runtimeLimits.stalledIntervalMs, maxStalledCount: runtimeLimits.maxStalledCount, lockDuration: Math.min(runtimeLimits.jobTimeoutMs, 10 * 60_000) });
-documentWorker.on("failed", async (message) => { if (message && message.attemptsMade < (message.opts.attempts ?? 1)) { recordMetric("retry_total", 1, "count", { tool_id: message.data.toolId, status: "retrying" }); await db.job.update({ where: { id: message.data.jobId }, data: { status: "RETRYING" } }); } });
+async function advanceWorkflow(message: QueuedJob) { if (message.workflowRunId && message.userId) await (await import("@/lib/workflows/service")).advanceWorkflowRun(message.workflowRunId, message.userId); }
+documentWorker.on("completed", (message) => { void advanceWorkflow(message.data).catch((error) => captureOperationalError(error, { worker: "workflow" })); });
+documentWorker.on("failed", async (message) => { if (!message) return; if (message.attemptsMade < (message.opts.attempts ?? 1)) { recordMetric("retry_total", 1, "count", { tool_id: message.data.toolId, status: "retrying" }); await db.job.update({ where: { id: message.data.jobId }, data: { status: "RETRYING" } }); } else await advanceWorkflow(message.data); });
 documentWorker.on("stalled", () => recordMetric("stalled_jobs_total", 1, "count", { status: "stalled" }));
 documentWorker.on("error", (error) => { captureOperationalError(error, { worker: "document" }); logger.error("worker.error", { error: error.message }); });
 
@@ -133,5 +135,7 @@ export const aiWorker = new Worker<QueuedJob>(AI_JOB_QUEUE_NAME, async (message)
   lockDuration: Math.min(runtimeLimits.jobTimeoutMs, 10 * 60_000),
 });
 aiWorker.on("failed", async (message) => { if (message && message.attemptsMade < (message.opts.attempts ?? 1)) { recordMetric("retry_total", 1, "count", { tool_id: message.data.toolId, status: "retrying" }); await db.job.update({ where: { id: message.data.jobId }, data: { status: "RETRYING" } }); } });
+aiWorker.on("completed", (message) => { void advanceWorkflow(message.data).catch((error) => captureOperationalError(error, { worker: "workflow" })); });
+aiWorker.on("failed", async (message) => { if (message && message.attemptsMade >= (message.opts.attempts ?? 1)) await advanceWorkflow(message.data); });
 aiWorker.on("stalled", () => recordMetric("stalled_jobs_total", 1, "count", { status: "stalled" }));
 aiWorker.on("error", (error) => { captureOperationalError(error, { worker: "ai" }); logger.error("ai.worker.error", { error: error.message }); });

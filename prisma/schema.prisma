@@ -35,6 +35,8 @@ model User {
   sessions        Session[]
   creditLedger    CreditLedger[]
   fileVersions    FileVersion[]
+  workflows       Workflow[]
+  workflowRuns    WorkflowRun[]
 
   @@index([status])
   @@map("users")
@@ -235,6 +237,8 @@ model Job {
   completedAt    DateTime? @map("completed_at")
   createdAt      DateTime  @default(now()) @map("created_at")
   updatedAt      DateTime  @updatedAt @map("updated_at")
+  workflowRunId  String?   @map("workflow_run_id") @db.Uuid
+  workflowNodeId String?   @map("workflow_node_id") @db.VarChar(100)
 
   requester      User?           @relation("RequesterJobs", fields: [requesterId], references: [id])
   inputFile      File?           @relation("InputFiles", fields: [inputFileId], references: [id])
@@ -242,14 +246,77 @@ model Job {
   steps          JobStep[]
   events         JobEvent[]
   toolExecutions ToolExecution[]
+  workflowRun    WorkflowRun?    @relation(fields: [workflowRunId], references: [id], onDelete: Restrict)
 
   @@unique([toolId, idempotencyKey])
+  @@unique([workflowRunId, workflowNodeId])
   @@index([requesterId])
   @@index([status])
   @@index([toolId])
   @@index([createdAt])
   @@index([requesterId, correlationId])
+  @@index([workflowRunId, status])
   @@map("jobs")
+}
+
+// ==================== WORKFLOWS ====================
+
+model Workflow {
+  id               String         @id @default(uuid()) @db.Uuid
+  ownerId          String         @map("owner_id") @db.Uuid
+  name             String         @db.VarChar(120)
+  status           WorkflowStatus @default(ACTIVE)
+  currentVersionId String?        @unique @map("current_version_id") @db.Uuid
+  createdAt        DateTime       @default(now()) @map("created_at")
+  updatedAt        DateTime       @updatedAt @map("updated_at")
+
+  owner          User              @relation(fields: [ownerId], references: [id], onDelete: Restrict)
+  versions       WorkflowVersion[] @relation("WorkflowVersions")
+  currentVersion WorkflowVersion?  @relation("CurrentWorkflowVersion", fields: [currentVersionId], references: [id], onDelete: Restrict)
+
+  @@index([ownerId, status, updatedAt])
+  @@map("workflows")
+}
+
+model WorkflowVersion {
+  id         String   @id @default(uuid()) @db.Uuid
+  workflowId String   @map("workflow_id") @db.Uuid
+  version    Int
+  definition Json
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  workflow   Workflow      @relation("WorkflowVersions", fields: [workflowId], references: [id], onDelete: Restrict)
+  currentFor Workflow?     @relation("CurrentWorkflowVersion")
+  runs       WorkflowRun[]
+
+  @@unique([workflowId, version])
+  @@index([workflowId, createdAt])
+  @@map("workflow_versions")
+}
+
+model WorkflowRun {
+  id                String    @id @default(uuid()) @db.Uuid
+  ownerId           String    @map("owner_id") @db.Uuid
+  workflowVersionId String    @map("workflow_version_id") @db.Uuid
+  status            JobStatus @default(QUEUED)
+  inputs            Json      @default("{}")
+  result            Json?
+  error             Json?
+  errorCode         String?   @map("error_code") @db.VarChar(100)
+  correlationId     String    @map("correlation_id") @db.Uuid
+  startedAt         DateTime? @map("started_at")
+  completedAt       DateTime? @map("completed_at")
+  cancelledAt       DateTime? @map("cancelled_at")
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+
+  owner           User            @relation(fields: [ownerId], references: [id], onDelete: Restrict)
+  workflowVersion WorkflowVersion @relation(fields: [workflowVersionId], references: [id], onDelete: Restrict)
+  jobs            Job[]
+
+  @@index([ownerId, status, createdAt])
+  @@index([workflowVersionId])
+  @@map("workflow_runs")
 }
 
 model JobStep {
@@ -676,6 +743,11 @@ enum JobStatus {
   FAILED
   CANCELLED
   EXPIRED
+}
+
+enum WorkflowStatus {
+  ACTIVE
+  ARCHIVED
 }
 
 enum ExecutionMode {

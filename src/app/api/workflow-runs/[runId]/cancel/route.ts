@@ -1,0 +1,3 @@
+import { requireUser } from "@/lib/auth/user";
+import { cancelWorkflowRun } from "@/lib/workflows/service";
+export async function POST(_: Request, { params }: { params: Promise<{ runId: string }> }) { try { const user = await requireUser(); const run = await cancelWorkflowRun(user.id, (await params).runId); return Response.json({ runId: run.id, status: run.status.toLowerCase() }); } catch (error) { const code = typeof error === "object" && error && "code" in error ? String(error.code) : error instanceof Error ? error.message : "INTERNAL_ERROR"; return Response.json({ code }, { status: code === "AUTH_REQUIRED" ? 401 : code === "NOT_FOUND" ? 404 : 400 }); } }

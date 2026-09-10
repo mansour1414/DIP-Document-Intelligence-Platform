@@ -119,6 +119,8 @@ dip/
 - Watermark PDF
 - Word to PDF
 - PDF to Word
+- Excel to PDF
+- PowerPoint to PDF
 - OCR PDF
 
 ### AI Tools

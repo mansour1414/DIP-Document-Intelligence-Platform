@@ -61,6 +61,9 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON
   tool_executions,
   job_events,
   ai_usage
+  ,workflows
+  ,workflow_versions
+  ,workflow_runs
 TO dip_app;
 
 GRANT SELECT, INSERT, UPDATE ON storage_objects TO dip_app;
