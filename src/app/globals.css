@@ -5,26 +5,27 @@
 @import "@fontsource/noto-sans-arabic/700.css";
 
 :root {
-  --background: #fcfafa;
-  --foreground: #24191d;
+  color-scheme: light;
+  --background: #ffffff;
+  --foreground: #202124;
   --card: #ffffff;
-  --card-foreground: #24191d;
+  --card-foreground: #202124;
   --popover: #ffffff;
-  --popover-foreground: #24191d;
-  --primary: #6f1938;
-  --primary-hover: #571229;
+  --popover-foreground: #202124;
+  --primary: #d83d31;
+  --primary-hover: #bf3027;
   --primary-foreground: #ffffff;
-  --secondary: #f3e9ec;
-  --secondary-foreground: #4c1d2d;
-  --muted: #f5f1f2;
-  --muted-foreground: #685b60;
-  --accent: #efe1e6;
-  --accent-foreground: #571229;
-  --border: #ddd3d6;
-  --input: #cfc3c7;
-  --ring: #8f3151;
-  --destructive: #b42318;
-  --destructive-hover: #912018;
+  --secondary: #fff0ed;
+  --secondary-foreground: #a92921;
+  --muted: #f5f6f7;
+  --muted-foreground: #5f6368;
+  --accent: #f3f4f6;
+  --accent-foreground: #202124;
+  --border: #e1e3e6;
+  --input: #c7cacf;
+  --ring: #e84c3d;
+  --destructive: #b91c1c;
+  --destructive-hover: #991b1b;
   --destructive-foreground: #ffffff;
   --success: #19715f;
   --success-foreground: #ffffff;
@@ -36,10 +37,44 @@
   --radius-sm: 0.5rem;
   --radius-md: 0.75rem;
   --radius-lg: 1rem;
-  --shadow-card: 0 1px 2px rgb(36 25 29 / 0.04), 0 8px 24px rgb(36 25 29 / 0.04);
-  --shadow-elevated: 0 18px 50px rgb(36 25 29 / 0.14);
+  --shadow-card: 0 1px 2px rgb(32 33 36 / 0.05), 0 8px 24px rgb(32 33 36 / 0.06);
+  --shadow-elevated: 0 18px 50px rgb(32 33 36 / 0.16);
   --duration-fast: 140ms;
   --duration-base: 200ms;
+}
+
+.dark {
+  color-scheme: dark;
+  --background: #070a11;
+  --foreground: #ffffff;
+  --card: #0e1424;
+  --card-foreground: #ffffff;
+  --popover: #111827;
+  --popover-foreground: #ffffff;
+  --primary: #e11d48;
+  --primary-hover: #be123c;
+  --primary-foreground: #ffffff;
+  --secondary: #172033;
+  --secondary-foreground: #e2e8f0;
+  --muted: #111827;
+  --muted-foreground: #94a3b8;
+  --accent: #1a2335;
+  --accent-foreground: #ffffff;
+  --border: rgb(255 255 255 / 0.08);
+  --input: #334155;
+  --ring: #f43f5e;
+  --destructive: #dc2626;
+  --destructive-hover: #b91c1c;
+  --destructive-foreground: #ffffff;
+  --success: #10b981;
+  --success-foreground: #ecfdf5;
+  --success-surface: #062f27;
+  --warning: #f59e0b;
+  --warning-surface: #352507;
+  --info: #38bdf8;
+  --info-surface: #102744;
+  --shadow-card: 0 1px 0 rgb(255 255 255 / 0.035), 0 14px 38px rgb(0 0 0 / 0.28);
+  --shadow-elevated: 0 24px 72px rgb(0 0 0 / 0.5), 0 0 36px rgb(225 29 72 / 0.06);
 }
 
 @theme inline {
@@ -115,9 +150,13 @@ html[dir="rtl"] body {
 }
 
 .dip-grid-pattern {
-  background-image: linear-gradient(rgb(111 25 56 / 0.045) 1px, transparent 1px), linear-gradient(90deg, rgb(111 25 56 / 0.045) 1px, transparent 1px);
+  background-image: linear-gradient(color-mix(in srgb, var(--primary) 8%, transparent) 1px, transparent 1px), linear-gradient(90deg, color-mix(in srgb, var(--primary) 8%, transparent) 1px, transparent 1px);
   background-size: 32px 32px;
   mask-image: linear-gradient(to bottom, black, transparent 90%);
+}
+
+.dark .dip-grid-pattern {
+  background-image: linear-gradient(rgb(255 255 255 / 0.03) 1px, transparent 1px), linear-gradient(90deg, rgb(255 255 255 / 0.03) 1px, transparent 1px), radial-gradient(circle at 50% 12%, rgb(225 29 72 / 0.08), transparent 38%);
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -4,7 +4,7 @@ This foundation standardizes the existing Phase 0–7 interface without changing
 
 ## Brand system
 
-DIP uses a warm, dark burgundy (`#6f1938`) as its primary brand color. The palette is expressed through semantic CSS roles in `src/app/globals.css`, not page-specific color utilities. Destructive actions remain a distinct red (`#b42318`), while success, warning, and information states have separate semantic roles.
+DIP uses a professional coral red (`#d83d31`) as its primary brand color. The palette is expressed through semantic CSS roles in `src/app/globals.css`, not page-specific color utilities. Destructive actions remain a darker semantic red (`#b91c1c`), while success, warning, and information states have separate roles.
 
 The primary text/background pair and interactive colors meet WCAG AA contrast. The default typography remains Inter for English and uses the already-installed Noto Sans Arabic for Arabic. Arabic receives its own line-height and is activated through document direction/language selectors.
 
@@ -21,4 +21,4 @@ The primary text/background pair and interactive colors meet WCAG AA contrast. T
 
 The shared container is capped at 80rem with responsive inline padding. Navigation collapses into an accessible Radix sheet on small screens. Forms retain visible labels and error associations, feedback uses live regions where appropriate, progress exposes native accessibility semantics, and Radix primitives provide keyboard handling and focus management for dialogs and menus.
 
-No dark-mode switch is introduced in this pass. Semantic tokens are structured so a future reviewed theme can be added without rewriting components.
+Light, dark, and system modes are supported. Preference is stored under `dip-theme`; a small pre-hydration script applies the resolved theme before React mounts, and system changes are observed while system mode is active.

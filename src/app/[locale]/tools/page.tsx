@@ -1,13 +1,25 @@
 import type { Metadata } from "next";
-import Link from "next/link";
 import { notFound } from "next/navigation";
+import { SiteFooter } from "@/components/seo/site-footer";
 import { SiteHeader } from "@/components/seo/site-header";
-import { getTool } from "@/config";
-import { locales, type Locale } from "@/lib/seo/tool-content";
+import { ToolGrid } from "@/components/tools/tool-grid";
 import { publicMetadata } from "@/lib/seo/metadata";
+import { locales, type Locale } from "@/lib/seo/tool-content";
 
-const groups = { edit: ["merge-pdf", "split-pdf", "compress-pdf", "organize-pdf", "rotate-pdf", "delete-pages", "extract-pages", "watermark-pdf"], convert: ["jpg-to-pdf", "pdf-to-jpg", "word-to-pdf", "pdf-to-word", "excel-to-pdf", "powerpoint-to-pdf"], ocr: ["ocr-pdf"], ai: ["summarize-pdf", "chat-with-pdf", "extract-data"] } as const;
 type Params = Promise<{ locale: string }>;
-export async function generateMetadata({ params }: { params: Params }): Promise<Metadata> { const { locale } = await params; const ar = locale === "ar"; return publicMetadata(locale as Locale, ar ? "أدوات PDF والمستندات | DIP" : "PDF & Document Tools | DIP", ar ? "استكشف 18 أداة لمعالجة وتحويل وفهم المستندات بالعربية والإنجليزية." : "Explore 18 tools to edit, convert, OCR, and understand documents in English and Arabic.", "/tools"); }
-export default async function ToolsPage({ params }: { params: Params }) { const { locale } = await params; if (!locales.includes(locale as Locale)) notFound(); const l = locale as Locale; const ar = l === "ar"; const labels = ar ? { edit: "تحرير PDF", convert: "التحويل", ocr: "التعرف الضوئي على النص", ai: "أدوات المستندات الذكية" } : { edit: "PDF Editing", convert: "Conversion", ocr: "OCR", ai: "AI Document Tools" }; return <><SiteHeader locale={l} /><main className="min-h-screen bg-muted/35 py-14"><header className="dip-container dip-page-header text-center"><p className="text-sm font-semibold uppercase tracking-[0.18em] text-primary">DIP</p><h1 className="mt-3 text-4xl font-bold tracking-tight sm:text-5xl">{ar ? "أدوات المستندات" : "Document tools"}</h1><p className="mt-4 text-lg leading-8 text-muted-foreground">{ar ? "اختر أداة عملية لتحرير ملفات PDF أو تحويلها أو قراءتها بالذكاء الاصطناعي." : "Choose a focused tool to edit, convert, recognize, or understand your documents."}</p></header><div className="dip-container mt-12 space-y-12">{Object.entries(groups).map(([key, ids]) => <section key={key} aria-labelledby={`group-${key}`}><div className="flex items-end justify-between gap-4 border-b pb-3"><h2 id={`group-${key}`} className="text-2xl font-semibold">{labels[key as keyof typeof labels]}</h2><span className="text-sm text-muted-foreground">{ids.length}</span></div><ul className="mt-5 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">{ids.map((id) => { const tool = getTool(id)!; return <li key={id}><Link href={`/${l}/tools/${id}`} className="group block h-full rounded-2xl border bg-card p-5 shadow-card transition-[border-color,box-shadow,transform] duration-200 hover:-translate-y-0.5 hover:border-primary/30 hover:shadow-md focus-visible:ring-2 focus-visible:ring-ring"><span className="flex items-center gap-2 text-base font-semibold">{ar ? tool.nameAr : tool.name}{id === "pdf-to-word" && <span className="rounded-full bg-warning-surface px-2 py-0.5 text-xs text-warning">Beta</span>}</span><span className="mt-2 block text-sm leading-6 text-muted-foreground">{ar ? tool.descriptionAr : tool.description}</span><span className="mt-4 block text-xs font-semibold text-primary">{labels[key as keyof typeof labels]}</span></Link></li>; })}</ul></section>)}</div></main></>; }
+
+export async function generateMetadata({ params }: { params: Params }): Promise<Metadata> {
+  const { locale } = await params;
+  const ar = locale === "ar";
+  return publicMetadata(locale as Locale, ar ? "أدوات PDF والمستندات | DIP" : "PDF & Document Tools | DIP", ar ? "استكشف 18 أداة لمعالجة وتحويل وفهم المستندات بالعربية والإنجليزية." : "Explore 18 tools to edit, convert, OCR, and understand documents in English and Arabic.", "/tools");
+}
+
+export default async function ToolsPage({ params }: { params: Params }) {
+  const { locale } = await params;
+  if (!locales.includes(locale as Locale)) notFound();
+  const l = locale as Locale;
+  const ar = l === "ar";
+  return <><SiteHeader locale={l}/><main id="main-content" className="min-h-screen bg-muted/35 py-14"><header className="dip-container dip-page-header text-center"><p className="text-sm font-semibold uppercase tracking-[0.18em] text-primary">DIP</p><h1 className="mt-3 text-4xl font-bold tracking-tight sm:text-5xl">{ar ? "أدوات المستندات" : "Document tools"}</h1><p className="mt-4 text-lg leading-8 text-muted-foreground">{ar ? "اختر من أدوات DIP الثماني عشرة لتحرير ملفات PDF وتحويلها وفهمها." : "Choose from all 18 DIP tools to edit, convert, recognize, and understand documents."}</p></header><section aria-label={ar ? "دليل الأدوات" : "Tools directory"} className="dip-container mt-10"><ToolGrid locale={l}/></section></main><SiteFooter locale={l}/></>;
+}
+
 export function generateStaticParams() { return locales.map((locale) => ({ locale })); }

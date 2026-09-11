@@ -1,0 +1,6 @@
+"use client";
+import { Laptop, Moon, Sun } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { useTheme, type Theme } from "./theme-provider";
+export function ThemeToggle({ locale }: { locale: "en" | "ar" }) { const { theme, setTheme } = useTheme(); const ar = locale === "ar"; const items: { value: Theme; label: string; Icon: typeof Sun }[] = [{ value: "light", label: ar ? "فاتح" : "Light", Icon: Sun }, { value: "dark", label: ar ? "داكن" : "Dark", Icon: Moon }, { value: "system", label: ar ? "النظام" : "System", Icon: Laptop }]; const Current = theme === "dark" ? Moon : theme === "light" ? Sun : Laptop; return <DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="icon" aria-label={ar ? "تغيير المظهر" : "Change theme"}><Current aria-hidden="true" /></Button></DropdownMenuTrigger><DropdownMenuContent align="end">{items.map(({ value, label, Icon }) => <DropdownMenuItem key={value} onSelect={() => setTheme(value)} className={theme === value ? "bg-accent" : ""}><Icon aria-hidden="true" />{label}</DropdownMenuItem>)}</DropdownMenuContent></DropdownMenu>; }
