@@ -4,7 +4,7 @@ This foundation standardizes the existing Phase 0–7 interface without changing
 
 ## Brand system
 
-DIP uses a professional coral red (`#d83d31`) as its primary brand color. The palette is expressed through semantic CSS roles in `src/app/globals.css`, not page-specific color utilities. Destructive actions remain a darker semantic red (`#b91c1c`), while success, warning, and information states have separate roles.
+DIP uses the official supplied logo and its cyan, blue, indigo, violet, and deep-navy family. Light-mode actions use blue (`#2563eb`); dark-mode actions use precision indigo (`#6366f1`) with restrained cyan live/AI accents. The palette is expressed through primitive brand tokens and semantic CSS roles in `src/app/globals.css`, not page-specific literals. Red is reserved for destructive and error states.
 
 The primary text/background pair and interactive colors meet WCAG AA contrast. The default typography remains Inter for English and uses the already-installed Noto Sans Arabic for Arabic. Arabic receives its own line-height and is activated through document direction/language selectors.
 

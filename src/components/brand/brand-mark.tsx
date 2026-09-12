@@ -1,3 +1,7 @@
+import Image from "next/image";
 import Link from "next/link";
 import { cn } from "@/lib/utils";
-export function BrandMark({ href = "/", className }: { href?: string; className?: string }) { return <Link href={href} aria-label="DIP home" className={cn("group inline-flex min-h-11 items-center gap-2 rounded-lg focus-visible:ring-2 focus-visible:ring-ring", className)}><span aria-hidden="true" className="relative grid h-9 w-8 place-items-center overflow-hidden rounded-md bg-primary text-sm font-black text-primary-foreground shadow-sm transition-colors group-hover:bg-primary-hover"><span className="absolute end-0 top-0 h-2.5 w-2.5 bg-background/85 [clip-path:polygon(100%_0,0_0,100%_100%)]"/><span>D</span><span className="absolute bottom-1.5 start-1.5 h-0.5 w-4 rounded-full bg-primary-foreground/55"/></span><span className="leading-none"><span className="block text-base font-black tracking-tight text-foreground">DIP</span><span className="hidden text-[9px] font-semibold tracking-wide text-muted-foreground xl:block">DOCUMENT INTELLIGENCE</span></span></Link>; }
+
+export function BrandMark({ href = "/", className }: { href?: string; className?: string }) {
+  return <Link href={href} aria-label="DIP home" className={cn("group inline-flex min-h-11 items-center rounded-xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background", className)}><Image src="/brand/dip-logo.svg" width={106} height={56} priority alt="DIP" className="h-11 w-auto drop-shadow-[0_0_12px_rgb(6_182_212/.16)] transition-[filter,transform] duration-200 group-hover:drop-shadow-[0_0_16px_rgb(6_182_212/.34)]" /></Link>;
+}

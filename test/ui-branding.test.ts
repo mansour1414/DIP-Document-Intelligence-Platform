@@ -4,15 +4,27 @@ import test from "node:test";
 
 const read = (path: string) => readFileSync(new URL(`../${path}`, import.meta.url), "utf8");
 
-test("semantic coral brand tokens keep brand and destructive actions distinct in both themes", () => {
+test("official DIP blue, indigo, cyan and violet tokens keep brand distinct from destructive actions", () => {
   const css = read("src/app/globals.css");
-  assert.match(css, /--primary:\s*#d83d31/);
+  assert.match(css, /--dip-neon-cyan:\s*#00f5ff/);
+  assert.match(css, /--dip-electric-blue:\s*#0ea5e9/);
+  assert.match(css, /--dip-cyber-indigo:\s*#4f46e5/);
+  assert.match(css, /--dip-violet:\s*#7c3aed/);
+  assert.match(css, /--primary:\s*#2563eb/);
   assert.match(css, /--destructive:\s*#b91c1c/);
   assert.match(css, /\.dark\s*\{/);
   assert.notEqual(css.match(/--primary:\s*(#[0-9a-f]+)/i)?.[1], css.match(/--destructive:\s*(#[0-9a-f]+)/i)?.[1]);
   for (const token of ["background", "foreground", "card", "popover", "secondary", "muted", "accent", "border", "input", "ring"]) {
     assert.match(css, new RegExp(`--${token}:`));
   }
+});
+
+test("official SVG logo asset is used by the shared brand component", () => {
+  const logo = read("src/components/brand/brand-mark.tsx");
+  const asset = read("public/brand/dip-logo.svg");
+  assert.match(logo, /\/brand\/dip-logo\.svg/);
+  assert.match(asset, /viewBox="0 0 176\.8 94"/);
+  assert.match(asset, /#23D2ED/i);
 });
 
 test("Arabic typography and reduced motion are explicit", () => {
