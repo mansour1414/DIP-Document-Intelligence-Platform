@@ -1,6 +1,6 @@
 # Phase 8 — Document Agent
 
-Phase 8 is current and is not closed. Phase 8A establishes deterministic control contracts only; it does not make the Agent executable.
+Phase 8A established deterministic control contracts. The Phase 8 runtime adds a durable first-party Agent that plans through the AI Gateway and executes only through Phase 7 workflows.
 
 ## Canonical pipeline
 
@@ -36,6 +36,22 @@ Verification contracts distinguish expected and actual outputs, artifact/schema/
 
 Agent audit events use the existing structured logger and carry only decision metadata such as user, correlation, plan/version, step/tool, result code, approval state, budget result, and frozen hash. Request/document contents and secrets are not part of the Agent audit contract.
 
-## Deliberately not implemented in Phase 8A
+## Phase 8 runtime
 
-No LLM or provider call, AI planner, API/UI, persistence or migration, WorkflowRun or Job creation, queue/Worker/processor call, execution, autonomous retry/replanning loop, shell/code/network capability, storage access, or public developer API is added.
+`AgentRun` owns the authenticated request, explicit scope, trusted budget and allowlist snapshots, lifecycle, WorkflowRun link, verification, and final evidence. Immutable `AgentPlanVersion` rows retain the draft, resolved scope, preview, approval, frozen plan/hash, and internal WorkflowVersion link. Both tables have forced, fail-closed tenant RLS.
+
+Planning uses the existing AI Gateway. The planner sees only safe file metadata and the allowed intersection of Tool Registry, entitlements, worker availability, and locale. Its JSON passes strict Phase 8A parsing and deterministic validation before freezing.
+
+Planner accounting uses `AiUsage.agentRunId`; ordinary Job AI accounting continues to use `jobId`. Both paths retain advisory-lock idempotency.
+
+The compiler maps a verified `FrozenAgentPlan` to a Phase 7 `WorkflowDefinition`. `AGENT_INTERNAL` workflows are excluded from Saved Workflows. `startWorkflowRun` remains the only execution handoff, so ordinary authorization, credits, Jobs, BullMQ, Workers, storage, output validation, retry, and cancellation apply.
+
+Authenticated routes create, read, approve/reject, and cancel Agent runs under `/api/agent-runs`. The localized `/{locale}/agent` page supports explicit files, English and Arabic RTL requests, safe plan display, approval, progress, cancellation, verification, and artifact downloads.
+
+Phase 8 excludes autonomous memory or open-ended replanning, arbitrary code/shell/network tools, direct provider/Worker/processor calls, external connectors, a second execution engine, public developer APIs, and Phase 9 functionality. Real-provider staging validation and final production policy values remain Production Readiness work.
+
+## Validation
+
+`test/agent.phase8a.test.ts` covers the deterministic security boundary. `test/agent.phase8.test.ts` covers planner restriction, compilation, migration/RLS, authenticated routes, RTL UI, and the execution boundary. The environment-gated lower-stack test in `test/workflow.execution.e2e.test.ts` uses the Fake planner plus real Postgres/RLS, object storage, Workflow/Jobs, BullMQ, and Workers for Agent success, idempotency, cancellation, failure, evidence, and cross-tenant behavior.
+
+Production Readiness still requires applying the reviewed migration through the established deployment process, setting the final approval-policy configuration, and running the gated lower-stack suite plus a real-provider planner smoke test in an isolated staging branch. Production is not an implementation or test target.

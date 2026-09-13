@@ -23,12 +23,26 @@ export type AiTask = {
   question?: string;
 };
 
-export type AiRequestContext = {
-  jobId: string;
+export type AgentPlannerTask = {
+  toolId: "agent-planner";
+  locale: AiLocale;
+  request: string;
+  planId: string;
+  planVersion: number;
+  inputs: readonly { name: string; files: readonly { mimeType: string; size: number; pageCount?: number }[] }[];
+  tools: readonly { toolId: string; version: string; inputMime: readonly string[]; outputMime: readonly string[]; maxFiles: number; resourceCost: string; ai: boolean }[];
+  maxSteps: number;
+  maxOutputTokens: number;
+};
+
+export type GatewayTask = AiTask | AgentPlannerTask;
+
+type AiRequestContextBase = {
   correlationId: string;
   userId: string;
-  toolId: AiTool;
+  toolId: AiTool | "agent-planner";
 };
+export type AiRequestContext = AiRequestContextBase & ({ jobId: string; agentRunId?: never } | { jobId?: never; agentRunId: string });
 
 export type ProviderRequest = {
   model: string;

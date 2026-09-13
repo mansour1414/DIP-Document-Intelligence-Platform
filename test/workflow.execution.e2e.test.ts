@@ -4,6 +4,7 @@ import test from "node:test";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@prisma/client";
 import { PDFDocument } from "pdf-lib";
+import type { AgentPlannerTask } from "../src/lib/ai/gateway";
 
 const integration = process.env.RUN_WORKFLOW_E2E === "1" ? test : test.skip;
 
@@ -12,6 +13,7 @@ integration("Phase 7 executes a real multi-step workflow with retry, failure, ca
   const { db } = await import("../src/lib/db/index");
   const { withTenant } = await import("../src/lib/db/tenant");
   const { createWorkflow, updateWorkflow, startWorkflowRun, getWorkflowRun, cancelWorkflowRun } = await import("../src/lib/workflows/service");
+  const { createAgentRun, getAgentRun, cancelAgentRun } = await import("../src/lib/agent/runtime");
   const { getStorage, closeStorage } = await import("../src/lib/storage/index");
   const { getJobQueue, enqueueJob, closeQueueResources } = await import("../src/lib/queue/index");
   const { getToolDefinition } = await import("../src/lib/tools/registry");
@@ -47,6 +49,15 @@ integration("Phase 7 executes a real multi-step workflow with retry, failure, ca
     }
     throw new Error(`WORKFLOW_RUN_STUCK:${runId}`);
   };
+  const waitAgent = async (runId: string, expected: string[]) => {
+    for (let index = 0; index < 240; index += 1) {
+      const run = await getAgentRun(userId, runId) as { status: string } | null;
+      if (run && expected.includes(run.status)) return run;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    throw new Error(`AGENT_RUN_STUCK:${runId}`);
+  };
+  const fakePlanner = async (task: AgentPlannerTask) => ({ output: { schemaVersion: 1 as const, planId: task.planId, version: task.planVersion, steps: [{ stepId: "compress", toolId: "compress-pdf", toolVersion: "1", dependsOn: [], inputs: [{ source: "request" as const, input: "documents" }], reason: "Compress the selected document." }] }, estimatedCost: 0 });
 
   try {
     const runtimeIdentity = await db.$queryRaw<Array<{ current_user: string; rolsuper: boolean; rolbypassrls: boolean; rolcreatedb: boolean; rolcreaterole: boolean }>>`
@@ -79,6 +90,26 @@ integration("Phase 7 executes a real multi-step workflow with retry, failure, ca
     const finalFiles = await withTenant({ userId }, (tx) => tx.file.findMany({ where: { id: { in: finalOutputs } } }));
     assert.equal(finalFiles.length, 1);
     for (const file of finalFiles) { objectKeys.add(file.storageKey); const head = await storage.head(file.storageKey); assert.equal(head?.contentType, "application/pdf"); assert.ok((head?.size ?? 0) > 0); }
+
+    const agentKey = randomUUID();
+    const agent = await createAgentRun(userId, { request: "Compress my selected document.", locale: "en", scope: { inputs: { documents: [successInputs[0]] } } }, agentKey, randomUUID(), fakePlanner) as { id: string; workflowRunId: string | null };
+    const repeatedAgent = await createAgentRun(userId, { request: "Compress my selected document.", locale: "en", scope: { inputs: { documents: [successInputs[0]] } } }, agentKey, randomUUID(), fakePlanner) as { id: string };
+    assert.equal(repeatedAgent.id, agent.id, "Agent request idempotency must prevent duplicate execution");
+    const completedAgent = await waitAgent(agent.id, ["SUCCEEDED", "FAILED"]);
+    assert.equal(completedAgent.status, "SUCCEEDED");
+    const agentRecord = await withTenant({ userId }, (tx) => tx.agentRun.findUniqueOrThrow({ where: { id: agent.id }, include: { currentPlanVersion: true, workflowRun: { include: { jobs: { include: { toolExecutions: true } } } } } }));
+    assert.equal(agentRecord.currentPlanVersion?.state, "FROZEN");
+    assert.equal(agentRecord.workflowRun?.jobs.length, 1);
+    assert.equal(agentRecord.workflowRun?.jobs[0].toolExecutions.length, 1);
+    assert.equal((agentRecord.evidence as { workflowRunId: string }).workflowRunId, agentRecord.workflowRunId);
+
+    const cancelledAgent = await createAgentRun(userId, { request: "Compress my selected document.", locale: "en", scope: { inputs: { documents: [successInputs[1]] } } }, randomUUID(), randomUUID(), fakePlanner) as { id: string };
+    await cancelAgentRun(userId, cancelledAgent.id);
+    assert.equal((await waitAgent(cancelledAgent.id, ["CANCELLED"]))?.status, "CANCELLED");
+
+    const brokenInputs = await createInputs("agent-failure", false);
+    const failedAgent = await createAgentRun(userId, { request: "Compress my selected document.", locale: "en", scope: { inputs: { documents: [brokenInputs[0]] } } }, randomUUID(), randomUUID(), fakePlanner) as { id: string };
+    assert.equal((await waitAgent(failedAgent.id, ["FAILED"]))?.status, "FAILED");
 
     await enqueueJob({ jobId: records[0].id, toolId: records[0].toolId, idempotencyKey: records[0].idempotencyKey, correlationId: records[0].correlationId!, userId, workflowRunId: successRun.id });
     await new Promise((resolve) => setTimeout(resolve, 500));

@@ -1,4 +1,6 @@
-import { AiGatewayError, type AiTask, type AiValidatedOutput, type Citation } from "./types";
+import { parseAgentPlanDraft } from "@/lib/agent/schema";
+import type { AgentPlanDraft } from "@/lib/agent/types";
+import { AiGatewayError, type AiTask, type AgentPlannerTask, type GatewayTask, type AiValidatedOutput, type Citation } from "./types";
 
 function stringArray(value: unknown, field: string): string[] {
   if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) throw new AiGatewayError("AI_RESPONSE_SCHEMA_INVALID", `${field} must be an array of strings.`);
@@ -16,10 +18,14 @@ function citations(value: unknown, pageCount: number): Citation[] {
   });
 }
 
-export function validateProviderResponse(task: AiTask, text: string): AiValidatedOutput {
+export function validateProviderResponse(task: AiTask, text: string): AiValidatedOutput;
+export function validateProviderResponse(task: AgentPlannerTask, text: string): AgentPlanDraft;
+export function validateProviderResponse(task: GatewayTask, text: string): AiValidatedOutput | AgentPlanDraft;
+export function validateProviderResponse(task: GatewayTask, text: string): AiValidatedOutput | AgentPlanDraft {
   let value: unknown;
   try { value = JSON.parse(text); } catch { throw new AiGatewayError("AI_RESPONSE_SCHEMA_INVALID", "The provider returned malformed JSON."); }
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new AiGatewayError("AI_RESPONSE_SCHEMA_INVALID", "The provider output is not an object.");
+  if (task.toolId === "agent-planner") { try { return parseAgentPlanDraft(value); } catch { throw new AiGatewayError("AI_RESPONSE_SCHEMA_INVALID", "The planner returned an invalid AgentPlanDraft."); } }
   const record = value as Record<string, unknown>; const checkedCitations = citations(record.citations, task.pageCount);
   if (task.toolId !== "extract-data") {
     if (typeof record.answer !== "string" || !record.answer.trim() || record.answer.length > 40_000) throw new AiGatewayError("AI_RESPONSE_SCHEMA_INVALID", "The provider answer is empty or too large.");

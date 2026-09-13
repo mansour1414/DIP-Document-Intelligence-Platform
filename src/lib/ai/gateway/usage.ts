@@ -12,13 +12,15 @@ export function estimateAiCost(response: Pick<ProviderResponse, "inputTokens" | 
 
 export async function recordAiUsageOnce(context: AiRequestContext, response: ProviderResponse) {
   const cost = estimateAiCost(response);
+  const reference = context.agentRunId ? { agentRunId: context.agentRunId } : { jobId: context.jobId };
+  const referenceKey = context.agentRunId ? `agent:${context.agentRunId}` : `job:${context.jobId}`;
   return db.$transaction(async (tx) => {
-    await acquireTransactionAdvisoryLock(tx, `ai-usage:${context.jobId}`);
-    const existing = await tx.aiUsage.findFirst({ where: { jobId: context.jobId }, select: { id: true, cost: true } });
+    await acquireTransactionAdvisoryLock(tx, `ai-usage:${referenceKey}`);
+    const existing = await tx.aiUsage.findFirst({ where: reference, select: { id: true, cost: true } });
     if (existing) return { id: existing.id, cost: Number(existing.cost), reused: true };
-    const usage = await tx.aiUsage.create({ data: { userId: context.userId, jobId: context.jobId, provider: response.provider, model: response.model, taskType: context.toolId, tokensInput: response.inputTokens, tokensOutput: response.outputTokens, cost }, select: { id: true, cost: true } });
+    const usage = await tx.aiUsage.create({ data: { userId: context.userId, ...reference, provider: response.provider, model: response.model, taskType: context.toolId, tokensInput: response.inputTokens, tokensOutput: response.outputTokens, cost }, select: { id: true, cost: true } });
     return { id: usage.id, cost: Number(usage.cost), reused: false };
-  // The advisory lock is the serialization mechanism for this job key.
+  // The advisory lock serializes the concrete Job or AgentRun usage key.
   // READ COMMITTED gives a waiter a fresh snapshot after the lock holder commits;
   // SERIALIZABLE would retain its pre-wait snapshot and raise P2034 on the insert.
   }, { isolationLevel: "ReadCommitted" });

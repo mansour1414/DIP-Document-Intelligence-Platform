@@ -37,6 +37,7 @@ model User {
   fileVersions    FileVersion[]
   workflows       Workflow[]
   workflowRuns    WorkflowRun[]
+  agentRuns       AgentRun[]
 
   @@index([status])
   @@map("users")
@@ -267,6 +268,7 @@ model Workflow {
   name             String         @db.VarChar(120)
   status           WorkflowStatus @default(ACTIVE)
   currentVersionId String?        @unique @map("current_version_id") @db.Uuid
+  origin           WorkflowOrigin @default(USER)
   createdAt        DateTime       @default(now()) @map("created_at")
   updatedAt        DateTime       @updatedAt @map("updated_at")
 
@@ -278,6 +280,58 @@ model Workflow {
   @@map("workflows")
 }
 
+model AgentRun {
+  id                   String             @id @default(uuid()) @db.Uuid
+  ownerId              String             @map("owner_id") @db.Uuid
+  status               AgentRunStatus     @default(REQUESTED)
+  locale               String             @db.VarChar(5)
+  request              String             @db.Text
+  scope                Json
+  trustedBudget        Json               @map("trusted_budget")
+  allowedToolIds       Json               @map("allowed_tool_ids")
+  correlationId        String             @unique @map("correlation_id") @db.Uuid
+  idempotencyKey       String             @map("idempotency_key") @db.VarChar(255)
+  currentPlanVersionId String?            @unique @map("current_plan_version_id") @db.Uuid
+  workflowRunId        String?            @unique @map("workflow_run_id") @db.Uuid
+  verification         Json?
+  evidence             Json?
+  errorCode            String?            @map("error_code") @db.VarChar(100)
+  createdAt            DateTime           @default(now()) @map("created_at")
+  updatedAt            DateTime           @updatedAt @map("updated_at")
+  completedAt          DateTime?          @map("completed_at")
+  owner                User               @relation(fields: [ownerId], references: [id], onDelete: Restrict)
+  plans                AgentPlanVersion[] @relation("AgentPlans")
+  currentPlanVersion   AgentPlanVersion?  @relation("CurrentAgentPlan", fields: [currentPlanVersionId], references: [id], onDelete: Restrict)
+  workflowRun          WorkflowRun?       @relation(fields: [workflowRunId], references: [id], onDelete: Restrict)
+  aiUsage              AiUsage[]
+
+  @@unique([ownerId, idempotencyKey])
+  @@index([ownerId, status, createdAt])
+  @@map("agent_runs")
+}
+
+model AgentPlanVersion {
+  id                String           @id @default(uuid()) @db.Uuid
+  agentRunId        String           @map("agent_run_id") @db.Uuid
+  version           Int
+  draft             Json
+  resolvedScope     Json             @map("resolved_scope")
+  budgetPreview     Json             @map("budget_preview")
+  approval          Json
+  state             String           @db.VarChar(30)
+  frozenPlan        Json?            @map("frozen_plan")
+  integrityHash     String?          @map("integrity_hash") @db.VarChar(64)
+  workflowVersionId String?          @unique @map("workflow_version_id") @db.Uuid
+  createdAt         DateTime         @default(now()) @map("created_at")
+  agentRun          AgentRun         @relation("AgentPlans", fields: [agentRunId], references: [id], onDelete: Restrict)
+  currentFor        AgentRun?        @relation("CurrentAgentPlan")
+  workflowVersion   WorkflowVersion? @relation(fields: [workflowVersionId], references: [id], onDelete: Restrict)
+
+  @@unique([agentRunId, version])
+  @@index([agentRunId, createdAt])
+  @@map("agent_plan_versions")
+}
+
 model WorkflowVersion {
   id         String   @id @default(uuid()) @db.Uuid
   workflowId String   @map("workflow_id") @db.Uuid
@@ -285,9 +339,10 @@ model WorkflowVersion {
   definition Json
   createdAt  DateTime @default(now()) @map("created_at")
 
-  workflow   Workflow      @relation("WorkflowVersions", fields: [workflowId], references: [id], onDelete: Restrict)
-  currentFor Workflow?     @relation("CurrentWorkflowVersion")
+  workflow   Workflow          @relation("WorkflowVersions", fields: [workflowId], references: [id], onDelete: Restrict)
+  currentFor Workflow?         @relation("CurrentWorkflowVersion")
   runs       WorkflowRun[]
+  agentPlan  AgentPlanVersion?
 
   @@unique([workflowId, version])
   @@index([workflowId, createdAt])
@@ -313,6 +368,7 @@ model WorkflowRun {
   owner           User            @relation(fields: [ownerId], references: [id], onDelete: Restrict)
   workflowVersion WorkflowVersion @relation(fields: [workflowVersionId], references: [id], onDelete: Restrict)
   jobs            Job[]
+  agentRun        AgentRun?
 
   @@index([ownerId, status, createdAt])
   @@index([workflowVersionId])
@@ -422,6 +478,7 @@ model AiUsage {
   id           String   @id @default(uuid()) @db.Uuid
   userId       String   @map("user_id") @db.Uuid
   jobId        String?  @map("job_id") @db.Uuid
+  agentRunId   String?  @map("agent_run_id") @db.Uuid
   provider     String   @db.VarChar(50)
   model        String   @db.VarChar(100)
   taskType     String   @map("task_type") @db.VarChar(50)
@@ -430,9 +487,11 @@ model AiUsage {
   cost         Decimal  @db.Decimal(10, 6)
   createdAt    DateTime @default(now()) @map("created_at")
 
-  user User @relation(fields: [userId], references: [id])
+  user     User      @relation(fields: [userId], references: [id])
+  agentRun AgentRun? @relation(fields: [agentRunId], references: [id], onDelete: Restrict)
 
   @@index([userId])
+  @@index([agentRunId])
   @@index([provider, model])
   @@index([createdAt])
   @@map("ai_usage")
@@ -748,6 +807,25 @@ enum JobStatus {
 enum WorkflowStatus {
   ACTIVE
   ARCHIVED
+}
+
+enum WorkflowOrigin {
+  USER
+  AGENT_INTERNAL
+}
+
+enum AgentRunStatus {
+  REQUESTED
+  PLANNING
+  PLAN_VALIDATED
+  AWAITING_APPROVAL
+  APPROVED
+  FROZEN
+  EXECUTING
+  VERIFYING
+  SUCCEEDED
+  FAILED
+  CANCELLED
 }
 
 enum ExecutionMode {

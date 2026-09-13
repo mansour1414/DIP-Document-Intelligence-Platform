@@ -11,7 +11,7 @@ import { assertValidWorkflow, validateWorkflowDefinition } from "./validator";
 const json = <T>(value: Prisma.JsonValue) => value as unknown as T;
 const terminal = new Set(["SUCCEEDED", "FAILED", "CANCELLED", "EXPIRED"]);
 
-export async function listWorkflows(userId: string) { return withTenant({ userId }, (tx) => tx.workflow.findMany({ where: { ownerId: userId, status: "ACTIVE" }, include: { currentVersion: true }, orderBy: { updatedAt: "desc" } })); }
+export async function listWorkflows(userId: string) { return withTenant({ userId }, (tx) => tx.workflow.findMany({ where: { ownerId: userId, status: "ACTIVE", origin: "USER" }, include: { currentVersion: true }, orderBy: { updatedAt: "desc" } })); }
 export async function getWorkflow(userId: string, id: string) { return withTenant({ userId }, (tx) => tx.workflow.findFirst({ where: { id, ownerId: userId }, include: { currentVersion: true, versions: { orderBy: { version: "desc" } } } })); }
 export async function createWorkflow(userId: string, input: { name: string; definition: unknown }) {
   if (!input.name?.trim() || input.name.trim().length > 120) throw Object.assign(new Error("WORKFLOW_NAME_INVALID"), { code: "WORKFLOW_NAME_INVALID" });

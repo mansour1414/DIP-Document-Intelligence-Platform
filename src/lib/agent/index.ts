@@ -5,6 +5,7 @@ export * from "./errors";
 export * from "./freeze";
 export * from "./schema";
 export * from "./scope";
+export * from "./runtime";
 export * from "./service";
 export * from "./types";
 export * from "./validator";

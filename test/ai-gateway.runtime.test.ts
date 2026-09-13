@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { executeAiGateway, AiGatewayError, type AiProviderAdapter, type AiTask } from "../src/lib/ai/gateway";
+import { executeAiGateway, AiGatewayError, type AiProviderAdapter, type AiRequestContext, type AiTask } from "../src/lib/ai/gateway";
 import { assertDocumentScope } from "../src/lib/ai/gateway/policy";
 import { buildProviderRequest } from "../src/lib/ai/gateway/task";
 import { validateProviderResponse } from "../src/lib/ai/gateway/validation";
@@ -46,7 +46,7 @@ test("credit/policy rejection prevents provider call", async () => {
 test("a retry reuses one accounting record", async () => {
   const adapter: AiProviderAdapter = { provider: "fake", version: "1", async generate() { return { provider: "fake", model: "fake", text: JSON.stringify({ answer: "ok", citations: [] }), inputTokens: 2, outputTokens: 1, latencyMs: 1 }; } };
   const recorded = new Set<string>(); let inserts = 0;
-  const dependencies = { policy: async () => {}, route: () => ({ adapter, model: "fake" }), account: async (context: { jobId: string }) => { const reused = recorded.has(context.jobId); if (!reused) { recorded.add(context.jobId); inserts += 1; } return { id: context.jobId, cost: 0.1, reused }; } };
+  const dependencies = { policy: async () => {}, route: () => ({ adapter, model: "fake" }), account: async (context: AiRequestContext) => { assert.ok(context.jobId); const reused = recorded.has(context.jobId); if (!reused) { recorded.add(context.jobId); inserts += 1; } return { id: context.jobId, cost: 0.1, reused }; } };
   const context = { jobId: "same-job", correlationId: "correlation", userId: "user", toolId: "summarize-pdf" as const };
   await executeAiGateway(baseTask, context, dependencies); await executeAiGateway(baseTask, context, dependencies);
   assert.equal(inserts, 1);
