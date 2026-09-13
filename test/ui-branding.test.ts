@@ -32,6 +32,26 @@ test("Arabic typography and reduced motion are explicit", () => {
   assert.match(css, /noto-sans-arabic/);
   assert.match(css, /\[dir="rtl"\]/);
   assert.match(css, /prefers-reduced-motion:\s*reduce/);
+  assert.match(css, /:lang\(ar\)[\s\S]*tracking-tight/);
+  assert.match(css, /unicode-bidi:\s*isolate/);
+});
+
+test("Blueprint motion, glass, dropzone, processing, and AI states are implemented", () => {
+  const css = read("src/app/globals.css");
+  const progress = read("src/components/ui/progress.tsx");
+  const upload = read("src/components/ui/upload-zone.tsx");
+  const ai = read("src/components/tools/ai-tool-workspace.tsx");
+  const layout = read("src/app/layout.tsx");
+  assert.match(css, /--glass-background:/);
+  assert.match(css, /dip-sweep:hover::before/);
+  assert.match(css, /dip-border-pulse/);
+  assert.match(css, /dip-laser/);
+  assert.match(css, /dip-ai-glow/);
+  assert.match(upload, /data-state=\{state\}/);
+  assert.match(progress, /stiffness:\s*100/);
+  assert.match(progress, /dip-progress-shimmer/);
+  assert.match(ai, /TypingIndicator/);
+  assert.match(layout, /PageTransition/);
 });
 
 test("navigation exposes localized primary routes and a mobile sheet", () => {
@@ -61,6 +81,32 @@ test("homepage catalog contains exactly the 18 official localized tools", async 
   const card = read("src/components/tools/tool-card.tsx");
   assert.match(card, /`\/\$\{locale\}\/tools\/\$\{toolId\}`/);
   assert.match(card, /nameAr/);
+});
+
+test("homepage places the real upload launcher before the official tool grid", () => {
+  const home = read("src/app/[locale]/page.tsx");
+  const launcher = read("src/components/home/home-upload-launcher.tsx");
+  assert.ok(home.indexOf("<HomeUploadLauncher") < home.indexOf('aria-labelledby="tools-heading"'));
+  assert.match(launcher, /tools\/merge-pdf/);
+  assert.match(launcher, /Choose PDF files/);
+});
+
+test("dashboard uses tenant-scoped real activity and an honest empty state", () => {
+  const dashboard = read("src/app/dashboard/page.tsx");
+  const localized = read("src/app/[locale]/dashboard/page.tsx");
+  const header = read("src/components/seo/site-header.tsx");
+  assert.match(dashboard, /withTenant/);
+  assert.match(dashboard, /tx\.job\.findMany/);
+  assert.match(dashboard, /tx\.workflow\.count/);
+  assert.match(dashboard, /P2021/);
+  assert.match(dashboard, /No processing activity yet/);
+  assert.match(dashboard, /requestedLocale/);
+  assert.match(dashboard, /مرحبًا بعودتك/);
+  assert.match(dashboard, /statuses:/);
+  assert.match(localized, /dashboard\/page/);
+  assert.match(header, /`\/\$\{locale\}\/dashboard`/);
+  assert.match(header, /localizedPath/);
+  assert.doesNotMatch(dashboard, /98\.7|1,284|3,420/);
 });
 
 test("workflow motion is reduced-motion aware and preserves API execution boundary", () => {

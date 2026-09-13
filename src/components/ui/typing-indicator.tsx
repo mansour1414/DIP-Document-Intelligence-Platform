@@ -1,0 +1,3 @@
+"use client";
+import { motion, useReducedMotion } from "motion/react";
+export function TypingIndicator({ label }: { label?: string }) { const reduced = useReducedMotion(); return <span className="inline-flex items-center gap-2"><span className="flex gap-1" aria-hidden="true">{[0,1,2].map((index) => <motion.span key={index} className="h-1.5 w-1.5 rounded-full bg-info" animate={reduced ? undefined : { y: [0,-4,0], opacity: [.35,1,.35] }} transition={{ duration: 1.2, repeat: Infinity, ease: "easeInOut", delay: index * .15 }}/>)}</span>{label && <span className="text-xs text-muted-foreground">{label}</span>}</span>; }

@@ -52,6 +52,7 @@ BEGIN
 END
 $grant_database$;
 GRANT USAGE ON SCHEMA public TO dip_app;
+GRANT SELECT, INSERT ON users TO dip_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON
   documents,
   files,

@@ -184,8 +184,20 @@ jobs:
       - name: Verify application dependencies are ready
         run: node scripts/wait-for-dependencies.mjs
         env:
-          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dip_processing
+          DATABASE_URL: postgresql://dip_app:dip_processing_runtime@localhost:5432/dip_processing
           REDIS_URL: redis://localhost:6379
+      - name: Run Phase 7 workflow closure as least-privilege runtime
+        run: node --import ./scripts/node-platform-compat.mjs --import tsx --test test/workflow.execution.e2e.test.ts
+        env:
+          STORAGE_ENDPOINT: http://localhost:9000
+          STORAGE_BUCKET: dip-test
+          STORAGE_ACCESS_KEY: minioadmin
+          STORAGE_SECRET_KEY: minioadmin
+          STORAGE_REGION: us-east-1
+          DATABASE_URL: postgresql://dip_app:dip_processing_runtime@localhost:5432/dip_processing
+          REDIS_URL: redis://localhost:6379
+          DIP_RLS_TEST_OWNER_URL: postgresql://postgres:postgres@localhost:5432/dip_processing
+          RUN_WORKFLOW_E2E: "1"
       - name: Run real processing integrations
         run: npm test
         env:

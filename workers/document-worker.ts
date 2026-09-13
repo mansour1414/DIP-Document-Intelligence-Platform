@@ -1,7 +1,6 @@
 import "../sentry.server.config";
 import { Worker } from "bullmq";
 import { createHash } from "crypto";
-import { db } from "@/lib/db";
 import { AI_JOB_QUEUE_NAME, getQueueConnection, JOB_QUEUE_NAME, type QueuedJob } from "@/lib/queue";
 import { getStorage } from "@/lib/storage";
 import { pdfWorkerEngine, runPdfWorkerTool, type PdfWorkerTool } from "@/lib/pdf/server";
@@ -15,20 +14,23 @@ import { validateWorkerOutputs } from "@/lib/outputs/validation";
 import { recordMetric } from "@/lib/observability/metrics";
 import { captureOperationalError } from "@/lib/observability/errors";
 import { configuredCostRates, estimateJobCost } from "@/lib/cost/model";
+import { withTenant } from "@/lib/db/tenant";
 
 async function processDocumentJob(message: QueuedJob) {
-  const job = await db.job.findUnique({ where: { id: message.jobId }, include: { steps: true } });
+  if (!message.userId) throw Object.assign(new Error("Worker job requires a tenant identity"), { code: "TENANT_CONTEXT_REQUIRED" });
+  const tenant = <T>(operation: Parameters<typeof withTenant<T>>[1]) => withTenant({ userId: message.userId! }, operation);
+  const job = await tenant((tx) => tx.job.findUnique({ where: { id: message.jobId }, include: { steps: true } }));
   if (!job) throw new Error("JOB_NOT_FOUND");
   const context = { job_id: job.id, correlation_id: job.correlationId ?? message.correlationId, tool_id: job.toolId };
   if (job.status === "SUCCEEDED" || job.outputFileId) { logger.info("job.idempotent_skip", context); return; }
   if (job.status === "CANCELLED" || job.status === "EXPIRED") return;
   const step = job.steps.find((item) => item.name === job.toolId);
   try {
-    await db.job.update({ where: { id: job.id }, data: { status: "RUNNING", startedAt: job.startedAt ?? new Date(), error: undefined, errorCode: null } });
-    if (step) await db.jobStep.update({ where: { id: step.id }, data: { status: "RUNNING", startedAt: new Date() } });
+    await tenant((tx) => tx.job.update({ where: { id: job.id }, data: { status: "RUNNING", startedAt: job.startedAt ?? new Date(), error: undefined, errorCode: null } }));
+    if (step) await tenant((tx) => tx.jobStep.update({ where: { id: step.id }, data: { status: "RUNNING", startedAt: new Date() } }));
     const params = job.params as { inputFileIds?: string[]; options?: Record<string, unknown> }; const ids = params.inputFileIds;
     if (!ids?.length) throw Object.assign(new Error("Unsupported job payload"), { code: "INVALID_JOB_INPUT" });
-    const files = await db.file.findMany({ where: { id: { in: ids } }, include: { document: true } });
+    const files = await tenant((tx) => tx.file.findMany({ where: { id: { in: ids } }, include: { document: true } }));
     if (files.length !== ids.length) throw Object.assign(new Error("Input file is missing"), { code: "INPUT_NOT_FOUND" });
     const inputById = new Map(files.map((file) => [file.id, file]));
     const bytes = await Promise.all(ids.map((id) => getStorage().get(inputById.get(id)!.storageKey))); const options: Record<string, unknown> = { ...(params.options ?? {}), inputMimeTypes: ids.map((id) => inputById.get(id)!.mimeType) };
@@ -46,7 +48,7 @@ async function processDocumentJob(message: QueuedJob) {
     const storage = getStorage();
     const storedOutputs = await Promise.all(outputs.map(async (output, index) => { const key = `output/${job.requesterId ?? "system"}/${job.id}/${index}-${output.name.replace(/[^a-zA-Z0-9._-]/g, "_")}`; const checksum = createHash("sha256").update(output.bytes).digest("base64"); const object = await storage.put({ key, bytes: output.bytes, contentType: output.mimeType, checksum }); return { output, object, checksum }; }));
     try {
-      await db.$transaction(async (tx) => {
+      await tenant(async (tx) => {
         const current = await tx.job.findUniqueOrThrow({ where: { id: job.id }, select: { outputFileId: true } });
         if (current.outputFileId) return;
         const outputDocument = await tx.document.create({ data: { userId: job.requesterId!, title: `${job.toolId} output` } }); const outputFileIds: string[] = [];
@@ -66,8 +68,8 @@ async function processDocumentJob(message: QueuedJob) {
     logger.info("job.succeeded", { ...context, engine, engine_version: engineVersion, duration_ms: durationMs, status: "succeeded" });
   } catch (error) {
     const errorCode = typeof error === "object" && error && "code" in error ? String(error.code) : "PROCESSING_FAILED";
-    await db.job.update({ where: { id: job.id }, data: { status: "FAILED", errorCode, error: { message: error instanceof Error ? error.message : "Processing failed" }, completedAt: new Date() } });
-    if (step) await db.jobStep.update({ where: { id: step.id }, data: { status: "FAILED", errorCode, error: { message: error instanceof Error ? error.message : "Processing failed" }, completedAt: new Date() } });
+    await tenant((tx) => tx.job.update({ where: { id: job.id }, data: { status: "FAILED", errorCode, error: { message: error instanceof Error ? error.message : "Processing failed" }, completedAt: new Date() } }));
+    if (step) await tenant((tx) => tx.jobStep.update({ where: { id: step.id }, data: { status: "FAILED", errorCode, error: { message: error instanceof Error ? error.message : "Processing failed" }, completedAt: new Date() } }));
     recordMetric("jobs_failure_total", 1, "count", { tool_id: job.toolId, status: "failed" });
     logger.error("job.failed", { ...context, error_code: errorCode, status: "failed" }); throw error;
   }
@@ -75,15 +77,26 @@ async function processDocumentJob(message: QueuedJob) {
 
 export const documentWorker = new Worker<QueuedJob>(JOB_QUEUE_NAME, async (message) => { recordMetric("queue_wait_ms", Math.max(0, Date.now() - message.timestamp), "ms", { tool_id: message.data.toolId, queue: "document" }); return processDocumentJob(message.data); }, { connection: getQueueConnection(), concurrency: runtimeLimits.documentConcurrency, stalledInterval: runtimeLimits.stalledIntervalMs, maxStalledCount: runtimeLimits.maxStalledCount, lockDuration: Math.min(runtimeLimits.jobTimeoutMs, 10 * 60_000) });
 async function advanceWorkflow(message: QueuedJob) { if (message.workflowRunId && message.userId) await (await import("@/lib/workflows/service")).advanceWorkflowRun(message.workflowRunId, message.userId); }
+async function recordTerminalFailure(message: QueuedJob) {
+  if (!message.userId) return;
+  await withTenant({ userId: message.userId }, async (tx) => {
+    const job = await tx.job.findUnique({ where: { id: message.jobId }, include: { toolExecutions: { select: { id: true } } } });
+    if (!job || job.toolExecutions.length) return;
+    const params = job.params as { inputFileIds?: string[] };
+    await tx.toolExecution.create({ data: { jobId: job.id, toolId: job.toolId, mode: "SERVER", input: { inputFileIds: params.inputFileIds ?? [] }, correlationId: job.correlationId, errorCode: job.errorCode ?? "PROCESSING_FAILED", engine: "worker", engineVersion: "1" } });
+  });
+}
 documentWorker.on("completed", (message) => { void advanceWorkflow(message.data).catch((error) => captureOperationalError(error, { worker: "workflow" })); });
-documentWorker.on("failed", async (message) => { if (!message) return; if (message.attemptsMade < (message.opts.attempts ?? 1)) { recordMetric("retry_total", 1, "count", { tool_id: message.data.toolId, status: "retrying" }); await db.job.update({ where: { id: message.data.jobId }, data: { status: "RETRYING" } }); } else await advanceWorkflow(message.data); });
+documentWorker.on("failed", async (message) => { if (!message) return; if (message.attemptsMade < (message.opts.attempts ?? 1)) { recordMetric("retry_total", 1, "count", { tool_id: message.data.toolId, status: "retrying" }); if (message.data.userId) await withTenant({ userId: message.data.userId }, (tx) => tx.job.update({ where: { id: message.data.jobId }, data: { status: "RETRYING" } })); } else { await recordTerminalFailure(message.data); await advanceWorkflow(message.data); } });
 documentWorker.on("stalled", () => recordMetric("stalled_jobs_total", 1, "count", { status: "stalled" }));
 documentWorker.on("error", (error) => { captureOperationalError(error, { worker: "document" }); logger.error("worker.error", { error: error.message }); });
 
 const aiTools = new Set<AiTool>(["summarize-pdf", "chat-with-pdf", "extract-data"]);
 
 export async function processAiJob(message: QueuedJob) {
-  const job = await db.job.findUnique({ where: { id: message.jobId }, include: { steps: true } });
+  if (!message.userId) throw Object.assign(new Error("AI worker job requires a tenant identity"), { code: "TENANT_CONTEXT_REQUIRED" });
+  const tenant = <T>(operation: Parameters<typeof withTenant<T>>[1]) => withTenant({ userId: message.userId! }, operation);
+  const job = await tenant((tx) => tx.job.findUnique({ where: { id: message.jobId }, include: { steps: true } }));
   if (!job) throw Object.assign(new Error("Job not found"), { code: "JOB_NOT_FOUND" });
   const correlationId = job.correlationId ?? message.correlationId;
   const context = { job_id: job.id, correlation_id: correlationId, tool_id: job.toolId, user_id: job.requesterId ?? "" };
@@ -93,11 +106,11 @@ export async function processAiJob(message: QueuedJob) {
   const step = job.steps.find((item) => item.name === job.toolId); const started = Date.now();
   try {
     if (!job.requesterId) throw Object.assign(new Error("AI jobs require a requester"), { code: "AI_REQUESTER_REQUIRED" });
-    await db.job.update({ where: { id: job.id }, data: { status: "RUNNING", startedAt: job.startedAt ?? new Date(), error: undefined, errorCode: null } });
-    if (step) await db.jobStep.update({ where: { id: step.id }, data: { status: "RUNNING", startedAt: step.startedAt ?? new Date(), error: undefined, errorCode: null } });
+    await tenant((tx) => tx.job.update({ where: { id: job.id }, data: { status: "RUNNING", startedAt: job.startedAt ?? new Date(), error: undefined, errorCode: null } }));
+    if (step) await tenant((tx) => tx.jobStep.update({ where: { id: step.id }, data: { status: "RUNNING", startedAt: step.startedAt ?? new Date(), error: undefined, errorCode: null } }));
     const params = job.params as { inputFileIds?: string[]; options?: Record<string, unknown> }; const ids = params.inputFileIds ?? [];
     if (ids.length !== 1) throw Object.assign(new Error("AI jobs require exactly one scoped document"), { code: "DOCUMENT_SCOPE_VIOLATION" });
-    const file = await db.file.findUnique({ where: { id: ids[0] }, include: { document: true } });
+    const file = await tenant((tx) => tx.file.findUnique({ where: { id: ids[0] }, include: { document: true } }));
     if (!file || file.document.userId !== job.requesterId || file.mimeType !== "application/pdf") throw Object.assign(new Error("The input is outside the document scope"), { code: "DOCUMENT_SCOPE_VIOLATION" });
     const requestedDocumentId = params.options?.documentId;
     if (requestedDocumentId !== undefined && requestedDocumentId !== file.documentId) throw Object.assign(new Error("The requested document does not match the job input"), { code: "DOCUMENT_SCOPE_VIOLATION" });
@@ -105,7 +118,7 @@ export async function processAiJob(message: QueuedJob) {
     const task = { toolId: job.toolId as AiTool, locale: params.options?.locale === "ar" ? "ar" as const : "en" as const, documentId: file.documentId, documentText: serializePdfPages(pages), pageCount: pages.length, question: typeof params.options?.question === "string" ? params.options.question : undefined };
     const gateway = await executeAiGateway(task, { jobId: job.id, correlationId, userId: job.requesterId, toolId: task.toolId });
     const result = { content: gateway.output.answer ?? JSON.stringify(gateway.output, null, 2), data: gateway.output, documentId: file.documentId };
-    await db.$transaction(async (tx) => {
+    await tenant(async (tx) => {
       const current = await tx.job.findUniqueOrThrow({ where: { id: job.id }, select: { status: true, result: true } });
       if (current.status === "SUCCEEDED" && current.result) return;
       await tx.job.update({ where: { id: job.id }, data: { status: "SUCCEEDED", result, engine: gateway.response.provider, engineVersion: gateway.response.model, completedAt: new Date() } });
@@ -116,7 +129,7 @@ export async function processAiJob(message: QueuedJob) {
   } catch (error) {
     const errorCode = error instanceof AiGatewayError ? error.code : typeof error === "object" && error && "code" in error ? String(error.code) : "AI_PROCESSING_FAILED";
     const message = error instanceof Error ? error.message : "AI processing failed";
-    await db.$transaction(async (tx) => {
+    await tenant(async (tx) => {
       await tx.job.update({ where: { id: job.id }, data: { status: "FAILED", errorCode, error: { message }, completedAt: new Date() } });
       if (step) await tx.jobStep.update({ where: { id: step.id }, data: { status: "FAILED", errorCode, error: { message }, completedAt: new Date() } });
       await tx.toolExecution.create({ data: { jobId: job.id, toolId: job.toolId, mode: "AI", input: { inputFileId: job.inputFileId }, correlationId, errorCode, engine: "ai-gateway", engineVersion: "1", durationMs: Date.now() - started } });
@@ -134,7 +147,7 @@ export const aiWorker = new Worker<QueuedJob>(AI_JOB_QUEUE_NAME, async (message)
   maxStalledCount: runtimeLimits.maxStalledCount,
   lockDuration: Math.min(runtimeLimits.jobTimeoutMs, 10 * 60_000),
 });
-aiWorker.on("failed", async (message) => { if (message && message.attemptsMade < (message.opts.attempts ?? 1)) { recordMetric("retry_total", 1, "count", { tool_id: message.data.toolId, status: "retrying" }); await db.job.update({ where: { id: message.data.jobId }, data: { status: "RETRYING" } }); } });
+aiWorker.on("failed", async (message) => { if (message && message.attemptsMade < (message.opts.attempts ?? 1)) { recordMetric("retry_total", 1, "count", { tool_id: message.data.toolId, status: "retrying" }); if (message.data.userId) await withTenant({ userId: message.data.userId }, (tx) => tx.job.update({ where: { id: message.data.jobId }, data: { status: "RETRYING" } })); } });
 aiWorker.on("completed", (message) => { void advanceWorkflow(message.data).catch((error) => captureOperationalError(error, { worker: "workflow" })); });
 aiWorker.on("failed", async (message) => { if (message && message.attemptsMade >= (message.opts.attempts ?? 1)) await advanceWorkflow(message.data); });
 aiWorker.on("stalled", () => recordMetric("stalled_jobs_total", 1, "count", { status: "stalled" }));

@@ -1,7 +1,9 @@
 import type { Metadata } from "next";
 import { Inter } from "next/font/google";
+import Script from "next/script";
 import { LocaleProvider } from "@/components/i18n/locale-provider";
 import { ThemeProvider } from "@/components/theme/theme-provider";
+import { PageTransition } from "@/components/layout/page-transition";
 import "./globals.css";
 
 const inter = Inter({
@@ -23,9 +25,9 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en" suppressHydrationWarning className={`${inter.variable} h-full`}>
-      <head><script dangerouslySetInnerHTML={{ __html: `(function(){try{var t=localStorage.getItem('dip-theme')||'system';var d=t==='dark'||(t==='system'&&matchMedia('(prefers-color-scheme: dark)').matches);document.documentElement.classList.toggle('dark',d);document.documentElement.dataset.theme=t}catch(e){}})()` }} /></head>
+      <head><Script id="dip-theme-init" strategy="beforeInteractive" dangerouslySetInnerHTML={{ __html: `(function(){try{var t=localStorage.getItem('dip-theme')||'system';var d=t==='dark'||(t==='system'&&matchMedia('(prefers-color-scheme: dark)').matches);document.documentElement.classList.toggle('dark',d);document.documentElement.dataset.theme=t}catch(e){}})()` }} /></head>
       <body className="min-h-full flex flex-col font-sans antialiased">
-        <ThemeProvider><LocaleProvider>{children}</LocaleProvider></ThemeProvider>
+        <ThemeProvider><LocaleProvider><PageTransition>{children}</PageTransition></LocaleProvider></ThemeProvider>
       </body>
     </html>
   );
