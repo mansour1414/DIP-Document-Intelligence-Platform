@@ -1,0 +1,10 @@
+export type AgentErrorCode =
+  | "AGENT_PLAN_INVALID" | "AGENT_SCOPE_EMPTY" | "AGENT_SCOPE_UNAUTHORIZED" | "AGENT_TOOL_NOT_ALLOWED"
+  | "AGENT_TOOL_NOT_REGISTERED" | "AGENT_TOOL_VERSION_UNSUPPORTED" | "AGENT_DEPENDENCY_INVALID"
+  | "AGENT_PLAN_CYCLE" | "AGENT_BINDING_INVALID" | "AGENT_MIME_INCOMPATIBLE" | "AGENT_BUDGET_EXCEEDED"
+  | "AGENT_BUDGET_UNKNOWN" | "AGENT_APPROVAL_REQUIRED" | "AGENT_APPROVAL_REJECTED"
+  | "AGENT_PLAN_NOT_FROZEN" | "AGENT_FORBIDDEN_FIELD" | "AGENT_ENTITLEMENT_DENIED";
+
+export class AgentError extends Error {
+  constructor(public readonly code: AgentErrorCode, message: string, public readonly path = "$") { super(message); this.name = "AgentError"; }
+}

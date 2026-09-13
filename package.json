@@ -10,6 +10,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
+    "typecheck": "tsc --noEmit",
     "test": "node --import ./scripts/node-platform-compat.mjs --import tsx --test --test-concurrency=1 test/*.test.ts test/*.test.mjs",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",

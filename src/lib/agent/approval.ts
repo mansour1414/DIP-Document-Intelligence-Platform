@@ -1,0 +1,6 @@
+import { AgentError } from "./errors";
+import type { AgentApprovalDecision, AgentApprovalState, AgentPlanDraft } from "./types";
+
+export type AgentApprovalPolicy = (draft: AgentPlanDraft) => Readonly<{ requiredStepIds: readonly string[] }>;
+export function evaluateApproval(draft: AgentPlanDraft, policyVersion: string, policy: AgentApprovalPolicy): AgentApprovalDecision { const required = [...new Set(policy(draft).requiredStepIds)]; if (required.some((id) => !draft.steps.some((step) => step.stepId === id))) throw new AgentError("AGENT_PLAN_INVALID", "Approval policy referenced an unknown step."); return Object.freeze({ state: required.length ? "REQUIRED" : "NOT_REQUIRED", policyVersion, requiredStepIds: Object.freeze(required) }); }
+export function decideApproval(current: AgentApprovalDecision, state: Extract<AgentApprovalState, "APPROVED" | "REJECTED">, trustedActorId: string, reason?: string, decidedAt = new Date()): AgentApprovalDecision { if (current.state !== "REQUIRED") throw new AgentError("AGENT_PLAN_INVALID", "Only required approval can be decided."); return Object.freeze({ ...current, state, decidedBy: trustedActorId, decidedAt: decidedAt.toISOString(), ...(reason ? { reason } : {}) }); }
