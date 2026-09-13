@@ -12,6 +12,7 @@ Reviewed 2026-09-10. Versions are installed/lockfile versions; host executables 
 | BullMQ | 6.3.4 | direct | MIT, package metadata | retain notice | cleared |
 | ioredis | 5.11.1 | direct | MIT, package metadata | retain notice | cleared |
 | @aws-sdk/client-s3 | 3.1128.0 | direct | Apache-2.0, package metadata | retain notices | cleared |
+| MinIO Community Server | RELEASE.2025-09-07T16-13-09Z (`quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e`) | unmodified ephemeral CI service only | AGPL-3.0, [official source and license](https://github.com/minio/minio) | not linked, modified, bundled, or shipped with DIP; runner pulls the official immutable image solely for isolated S3 integration tests | cleared for ephemeral CI only; production/runtime adoption requires a separate Licensing Gate |
 | JSZip | 3.10.2 | direct | MIT OR GPL-3.0-or-later | project selects MIT terms and retains notice | cleared |
 | @sentry/nextjs | 10.74.0 | direct/runtime+build | MIT, package metadata | secret-only DSN/auth; production account DPA/retention review | code cleared; account gate |
 | LibreOffice | CI/host | subprocess | MPL-2.0 plus bundled notices, official inventory | preserve exact distribution notices and image manifest | subprocess cleared; image verification |

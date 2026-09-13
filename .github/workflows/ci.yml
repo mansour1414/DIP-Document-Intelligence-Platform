@@ -154,7 +154,7 @@ jobs:
       - name: Generate safe processing corpus
         run: python scripts/generate-processing-corpus.py
       - name: Start local S3-compatible storage
-        run: docker run --detach --name dip-minio --publish 9000:9000 --env MINIO_ROOT_USER=minioadmin --env MINIO_ROOT_PASSWORD=minioadmin minio/minio server /data
+        run: docker run --detach --name dip-minio --publish 9000:9000 --env MINIO_ROOT_USER=minioadmin --env MINIO_ROOT_PASSWORD=minioadmin quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e server /data
       - name: Wait for object storage readiness
         run: for i in {1..30}; do curl --fail --silent http://localhost:9000/minio/health/ready && exit 0; sleep 1; done; exit 1
       - name: Create isolated test bucket
