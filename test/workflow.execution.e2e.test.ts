@@ -88,11 +88,29 @@ integration("Phase 7 executes a real multi-step workflow with retry, failure, ca
 
     const attackerId = randomUUID();
     await owner.user.create({ data: { id: attackerId, email: `workflow-e2e-attacker-${attackerId}@example.invalid` } });
+    const victimBeforeAttack = await withTenant({ userId }, (tx) => tx.job.findUniqueOrThrow({ where: { id: records[0].id }, include: { steps: true, toolExecutions: true } }));
+    const victimRunBeforeAttack = await withTenant({ userId }, (tx) => tx.workflowRun.findUniqueOrThrow({ where: { id: successRun.id } }));
+    const victimOutputBeforeAttack = await withTenant({ userId }, (tx) => tx.file.findUniqueOrThrow({ where: { id: firstOutputs[0] } }));
+    const victimObjectBeforeAttack = await storage.head(victimOutputBeforeAttack.storageKey);
+    assert.equal(await withTenant({ userId: attackerId }, (tx) => tx.job.findUnique({ where: { id: records[0].id } })), null, "attacker RLS lookup must not reveal the victim job");
+    assert.equal(await withTenant({ userId: attackerId }, (tx) => tx.file.findUnique({ where: { id: firstOutputs[0] } })), null, "attacker RLS lookup must not reveal the victim artifact");
     const injected = await getJobQueue().add("merge-pdf", { jobId: records[0].id, toolId: "merge-pdf", idempotencyKey: "cross-tenant-injection", correlationId: randomUUID(), userId: attackerId, workflowRunId: successRun.id }, { jobId: `cross-${randomUUID()}`, attempts: 1, removeOnFail: false });
     for (let index = 0; index < 80 && await injected.getState() !== "failed"; index += 1) await new Promise((resolve) => setTimeout(resolve, 100));
     assert.equal(await injected.getState(), "failed");
-    assert.match(injected.failedReason ?? "", /JOB_NOT_FOUND/);
-    assert.equal((await withTenant({ userId }, (tx) => tx.toolExecution.count({ where: { jobId: records[0].id } }))), 1);
+    const failedInjection = await getJobQueue().getJob(injected.id!);
+    assert.match(failedInjection?.failedReason ?? "", /JOB_NOT_FOUND/);
+    const victimAfterAttack = await withTenant({ userId }, (tx) => tx.job.findUniqueOrThrow({ where: { id: records[0].id }, include: { steps: true, toolExecutions: true } }));
+    const victimRunAfterAttack = await withTenant({ userId }, (tx) => tx.workflowRun.findUniqueOrThrow({ where: { id: successRun.id } }));
+    const victimOutputAfterAttack = await withTenant({ userId }, (tx) => tx.file.findUniqueOrThrow({ where: { id: firstOutputs[0] } }));
+    const victimObjectAfterAttack = await storage.head(victimOutputAfterAttack.storageKey);
+    assert.equal(victimAfterAttack.status, victimBeforeAttack.status);
+    assert.deepEqual(victimAfterAttack.result, victimBeforeAttack.result, "victim output IDs must not change");
+    assert.deepEqual(victimAfterAttack.steps.map(({ id, status }) => ({ id, status })), victimBeforeAttack.steps.map(({ id, status }) => ({ id, status })), "victim JobSteps must not change");
+    assert.deepEqual(victimAfterAttack.toolExecutions.map(({ id, errorCode }) => ({ id, errorCode })), victimBeforeAttack.toolExecutions.map(({ id, errorCode }) => ({ id, errorCode })), "victim ToolExecutions must not change");
+    assert.equal(victimRunAfterAttack.status, victimRunBeforeAttack.status, "victim workflow run must not change");
+    assert.equal(victimOutputAfterAttack.storageKey, victimOutputBeforeAttack.storageKey);
+    assert.deepEqual(victimObjectAfterAttack, victimObjectBeforeAttack, "victim object must not be replaced or deleted");
+    assert.equal(await withTenant({ userId: attackerId }, (tx) => tx.job.findUnique({ where: { id: records[0].id } })), null);
 
     const failureInputs = await createInputs("failure", false);
     const failureWorkflow = await createWorkflow(userId, { name: "Phase 7 controlled failure", definition });
