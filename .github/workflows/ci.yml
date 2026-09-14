@@ -250,6 +250,7 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - run: npx prisma generate
       - name: Run safe EICAR scanner integration
         run: node --import ./scripts/node-platform-compat.mjs --import tsx --test test/malware-scanning.test.ts
         env:
