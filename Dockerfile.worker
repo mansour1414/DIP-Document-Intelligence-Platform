@@ -12,9 +12,7 @@ ARG OCRMYPDF_VERSION=17.10.0
 ARG PYPDFIUM2_VERSION=5.13.0
 
 ENV NODE_ENV=production \
-    PATH="/opt/dip-ocr/bin:${PATH}" \
-    HOME=/home/dipworker \
-    TMPDIR=/tmp/dip
+    PATH="/opt/dip-ocr/bin:${PATH}"
 
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y \
@@ -25,7 +23,6 @@ RUN apt-get update \
       libreoffice-impress \
       libreoffice-writer \
       python3 \
-      python3-pip \
       python3-venv \
       qpdf \
       tesseract-ocr \
@@ -33,7 +30,7 @@ RUN apt-get update \
       tesseract-ocr-eng \
       tini \
  && python3 -m venv /opt/dip-ocr \
- && /opt/dip-ocr/bin/pip install --no-cache-dir --disable-pip-version-check \
+ && /opt/dip-ocr/bin/python -m pip install --no-cache-dir --disable-pip-version-check \
       "ocrmypdf==${OCRMYPDF_VERSION}" "pypdfium2==${PYPDFIUM2_VERSION}" \
  && test ! -e /usr/bin/gs \
  && test ! -e /usr/local/bin/gs \
@@ -43,6 +40,9 @@ WORKDIR /app
 RUN groupadd --system --gid 10001 dipworker \
  && useradd --system --uid 10001 --gid dipworker --home-dir /home/dipworker --create-home dipworker \
  && install -d -o dipworker -g dipworker -m 0700 /tmp/dip
+
+ENV HOME=/home/dipworker \
+    TMPDIR=/tmp/dip
 
 COPY --from=node-deps --chown=dipworker:dipworker /app/node_modules ./node_modules
 COPY --chown=dipworker:dipworker package.json tsconfig.json sentry.server.config.ts ./

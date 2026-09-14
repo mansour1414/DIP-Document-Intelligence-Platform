@@ -148,8 +148,8 @@ jobs:
       - run: npm ci
       - run: npx prisma generate
       - run: sudo apt-get update
-      - name: Install LibreOffice, Tesseract and fonts
-        run: sudo apt-get install --no-install-recommends -y libreoffice-writer libreoffice-calc libreoffice-impress tesseract-ocr tesseract-ocr-eng tesseract-ocr-ara fonts-noto-core
+      - name: Install LibreOffice, Tesseract, qpdf and fonts
+        run: sudo apt-get install --no-install-recommends -y libreoffice-writer libreoffice-calc libreoffice-impress tesseract-ocr tesseract-ocr-eng tesseract-ocr-ara qpdf fonts-noto-core
       - name: Install corpus and Ghostscript-free OCR dependencies
         run: python -m pip install python-docx openpyxl python-pptx pillow "ocrmypdf==17.10.0" "pypdfium2==5.13.0"
       - name: Verify approved Ghostscript-free OCR production path
