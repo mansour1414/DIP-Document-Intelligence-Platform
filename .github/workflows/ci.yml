@@ -373,6 +373,7 @@ jobs:
           --env STORAGE_ENDPOINT=http://127.0.0.1:9000 --env STORAGE_BUCKET=dip-release-b
           --env STORAGE_ACCESS_KEY=minioadmin --env STORAGE_SECRET_KEY=minioadmin --env STORAGE_REGION=us-east-1
           --env CLAMD_HOST=127.0.0.1 --env CLAMD_PORT=3310 --env AUTH_SECRET=release-b-ci-only-secret
+          --env NEXT_PUBLIC_APP_URL=http://127.0.0.1:3000
           --env GEMINI_API_KEY
           dip-document-worker:release-b
       - name: Build and start standalone Public API
