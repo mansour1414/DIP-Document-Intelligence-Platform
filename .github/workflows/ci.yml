@@ -450,4 +450,6 @@ jobs:
           exit 1
       - name: Print worker diagnostics on failure
         if: failure()
-        run: docker logs dip-release-b-worker
+        run: |
+          docker logs dip-release-b-worker
+          test ! -f /tmp/dip-release-b-web.log || sed -E 's#(Bearer )[A-Za-z0-9._~-]+#\1[REDACTED]#g; s#(postgres(ql)?://)[^@[:space:]]+@#\1[REDACTED]@#g; s#dip_v1_[A-Za-z0-9_-]+#[REDACTED_API_KEY]#g' /tmp/dip-release-b-web.log | tail -n 200

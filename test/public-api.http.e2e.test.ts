@@ -22,10 +22,11 @@ integration("Public API v1 authenticates, executes on BullMQ, isolates tenants a
   const clientA = await createApiClient(userA, orgA.id, "Release B client A"); const clientB = await createApiClient(userB, orgB.id, "Release B client B");
   const keyA = await createApiKey(userA, orgA.id, clientA.id, "Release B key A", ["*"]); const keyB = await createApiKey(userB, orgB.id, clientB.id, "Release B key B", ["*"]);
   const request = (path: string, key: string, init: RequestInit = {}) => fetch(`${base}${path}`, { ...init, headers: { authorization: `Bearer ${key}`, ...(init.headers ?? {}) } });
+  const expectStatus = async (path: string, key: string, expected: number, init: RequestInit = {}) => { const response = await request(path, key, init); if (response.status !== expected) { const body = (await response.clone().text()).replace(/Bearer\s+\S+/gi, "Bearer [REDACTED]").replace(/dip_v1_[A-Za-z0-9_-]+/g, "[REDACTED_API_KEY]").slice(0, 2_000); assert.equal(response.status, expected, `${init.method ?? "GET"} ${path} returned ${response.status}: ${body}`); } return response; };
   const pdf = await PDFDocument.create(); pdf.addPage().drawText("DIP public API Release B"); const bytes = await pdf.save();
   const form = (label = "a") => { const value = new FormData(); value.set("toolId", "compress-pdf"); value.set("files", new File([bytes as BlobPart], `${label}.pdf`, { type: "application/pdf" })); return value; };
   try {
-    assert.equal((await request("/v1/tools", keyA.key)).status, 200); assert.equal((await request("/v1/tools/compress-pdf", keyA.key)).status, 200); assert.equal((await request("/v1/tools/internal-missing", keyA.key)).status, 404);
+    await expectStatus("/v1/tools", keyA.key, 200); await expectStatus("/v1/tools/compress-pdf", keyA.key, 200); await expectStatus("/v1/tools/internal-missing", keyA.key, 404);
     const createdResponse = await request("/v1/jobs", keyA.key, { method: "POST", headers: { "idempotency-key": "release-b-http" }, body: form() }); assert.equal(createdResponse.status, 202);
     const created = await createdResponse.json() as { data: { id: string } }; const jobId = created.data.id;
     const replay = await request("/v1/jobs", keyA.key, { method: "POST", headers: { "idempotency-key": "release-b-http" }, body: form() }); assert.equal(replay.status, 200); assert.equal((await replay.json() as { data: { id: string } }).data.id, jobId);

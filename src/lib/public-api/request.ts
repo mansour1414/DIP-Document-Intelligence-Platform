@@ -4,9 +4,11 @@ import { consumeApiRateLimit } from "@/lib/api-platform/rate-limit";
 import { withApiTenant } from "@/lib/db/tenant";
 import { logger } from "@/lib/logging";
 import { recordMetric } from "@/lib/observability/metrics";
+import { captureOperationalError } from "@/lib/observability/errors";
 import { PublicApiError, publicErrorResponse } from "./errors";
 
 export type PublicRequestContext = { principal: ApiPrincipal; requestId: string; route: string; bytesIn: number; creditsUsed: number; toolId?: string };
+function safeInternalDiagnostic(error: unknown) { return (error instanceof Error ? error.stack ?? `${error.name}: ${error.message}` : String(error)).replace(/Bearer\s+\S+/gi, "Bearer [REDACTED]").replace(/postgres(?:ql)?:\/\/[^@\s]+@/gi, "postgresql://[REDACTED]@").replace(/dip_v1_[A-Za-z0-9_-]+/g, "[REDACTED_API_KEY]").slice(0, 4_000); }
 function positive(value: string | undefined, fallback: number) { const parsed = Number(value); return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback; }
 export function rateLimitDecision(result: { allowed: boolean; retryAfterMs: number }) { if (!result.allowed) throw new PublicApiError("RATE_LIMITED", "The API rate limit was exceeded.", 429, { retryAfterSeconds: Math.max(1, Math.ceil(result.retryAfterMs / 1000)) }); return result; }
 
@@ -24,7 +26,7 @@ export async function handlePublicApi(request: Request, route: string, scope: st
     logger.info("public_api.rate_limit", { request_id: requestId, api_client_id: principal.apiClientId, organization_id: principal.organizationId, route, allowed: rateResult.allowed });
     rateLimitDecision(rateResult);
     response = await handler(context);
-  } catch (error) { response = publicErrorResponse(error, requestId); }
+  } catch (error) { response = publicErrorResponse(error, requestId); if (response.status === 500) { captureOperationalError(error, { request_id: requestId, route, method: request.method, subsystem: "public_api" }); logger.error("public_api.internal_error", { request_id: requestId, route, method: request.method, error_stack: safeInternalDiagnostic(error) }); } }
   if (context) await recordUsage(context, request, response);
   logger.info("public_api.request", { request_id: requestId, api_client_id: context?.principal.apiClientId, organization_id: context?.principal.organizationId, route, status: response.status, latency_ms: Math.round(performance.now() - started), tool_id: context?.toolId });
   response.headers.set("x-request-id", requestId); response.headers.set("cache-control", "no-store"); return response;
