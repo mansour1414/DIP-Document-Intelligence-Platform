@@ -1,5 +1,5 @@
 import { createHmac } from "node:crypto";
-import { getQueueConnection } from "@/lib/queue";
+import { getReadyQueueConnection } from "@/lib/queue";
 import type { ApiPrincipal } from "./auth";
 
 const script = `
@@ -14,7 +14,7 @@ function identifier(kind: string, value: string) { return createHmac("sha256", p
 
 export async function consumeApiRateLimit(principal: ApiPrincipal, limits: { client: number; organization: number; windowMs: number }) {
   if (limits.client < 1 || limits.organization < 1 || limits.windowMs < 1000) throw new Error("INVALID_RATE_LIMIT");
-  const bucket = Math.floor(Date.now() / limits.windowMs); const redis = getQueueConnection();
+  const bucket = Math.floor(Date.now() / limits.windowMs); const redis = await getReadyQueueConnection();
   const result = await redis.eval(script, 2, `dip:api:client:${identifier("client", principal.apiClientId)}:${bucket}`, `dip:api:organization:${identifier("organization", principal.organizationId)}:${bucket}`, limits.client, limits.organization, limits.windowMs) as number[];
   return { allowed: result[0] === 1, clientCount: result[1], organizationCount: result[2], retryAfterMs: Math.max(result[3], result[4], 0) };
 }

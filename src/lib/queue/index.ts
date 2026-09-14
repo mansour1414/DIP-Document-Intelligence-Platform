@@ -11,24 +11,28 @@ export type QueuedJob = { jobId: string; toolId: string; idempotencyKey: string;
 let redis: Redis | undefined;
 let queue: Queue<QueuedJob> | undefined;
 let aiQueue: Queue<QueuedJob> | undefined;
+const redisReadiness = new WeakMap<Redis, Promise<void>>();
 
 export function getQueueConnection() {
   if (!redis || redis.status === "end") redis = new Redis(readEnvironment().redisUrl ?? "redis://localhost:6379", { maxRetriesPerRequest: null, connectTimeout: 10_000, commandTimeout: 15_000, enableOfflineQueue: false });
   return redis;
 }
-async function waitForRedisReady(connection: Redis, timeoutMs = 10_000) {
+export function waitForRedisReady(connection: Redis, timeoutMs = 10_000) {
   if (connection.status === "ready") return;
-  await new Promise<void>((resolve, reject) => {
+  const existing = redisReadiness.get(connection); if (existing) return existing;
+  const readiness = new Promise<void>((resolve, reject) => {
     const cleanup = () => { clearTimeout(timer); connection.off("ready", onReady); connection.off("error", onError); connection.off("end", onEnd); };
     const onReady = () => { cleanup(); resolve(); };
     const onError = (error: Error) => { cleanup(); reject(error); };
     const onEnd = () => { cleanup(); reject(new Error("Redis connection ended before becoming ready")); };
     const timer = setTimeout(() => { cleanup(); reject(new Error("Redis readiness connection timed out")); }, timeoutMs); timer.unref?.();
     connection.once("ready", onReady); connection.once("error", onError); connection.once("end", onEnd);
-    if (connection.status === "wait") void connection.connect().catch(onError);
+    if (connection.status === "ready") onReady(); else if (connection.status === "wait") void connection.connect().catch(onError);
   });
+  redisReadiness.set(connection, readiness); void readiness.then(() => redisReadiness.delete(connection), () => redisReadiness.delete(connection)); return readiness;
 }
-export async function pingQueueConnection() { const connection = getQueueConnection(); await waitForRedisReady(connection); return connection.ping(); }
+export async function getReadyQueueConnection() { const connection = getQueueConnection(); await waitForRedisReady(connection); return connection; }
+export async function pingQueueConnection() { return (await getReadyQueueConnection()).ping(); }
 const retention = { age: 24 * 60 * 60, count: 1_000 };
 export function getJobQueue() { return queue ??= new Queue<QueuedJob>(JOB_QUEUE_NAME, { connection: getQueueConnection(), defaultJobOptions: { attempts: 3, backoff: { type: "exponential", delay: 1000 }, removeOnComplete: retention, removeOnFail: retention } }); }
 export function getAiJobQueue() { return aiQueue ??= new Queue<QueuedJob>(AI_JOB_QUEUE_NAME, { connection: getQueueConnection(), defaultJobOptions: { attempts: 3, backoff: { type: "exponential", delay: 2000 }, removeOnComplete: retention, removeOnFail: retention } }); }

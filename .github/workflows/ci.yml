@@ -451,5 +451,12 @@ jobs:
       - name: Print worker diagnostics on failure
         if: failure()
         run: |
-          docker logs dip-release-b-worker
+          set +e
+          docker ps -a
+          if docker container inspect dip-release-b-worker >/dev/null 2>&1; then
+            docker logs dip-release-b-worker 2>&1 | sed -E 's#(Bearer )[A-Za-z0-9._~-]+#\1[REDACTED]#g; s#(postgres(ql)?://)[^@[:space:]]+@#\1[REDACTED]@#g; s#dip_v1_[A-Za-z0-9_-]+#[REDACTED_API_KEY]#g'
+          else
+            echo "Worker container was not created; no worker logs are available."
+          fi
           test ! -f /tmp/dip-release-b-web.log || sed -E 's#(Bearer )[A-Za-z0-9._~-]+#\1[REDACTED]#g; s#(postgres(ql)?://)[^@[:space:]]+@#\1[REDACTED]@#g; s#dip_v1_[A-Za-z0-9_-]+#[REDACTED_API_KEY]#g' /tmp/dip-release-b-web.log | tail -n 200
+          exit 0
