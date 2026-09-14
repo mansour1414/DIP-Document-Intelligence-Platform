@@ -9,6 +9,6 @@ export function routeAiTask(task: GatewayTask): AiRoute {
   const provider = (process.env.AI_PROVIDER ?? "gemini").toLowerCase();
   if (provider !== "gemini") throw new AiGatewayError("AI_PROVIDER_NOT_REGISTERED", `AI provider ${provider} is not registered.`);
   const routeClass: AiRouteClass = task.toolId === "extract-data" ? "high_accuracy" : task.toolId === "chat-with-pdf" ? "balanced" : "economy";
-  const model = process.env[`GEMINI_MODEL_${routeClass.toUpperCase()}`] ?? process.env.GEMINI_MODEL ?? "gemini-2.5-flash";
+  const model = process.env[`GEMINI_MODEL_${routeClass.toUpperCase()}`] ?? process.env.GEMINI_MODEL ?? "gemini-3.6-flash";
   return { adapter: new GeminiProviderAdapter(), model, routeClass };
 }

@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 import { executeAiGateway, AiGatewayError, type AiProviderAdapter, type AiRequestContext, type AiTask } from "../src/lib/ai/gateway";
 import { assertDocumentScope } from "../src/lib/ai/gateway/policy";
 import { buildProviderRequest } from "../src/lib/ai/gateway/task";
+import { routeAiTask } from "../src/lib/ai/gateway/routing";
 import { validateProviderResponse } from "../src/lib/ai/gateway/validation";
 import { workerToolIds, toolRegistry } from "../src/lib/tools/registry";
 import { extractPdfTextServer, serializePdfPages } from "../src/lib/pdf/text-server";
@@ -11,6 +12,20 @@ import { PDFDocument } from "pdf-lib";
 import { normalizePdfJsData } from "../src/lib/pdf/pdfjs-data";
 
 const baseTask: AiTask = { toolId: "summarize-pdf", locale: "en", documentId: "11111111-1111-1111-1111-111111111111", documentText: "[PAGE 1]\nDIP contract\n[/PAGE 1]", pageCount: 1 };
+
+test("document AI routes default to the supported Gemini model without bypassing route classes", () => {
+  const names = ["GEMINI_MODEL", "GEMINI_MODEL_ECONOMY", "GEMINI_MODEL_BALANCED", "GEMINI_MODEL_HIGH_ACCURACY"] as const;
+  const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+  for (const name of names) delete process.env[name];
+  try {
+    for (const toolId of ["summarize-pdf", "chat-with-pdf", "extract-data"] as const) {
+      const route = routeAiTask({ ...baseTask, toolId, ...(toolId === "chat-with-pdf" ? { question: "Cite the document." } : {}) });
+      assert.equal(route.model, "gemini-3.6-flash");
+    }
+  } finally {
+    for (const name of names) { if (previous[name] === undefined) delete process.env[name]; else process.env[name] = previous[name]; }
+  }
+});
 
 test("all three AI tools are registered on the unified worker with AI schemas", () => {
   for (const tool of ["summarize-pdf", "chat-with-pdf", "extract-data"]) { assert.ok(workerToolIds.has(tool)); assert.equal(toolRegistry[tool].executionMode, "ai"); assert.notDeepEqual(toolRegistry[tool].outputSchema, toolRegistry["merge-pdf"].outputSchema); }
