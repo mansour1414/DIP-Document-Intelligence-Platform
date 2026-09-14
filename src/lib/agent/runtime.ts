@@ -29,7 +29,11 @@ const productionPlanner: Planner = (task, context) => executeAiGateway(task, con
 
 async function audit(userId: string, event: AgentAuditEvent, context: Parameters<typeof agentAuditContext>[0], resourceId?: string) {
   const details = agentAuditContext(context); logger.info(event, details);
-  await withTenant({ userId }, (tx) => tx.auditLog.create({ data: { userId, action: event, resource: "agent_run", resourceId, details: Object.fromEntries(Object.entries(details).filter(([, value]) => value !== undefined)) } }));
+  const persistedDetails = JSON.stringify(Object.fromEntries(Object.entries(details).filter(([, value]) => value !== undefined)));
+  await withTenant({ userId }, (tx) => tx.$executeRaw`
+    INSERT INTO audit_logs(id, user_id, action, resource, resource_id, details)
+    VALUES (${randomUUID()}::uuid, ${userId}::uuid, ${event}, 'agent_run', ${resourceId ?? null}::uuid, ${persistedDetails}::jsonb)
+  `);
 }
 
 function trustedBudget(entitlements: Awaited<ReturnType<typeof resolvePlan>>["entitlements"]): AgentBudget {

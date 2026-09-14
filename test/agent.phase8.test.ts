@@ -48,6 +48,15 @@ test("Phase 8 migration has origin, lifecycle constraints, indexes, grants, and 
   assert.match(migration, /CREATE (?:UNIQUE )?INDEX/);
 });
 
+test("Agent audit migration grants INSERT only and enforces the tenant boundary", async () => {
+  const migration = await file("prisma/migrations/20260913130000_phase8_agent_audit_permissions/migration.sql");
+  assert.match(migration, /ALTER TABLE "audit_logs" ENABLE ROW LEVEL SECURITY/);
+  assert.match(migration, /ALTER TABLE "audit_logs" FORCE ROW LEVEL SECURITY/);
+  assert.match(migration, /CREATE POLICY audit_logs_tenant_insert_policy ON "audit_logs"\s+FOR INSERT\s+WITH CHECK \(\s*"user_id" = NULLIF\(current_setting\('app\.current_user_id', true\), ''\)::uuid\s*\)/);
+  assert.match(migration, /GRANT INSERT ON "audit_logs" TO dip_app/);
+  assert.doesNotMatch(migration, /GRANT (?:ALL|SELECT|UPDATE|DELETE)[^;]*"audit_logs"/);
+});
+
 test("first-party APIs authenticate and bind identity server-side", async () => {
   const sources = await Promise.all([
     file("src/app/api/agent-runs/route.ts"),
@@ -73,4 +82,6 @@ test("Agent runtime delegates execution only through the Workflow service", asyn
   assert.match(source, /startWorkflowRun/);
   assert.match(source, /cancelWorkflowRun/);
   assert.doesNotMatch(source, /documentWorker|aiWorker|processDocument|enqueueJob|provider\.generate/);
+  assert.match(source, /\$executeRaw`\s*INSERT INTO audit_logs/);
+  assert.doesNotMatch(source, /auditLog\.create/);
 });

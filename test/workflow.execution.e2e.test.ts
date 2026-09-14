@@ -119,6 +119,20 @@ integration("Phase 7 executes a real multi-step workflow with retry, failure, ca
 
     const attackerId = randomUUID();
     await owner.user.create({ data: { id: attackerId, email: `workflow-e2e-attacker-${attackerId}@example.invalid` } });
+    const auditPrivilege = await db.$queryRaw<Array<{ can_insert: boolean; can_select: boolean; can_update: boolean; can_delete: boolean }>>`
+      SELECT has_table_privilege(current_user, 'audit_logs', 'INSERT') AS can_insert,
+             has_table_privilege(current_user, 'audit_logs', 'SELECT') AS can_select,
+             has_table_privilege(current_user, 'audit_logs', 'UPDATE') AS can_update,
+             has_table_privilege(current_user, 'audit_logs', 'DELETE') AS can_delete
+    `;
+    assert.deepEqual(auditPrivilege, [{ can_insert: true, can_select: false, can_update: false, can_delete: false }]);
+    await assert.rejects(
+      () => withTenant({ userId: attackerId }, (tx) => tx.$executeRaw`
+        INSERT INTO audit_logs(id, user_id, action, resource, resource_id, details)
+        VALUES (${randomUUID()}::uuid, ${userId}::uuid, 'agent.cross_tenant.denied', 'agent_run', ${agent.id}::uuid, '{}'::jsonb)
+      `),
+      /row-level security policy|permission denied/i,
+    );
     const victimBeforeAttack = await withTenant({ userId }, (tx) => tx.job.findUniqueOrThrow({ where: { id: records[0].id }, include: { steps: true, toolExecutions: true } }));
     const victimRunBeforeAttack = await withTenant({ userId }, (tx) => tx.workflowRun.findUniqueOrThrow({ where: { id: successRun.id } }));
     const victimOutputBeforeAttack = await withTenant({ userId }, (tx) => tx.file.findUniqueOrThrow({ where: { id: firstOutputs[0] } }));
