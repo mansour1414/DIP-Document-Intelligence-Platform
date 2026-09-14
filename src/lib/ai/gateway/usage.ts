@@ -1,6 +1,6 @@
-import { db } from "@/lib/db";
 import type { AiRequestContext, ProviderResponse } from "./types";
 import { acquireTransactionAdvisoryLock } from "@/lib/db/advisory-lock";
+import { withTenant } from "@/lib/db/tenant";
 
 function envNumber(name: string, fallback: number) { const value = Number(process.env[name]); return Number.isFinite(value) && value >= 0 ? value : fallback; }
 
@@ -14,7 +14,7 @@ export async function recordAiUsageOnce(context: AiRequestContext, response: Pro
   const cost = estimateAiCost(response);
   const reference = context.agentRunId ? { agentRunId: context.agentRunId } : { jobId: context.jobId };
   const referenceKey = context.agentRunId ? `agent:${context.agentRunId}` : `job:${context.jobId}`;
-  return db.$transaction(async (tx) => {
+  return withTenant({ userId: context.userId }, async (tx) => {
     await acquireTransactionAdvisoryLock(tx, `ai-usage:${referenceKey}`);
     const existing = await tx.aiUsage.findFirst({ where: reference, select: { id: true, cost: true } });
     if (existing) return { id: existing.id, cost: Number(existing.cost), reused: true };
@@ -23,5 +23,5 @@ export async function recordAiUsageOnce(context: AiRequestContext, response: Pro
   // The advisory lock serializes the concrete Job or AgentRun usage key.
   // READ COMMITTED gives a waiter a fresh snapshot after the lock holder commits;
   // SERIALIZABLE would retain its pre-wait snapshot and raise P2034 on the insert.
-  }, { isolationLevel: "ReadCommitted" });
+  });
 }

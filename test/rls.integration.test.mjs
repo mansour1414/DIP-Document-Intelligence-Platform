@@ -21,6 +21,7 @@ integrationTest("dip_app pooled RLS isolates tenants and fails closed", async ()
     executionA: randomUUID(), executionB: randomUUID(),
     eventA: randomUUID(), eventB: randomUUID(),
     usageA: randomUUID(), usageB: randomUUID(),
+    accountingJob: randomUUID(),
   };
   const owner = new Client({ connectionString: ownerUrl });
   const runtime = new PrismaClient({
@@ -97,6 +98,19 @@ integrationTest("dip_app pooled RLS isolates tenants and fails closed", async ()
 
     const noContext = await runtime.$transaction((tx) => tx.$queryRaw`SELECT id FROM documents`);
     assert.deepEqual(noContext, []);
+
+    const { recordAiUsageOnce } = await import("../src/lib/ai/gateway/usage");
+    const accountingContext = { userId: ids.userA, jobId: ids.accountingJob, toolId: "summarize-pdf", correlationId: randomUUID() };
+    const accountingResponse = { provider: "integration", model: "fixture", text: "ok", inputTokens: 10, outputTokens: 5, latencyMs: 1 };
+    const creditsBefore = Number((await owner.query(`SELECT count(*) FROM credit_ledger WHERE user_id = ANY($1::uuid[])`, [[ids.userA, ids.userB]])).rows[0].count);
+    const [createdUsage, replayedUsage] = await Promise.all([recordAiUsageOnce(accountingContext, accountingResponse), recordAiUsageOnce(accountingContext, accountingResponse)]);
+    assert.equal([createdUsage, replayedUsage].filter((entry) => !entry.reused).length, 1);
+    assert.equal(await withTenant(ids.userA, (tx) => tx.aiUsage.count({ where: { userId: ids.userA, jobId: ids.accountingJob } })), 1);
+    assert.equal(await withTenant(ids.userB, (tx) => tx.aiUsage.count({ where: { userId: ids.userA, jobId: ids.accountingJob } })), 0);
+    await assert.rejects(() => runtime.aiUsage.create({ data: { userId: ids.userA, jobId: randomUUID(), provider: "test", model: "test", taskType: "test", tokensInput: 1, tokensOutput: 1, cost: 0 } }), /row-level security|42501/i);
+    await assert.rejects(() => withTenant(ids.userB, (tx) => tx.aiUsage.create({ data: { userId: ids.userA, jobId: randomUUID(), provider: "test", model: "test", taskType: "test", tokensInput: 1, tokensOutput: 1, cost: 0 } })), /row-level security|42501/i);
+    const creditsAfter = Number((await owner.query(`SELECT count(*) FROM credit_ledger WHERE user_id = ANY($1::uuid[])`, [[ids.userA, ids.userB]])).rows[0].count);
+    assert.equal(creditsAfter, creditsBefore);
 
     const role = (await owner.query(`SELECT rolsuper,rolbypassrls,rolcreaterole,rolcreatedb FROM pg_roles WHERE rolname='dip_app'`)).rows[0];
     assert.deepEqual(role, { rolsuper: false, rolbypassrls: false, rolcreaterole: false, rolcreatedb: false });
