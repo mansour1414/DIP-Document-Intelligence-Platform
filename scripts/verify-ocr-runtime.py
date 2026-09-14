@@ -23,14 +23,15 @@ def sanitized(value: str) -> str:
 
 
 executable_paths: dict[str, str] = {}
-for executable in ("ocrmypdf", "tesseract"):
+for executable in ("ocrmypdf", "tesseract", "qpdf", "soffice"):
     executable_path = which(executable)
     if executable_path is None:
         fail(f"required executable '{executable}' was not found")
     executable_paths[executable] = executable_path
 
-if which("gs") is not None:
-    fail("Ghostscript executable 'gs' is present in the approved OCR runtime")
+for prohibited in ("gs", "ghostscript"):
+    if which(prohibited) is not None:
+        fail(f"prohibited Ghostscript executable '{prohibited}' is present")
 
 try:
     ocrmypdf_version = version("ocrmypdf")
@@ -80,6 +81,17 @@ missing_languages = {"ara", "eng"} - available_languages
 if missing_languages:
     fail(f"missing Tesseract language packs: {', '.join(sorted(missing_languages))}")
 
+runtime_versions: dict[str, str] = {}
+for executable, arguments in (
+    ("tesseract", ["--version"]),
+    ("qpdf", ["--version"]),
+    ("soffice", ["--version"]),
+):
+    probe = run([executable, *arguments], capture_output=True, text=True, timeout=20)
+    if probe.returncode != 0:
+        fail(f"required executable '{executable}' version probe failed")
+    runtime_versions[executable] = sanitized(probe.stdout or probe.stderr).splitlines()[0]
+
 with TemporaryDirectory(prefix="dip-ocr-runtime-") as directory:
     fixture = Path(directory) / "input.png"
     output = Path(directory) / "output.pdf"
@@ -124,5 +136,6 @@ with TemporaryDirectory(prefix="dip-ocr-runtime-") as directory:
 print(
     "Approved OCR runtime verified: "
     f"OCRmyPDF {ocrmypdf_version}, pypdfium2 {pdfium_version}, "
-    "Tesseract languages ara+eng, Ghostscript absent"
+    f"{runtime_versions['tesseract']}, {runtime_versions['qpdf']}, "
+    f"{runtime_versions['soffice']}, Tesseract languages ara+eng, Ghostscript absent"
 )

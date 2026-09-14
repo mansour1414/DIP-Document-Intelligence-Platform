@@ -11,8 +11,8 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
@@ -23,8 +23,8 @@ jobs:
     name: Type Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
@@ -36,8 +36,8 @@ jobs:
     name: Build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
@@ -75,8 +75,8 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
@@ -112,6 +112,9 @@ jobs:
   processing-integration:
     name: Integration / Processing
     runs-on: ubuntu-latest
+    env:
+      CLAMD_HOST: 127.0.0.1
+      CLAMD_PORT: "3310"
     services:
       postgres:
         image: postgres:16-alpine
@@ -134,12 +137,12 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - run: npm ci
@@ -155,6 +158,10 @@ jobs:
         run: python scripts/generate-processing-corpus.py
       - name: Start local S3-compatible storage
         run: docker run --detach --name dip-minio --publish 9000:9000 --env MINIO_ROOT_USER=minioadmin --env MINIO_ROOT_PASSWORD=minioadmin quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e server /data
+      - name: Start private malware scanner
+        run: docker run --detach --name dip-clamd --publish 127.0.0.1:3310:3310 --env CLAMD_CONF_StreamMaxLength=100M clamav/clamav:1.4.3
+      - name: Wait for malware scanner readiness
+        run: for i in {1..180}; do docker exec dip-clamd clamdscan --ping=1 && exit 0; sleep 2; done; docker logs dip-clamd; exit 1
       - name: Wait for object storage readiness
         run: for i in {1..30}; do curl --fail --silent http://localhost:9000/minio/health/ready && exit 0; sleep 1; done; exit 1
       - name: Create isolated test bucket
@@ -214,3 +221,36 @@ jobs:
           RUN_PROCESSING_CORPUS: "1"
           FULL_PROCESSING_E2E: "1"
           REDIS_E2E: "1"
+
+  worker-image:
+    name: Production worker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build dedicated document worker
+        run: docker build --file Dockerfile.worker --tag dip-document-worker:release-a .
+      - name: Verify non-root runtime identity
+        run: test "$(docker run --rm --entrypoint id dip-document-worker:release-a -u)" = "10001"
+      - name: Verify worker runtime and prohibited dependency gate
+        run: docker run --rm --read-only --tmpfs /tmp/dip:rw,noexec,nosuid,size=256m --entrypoint python3 dip-document-worker:release-a scripts/verify-ocr-runtime.py
+      - name: Print immutable worker dependency versions
+        run: |
+          docker run --rm --entrypoint node dip-document-worker:release-a --version
+          docker run --rm --entrypoint soffice dip-document-worker:release-a --version
+          docker run --rm --entrypoint qpdf dip-document-worker:release-a --version
+          docker run --rm --entrypoint tesseract dip-document-worker:release-a --version
+      - name: Start private ClamAV scanner
+        run: docker run --detach --name dip-clamd --publish 127.0.0.1:3310:3310 --env CLAMD_CONF_StreamMaxLength=100M clamav/clamav:1.4.3
+      - name: Wait for ClamAV signatures and clamd readiness
+        run: for i in {1..180}; do docker exec dip-clamd clamdscan --ping=1 && exit 0; sleep 2; done; docker logs dip-clamd; exit 1
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Run safe EICAR scanner integration
+        run: node --import ./scripts/node-platform-compat.mjs --import tsx --test test/malware-scanning.test.ts
+        env:
+          CLAMD_E2E: "1"
+          CLAMD_HOST: 127.0.0.1
+          CLAMD_PORT: "3310"

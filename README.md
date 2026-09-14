@@ -145,6 +145,9 @@ Before the first deployment, set production values for every variable in
 `.env.example`, create and review a Prisma migration, and configure the
 provider-specific S3/R2 adapter behind `src/lib/storage`.
 
+The concise deployment, migration, rollback, backup/restore, incident, and
+secret-rotation procedures are in [`docs/operator-runbook.md`](docs/operator-runbook.md).
+
 ## License
 
 Proprietary — All rights reserved.

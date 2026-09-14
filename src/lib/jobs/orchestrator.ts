@@ -7,6 +7,7 @@ import { logger } from "@/lib/logging";
 import { enforceJobCreation } from "@/lib/usage/enforcement";
 import { measure, recordMetric } from "@/lib/observability/metrics";
 import { withTenant } from "@/lib/db/tenant";
+import { requireCleanUpload } from "@/lib/malware";
 
 type Upload = { filename: string; mimeType: string; bytes: Uint8Array };
 export async function createToolJob(input: { userId: string; toolId: string; uploads: Upload[]; options?: Record<string, string | number | boolean>; idempotencyKey: string; correlationId?: string; organizationId?: string; apiClientId?: string }) {
@@ -19,7 +20,11 @@ export async function createToolJob(input: { userId: string; toolId: string; upl
   const existing = await measure("db_job_idempotency_query", { tool_id: tool.toolId }, () => withTenant({ userId: input.userId }, (tx) => tx.job.findUnique({ where: { toolId_idempotencyKey: { toolId: tool.toolId, idempotencyKey: input.idempotencyKey } }, select: { id: true, status: true } })));
   if (existing) return { ...existing, reused: true };
   const storage = getStorage();
-  const prepared = await Promise.all(input.uploads.map(async (upload) => ({ upload, validation: await validateUpload({ toolId: tool.toolId, declaredMime: upload.mimeType, bytes: upload.bytes }) })));
+  const prepared = await Promise.all(input.uploads.map(async (upload) => {
+    const validation = await validateUpload({ toolId: tool.toolId, declaredMime: upload.mimeType, bytes: upload.bytes });
+    const malwareScan = await requireCleanUpload(upload.bytes);
+    return { upload, validation, malwareScan };
+  }));
   const monetization = await enforceJobCreation({ userId: input.userId, toolId: tool.toolId, idempotencyKey: input.idempotencyKey, correlationId, options: input.options, files: prepared.map(({upload,validation})=>({size:upload.bytes.byteLength,pageCount:validation.pageCount})) });
   const stored: Array<{ key: string; bucket: string; upload: Upload; validation: Awaited<ReturnType<typeof validateUpload>> }> = [];
   try {
