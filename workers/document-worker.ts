@@ -51,7 +51,7 @@ async function processDocumentJob(message: QueuedJob) {
       await tenant(async (tx) => {
         const current = await tx.job.findUniqueOrThrow({ where: { id: job.id }, select: { outputFileId: true } });
         if (current.outputFileId) return;
-        const outputDocument = await tx.document.create({ data: { userId: job.requesterId!, title: `${job.toolId} output` } }); const outputFileIds: string[] = [];
+        const outputDocument = await tx.document.create({ data: { userId: job.requesterId!, organizationId: job.organizationId, title: `${job.toolId} output` } }); const outputFileIds: string[] = [];
         for (const item of storedOutputs) { const outputFile = await tx.file.create({ data: { document: { connect: { id: outputDocument.id } }, originalName: item.output.name, mimeType: item.output.mimeType, size: BigInt(item.output.bytes.byteLength), storageKey: item.object.key, checksum: item.checksum, storageObject: { connectOrCreate: { where: { provider_bucket_objectKey: { provider: "s3", bucket: item.object.bucket, objectKey: item.object.key } }, create: { provider: "s3", bucket: item.object.bucket, objectKey: item.object.key, size: BigInt(item.output.bytes.byteLength), checksum: item.checksum } } } } }); await tx.fileVersion.create({ data: { fileId: outputFile.id, ownerId: job.requesterId!, version: 1, storageKey: item.object.key, checksum: item.checksum } }); outputFileIds.push(outputFile.id); }
         await tx.job.update({ where: { id: job.id }, data: { outputFileId: outputFileIds[0], status: "SUCCEEDED", result: { outputFileIds }, completedAt: new Date() } });
         if (step) await tx.jobStep.update({ where: { id: step.id }, data: { status: "SUCCEEDED", output: { outputFileIds }, completedAt: new Date() } });

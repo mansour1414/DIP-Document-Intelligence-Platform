@@ -1,0 +1,3 @@
+import { handlePublicApi } from "@/lib/public-api/request";
+import { parsePublicJobRequest, submitPublicJob } from "@/lib/public-api/jobs";
+export async function POST(request: Request) { return handlePublicApi(request, "/v1/jobs", "jobs:create", async (context) => { const input = await parsePublicJobRequest(request); context.bytesIn = input.bytesIn; context.toolId = input.toolId; const result = await submitPublicJob(context.principal, input); context.creditsUsed = result.chargedCredits; return Response.json({ data: result.job, meta: { idempotentReplay: result.replayed } }, { status: result.replayed ? 200 : 202 }); }); }

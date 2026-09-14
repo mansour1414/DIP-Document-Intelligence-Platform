@@ -9,7 +9,7 @@ import { measure, recordMetric } from "@/lib/observability/metrics";
 import { withTenant } from "@/lib/db/tenant";
 
 type Upload = { filename: string; mimeType: string; bytes: Uint8Array };
-export async function createToolJob(input: { userId: string; toolId: string; uploads: Upload[]; options?: Record<string, string | number | boolean>; idempotencyKey: string; correlationId?: string }) {
+export async function createToolJob(input: { userId: string; toolId: string; uploads: Upload[]; options?: Record<string, string | number | boolean>; idempotencyKey: string; correlationId?: string; organizationId?: string; apiClientId?: string }) {
   const apiStarted = performance.now();
   const tool = getToolDefinition(input.toolId);
   const minimumFiles = input.toolId === "merge-pdf" ? 2 : 1;
@@ -25,9 +25,9 @@ export async function createToolJob(input: { userId: string; toolId: string; upl
   try {
     for (const item of prepared) { const key = storage.createUploadKey({ userId: input.userId, filename: item.upload.filename }); const object = await storage.put({ key, bytes: item.upload.bytes, contentType: item.validation.mimeType, checksum: item.validation.checksum }); stored.push({ key: object.key, bucket: object.bucket, upload: item.upload, validation: item.validation }); }
     const job = await withTenant({ userId: input.userId }, async (tx) => {
-      const document = await tx.document.create({ data: { userId: input.userId, title: `${tool.name} input` } });
+      const document = await tx.document.create({ data: { userId: input.userId, organizationId: input.organizationId, title: `${tool.name} input` } });
       const files = await Promise.all(stored.map(async (item) => { const file = await tx.file.create({ data: { document: { connect: { id: document.id } }, originalName: item.upload.filename.slice(0, 255), mimeType: item.validation.mimeType, size: BigInt(item.upload.bytes.byteLength), storageKey: item.key, checksum: item.validation.checksum, pageCount: item.validation.pageCount, storageObject: { connectOrCreate: { where: { provider_bucket_objectKey: { provider: "s3", bucket: item.bucket, objectKey: item.key } }, create: { provider: "s3", bucket: item.bucket, objectKey: item.key, size: BigInt(item.upload.bytes.byteLength), checksum: item.validation.checksum } } } } }); await tx.fileVersion.create({ data: { fileId: file.id, ownerId: input.userId, version: 1, storageKey: item.key, checksum: item.validation.checksum } }); return file; }));
-      return tx.job.create({ data: { toolId: tool.toolId, idempotencyKey: input.idempotencyKey, requesterId: input.userId, inputFileId: files[0].id, status: "QUEUED", params: { inputFileIds: files.map((file) => file.id), options: input.options ?? {} }, correlationId, steps: { create: { name: tool.toolId, idempotencyKey: `${input.idempotencyKey}:${tool.toolId}`, status: "QUEUED", correlationId } } }, select: { id: true, status: true } });
+      return tx.job.create({ data: { toolId: tool.toolId, idempotencyKey: input.idempotencyKey, requesterId: input.userId, organizationId: input.organizationId, apiClientId: input.apiClientId, inputFileId: files[0].id, status: "QUEUED", params: { inputFileIds: files.map((file) => file.id), options: input.options ?? {} }, correlationId, steps: { create: { name: tool.toolId, idempotencyKey: `${input.idempotencyKey}:${tool.toolId}`, status: "QUEUED", correlationId } } }, select: { id: true, status: true } });
     });
     const queuedJob = { jobId: job.id, toolId: tool.toolId, idempotencyKey: input.idempotencyKey, correlationId, userId: input.userId };
     const queueOptions = { priority: monetization.entitlements.processingPriority === "high" ? 1 : 5 };

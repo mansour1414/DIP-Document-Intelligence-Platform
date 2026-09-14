@@ -77,6 +77,7 @@ TO dip_app;
 
 GRANT SELECT, INSERT, UPDATE ON storage_objects TO dip_app;
 GRANT INSERT ON audit_logs TO dip_app;
+GRANT SELECT, INSERT ON api_usage TO dip_app;
 
 GRANT SELECT ON plans, plan_entitlements, ai_provider_prices TO dip_app;
 GRANT SELECT, INSERT ON credit_ledger TO dip_app;

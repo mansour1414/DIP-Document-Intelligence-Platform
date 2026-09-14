@@ -19,25 +19,26 @@ model User {
   createdAt      DateTime   @default(now()) @map("created_at")
   updatedAt      DateTime   @updatedAt @map("updated_at")
 
-  memberships     Membership[]
-  apiKeys         ApiKey[]
-  jobs            Job[]            @relation("RequesterJobs")
-  documents       Document[]
-  aiConversations AiConversation[]
-  aiUsage         AiUsage[]
-  subscriptions   Subscription[]
-  invoices        Invoice[]
-  payments        Payment[]
-  creditPurchases CreditPurchase[]
-  usageEvents     UsageEvent[]
-  billingEvents   BillingEvent[]
-  accounts        Account[]
-  sessions        Session[]
-  creditLedger    CreditLedger[]
-  fileVersions    FileVersion[]
-  workflows       Workflow[]
-  workflowRuns    WorkflowRun[]
-  agentRuns       AgentRun[]
+  memberships       Membership[]
+  apiKeys           ApiKey[]
+  jobs              Job[]            @relation("RequesterJobs")
+  documents         Document[]
+  aiConversations   AiConversation[]
+  aiUsage           AiUsage[]
+  subscriptions     Subscription[]
+  invoices          Invoice[]
+  payments          Payment[]
+  creditPurchases   CreditPurchase[]
+  usageEvents       UsageEvent[]
+  billingEvents     BillingEvent[]
+  accounts          Account[]
+  sessions          Session[]
+  creditLedger      CreditLedger[]
+  fileVersions      FileVersion[]
+  workflows         Workflow[]
+  workflowRuns      WorkflowRun[]
+  agentRuns         AgentRun[]
+  createdApiClients ApiClient[]      @relation("ApiClientCreator")
 
   @@index([status])
   @@map("users")
@@ -59,6 +60,8 @@ model Organization {
   apiKeys               ApiKey[]
   auditLogs             AuditLog[]
   apiIdempotencyRecords ApiIdempotencyRecord[]
+  apiUsage              ApiUsage[]
+  jobs                  Job[]
 
   @@map("organizations")
 }
@@ -126,16 +129,20 @@ model ApiKey {
 }
 
 model ApiClient {
-  id             String          @id @default(uuid()) @db.Uuid
-  organizationId String          @map("organization_id") @db.Uuid
-  name           String          @db.VarChar(100)
-  status         ApiClientStatus @default(ACTIVE)
-  createdAt      DateTime        @default(now()) @map("created_at")
-  updatedAt      DateTime        @updatedAt @map("updated_at")
+  id              String          @id @default(uuid()) @db.Uuid
+  organizationId  String          @map("organization_id") @db.Uuid
+  createdByUserId String          @map("created_by_user_id") @db.Uuid
+  name            String          @db.VarChar(100)
+  status          ApiClientStatus @default(ACTIVE)
+  createdAt       DateTime        @default(now()) @map("created_at")
+  updatedAt       DateTime        @updatedAt @map("updated_at")
 
   organization       Organization           @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  createdBy          User                   @relation("ApiClientCreator", fields: [createdByUserId], references: [id], onDelete: Restrict)
   apiKeys            ApiKey[]
   idempotencyRecords ApiIdempotencyRecord[]
+  jobs               Job[]
+  apiUsage           ApiUsage[]
 
   @@unique([organizationId, name])
   @@index([organizationId, status])
@@ -295,6 +302,8 @@ model Job {
   updatedAt      DateTime  @updatedAt @map("updated_at")
   workflowRunId  String?   @map("workflow_run_id") @db.Uuid
   workflowNodeId String?   @map("workflow_node_id") @db.VarChar(100)
+  organizationId String?   @map("organization_id") @db.Uuid
+  apiClientId    String?   @map("api_client_id") @db.Uuid
 
   requester      User?           @relation("RequesterJobs", fields: [requesterId], references: [id])
   inputFile      File?           @relation("InputFiles", fields: [inputFileId], references: [id])
@@ -303,6 +312,8 @@ model Job {
   events         JobEvent[]
   toolExecutions ToolExecution[]
   workflowRun    WorkflowRun?    @relation(fields: [workflowRunId], references: [id], onDelete: Restrict)
+  organization   Organization?   @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  apiClient      ApiClient?      @relation(fields: [apiClientId], references: [id], onDelete: Restrict)
 
   @@unique([toolId, idempotencyKey])
   @@unique([workflowRunId, workflowNodeId])
@@ -312,6 +323,7 @@ model Job {
   @@index([createdAt])
   @@index([requesterId, correlationId])
   @@index([workflowRunId, status])
+  @@index([organizationId, apiClientId, createdAt])
   @@map("jobs")
 }
 
@@ -708,6 +720,30 @@ model UsageEvent {
   @@unique([userId, kind, reference])
   @@index([userId, kind, occurredAt])
   @@map("usage_events")
+}
+
+model ApiUsage {
+  id             String   @id @default(uuid()) @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  apiClientId    String   @map("api_client_id") @db.Uuid
+  requestId      String   @unique @map("request_id") @db.Uuid
+  route          String   @db.VarChar(120)
+  method         String   @db.VarChar(10)
+  toolId         String?  @map("tool_id") @db.VarChar(50)
+  statusCode     Int      @map("status_code")
+  requestCount   Int      @default(1) @map("request_count")
+  bytesIn        BigInt   @default(0) @map("bytes_in")
+  bytesOut       BigInt   @default(0) @map("bytes_out")
+  creditsUsed    Decimal  @default(0) @map("credits_used") @db.Decimal(12, 2)
+  occurredAt     DateTime @default(now()) @map("occurred_at")
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  apiClient    ApiClient    @relation(fields: [apiClientId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, occurredAt])
+  @@index([apiClientId, occurredAt])
+  @@index([toolId, occurredAt])
+  @@map("api_usage")
 }
 
 model AiProviderPrice {

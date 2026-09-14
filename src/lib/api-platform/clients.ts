@@ -12,7 +12,7 @@ const name = (value: string) => { const result = value.trim(); if (!result || re
 const scopes = (value: readonly string[]) => [...new Set(value)].filter((item) => /^[a-z][a-z0-9:_-]{0,63}$|^\*$/.test(item)).slice(0, 50);
 
 export async function createApiClient(actorUserId: string, organizationId: string, clientName: string) {
-  return withOrganization({ userId: actorUserId, organizationId }, async (tx) => { await requireManager(tx, organizationId, actorUserId); const client = await tx.apiClient.create({ data: { organizationId, name: name(clientName) } }); await writeBusinessAudit(tx, { organizationId, actorUserId, action: "api_client.created", resource: "api_client", resourceId: client.id, details: { name: client.name } }); return client; });
+  return withOrganization({ userId: actorUserId, organizationId }, async (tx) => { await requireManager(tx, organizationId, actorUserId); const client = await tx.apiClient.create({ data: { organizationId, createdByUserId: actorUserId, name: name(clientName) } }); await writeBusinessAudit(tx, { organizationId, actorUserId, action: "api_client.created", resource: "api_client", resourceId: client.id, details: { name: client.name } }); return client; });
 }
 
 export async function setApiClientStatus(actorUserId: string, organizationId: string, clientId: string, status: "ACTIVE" | "INACTIVE") {

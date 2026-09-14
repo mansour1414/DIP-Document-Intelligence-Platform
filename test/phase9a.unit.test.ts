@@ -23,7 +23,7 @@ test("organization policy prevents member and self privilege escalation", () => 
 });
 
 test("API auth rejects unknown, revoked, expired, and inactive-client keys", () => {
-  const secret = "s".repeat(43); const base = { key_id: crypto.randomUUID(), key_hash: apiKeyVerifier(secret), key_status: "ACTIVE", expires_at: null, api_client_id: crypto.randomUUID(), client_status: "ACTIVE", organization_id: crypto.randomUUID(), organization_status: "ACTIVE", scopes: ["jobs:create"] };
+  const secret = "s".repeat(43); const base = { key_id: crypto.randomUUID(), key_hash: apiKeyVerifier(secret), key_status: "ACTIVE", expires_at: null, api_client_id: crypto.randomUUID(), client_status: "ACTIVE", organization_id: crypto.randomUUID(), organization_status: "ACTIVE", execution_user_id: crypto.randomUUID(), scopes: ["jobs:create"] };
   assert.equal(principalFromApiKeyCandidate(secret, base).organizationId, base.organization_id);
   assert.throws(() => principalFromApiKeyCandidate(secret, undefined), /API_AUTHENTICATION_FAILED/);
   assert.throws(() => principalFromApiKeyCandidate("x".repeat(43), base), /API_AUTHENTICATION_FAILED/);

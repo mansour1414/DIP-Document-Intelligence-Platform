@@ -1,0 +1,3 @@
+import { handlePublicApi } from "@/lib/public-api/request";
+import { downloadPublicJobResult } from "@/lib/public-api/jobs";
+export async function GET(request: Request, { params }: { params: Promise<{ jobId: string; fileId: string }> }) { return handlePublicApi(request, "/v1/jobs/:jobId/result/:fileId", "jobs:read", async ({ principal }) => { const { jobId, fileId } = await params; const file = await downloadPublicJobResult(principal, jobId, fileId); const name = file.originalName.replace(/["\\\r\n]/g, "_"); return new Response(file.bytes as BodyInit, { headers: { "content-type": file.mimeType, "content-disposition": `attachment; filename="${name}"`, "cache-control": "private, no-store" } }); }); }
