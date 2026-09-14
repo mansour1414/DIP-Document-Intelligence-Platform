@@ -13,11 +13,13 @@ $runtimeBuilder.Password = $runtimePassword
 
 $env:DIP_RLS_TEST_OWNER_URL = $ownerDirect
 $env:DIP_RLS_TEST_DATABASE_URL = $runtimeBuilder.Uri.AbsoluteUri
+$env:DATABASE_URL = $runtimeBuilder.Uri.AbsoluteUri
 try {
-  node --test --test-reporter=tap test/rls.integration.test.mjs
+  node --import ./scripts/node-platform-compat.mjs --import tsx --test --test-concurrency=1 --test-reporter=tap test/rls.integration.test.mjs test/auth-identity.rls.integration.test.mjs test/workflow.rls.integration.test.mjs test/phase9a.rls.integration.test.mjs test/phase9a.business.integration.test.ts
   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 } finally {
   Remove-Item Env:DIP_RLS_TEST_OWNER_URL -ErrorAction SilentlyContinue
   Remove-Item Env:DIP_RLS_TEST_DATABASE_URL -ErrorAction SilentlyContinue
+  Remove-Item Env:DATABASE_URL -ErrorAction SilentlyContinue
   $runtimePassword = $null
 }

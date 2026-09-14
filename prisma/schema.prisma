@@ -44,16 +44,21 @@ model User {
 }
 
 model Organization {
-  id        String   @id @default(uuid()) @db.Uuid
-  name      String   @db.VarChar(100)
-  slug      String   @unique @db.VarChar(100)
-  plan      Plan     @default(FREE)
-  createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @updatedAt @map("updated_at")
+  id        String             @id @default(uuid()) @db.Uuid
+  name      String             @db.VarChar(100)
+  slug      String             @unique @db.VarChar(100)
+  plan      Plan               @default(FREE)
+  status    OrganizationStatus @default(ACTIVE)
+  createdAt DateTime           @default(now()) @map("created_at")
+  updatedAt DateTime           @updatedAt @map("updated_at")
 
-  memberships Membership[]
-  teams       Team[]
-  documents   Document[]
+  memberships           Membership[]
+  teams                 Team[]
+  documents             Document[]
+  apiClients            ApiClient[]
+  apiKeys               ApiKey[]
+  auditLogs             AuditLog[]
+  apiIdempotencyRecords ApiIdempotencyRecord[]
 
   @@map("organizations")
 }
@@ -79,6 +84,7 @@ model Membership {
   teamId         String?    @map("team_id") @db.Uuid
   role           MemberRole @default(MEMBER)
   createdAt      DateTime   @default(now()) @map("created_at")
+  updatedAt      DateTime   @updatedAt @map("updated_at")
 
   user         User         @relation(fields: [userId], references: [id])
   organization Organization @relation(fields: [organizationId], references: [id])
@@ -91,19 +97,68 @@ model Membership {
 }
 
 model ApiKey {
-  id         String    @id @default(uuid()) @db.Uuid
-  userId     String    @map("user_id") @db.Uuid
-  name       String    @db.VarChar(100)
-  keyHash    String    @map("key_hash") @db.VarChar(255)
-  scopes     Json      @default("[]")
-  expiresAt  DateTime? @map("expires_at")
-  lastUsedAt DateTime? @map("last_used_at")
-  createdAt  DateTime  @default(now()) @map("created_at")
+  id             String              @id @default(uuid()) @db.Uuid
+  userId         String?             @map("user_id") @db.Uuid
+  organizationId String?             @map("organization_id") @db.Uuid
+  apiClientId    String?             @map("api_client_id") @db.Uuid
+  name           String              @db.VarChar(100)
+  keyHash        String              @map("key_hash") @db.VarChar(255)
+  keyPrefix      String?             @unique @map("key_prefix") @db.VarChar(32)
+  status         ApiCredentialStatus @default(ACTIVE)
+  scopes         Json                @default("[]")
+  expiresAt      DateTime?           @map("expires_at")
+  lastUsedAt     DateTime?           @map("last_used_at")
+  revokedAt      DateTime?           @map("revoked_at")
+  rotatedFromId  String?             @map("rotated_from_id") @db.Uuid
+  createdAt      DateTime            @default(now()) @map("created_at")
+  updatedAt      DateTime            @updatedAt @map("updated_at")
 
-  user User @relation(fields: [userId], references: [id])
+  user         User?         @relation(fields: [userId], references: [id])
+  organization Organization? @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  apiClient    ApiClient?    @relation(fields: [apiClientId], references: [id], onDelete: Cascade)
+  rotatedFrom  ApiKey?       @relation("ApiKeyRotations", fields: [rotatedFromId], references: [id])
+  rotations    ApiKey[]      @relation("ApiKeyRotations")
 
   @@index([userId])
+  @@index([organizationId, status])
+  @@index([apiClientId, status])
   @@map("api_keys")
+}
+
+model ApiClient {
+  id             String          @id @default(uuid()) @db.Uuid
+  organizationId String          @map("organization_id") @db.Uuid
+  name           String          @db.VarChar(100)
+  status         ApiClientStatus @default(ACTIVE)
+  createdAt      DateTime        @default(now()) @map("created_at")
+  updatedAt      DateTime        @updatedAt @map("updated_at")
+
+  organization       Organization           @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  apiKeys            ApiKey[]
+  idempotencyRecords ApiIdempotencyRecord[]
+
+  @@unique([organizationId, name])
+  @@index([organizationId, status])
+  @@map("api_clients")
+}
+
+model ApiIdempotencyRecord {
+  id             String   @id @default(uuid()) @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  apiClientId    String   @map("api_client_id") @db.Uuid
+  idempotencyKey String   @map("idempotency_key") @db.VarChar(255)
+  requestHash    String   @map("request_hash") @db.VarChar(64)
+  resourceType   String?  @map("resource_type") @db.VarChar(50)
+  resourceId     String?  @map("resource_id") @db.Uuid
+  createdAt      DateTime @default(now()) @map("created_at")
+  expiresAt      DateTime @map("expires_at")
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  apiClient    ApiClient    @relation(fields: [apiClientId], references: [id], onDelete: Cascade)
+
+  @@unique([apiClientId, idempotencyKey])
+  @@index([organizationId, expiresAt])
+  @@map("api_idempotency_records")
 }
 
 model Account {
@@ -724,17 +779,21 @@ model Redirect {
 // ==================== SECURITY / AUDIT ====================
 
 model AuditLog {
-  id         String   @id @default(uuid()) @db.Uuid
-  userId     String?  @map("user_id") @db.Uuid
-  action     String   @db.VarChar(100)
-  resource   String   @db.VarChar(100)
-  resourceId String?  @map("resource_id") @db.Uuid
-  details    Json     @default("{}")
-  ipAddress  String?  @map("ip_address") @db.VarChar(45)
-  userAgent  String?  @map("user_agent") @db.VarChar(500)
-  createdAt  DateTime @default(now()) @map("created_at")
+  id             String   @id @default(uuid()) @db.Uuid
+  userId         String?  @map("user_id") @db.Uuid
+  organizationId String?  @map("organization_id") @db.Uuid
+  action         String   @db.VarChar(100)
+  resource       String   @db.VarChar(100)
+  resourceId     String?  @map("resource_id") @db.Uuid
+  details        Json     @default("{}")
+  ipAddress      String?  @map("ip_address") @db.VarChar(45)
+  userAgent      String?  @map("user_agent") @db.VarChar(500)
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  organization Organization? @relation(fields: [organizationId], references: [id])
 
   @@index([userId])
+  @@index([organizationId, createdAt])
   @@index([action])
   @@index([resource, resourceId])
   @@index([createdAt])
@@ -774,6 +833,22 @@ enum UserStatus {
   ACTIVE
   SUSPENDED
   DELETED
+}
+
+enum OrganizationStatus {
+  ACTIVE
+  SUSPENDED
+  ARCHIVED
+}
+
+enum ApiClientStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum ApiCredentialStatus {
+  ACTIVE
+  REVOKED
 }
 
 enum Plan {

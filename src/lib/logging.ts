@@ -1,6 +1,6 @@
 export type LogContext = Record<string, string | number | boolean | undefined>;
 
-const sensitiveKey = /(content|text|prompt|credential|secret|token(?!s?$)|signed.?url|api.?key|password)/i;
+const sensitiveKey = /(authorization|cookie|content|text|prompt|credential|secret|token(?!s?$)|signed.?url|api.?key|password)/i;
 export function redactLogContext(context: LogContext) {
   return Object.fromEntries(Object.entries(context).map(([key, value]) => sensitiveKey.test(key) ? [key, "[REDACTED]"] : [key, value])) as LogContext;
 }
