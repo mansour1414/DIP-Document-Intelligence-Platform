@@ -1,4 +1,5 @@
 import { db } from "@/lib/db";
+import { withTenant } from "@/lib/db/tenant";
 import { AiGatewayError, type AiRequestContext, type GatewayTask } from "./types";
 
 export function assertDocumentScope(input: { taskDocumentId: string; fileDocumentId: string; ownerId: string; requesterId: string; inputCount: number }) {
@@ -15,6 +16,6 @@ export async function enforceAiPolicy(task: GatewayTask, context: AiRequestConte
   if (process.env.GEMINI_ENABLED === "false" || await explicitlyDisabled("ai.provider.gemini.enabled")) throw new AiGatewayError("AI_PROVIDER_DISABLED", "The AI provider is disabled.");
   if (await explicitlyDisabled(`ai.tool.${task.toolId}.enabled`)) throw new AiGatewayError("AI_TOOL_DISABLED", "This AI tool is disabled.");
   if (task.toolId !== context.toolId) throw new AiGatewayError("AI_TOOL_SCOPE_VIOLATION", "The task does not match the queued tool.");
-  if (task.toolId !== "agent-planner") { const document = await db.document.findFirst({ where: { id: task.documentId, userId: context.userId }, select: { id: true } }); if (!document) throw new AiGatewayError("DOCUMENT_SCOPE_VIOLATION", "The requested document is outside the job scope."); }
+  if (task.toolId !== "agent-planner") { const document = await withTenant({ userId: context.userId }, (tx) => tx.document.findFirst({ where: { id: task.documentId, userId: context.userId }, select: { id: true } })); if (!document) throw new AiGatewayError("DOCUMENT_SCOPE_VIOLATION", "The requested document is outside the job scope."); }
   // Credits and commercial entitlements are reserved before enqueue by the orchestrator.
 }

@@ -89,6 +89,12 @@ integrationTest("dip_app pooled RLS isolates tenants and fails closed", async ()
       assert.equal(await tx.$executeRaw`DELETE FROM jobs WHERE id = ${ids.jobB}::uuid`, 0);
     });
 
+    const scopedDocument = await withTenant(ids.userA, (tx) => tx.document.findFirst({ where: { id: ids.documentA, userId: ids.userA }, select: { id: true } }));
+    assert.deepEqual(scopedDocument, { id: ids.documentA });
+
+    const otherTenantDocument = await withTenant(ids.userB, (tx) => tx.document.findFirst({ where: { id: ids.documentA, userId: ids.userA }, select: { id: true } }));
+    assert.equal(otherTenantDocument, null);
+
     const noContext = await runtime.$transaction((tx) => tx.$queryRaw`SELECT id FROM documents`);
     assert.deepEqual(noContext, []);
 
