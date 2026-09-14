@@ -232,7 +232,9 @@ jobs:
       - name: Verify non-root runtime identity
         run: test "$(docker run --rm --entrypoint id dip-document-worker:release-a -u)" = "10001"
       - name: Verify worker runtime and prohibited dependency gate
-        run: docker run --rm --read-only --tmpfs /tmp/dip:rw,noexec,nosuid,size=256m --entrypoint python3 dip-document-worker:release-a scripts/verify-ocr-runtime.py
+        run: |
+          docker run --rm --read-only --tmpfs /tmp/dip:rw,noexec,nosuid,size=256m,uid=10001,gid=10001,mode=0700 --entrypoint python3 dip-document-worker:release-a -c "from pathlib import Path; from tempfile import TemporaryDirectory; d=TemporaryDirectory(dir='/tmp/dip'); p=Path(d.name)/'probe'; p.write_text('ok'); assert p.read_text() == 'ok'; d.cleanup()"
+          docker run --rm --read-only --tmpfs /tmp/dip:rw,noexec,nosuid,size=256m,uid=10001,gid=10001,mode=0700 --entrypoint python3 dip-document-worker:release-a scripts/verify-ocr-runtime.py
       - name: Print immutable worker dependency versions
         run: |
           docker run --rm --entrypoint node dip-document-worker:release-a --version
