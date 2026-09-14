@@ -17,7 +17,7 @@ integration("Phase 7 executes a real multi-step workflow with retry, failure, ca
   const { getStorage, closeStorage } = await import("../src/lib/storage/index");
   const { getJobQueue, enqueueJob, closeQueueResources } = await import("../src/lib/queue/index");
   const { getToolDefinition } = await import("../src/lib/tools/registry");
-  const { documentWorker, aiWorker } = await import("../workers/document-worker");
+  const localWorkers = process.env.EXTERNAL_WORKER_E2E === "1" ? null : await import("../workers/document-worker");
   const storage = getStorage();
   const userId = randomUUID();
   const objectKeys = new Set<string>();
@@ -189,7 +189,7 @@ integration("Phase 7 executes a real multi-step workflow with retry, failure, ca
     const files = await owner.file.findMany({ where: { document: { userId } }, select: { storageKey: true } }).catch(() => []);
     for (const file of files) objectKeys.add(file.storageKey);
     for (const key of objectKeys) await storage.deleteObject(key).catch(() => undefined);
-    await Promise.allSettled([documentWorker.close(), aiWorker.close()]);
+    if (localWorkers) await Promise.allSettled([localWorkers.documentWorker.close(), localWorkers.aiWorker.close()]);
     await Promise.allSettled([closeQueueResources(), closeStorage(), db.$disconnect(), owner.$disconnect()]);
   }
 });

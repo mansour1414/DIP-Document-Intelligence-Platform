@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Bot, FileText, LoaderCircle, Send, Sparkles, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -35,6 +35,7 @@ export function AiToolWorkspace({ tool, embedded: _embedded = false }: { tool: T
   const [result, setResult] = useState(""); const [status, setStatus] = useState<"idle" | "reading" | "thinking" | "error">("idle"); const [notice, setNotice] = useState("");
   const chat = tool.id === "chat-with-pdf"; const extract = tool.id === "extract-data";
   const copy = ar ? { badge: "ذكاء DIP", drop: "اسحب ملف PDF أو اختره", limit: "حتى 100 ميجابايت و500 صفحة", read: "قراءة المستند…", think: "يجري تحليل المستند…", upload: "اختر ملف PDF أولاً", ask: "اسأل عن المستند", send: "إرسال", summary: "إنشاء ملخص", data: "استخراج البيانات", response: "نتيجة مولّدة بالذكاء الاصطناعي", noText: "لم يُعثر على نص قابل للقراءة. شغّل OCR للمستندات الممسوحة.", remove: "إزالة" } : { badge: "DIP AI", drop: "Drop a PDF or browse", limit: "Up to 100 MB and 500 pages", read: "Reading document…", think: "Analyzing document…", upload: "Choose a PDF first", ask: "Ask about the document", send: "Send", summary: "Create summary", data: "Extract data", response: "AI-generated result", noText: "No readable text was found. Run OCR for scanned documents.", remove: "Remove" };
+  useEffect(() => fileRef.current?.setAttribute("aria-label", copy.drop), [copy.drop]);
   const select = async (candidate?: File) => {
     if (!candidate) return;
     if (!candidate.name.toLowerCase().endsWith(".pdf") && candidate.type !== "application/pdf") { setStatus("error"); setNotice("UNSUPPORTED_FILE: Choose a PDF file."); return; }

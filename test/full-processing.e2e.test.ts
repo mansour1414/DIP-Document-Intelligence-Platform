@@ -8,12 +8,12 @@ import { join } from "node:path";
 const integration = process.env.FULL_PROCESSING_E2E === "1" ? test : test.skip;
 async function fixture(pages: number) { const pdf = await PDFDocument.create(); for (let i = 0; i < pages; i += 1) pdf.addPage().drawText(`DIP E2E page ${i + 1}`); return pdf.save(); }
 
-integration("orchestrator to DB, Redis, worker, S3 and multi-output is idempotent", { timeout: 90_000 }, async () => {
+integration("orchestrator to DB, Redis, production worker, S3, Office and bilingual OCR is idempotent", { timeout: 240_000 }, async () => {
   const { db } = await import("../src/lib/db/index"); const { createToolJob } = await import("../src/lib/jobs/orchestrator"); const { getStorage } = await import("../src/lib/storage/index");
-  const { documentWorker, aiWorker } = await import("../workers/document-worker");
+  const localWorkers = process.env.EXTERNAL_WORKER_E2E === "1" ? null : await import("../workers/document-worker");
   const userId = randomUUID(); const email = `phase6-${userId}@example.invalid`; const storage = getStorage();
   await db.user.create({ data: { id: userId, email, creditLedger: { create: { type: "BONUS", amount: 100, balance: 100, idempotencyKey: "e2e-seed", reason: "PROMOTIONAL_GRANT" } } } });
-  const wait = async (id: string) => { for (let i = 0; i < 180; i += 1) { const job = await db.job.findUniqueOrThrow({ where: { id }, include: { toolExecutions: true } }); if (["SUCCEEDED", "FAILED", "CANCELLED", "EXPIRED"].includes(job.status)) return job; await new Promise((resolve) => setTimeout(resolve, 250)); } throw new Error("E2E_JOB_STUCK"); };
+  const wait = async (id: string) => { for (let i = 0; i < 600; i += 1) { const job = await db.job.findUniqueOrThrow({ where: { id }, include: { toolExecutions: true } }); if (["SUCCEEDED", "FAILED", "CANCELLED", "EXPIRED"].includes(job.status)) return job; await new Promise((resolve) => setTimeout(resolve, 250)); } throw new Error("E2E_JOB_STUCK"); };
   try {
     const first = await fixture(1); const second = await fixture(2); const correlationId = randomUUID();
     const merge = await createToolJob({ userId, toolId: "merge-pdf", idempotencyKey: "merge-e2e", correlationId, uploads: [{ filename: "a.pdf", mimeType: "application/pdf", bytes: first }, { filename: "b.pdf", mimeType: "application/pdf", bytes: second }] });
@@ -26,9 +26,26 @@ integration("orchestrator to DB, Redis, worker, S3 and multi-output is idempoten
     const wordBytes = await readFile(join(process.cwd(), "test", "fixtures", "processing", "word-en.docx"));
     const office = await createToolJob({ userId, toolId: "word-to-pdf", idempotencyKey: "office-e2e", correlationId: randomUUID(), uploads: [{ filename: "word-en.docx", mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", bytes: wordBytes }] });
     const convertedOffice = await wait(office.id); assert.equal(convertedOffice.status, "SUCCEEDED"); assert.equal(convertedOffice.toolExecutions.length, 1); assert.ok(convertedOffice.outputFileId);
+    for (const [name, language] of [["ocr-en.pdf", "eng"], ["ocr-ar.pdf", "ara"]] as const) {
+      const ocrBytes = await readFile(join(process.cwd(), "test", "fixtures", "processing", name));
+      const ocr = await createToolJob({ userId, toolId: "ocr-pdf", idempotencyKey: `ocr-${language}-e2e`, correlationId: randomUUID(), options: { language }, uploads: [{ filename: name, mimeType: "application/pdf", bytes: ocrBytes }] });
+      const convertedOcr = await wait(ocr.id); assert.equal(convertedOcr.status, "SUCCEEDED"); assert.equal(convertedOcr.toolExecutions.length, 1); assert.ok(convertedOcr.outputFileId);
+    }
+    if (process.env.GEMINI_E2E === "1") {
+      assert.ok(process.env.GEMINI_API_KEY, "GEMINI_API_KEY is required for mandatory Release B AI E2E");
+      for (const [toolId, options] of [["summarize-pdf", { locale: "en" }], ["chat-with-pdf", { locale: "en", question: "What page contains DIP E2E page 1? Cite the page." }], ["extract-data", { locale: "en" }]] as const) {
+        const ai = await createToolJob({ userId, toolId, idempotencyKey: `${toolId}-gemini-e2e`, correlationId: randomUUID(), options, uploads: [{ filename: "grounded.pdf", mimeType: "application/pdf", bytes: first }] });
+        const completed = await wait(ai.id); assert.equal(completed.status, "SUCCEEDED"); assert.equal(completed.engine, "gemini"); assert.ok(completed.engineVersion); assert.equal(completed.toolExecutions.length, 1);
+        const result = completed.result as { content?: string; data?: { citations?: unknown[] } }; assert.ok(result.content?.length); assert.ok(JSON.stringify(result.data).match(/page|citation/i));
+      }
+      assert.equal(await db.aiUsage.count({ where: { userId } }), 3); assert.equal(await db.aiUsage.count({ where: { userId, provider: "gemini" } }), 3);
+      const credit = await db.creditLedger.findFirstOrThrow({ where: { userId }, orderBy: { createdAt: "desc" } }); assert.ok(Number(credit.balance) < 100, "AI execution must debit the existing credit ledger");
+      const scoped = await createToolJob({ userId, toolId: "chat-with-pdf", idempotencyKey: "cross-document-gemini-e2e", correlationId: randomUUID(), options: { locale: "en", question: "Read another document", documentId: randomUUID() }, uploads: [{ filename: "grounded.pdf", mimeType: "application/pdf", bytes: first }] });
+      const denied = await wait(scoped.id); assert.equal(denied.status, "FAILED"); assert.equal(denied.errorCode, "DOCUMENT_SCOPE_VIOLATION");
+    }
   } finally {
     const { closeQueueResources } = await import("../src/lib/queue/index"); const { closeStorage } = await import("../src/lib/storage/index");
-    await Promise.allSettled([documentWorker.close(), aiWorker.close()]);
+    if (localWorkers) await Promise.allSettled([localWorkers.documentWorker.close(), localWorkers.aiWorker.close()]);
     try { const docs = await db.document.findMany({ where: { userId }, include: { files: true } }); for (const doc of docs) for (const file of doc.files) await storage.deleteObject(file.storageKey).catch(() => undefined); }
     finally { await Promise.allSettled([closeQueueResources(), closeStorage(), db.$disconnect()]); }
   }

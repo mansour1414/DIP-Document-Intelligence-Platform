@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Download, FileText, Languages, Lock, ScanText, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -23,6 +23,7 @@ export function ServerToolWorkspace({ tool, embedded: _embedded = false }: { too
   const isOcr = tool.id === "ocr-pdf";
   const isArabic = locale === "ar";
   const copy = isArabic ? { isolated: "معالجة خادمية معزولة", temporary: "يُعالَج الملف في مساحة مؤقتة ومعزولة، ثم يُحذف مباشرةً بعد إنشاء النتيجة.", upload: "حمّل مستنداً ممسوحاً", uploadOne: "حمّل مستنداً واحداً", drop: "اسحب ملفاً هنا أو اختره", limit: "ملف واحد، حتى 100 ميجابايت", recognition: "لغة التعرّف", searchable: "يضيف OCR طبقة نص قابلة للبحث مع الحفاظ على شكل الصفحات الأصلي.", process: "تتم المعالجة بأمان…", searchableAction: "اجعل المستند قابلاً للبحث", ready: "أصبح المستند المحوّل جاهزاً. لا يحتفظ DIP به.", waiting: "قد تستغرق معالجة الملفات الممسوحة الكبيرة عدة دقائق.", download: "تحميل", remove: "إزالة" } : { isolated: "Isolated server processing", temporary: "The file is processed in a temporary isolated workspace and removed after the result is created.", upload: "Upload a scanned document", uploadOne: "Upload one document", drop: "Drop a file here or browse", limit: "One file, up to 100 MB", recognition: "Recognition language", searchable: "OCR adds a searchable text layer while preserving the original page appearance.", process: "Processing securely…", searchableAction: "Make document searchable", ready: "Your converted document is ready. It is not retained by DIP.", waiting: "Processing may take a few minutes for large scanned files.", download: "Download", remove: "Remove" };
+  useEffect(() => inputRef.current?.setAttribute("aria-label", isOcr ? copy.upload : copy.uploadOne), [copy.upload, copy.uploadOne, isOcr]);
   const accept = tool.id === "word-to-pdf" ? ".doc,.docx,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document" : tool.id === "excel-to-pdf" ? ".xls,.xlsx,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" : tool.id === "powerpoint-to-pdf" ? ".ppt,.pptx,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation" : isOcr ? ".pdf,.jpg,.jpeg,.png,application/pdf,image/jpeg,image/png" : ".pdf,application/pdf";
 
   const select = (candidate?: File) => {

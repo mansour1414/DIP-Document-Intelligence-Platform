@@ -257,3 +257,194 @@ jobs:
           CLAMD_E2E: "1"
           CLAMD_HOST: 127.0.0.1
           CLAMD_PORT: "3310"
+
+  browser-accessibility:
+    name: Browser / Accessibility
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: dip_browser
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: --health-cmd "redis-cli ping" --health-interval 10s --health-timeout 5s --health-retries 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx prisma generate
+      - name: Prepare authenticated browser database
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dip_browser
+        run: |
+          psql "$DATABASE_URL" --set=ON_ERROR_STOP=1 --file=prisma/bootstrap/roles.sql
+          npx prisma migrate deploy
+          psql "$DATABASE_URL" --set=ON_ERROR_STOP=1 --file=prisma/bootstrap/dip_app.sql
+          psql "$DATABASE_URL" --set=ON_ERROR_STOP=1 --command="ALTER ROLE dip_app PASSWORD 'dip_browser_runtime'"
+          psql "$DATABASE_URL" --set=ON_ERROR_STOP=1 --command="INSERT INTO users (id,email,display_name,locale,status,created_at,updated_at) VALUES ('b0000000-0000-4000-8000-000000000001','release-b-browser@example.invalid','Release B','en','ACTIVE',now(),now())"
+      - run: npx playwright install --with-deps chromium
+      - run: npm run build
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dip_browser
+          REDIS_URL: redis://localhost:6379
+          NEXT_PUBLIC_APP_URL: http://127.0.0.1:3000
+      - run: npm run test:browser
+        env:
+          DATABASE_URL: postgresql://dip_app:dip_browser_runtime@localhost:5432/dip_browser
+          REDIS_URL: redis://localhost:6379
+          NEXT_PUBLIC_APP_URL: http://127.0.0.1:3000
+          AUTH_SECRET: release-b-browser-secret
+          AUTH_BROWSER_E2E: "1"
+
+  release-b-e2e:
+    name: Full Release B E2E
+    runs-on: ubuntu-latest
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: dip_release_b
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: --health-cmd "redis-cli ping" --health-interval 10s --health-timeout 5s --health-retries 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: npm ci
+      - run: npx prisma generate
+      - name: Require protected Gemini credential
+        run: test -n "$GEMINI_API_KEY"
+      - name: Generate safe Office and OCR corpus
+        run: |
+          python -m pip install python-docx openpyxl python-pptx pillow
+          python scripts/generate-processing-corpus.py
+      - name: Build the Release A production worker
+        run: docker build --file Dockerfile.worker --tag dip-document-worker:release-b .
+      - name: Start private storage and malware scanner
+        run: |
+          docker run --detach --name dip-release-b-minio --network host --env MINIO_ROOT_USER=minioadmin --env MINIO_ROOT_PASSWORD=minioadmin quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e server /data --address :9000
+          docker run --detach --name dip-release-b-clamd --network host --env CLAMD_CONF_StreamMaxLength=100M clamav/clamav:1.4.3
+      - name: Wait for private dependencies
+        run: |
+          for i in {1..180}; do docker exec dip-release-b-clamd clamdscan --ping=1 && break; test "$i" != 180 || exit 1; sleep 2; done
+          for i in {1..60}; do curl --fail --silent http://127.0.0.1:9000/minio/health/ready && break; test "$i" != 60 || exit 1; sleep 1; done
+      - name: Create object bucket and database
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/dip_release_b
+          STORAGE_ENDPOINT: http://127.0.0.1:9000
+          STORAGE_BUCKET: dip-release-b
+          STORAGE_ACCESS_KEY: minioadmin
+          STORAGE_SECRET_KEY: minioadmin
+          STORAGE_REGION: us-east-1
+        run: |
+          node scripts/ensure-test-bucket.mjs
+          psql "$DATABASE_URL" --set=ON_ERROR_STOP=1 --file=prisma/bootstrap/roles.sql
+          npx prisma migrate deploy
+          psql "$DATABASE_URL" --set=ON_ERROR_STOP=1 --file=prisma/bootstrap/dip_app.sql
+          psql "$DATABASE_URL" --set=ON_ERROR_STOP=1 --command="ALTER ROLE dip_app PASSWORD 'dip_release_b_runtime'"
+      - name: Start actual production worker image
+        run: >-
+          docker run --detach --name dip-release-b-worker --network host --read-only
+          --tmpfs /tmp/dip:rw,noexec,nosuid,size=256m,uid=10001,gid=10001,mode=0700
+          --env DATABASE_URL=postgresql://dip_app:dip_release_b_runtime@127.0.0.1:5432/dip_release_b
+          --env REDIS_URL=redis://127.0.0.1:6379
+          --env STORAGE_ENDPOINT=http://127.0.0.1:9000 --env STORAGE_BUCKET=dip-release-b
+          --env STORAGE_ACCESS_KEY=minioadmin --env STORAGE_SECRET_KEY=minioadmin --env STORAGE_REGION=us-east-1
+          --env CLAMD_HOST=127.0.0.1 --env CLAMD_PORT=3310 --env AUTH_SECRET=release-b-ci-only-secret
+          --env GEMINI_API_KEY
+          dip-document-worker:release-b
+      - name: Build and start standalone Public API
+        env:
+          DATABASE_URL: postgresql://dip_app:dip_release_b_runtime@127.0.0.1:5432/dip_release_b
+          REDIS_URL: redis://127.0.0.1:6379
+          STORAGE_ENDPOINT: http://127.0.0.1:9000
+          STORAGE_BUCKET: dip-release-b
+          STORAGE_ACCESS_KEY: minioadmin
+          STORAGE_SECRET_KEY: minioadmin
+          STORAGE_REGION: us-east-1
+          CLAMD_HOST: 127.0.0.1
+          CLAMD_PORT: "3310"
+          AUTH_SECRET: release-b-ci-only-secret
+          API_KEY_PEPPER: release-b-ci-only-pepper
+          NEXT_PUBLIC_APP_URL: http://127.0.0.1:3000
+        run: |
+          npm run build
+          nohup node scripts/start-browser-e2e.mjs >/tmp/dip-release-b-web.log 2>&1 &
+          echo $! >/tmp/dip-release-b-web.pid
+          for i in {1..60}; do curl --fail --silent http://127.0.0.1:3000/api/health && exit 0; sleep 1; done
+          cat /tmp/dip-release-b-web.log
+          exit 1
+      - name: Run external production-image processing closure
+        run: node --import ./scripts/node-platform-compat.mjs --import tsx --test test/full-processing.e2e.test.ts
+        env:
+          FULL_PROCESSING_E2E: "1"
+          EXTERNAL_WORKER_E2E: "1"
+          GEMINI_E2E: "1"
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/dip_release_b
+          REDIS_URL: redis://127.0.0.1:6379
+          STORAGE_ENDPOINT: http://127.0.0.1:9000
+          STORAGE_BUCKET: dip-release-b
+          STORAGE_ACCESS_KEY: minioadmin
+          STORAGE_SECRET_KEY: minioadmin
+          STORAGE_REGION: us-east-1
+          CLAMD_HOST: 127.0.0.1
+          CLAMD_PORT: "3310"
+      - name: Run Workflow and Document Agent through production worker image
+        run: node --import ./scripts/node-platform-compat.mjs --import tsx --test test/workflow.execution.e2e.test.ts
+        env:
+          RUN_WORKFLOW_E2E: "1"
+          EXTERNAL_WORKER_E2E: "1"
+          DATABASE_URL: postgresql://dip_app:dip_release_b_runtime@127.0.0.1:5432/dip_release_b
+          DIP_RLS_TEST_OWNER_URL: postgresql://postgres:postgres@127.0.0.1:5432/dip_release_b
+          REDIS_URL: redis://127.0.0.1:6379
+          STORAGE_ENDPOINT: http://127.0.0.1:9000
+          STORAGE_BUCKET: dip-release-b
+          STORAGE_ACCESS_KEY: minioadmin
+          STORAGE_SECRET_KEY: minioadmin
+          STORAGE_REGION: us-east-1
+      - name: Run real Public API v1 HTTP closure
+        run: node --import ./scripts/node-platform-compat.mjs --import tsx --test test/public-api.http.e2e.test.ts
+        env:
+          PUBLIC_API_HTTP_E2E: "1"
+          PUBLIC_API_BASE_URL: http://127.0.0.1:3000
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/dip_release_b
+          REDIS_URL: redis://127.0.0.1:6379
+          STORAGE_ENDPOINT: http://127.0.0.1:9000
+          STORAGE_BUCKET: dip-release-b
+          STORAGE_ACCESS_KEY: minioadmin
+          STORAGE_SECRET_KEY: minioadmin
+          STORAGE_REGION: us-east-1
+          CLAMD_HOST: 127.0.0.1
+          CLAMD_PORT: "3310"
+          API_KEY_PEPPER: release-b-ci-only-pepper
+      - name: Stop standalone Public API cleanly
+        if: always()
+        run: |
+          test ! -f /tmp/dip-release-b-web.pid || kill -TERM "$(cat /tmp/dip-release-b-web.pid)"
+          for i in {1..30}; do test ! -f /tmp/dip-release-b-web.pid || ! kill -0 "$(cat /tmp/dip-release-b-web.pid)" 2>/dev/null && exit 0; sleep 1; done
+          exit 1
+      - name: Print worker diagnostics on failure
+        if: failure()
+        run: docker logs dip-release-b-worker

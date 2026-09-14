@@ -12,6 +12,7 @@
     "lint": "eslint",
     "typecheck": "tsc --noEmit",
     "test": "node --import ./scripts/node-platform-compat.mjs --import tsx --test --test-concurrency=1 test/*.test.ts test/*.test.mjs",
+    "test:browser": "playwright test",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
     "db:migrate:prod": "prisma migrate deploy",
@@ -54,6 +55,8 @@
     "tsx": "^4.19.0"
   },
   "devDependencies": {
+    "@axe-core/playwright": "^4.13.0",
+    "@playwright/test": "^1.63.0",
     "@tailwindcss/postcss": "^4",
     "@types/node": "^20",
     "@types/pg": "^8.23.1",
