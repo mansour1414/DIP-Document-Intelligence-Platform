@@ -233,8 +233,9 @@ jobs:
         run: test "$(docker run --rm --entrypoint id dip-document-worker:release-a -u)" = "10001"
       - name: Verify worker runtime and prohibited dependency gate
         run: |
-          docker run --rm --read-only --tmpfs /tmp/dip:rw,noexec,nosuid,size=256m,uid=10001,gid=10001,mode=0700 --entrypoint python3 dip-document-worker:release-a -c "from pathlib import Path; from tempfile import TemporaryDirectory; d=TemporaryDirectory(dir='/tmp/dip'); p=Path(d.name)/'probe'; p.write_text('ok'); assert p.read_text() == 'ok'; d.cleanup()"
-          docker run --rm --read-only --tmpfs /tmp/dip:rw,noexec,nosuid,size=256m,uid=10001,gid=10001,mode=0700 --entrypoint python3 dip-document-worker:release-a scripts/verify-ocr-runtime.py
+          docker run --rm --read-only --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777 --tmpfs /tmp/dip:rw,nosuid,nodev,noexec,size=256m,uid=10001,gid=10001,mode=0700 --entrypoint python3 dip-document-worker:release-a -c "from pathlib import Path; from tempfile import TemporaryDirectory; d=TemporaryDirectory(dir='/tmp/dip'); p=Path(d.name)/'probe'; p.write_text('ok'); assert p.read_text() == 'ok'; d.cleanup()"
+          docker run --rm --read-only --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777 --tmpfs /tmp/dip:rw,nosuid,nodev,noexec,size=256m,uid=10001,gid=10001,mode=0700 --entrypoint python3 dip-document-worker:release-a scripts/verify-ocr-runtime.py
+          docker run --rm --read-only --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777 --tmpfs /tmp/dip:rw,nosuid,nodev,noexec,size=256m,uid=10001,gid=10001,mode=0700 --entrypoint sh dip-document-worker:release-a -c 'test "$(id -u):$(id -g)" = "10001:10001"; test "$(stat -c %a /tmp)" = "1777"; test "$(stat -c %a /tmp/dip)" = "700"; awk '\''$2 == "/" && $4 ~ /(^|,)ro(,|$)/ { root=1 } $2 == "/tmp" && $4 ~ /size=65536k/ { tmp=1 } $2 == "/tmp/dip" && $4 ~ /size=262144k/ { dip=1 } END { exit !(root && tmp && dip) }'\'' /proc/mounts; soffice -env:UserInstallation=file:///tmp/dip/lo-startup-profile --headless --terminate_after_init'
       - name: Print immutable worker dependency versions
         run: |
           docker run --rm --entrypoint node dip-document-worker:release-a --version
@@ -367,7 +368,8 @@ jobs:
       - name: Start actual production worker image
         run: >-
           docker run --detach --name dip-release-b-worker --network host --read-only
-          --tmpfs /tmp/dip:rw,noexec,nosuid,size=256m,uid=10001,gid=10001,mode=0700
+          --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777
+          --tmpfs /tmp/dip:rw,nosuid,nodev,noexec,size=256m,uid=10001,gid=10001,mode=0700
           --env DATABASE_URL=postgresql://dip_app:dip_release_b_runtime@127.0.0.1:5432/dip_release_b
           --env REDIS_URL=redis://127.0.0.1:6379
           --env STORAGE_ENDPOINT=http://127.0.0.1:9000 --env STORAGE_BUCKET=dip-release-b

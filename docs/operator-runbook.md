@@ -5,7 +5,7 @@ This runbook covers the existing modular monolith. It does not authorize deploym
 ## Release prerequisites
 
 - Build the web image with `Dockerfile` and the separate document-worker image with `Dockerfile.worker` from the same commit. The worker contains the existing BullMQ entrypoint, LibreOffice, qpdf, Tesseract `eng`/`ara`, OCRmyPDF 17.10.0 and pypdfium2 5.13.0, and must pass `python scripts/verify-ocr-runtime.py` with Ghostscript absent.
-- Run both as non-root with bounded CPU, RAM, PIDs, and temporary disk. Prefer a read-only root filesystem and an isolated writable temp mount.
+- Run both as non-root with bounded CPU, RAM, PIDs, and temporary disk. The document worker requires a read-only root filesystem plus two bounded tmpfs mounts: `/tmp` as `rw,nosuid,nodev,noexec,size=64m,mode=1777` for LibreOffice pipe semantics, and the nested private workspace `/tmp/dip` as `rw,nosuid,nodev,noexec,size=256m,uid=10001,gid=10001,mode=0700`. Do not replace these with a writable root filesystem or writable `/var/tmp`.
 - Allow deterministic workers to reach only PostgreSQL, Redis, and object storage. AI workers may additionally reach the configured AI Gateway/provider endpoint.
 - Run the pinned ClamAV scanner image as a separate private service. Do not expose port 3310 publicly. Permit signature-update egress only to approved mirrors and verify the database freshness before accepting traffic.
 - Configure the monitoring sink/Sentry project and route thresholds from `src/lib/observability/alerts.ts` to on-call alerts.
