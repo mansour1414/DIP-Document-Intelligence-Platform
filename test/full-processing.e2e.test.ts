@@ -13,7 +13,26 @@ integration("orchestrator to DB, Redis, production worker, S3, Office and biling
   const localWorkers = process.env.EXTERNAL_WORKER_E2E === "1" ? null : await import("../workers/document-worker");
   const userId = randomUUID(); const email = `phase6-${userId}@example.invalid`; const storage = getStorage();
   await db.user.create({ data: { id: userId, email, creditLedger: { create: { type: "BONUS", amount: 100, balance: 100, idempotencyKey: "e2e-seed", reason: "PROMOTIONAL_GRANT" } } } });
-  const wait = async (id: string) => { for (let i = 0; i < 600; i += 1) { const job = await db.job.findUniqueOrThrow({ where: { id }, include: { steps: true, toolExecutions: true } }); if (["SUCCEEDED", "CANCELLED", "EXPIRED"].includes(job.status)) return job; if (job.status === "FAILED") { const queued = await (job.toolId.startsWith("summarize-") || job.toolId === "chat-with-pdf" || job.toolId === "extract-data" ? getAiJobQueue() : getJobQueue()).getJob(id); const queueState = await queued?.getState(); if (queueState === "failed") { const safe = (value: unknown) => String(value ?? "").replace(/Bearer\s+\S+/gi, "Bearer [REDACTED]").replace(/postgres(?:ql)?:\/\/[^@\s]+@/gi, "postgresql://[REDACTED]@").slice(-2000); throw new Error(`RELEASE_B_JOB_FAILED ${JSON.stringify({ jobId: job.id, toolId: job.toolId, status: job.status, errorCode: job.errorCode, error: safe((job.error as { message?: string } | null)?.message), queueState, failedReason: safe(queued?.failedReason), attemptsMade: queued?.attemptsMade, jobSteps: job.steps.map((step) => ({ name: step.name, status: step.status, errorCode: step.errorCode, error: safe((step.error as { message?: string } | null)?.message) })), toolExecutions: job.toolExecutions.map((execution) => ({ mode: execution.mode, errorCode: execution.errorCode, engine: execution.engine })) })}`); } } await new Promise((resolve) => setTimeout(resolve, 250)); } throw new Error(`E2E_JOB_STUCK:${id}`); };
+  const wait = async (id: string) => {
+    for (let i = 0; i < 600; i += 1) {
+      const job = await db.job.findUniqueOrThrow({ where: { id }, include: { steps: true, toolExecutions: true } });
+      if (["SUCCEEDED", "CANCELLED", "EXPIRED"].includes(job.status)) return job;
+      if (job.status === "FAILED") {
+        const queued = await (job.toolId.startsWith("summarize-") || job.toolId === "chat-with-pdf" || job.toolId === "extract-data" ? getAiJobQueue() : getJobQueue()).getJob(id);
+        const queueState = await queued?.getState();
+        if (queueState === "failed") {
+          const safe = (value: unknown) => String(value ?? "").replace(/Bearer\s+\S+/gi, "Bearer [REDACTED]").replace(/postgres(?:ql)?:\/\/[^@\s]+@/gi, "postgresql://[REDACTED]@").slice(-2000);
+          const safeFailure = (value: unknown) => {
+            const failure = value && typeof value === "object" ? value as Record<string, unknown> : {};
+            return { message: safe(failure.message), provider: safe(failure.provider), model: safe(failure.model), httpStatus: failure.httpStatus, providerCode: safe(failure.providerCode), providerStatus: safe(failure.providerStatus), retryable: failure.retryable, attemptNumber: failure.attemptNumber, latencyMs: failure.latencyMs };
+          };
+          throw new Error(`RELEASE_B_JOB_FAILED ${JSON.stringify({ jobId: job.id, correlationId: job.correlationId, toolId: job.toolId, status: job.status, errorCode: job.errorCode, error: safeFailure(job.error), queueState, failedReason: safe(queued?.failedReason), attemptsMade: queued?.attemptsMade, jobSteps: job.steps.map((step) => ({ name: step.name, status: step.status, errorCode: step.errorCode, error: safeFailure(step.error) })), toolExecutions: job.toolExecutions.map((execution) => ({ mode: execution.mode, errorCode: execution.errorCode, provider: execution.engine, model: execution.engineVersion, latencyMs: execution.durationMs })) })}`);
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    throw new Error(`E2E_JOB_STUCK:${id}`);
+  };
   const waitForFailure = async (id: string) => { for (let i = 0; i < 600; i += 1) { const job = await db.job.findUniqueOrThrow({ where: { id }, include: { toolExecutions: true } }); if (job.status === "FAILED") { const queued = await getAiJobQueue().getJob(id); const queueState = await queued?.getState(); if (queueState === "failed") return { job, queueState }; } else if (["SUCCEEDED", "CANCELLED", "EXPIRED"].includes(job.status)) { throw new Error(`EXPECTED_JOB_FAILURE:${id}:${job.status}`); } await new Promise((resolve) => setTimeout(resolve, 250)); } throw new Error(`E2E_FAILED_JOB_STUCK:${id}`); };
   try {
     const first = await fixture(1); const second = await fixture(2); const correlationId = randomUUID();

@@ -67,8 +67,22 @@ export interface AiProviderAdapter {
   generate(request: ProviderRequest): Promise<ProviderResponse>;
 }
 
+export type AiProviderFailureMetadata = {
+  provider?: string;
+  model?: string;
+  httpStatus?: number;
+  providerCode?: string;
+  providerStatus?: string;
+  latencyMs?: number;
+};
+
 export class AiGatewayError extends Error {
-  constructor(public readonly code: string, message: string, public readonly retryable = false) {
+  constructor(
+    public readonly code: string,
+    message: string,
+    public readonly retryable = false,
+    public readonly metadata: AiProviderFailureMetadata = {},
+  ) {
     super(message);
     this.name = "AiGatewayError";
   }

@@ -58,7 +58,7 @@ Keep secrets in the deployment secret manager, never Git or images.
 
 Alert on readiness, queue depth and oldest age, stuck jobs, latency and terminal outcomes, retries/stalls, worker CPU/RAM/temp disk, storage latency/failures/capacity, cleanup failures, AI usage/cost/provider failures, API latency/status/rate-limit outcomes, auth failures, and privilege/key lifecycle events. Investigate using `correlation_id`, `request_id`, and `job_id`; never trust user-supplied headers for tenant or limiter identity.
 
-## AI reliability follow-ups
+## AI retry and diagnostics policy
 
-- Treat `AiGatewayError.retryable === false` as an unrecoverable BullMQ failure so permanent provider/configuration errors do not consume all attempts. This is separate from the Gemini 3.8 routing Change Request.
-- Preserve safe provider HTTP status, provider error status, retryability, attempt number, and latency in internal diagnostics without logging prompts, document content, credentials, or complete provider payloads.
+- AI jobs use three BullMQ attempts with 2-second exponential backoff and 50% jitter. HTTP 408, 429, 5xx, network errors, and provider timeouts are retryable; permanent client/provider errors use BullMQ's unrecoverable-error path and stop after the current attempt.
+- Internal failure diagnostics retain only provider, resolved model, HTTP/provider status codes, retryability, attempt number, latency, job/correlation identifiers, and the stable DIP error code. Prompts, document content, credentials, and complete provider payloads must never be logged or persisted.

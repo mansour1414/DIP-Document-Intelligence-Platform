@@ -311,6 +311,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GEMINI_MODEL: gemini-3.8-flash
     services:
       postgres:
         image: postgres:16-alpine
@@ -337,6 +338,10 @@ jobs:
       - run: npx prisma generate
       - name: Require protected Gemini credential
         run: test -n "$GEMINI_API_KEY"
+      - name: Verify Release B Gemini route
+        run: |
+          test "$GEMINI_MODEL" = "gemini-3.8-flash"
+          echo "Release B resolved Gemini model: $GEMINI_MODEL"
       - name: Generate safe Office and OCR corpus
         run: |
           python -m pip install python-docx openpyxl python-pptx pillow
@@ -376,7 +381,7 @@ jobs:
           --env STORAGE_ACCESS_KEY=minioadmin --env STORAGE_SECRET_KEY=minioadmin --env STORAGE_REGION=us-east-1
           --env CLAMD_HOST=127.0.0.1 --env CLAMD_PORT=3310 --env AUTH_SECRET=release-b-ci-only-secret
           --env NEXT_PUBLIC_APP_URL=http://127.0.0.1:3000
-          --env GEMINI_API_KEY
+          --env GEMINI_API_KEY --env GEMINI_MODEL
           dip-document-worker:release-b
       - name: Build and start standalone Public API
         env:
@@ -452,6 +457,7 @@ jobs:
         if: failure()
         run: |
           set +e
+          echo "Release B resolved Gemini model: $GEMINI_MODEL"
           docker ps -a
           if docker container inspect dip-release-b-worker >/dev/null 2>&1; then
             docker logs dip-release-b-worker 2>&1 | sed -E 's#(Bearer )[A-Za-z0-9._~-]+#\1[REDACTED]#g; s#(postgres(ql)?://)[^@[:space:]]+@#\1[REDACTED]@#g; s#dip_v1_[A-Za-z0-9_-]+#[REDACTED_API_KEY]#g'

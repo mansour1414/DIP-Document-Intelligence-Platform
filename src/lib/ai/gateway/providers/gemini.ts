@@ -4,8 +4,27 @@ import { timeoutFor } from "@/lib/runtime/config";
 type GeminiPayload = {
   candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
   usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number };
-  error?: { message?: string; status?: string };
+  error?: { code?: number | string; message?: string; status?: string };
 };
+
+function safeProviderIdentifier(value: number | string | undefined) {
+  const normalized = value === undefined ? undefined : String(value);
+  return normalized && /^[A-Z0-9_.-]{1,80}$/i.test(normalized) ? normalized : undefined;
+}
+
+function httpFailure(status: number, payload: GeminiPayload | null, model: string, latencyMs: number) {
+  const retryable = status === 408 || status === 429 || status >= 500;
+  const code = status === 408 ? "AI_PROVIDER_TIMEOUT" : status === 429 ? "AI_PROVIDER_RATE_LIMITED" : status === 401 || status === 403 ? "AI_PROVIDER_AUTH_FAILED" : "AI_PROVIDER_ERROR";
+  const message = status === 408 ? "Gemini timed out." : status === 429 ? "Gemini rate limit was reached." : status >= 500 ? "Gemini is temporarily unavailable." : "Gemini rejected the request.";
+  return new AiGatewayError(code, message, retryable, {
+    provider: "gemini",
+    model,
+    httpStatus: status,
+    providerCode: safeProviderIdentifier(payload?.error?.code),
+    providerStatus: safeProviderIdentifier(payload?.error?.status),
+    latencyMs,
+  });
+}
 
 export class GeminiProviderAdapter implements AiProviderAdapter {
   readonly provider = "gemini";
@@ -14,7 +33,7 @@ export class GeminiProviderAdapter implements AiProviderAdapter {
   constructor(private readonly apiKey = process.env.GEMINI_API_KEY) {}
 
   async generate(request: ProviderRequest): Promise<ProviderResponse> {
-    if (!this.apiKey) throw new AiGatewayError("AI_PROVIDER_NOT_CONFIGURED", "Gemini is not configured.");
+    if (!this.apiKey) throw new AiGatewayError("AI_PROVIDER_NOT_CONFIGURED", "Gemini is not configured.", false, { provider: this.provider, model: request.model });
     const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), timeoutFor("ai")); const started = Date.now();
     try {
       const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(request.model)}:generateContent?key=${encodeURIComponent(this.apiKey)}`, {
@@ -26,18 +45,15 @@ export class GeminiProviderAdapter implements AiProviderAdapter {
         }),
       });
       const payload = await response.json().catch(() => null) as GeminiPayload | null;
-      if (!response.ok) {
-        const code = response.status === 429 ? "AI_PROVIDER_RATE_LIMITED" : response.status === 401 || response.status === 403 ? "AI_PROVIDER_AUTH_FAILED" : "AI_PROVIDER_ERROR";
-        throw new AiGatewayError(code, payload?.error?.message ?? "Gemini could not complete the request.", response.status === 429 || response.status >= 500);
-      }
+      if (!response.ok) throw httpFailure(response.status, payload, request.model, Date.now() - started);
       const text = payload?.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join("").trim();
-      if (!text) throw new AiGatewayError("AI_PROVIDER_EMPTY_RESPONSE", "Gemini returned no usable response.", true);
-      if (!payload?.usageMetadata || !Number.isInteger(payload.usageMetadata.promptTokenCount) || !Number.isInteger(payload.usageMetadata.candidatesTokenCount)) throw new AiGatewayError("AI_PROVIDER_USAGE_MISSING", "Gemini did not return token accounting metadata.", true);
+      if (!text) throw new AiGatewayError("AI_PROVIDER_EMPTY_RESPONSE", "Gemini returned no usable response.", true, { provider: this.provider, model: request.model, latencyMs: Date.now() - started });
+      if (!payload?.usageMetadata || !Number.isInteger(payload.usageMetadata.promptTokenCount) || !Number.isInteger(payload.usageMetadata.candidatesTokenCount)) throw new AiGatewayError("AI_PROVIDER_USAGE_MISSING", "Gemini did not return token accounting metadata.", true, { provider: this.provider, model: request.model, latencyMs: Date.now() - started });
       return { provider: this.provider, model: request.model, text, inputTokens: payload.usageMetadata.promptTokenCount!, outputTokens: payload.usageMetadata.candidatesTokenCount!, latencyMs: Date.now() - started };
     } catch (error) {
       if (error instanceof AiGatewayError) throw error;
-      if (error instanceof Error && error.name === "AbortError") throw new AiGatewayError("AI_PROVIDER_TIMEOUT", "Gemini timed out.", true);
-      throw new AiGatewayError("AI_PROVIDER_UNAVAILABLE", error instanceof Error ? error.message : "Gemini is unavailable.", true);
+      if (error instanceof Error && error.name === "AbortError") throw new AiGatewayError("AI_PROVIDER_TIMEOUT", "Gemini timed out.", true, { provider: this.provider, model: request.model, latencyMs: Date.now() - started });
+      throw new AiGatewayError("AI_PROVIDER_UNAVAILABLE", "Gemini is unavailable.", true, { provider: this.provider, model: request.model, latencyMs: Date.now() - started });
     } finally { clearTimeout(timeout); }
   }
 }

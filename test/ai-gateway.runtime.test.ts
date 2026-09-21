@@ -12,6 +12,8 @@ import { PDFDocument } from "pdf-lib";
 import { normalizePdfJsData } from "../src/lib/pdf/pdfjs-data";
 import { GeminiProviderAdapter } from "../src/lib/ai/gateway/providers/gemini";
 import { defaultGeminiPrice, estimateAiCost } from "../src/lib/ai/gateway/usage";
+import { toAiQueueError } from "../src/lib/ai/gateway/retry";
+import { UnrecoverableError } from "bullmq";
 
 const baseTask: AiTask = { toolId: "summarize-pdf", locale: "en", documentId: "11111111-1111-1111-1111-111111111111", documentText: "[PAGE 1]\nDIP contract\n[/PAGE 1]", pageCount: 1 };
 
@@ -40,6 +42,56 @@ test("Gemini 3.8 request keeps structured output and omits deprecated sampling p
   globalThis.fetch = async (_input, init) => { body = JSON.parse(String(init?.body)) as Record<string, unknown>; return Response.json({ candidates: [{ content: { parts: [{ text: JSON.stringify({ answer: "Scoped", citations: [{ page: 1 }] }) }] } }], usageMetadata: { promptTokenCount: 4, candidatesTokenCount: 2 } }); };
   try { const request = buildProviderRequest(baseTask, "gemini-3.8-flash"); const response = await new GeminiProviderAdapter("test-key").generate(request); assert.equal(response.model, "gemini-3.8-flash"); const config = body?.generationConfig as Record<string, unknown>; assert.equal(config.responseMimeType, "application/json"); assert.deepEqual(config.responseJsonSchema, request.responseSchema); for (const key of ["temperature", "top_p", "top_k", "candidate_count", "thinking_budget"]) assert.equal(key in config, false); }
   finally { globalThis.fetch = originalFetch; }
+});
+
+test("Gemini classifies transient provider responses with safe diagnostics", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const status of [408, 429, 500, 502, 503, 504]) {
+      globalThis.fetch = async () => Response.json({ error: { code: status, status: status === 429 ? "RESOURCE_EXHAUSTED" : "UNAVAILABLE", message: "provider detail containing PRIVATE_DOCUMENT_TEXT" }, apiKey: "secret" }, { status });
+      const error = await new GeminiProviderAdapter("test-key").generate(buildProviderRequest(baseTask, "gemini-3.8-flash")).catch((reason: unknown) => reason);
+      assert.ok(error instanceof AiGatewayError);
+      assert.equal(error.retryable, true);
+      assert.equal(error.metadata.provider, "gemini");
+      assert.equal(error.metadata.model, "gemini-3.8-flash");
+      assert.equal(error.metadata.httpStatus, status);
+      assert.equal(error.metadata.providerCode, String(status));
+      assert.doesNotMatch(JSON.stringify(error), /PRIVATE_DOCUMENT_TEXT|secret|test-key/);
+    }
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test("Gemini classifies permanent client responses as unrecoverable queue failures", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const status of [400, 401, 403, 404]) {
+      globalThis.fetch = async () => Response.json({ error: { code: status, status: "INVALID_ARGUMENT" } }, { status });
+      const error = await new GeminiProviderAdapter("test-key").generate(buildProviderRequest(baseTask, "gemini-3.8-flash")).catch((reason: unknown) => reason);
+      assert.ok(error instanceof AiGatewayError);
+      assert.equal(error.retryable, false);
+      assert.ok(toAiQueueError(error) instanceof UnrecoverableError);
+    }
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test("Gemini network and timeout failures remain retryable", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const failure of [new TypeError("fetch failed"), Object.assign(new Error("aborted"), { name: "AbortError" })]) {
+      globalThis.fetch = async () => { throw failure; };
+      const error = await new GeminiProviderAdapter("test-key").generate(buildProviderRequest(baseTask, "gemini-3.8-flash")).catch((reason: unknown) => reason);
+      assert.ok(error instanceof AiGatewayError);
+      assert.equal(error.retryable, true);
+      assert.equal(toAiQueueError(error), error);
+      assert.equal(error.metadata.provider, "gemini");
+      assert.equal(error.metadata.model, "gemini-3.8-flash");
+    }
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test("AI queue keeps three attempts and adds exponential jitter", async () => {
+  const source = await readFile(new URL("../src/lib/queue/index.ts", import.meta.url), "utf8");
+  assert.match(source, /attempts: 3, backoff: \{ type: "exponential", delay: 2000, jitter: 0\.5 \}/);
 });
 
 test("Gemini 3.8 pricing follows the audited effective-date schedule and explicit overrides", () => {

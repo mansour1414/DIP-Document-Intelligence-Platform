@@ -15,6 +15,7 @@ import { recordMetric } from "@/lib/observability/metrics";
 import { captureOperationalError } from "@/lib/observability/errors";
 import { configuredCostRates, estimateJobCost } from "@/lib/cost/model";
 import { withTenant } from "@/lib/db/tenant";
+import { isUnrecoverableAiQueueError, toAiQueueError } from "@/lib/ai/gateway/retry";
 
 async function processDocumentJob(message: QueuedJob) {
   if (!message.userId) throw Object.assign(new Error("Worker job requires a tenant identity"), { code: "TENANT_CONTEXT_REQUIRED" });
@@ -93,7 +94,7 @@ documentWorker.on("error", (error) => { captureOperationalError(error, { worker:
 
 const aiTools = new Set<AiTool>(["summarize-pdf", "chat-with-pdf", "extract-data"]);
 
-export async function processAiJob(message: QueuedJob) {
+export async function processAiJob(message: QueuedJob, attemptNumber = 1) {
   if (!message.userId) throw Object.assign(new Error("AI worker job requires a tenant identity"), { code: "TENANT_CONTEXT_REQUIRED" });
   const tenant = <T>(operation: Parameters<typeof withTenant<T>>[1]) => withTenant({ userId: message.userId! }, operation);
   const job = await tenant((tx) => tx.job.findUnique({ where: { id: message.jobId }, include: { steps: true } }));
@@ -129,17 +130,37 @@ export async function processAiJob(message: QueuedJob) {
   } catch (error) {
     const errorCode = error instanceof AiGatewayError ? error.code : typeof error === "object" && error && "code" in error ? String(error.code) : "AI_PROCESSING_FAILED";
     const message = error instanceof Error ? error.message : "AI processing failed";
+    const metadata = error instanceof AiGatewayError ? error.metadata : {};
+    const retryable = error instanceof AiGatewayError ? error.retryable : true;
+    const failure = {
+      message,
+      retryable,
+      attemptNumber,
+      latencyMs: metadata.latencyMs ?? Date.now() - started,
+      ...(metadata.provider ? { provider: metadata.provider } : {}),
+      ...(metadata.model ? { model: metadata.model } : {}),
+      ...(metadata.httpStatus === undefined ? {} : { httpStatus: metadata.httpStatus }),
+      ...(metadata.providerCode ? { providerCode: metadata.providerCode } : {}),
+      ...(metadata.providerStatus ? { providerStatus: metadata.providerStatus } : {}),
+    };
     await tenant(async (tx) => {
-      await tx.job.update({ where: { id: job.id }, data: { status: "FAILED", errorCode, error: { message }, completedAt: new Date() } });
-      if (step) await tx.jobStep.update({ where: { id: step.id }, data: { status: "FAILED", errorCode, error: { message }, completedAt: new Date() } });
-      await tx.toolExecution.create({ data: { jobId: job.id, toolId: job.toolId, mode: "AI", input: { inputFileId: job.inputFileId }, correlationId, errorCode, engine: "ai-gateway", engineVersion: "1", durationMs: Date.now() - started } });
+      await tx.job.update({ where: { id: job.id }, data: { status: "FAILED", errorCode, error: failure, completedAt: new Date() } });
+      if (step) await tx.jobStep.update({ where: { id: step.id }, data: { status: "FAILED", errorCode, error: failure, completedAt: new Date() } });
+      await tx.toolExecution.create({ data: { jobId: job.id, toolId: job.toolId, mode: "AI", input: { inputFileId: job.inputFileId }, correlationId, errorCode, engine: metadata.provider ?? "ai-gateway", engineVersion: metadata.model ?? "1", durationMs: Date.now() - started } });
     });
-    logger.error("ai.job.failed", { ...context, error_code: errorCode });
+    const failureLabels = { tool_id: job.toolId, provider: metadata.provider, model: metadata.model, status: "failed", error_code: errorCode, retryable };
+    recordMetric("ai_provider_failures_total", 1, "count", failureLabels);
+    recordMetric("ai_latency_ms", failure.latencyMs, "ms", failureLabels);
+    logger.error("ai.job.failed", { ...context, error_code: errorCode, provider: metadata.provider, model: metadata.model, http_status: metadata.httpStatus, provider_code: metadata.providerCode, provider_status: metadata.providerStatus, retryable, attempt_number: attemptNumber, latency_ms: failure.latencyMs });
     throw error;
   }
 }
 
-export const aiWorker = new Worker<QueuedJob>(AI_JOB_QUEUE_NAME, async (message) => { recordMetric("queue_wait_ms", Math.max(0, Date.now() - message.timestamp), "ms", { tool_id: message.data.toolId, queue: "ai" }); return withTimeout(message.data.toolId, timeoutFor("ai") + 30_000, processAiJob(message.data)); }, {
+export const aiWorker = new Worker<QueuedJob>(AI_JOB_QUEUE_NAME, async (message) => {
+  recordMetric("queue_wait_ms", Math.max(0, Date.now() - message.timestamp), "ms", { tool_id: message.data.toolId, queue: "ai" });
+  try { return await withTimeout(message.data.toolId, timeoutFor("ai") + 30_000, processAiJob(message.data, message.attemptsMade + 1)); }
+  catch (error) { throw toAiQueueError(error); }
+}, {
   connection: getQueueConnection(),
   concurrency: runtimeLimits.aiConcurrency,
   limiter: { max: runtimeLimits.aiRatePerMinute, duration: 60_000 },
@@ -147,8 +168,14 @@ export const aiWorker = new Worker<QueuedJob>(AI_JOB_QUEUE_NAME, async (message)
   maxStalledCount: runtimeLimits.maxStalledCount,
   lockDuration: Math.min(runtimeLimits.jobTimeoutMs, 10 * 60_000),
 });
-aiWorker.on("failed", async (message) => { if (message && message.attemptsMade < (message.opts.attempts ?? 1)) { recordMetric("retry_total", 1, "count", { tool_id: message.data.toolId, status: "retrying" }); if (message.data.userId) await withTenant({ userId: message.data.userId }, (tx) => tx.job.update({ where: { id: message.data.jobId }, data: { status: "RETRYING" } })); } });
 aiWorker.on("completed", (message) => { void advanceWorkflow(message.data).catch((error) => captureOperationalError(error, { worker: "workflow" })); });
-aiWorker.on("failed", async (message) => { if (message && message.attemptsMade >= (message.opts.attempts ?? 1)) await advanceWorkflow(message.data); });
+aiWorker.on("failed", async (message, error) => {
+  if (!message) return;
+  const terminal = isUnrecoverableAiQueueError(error) || message.attemptsMade >= (message.opts.attempts ?? 1);
+  if (!terminal) {
+    recordMetric("retry_total", 1, "count", { tool_id: message.data.toolId, status: "retrying" });
+    if (message.data.userId) await withTenant({ userId: message.data.userId }, (tx) => tx.job.update({ where: { id: message.data.jobId }, data: { status: "RETRYING" } }));
+  } else await advanceWorkflow(message.data);
+});
 aiWorker.on("stalled", () => recordMetric("stalled_jobs_total", 1, "count", { status: "stalled" }));
 aiWorker.on("error", (error) => { captureOperationalError(error, { worker: "ai" }); logger.error("ai.worker.error", { error: error.message }); });
