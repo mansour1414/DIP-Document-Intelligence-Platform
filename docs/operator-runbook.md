@@ -19,7 +19,7 @@ Keep secrets in the deployment secret manager, never Git or images.
 - Storage: configure `STORAGE_ENDPOINT`, `STORAGE_BUCKET`, `STORAGE_ACCESS_KEY`, `STORAGE_SECRET_KEY`, and `STORAGE_REGION`, or the supported `AWS_*` equivalents. Keep the bucket private and scope credentials to the required bucket/prefix.
 - Malware scanning: configure private `CLAMD_HOST`/`CLAMD_PORT`, `MALWARE_SCAN_TIMEOUT_MS`, and `MALWARE_SCAN_MAX_BYTES`. Set clamd `StreamMaxLength` to at least the application scan maximum (100 MiB baseline). Readiness policy must keep public job intake closed until the scanner and signatures are healthy.
 - Auth: configure high-entropy `AUTH_SECRET`, `API_KEY_PEPPER`, and `RATE_LIMIT_KEY_SECRET`. Register exact OAuth callbacks and configure a provider only when enabled.
-- AI: configure gateway URL, provider credential/model, timeouts, hard token budget, prices, concurrency, and rate limits. `AI_ENABLED` and `GEMINI_ENABLED` are kill switches.
+- AI: the production default is stable `gemini-3.8-flash`, with `GEMINI_MODEL` and `GEMINI_MODEL_<ROUTE_CLASS>` remaining explicit overrides. Configure the provider credential, timeouts, hard token budget, concurrency, and rate limits. DIP's default Standard pricing schedule is date-aware: $0.75/$3.75 per million input/output tokens through 2026-12-31 and $1.50/$7.50 from 2027-01-01, based on [Google's published Gemini 3.8 pricing](https://ai.google.dev/gemini-api/docs/pricing) audited on 2026-09-21. Leave `GEMINI_*_USD_PER_MILLION` blank to use that schedule. A model override must set both prices from its approved provider contract; missing or partial override pricing fails closed. Audit configured prices at contract renewal. `AI_ENABLED` and `GEMINI_ENABLED` are kill switches.
 - App: set the canonical HTTPS `NEXT_PUBLIC_APP_URL` at build and runtime.
 - Limits: review all `API_RATE_LIMIT_*`, `MAX_*`, worker concurrency/timeouts, BullMQ stalled settings, retention/apply flag, and cost-rate settings against measured capacity.
 - Monitoring: configure `SENTRY_DSN`, sampling, and every `ALERT_*` threshold. Verify logs and metrics reach the selected backend without content or credentials.
@@ -57,3 +57,8 @@ Keep secrets in the deployment secret manager, never Git or images.
 ## Monitoring minimums
 
 Alert on readiness, queue depth and oldest age, stuck jobs, latency and terminal outcomes, retries/stalls, worker CPU/RAM/temp disk, storage latency/failures/capacity, cleanup failures, AI usage/cost/provider failures, API latency/status/rate-limit outcomes, auth failures, and privilege/key lifecycle events. Investigate using `correlation_id`, `request_id`, and `job_id`; never trust user-supplied headers for tenant or limiter identity.
+
+## AI reliability follow-ups
+
+- Treat `AiGatewayError.retryable === false` as an unrecoverable BullMQ failure so permanent provider/configuration errors do not consume all attempts. This is separate from the Gemini 3.8 routing Change Request.
+- Preserve safe provider HTTP status, provider error status, retryability, attempt number, and latency in internal diagnostics without logging prompts, document content, credentials, or complete provider payloads.

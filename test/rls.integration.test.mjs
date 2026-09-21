@@ -101,7 +101,7 @@ integrationTest("dip_app pooled RLS isolates tenants and fails closed", async ()
 
     const { recordAiUsageOnce } = await import("../src/lib/ai/gateway/usage");
     const accountingContext = { userId: ids.userA, jobId: ids.accountingJob, toolId: "summarize-pdf", correlationId: randomUUID() };
-    const accountingResponse = { provider: "integration", model: "fixture", text: "ok", inputTokens: 10, outputTokens: 5, latencyMs: 1 };
+    const accountingResponse = { provider: "gemini", model: "gemini-3.8-flash", text: "ok", inputTokens: 10, outputTokens: 5, latencyMs: 1 };
     const creditsBefore = Number((await owner.query(`SELECT count(*) FROM credit_ledger WHERE user_id = ANY($1::uuid[])`, [[ids.userA, ids.userB]])).rows[0].count);
     const [createdUsage, replayedUsage] = await Promise.all([recordAiUsageOnce(accountingContext, accountingResponse), recordAiUsageOnce(accountingContext, accountingResponse)]);
     assert.equal([createdUsage, replayedUsage].filter((entry) => !entry.reused).length, 1);

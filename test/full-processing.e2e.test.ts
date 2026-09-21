@@ -36,7 +36,7 @@ integration("orchestrator to DB, Redis, production worker, S3, Office and biling
       assert.ok(process.env.GEMINI_API_KEY, "GEMINI_API_KEY is required for mandatory Release B AI E2E");
       for (const [toolId, options] of [["summarize-pdf", { locale: "en" }], ["chat-with-pdf", { locale: "en", question: "What page contains DIP E2E page 1? Cite the page." }], ["extract-data", { locale: "en" }]] as const) {
         const ai = await createToolJob({ userId, toolId, idempotencyKey: `${toolId}-gemini-e2e`, correlationId: randomUUID(), options, uploads: [{ filename: "grounded.pdf", mimeType: "application/pdf", bytes: first }] });
-        const completed = await wait(ai.id); assert.equal(completed.status, "SUCCEEDED"); assert.equal(completed.engine, "gemini"); assert.ok(completed.engineVersion);
+        const completed = await wait(ai.id); assert.equal(completed.status, "SUCCEEDED"); assert.equal(completed.engine, "gemini"); assert.equal(completed.engineVersion, "gemini-3.8-flash");
         const successfulExecutions = completed.toolExecutions.filter((execution) => execution.errorCode === null && execution.output !== null);
         assert.equal(successfulExecutions.length, 1, "BullMQ retries may retain failed attempt records, but exactly one execution may produce the successful side effect");
         assert.ok(completed.toolExecutions.filter((execution) => execution.id !== successfulExecutions[0].id).every((execution) => execution.errorCode !== null && execution.output === null), "non-successful ToolExecution rows must be failed attempt history only");

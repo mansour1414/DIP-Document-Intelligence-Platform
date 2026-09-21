@@ -18,7 +18,7 @@ integration("real PostgreSQL advisory locks serialize usage, credit and AI idemp
   assert.equal(await db.creditLedger.count({ where: { userId, idempotencyKey: `job:merge-pdf:${idempotencyKey}` } }), 1);
 
   const context = { userId, jobId, toolId: "summarize-pdf" as const, correlationId: randomUUID() };
-  const response = { provider: "integration", model: "fixture", text: "ok", inputTokens: 10, outputTokens: 5, latencyMs: 1 };
+  const response = { provider: "gemini", model: "gemini-3.8-flash", text: "ok", inputTokens: 10, outputTokens: 5, latencyMs: 1 };
   const accounting = await Promise.all(Array.from({ length: 4 }, () => recordAiUsageOnce(context, response)));
   assert.equal(accounting.filter((entry) => !entry.reused).length, 1);
   assert.equal(await db.aiUsage.count({ where: { userId, jobId } }), 1);

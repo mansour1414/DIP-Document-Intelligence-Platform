@@ -22,7 +22,7 @@ export class GeminiProviderAdapter implements AiProviderAdapter {
         body: JSON.stringify({
           systemInstruction: { parts: [{ text: request.systemInstruction }] },
           contents: [{ role: "user", parts: [{ text: request.content }] }],
-          generationConfig: { temperature: 0.1, maxOutputTokens: request.maxOutputTokens, responseMimeType: "application/json", responseJsonSchema: request.responseSchema },
+          generationConfig: { maxOutputTokens: request.maxOutputTokens, responseMimeType: "application/json", responseJsonSchema: request.responseSchema },
         }),
       });
       const payload = await response.json().catch(() => null) as GeminiPayload | null;

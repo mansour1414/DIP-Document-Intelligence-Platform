@@ -10,6 +10,8 @@ import { workerToolIds, toolRegistry } from "../src/lib/tools/registry";
 import { extractPdfTextServer, serializePdfPages } from "../src/lib/pdf/text-server";
 import { PDFDocument } from "pdf-lib";
 import { normalizePdfJsData } from "../src/lib/pdf/pdfjs-data";
+import { GeminiProviderAdapter } from "../src/lib/ai/gateway/providers/gemini";
+import { defaultGeminiPrice, estimateAiCost } from "../src/lib/ai/gateway/usage";
 
 const baseTask: AiTask = { toolId: "summarize-pdf", locale: "en", documentId: "11111111-1111-1111-1111-111111111111", documentText: "[PAGE 1]\nDIP contract\n[/PAGE 1]", pageCount: 1 };
 
@@ -20,11 +22,34 @@ test("document AI routes default to the supported Gemini model without bypassing
   try {
     for (const toolId of ["summarize-pdf", "chat-with-pdf", "extract-data"] as const) {
       const route = routeAiTask({ ...baseTask, toolId, ...(toolId === "chat-with-pdf" ? { question: "Cite the document." } : {}) });
-      assert.equal(route.model, "gemini-3.6-flash");
+      assert.equal(route.model, "gemini-3.8-flash");
     }
   } finally {
     for (const name of names) { if (previous[name] === undefined) delete process.env[name]; else process.env[name] = previous[name]; }
   }
+});
+
+test("global and route-class Gemini model overrides remain authoritative", () => {
+  const names = ["GEMINI_MODEL", "GEMINI_MODEL_ECONOMY", "GEMINI_MODEL_BALANCED", "GEMINI_MODEL_HIGH_ACCURACY"] as const; const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+  try { process.env.GEMINI_MODEL = "global-model"; process.env.GEMINI_MODEL_BALANCED = "balanced-model"; assert.equal(routeAiTask(baseTask).model, "global-model"); assert.equal(routeAiTask({ ...baseTask, toolId: "chat-with-pdf", question: "Cite it." }).model, "balanced-model"); }
+  finally { for (const name of names) { if (previous[name] === undefined) delete process.env[name]; else process.env[name] = previous[name]; } }
+});
+
+test("Gemini 3.8 request keeps structured output and omits deprecated sampling parameters", async () => {
+  const originalFetch = globalThis.fetch; let body: Record<string, unknown> | undefined;
+  globalThis.fetch = async (_input, init) => { body = JSON.parse(String(init?.body)) as Record<string, unknown>; return Response.json({ candidates: [{ content: { parts: [{ text: JSON.stringify({ answer: "Scoped", citations: [{ page: 1 }] }) }] } }], usageMetadata: { promptTokenCount: 4, candidatesTokenCount: 2 } }); };
+  try { const request = buildProviderRequest(baseTask, "gemini-3.8-flash"); const response = await new GeminiProviderAdapter("test-key").generate(request); assert.equal(response.model, "gemini-3.8-flash"); const config = body?.generationConfig as Record<string, unknown>; assert.equal(config.responseMimeType, "application/json"); assert.deepEqual(config.responseJsonSchema, request.responseSchema); for (const key of ["temperature", "top_p", "top_k", "candidate_count", "thinking_budget"]) assert.equal(key in config, false); }
+  finally { globalThis.fetch = originalFetch; }
+});
+
+test("Gemini 3.8 pricing follows the audited effective-date schedule and explicit overrides", () => {
+  const input = process.env.GEMINI_INPUT_USD_PER_MILLION; const output = process.env.GEMINI_OUTPUT_USD_PER_MILLION; delete process.env.GEMINI_INPUT_USD_PER_MILLION; delete process.env.GEMINI_OUTPUT_USD_PER_MILLION;
+  try { assert.deepEqual(defaultGeminiPrice("gemini-3.8-flash", new Date("2026-12-31T23:59:59Z")), { inputPerMillion: 0.75, outputPerMillion: 3.75 }); assert.deepEqual(defaultGeminiPrice("gemini-3.8-flash", new Date("2027-01-01T00:00:00Z")), { inputPerMillion: 1.5, outputPerMillion: 7.5 }); assert.equal(estimateAiCost({ model: "gemini-3.8-flash", inputTokens: 1_000_000, outputTokens: 1_000_000 }, new Date("2026-09-21T00:00:00Z")), 4.5); assert.throws(() => estimateAiCost({ model: "override-model", inputTokens: 1, outputTokens: 1 }), /GEMINI_PRICE_NOT_CONFIGURED/); process.env.GEMINI_INPUT_USD_PER_MILLION = "2"; assert.throws(() => estimateAiCost({ model: "gemini-3.8-flash", inputTokens: 1, outputTokens: 1 }), /GEMINI_PRICE_CONFIGURATION_INCOMPLETE/); process.env.GEMINI_OUTPUT_USD_PER_MILLION = "8"; assert.equal(estimateAiCost({ model: "gemini-3.8-flash", inputTokens: 1_000_000, outputTokens: 1_000_000 }), 10); }
+  finally { if (input === undefined) delete process.env.GEMINI_INPUT_USD_PER_MILLION; else process.env.GEMINI_INPUT_USD_PER_MILLION = input; if (output === undefined) delete process.env.GEMINI_OUTPUT_USD_PER_MILLION; else process.env.GEMINI_OUTPUT_USD_PER_MILLION = output; }
+});
+
+test("all document AI tools preserve English and Arabic structured grounding contracts", () => {
+  for (const locale of ["en", "ar"] as const) for (const toolId of ["summarize-pdf", "chat-with-pdf", "extract-data"] as const) { const task: AiTask = { ...baseTask, locale, toolId, ...(toolId === "chat-with-pdf" ? { question: locale === "ar" ? "استشهد بالصفحة." : "Cite the page." } : {}) }; const request = buildProviderRequest(task, "gemini-3.8-flash"); assert.equal(request.model, "gemini-3.8-flash"); const text = toolId === "extract-data" ? JSON.stringify({ summary: locale === "ar" ? "ملخص" : "summary", entities: [], dates: [], amounts: [], contacts: [], actionItems: [], citations: [{ page: 1 }] }) : JSON.stringify({ answer: locale === "ar" ? "إجابة" : "answer", citations: [{ page: 1 }] }); assert.equal(validateProviderResponse(task, text).citations[0].page, 1); }
 });
 
 test("all three AI tools are registered on the unified worker with AI schemas", () => {
