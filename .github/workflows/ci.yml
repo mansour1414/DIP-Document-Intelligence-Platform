@@ -325,13 +325,13 @@ jobs:
       - run: npx prisma generate
       - name: Run CR-002 contract and corpus tests
         run: node --import ./scripts/node-platform-compat.mjs --import tsx --test test/ai-gateway.runtime.test.ts test/groq-evaluation.e2e.test.ts
-      - name: Run optional live Gemini versus Groq comparison
+      - name: Run live Groq evaluation with independent Gemini comparison when available
         shell: bash
         run: |
-          if test -n "$GEMINI_API_KEY" && test -n "$GROQ_API_KEY"; then
+          if test -n "$GROQ_API_KEY"; then
             AI_PROVIDER_EVALUATION_E2E=1 node --import ./scripts/node-platform-compat.mjs --import tsx --test test/groq-evaluation.e2e.test.ts
           else
-            echo "CR-002 live comparison skipped: both provider credentials are required."
+            echo "CR-002 live evaluation skipped: GROQ_API_KEY is required."
           fi
 
   release-b-e2e:
