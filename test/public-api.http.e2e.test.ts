@@ -17,7 +17,8 @@ integration("Public API v1 authenticates, executes on BullMQ, isolates tenants a
   const { getStorage, closeStorage } = await import("../src/lib/storage/index"); const storage = getStorage();
   const base = process.env.PUBLIC_API_BASE_URL ?? "http://127.0.0.1:3000";
   const userA = randomUUID(); const userB = randomUUID();
-  await db.user.createMany({ data: [{ id: userA, email: `${userA}@example.invalid` }, { id: userB, email: `${userB}@example.invalid` }] });
+  await db.user.create({ data: { id: userA, email: `${userA}@example.invalid`, creditLedger: { create: { type: "BONUS", amount: 100, balance: 100, idempotencyKey: "public-api-e2e-seed", reason: "PROMOTIONAL_GRANT" } } } });
+  await db.user.create({ data: { id: userB, email: `${userB}@example.invalid` } });
   const orgA = await createOrganization(userA, "Release B A"); const orgB = await createOrganization(userB, "Release B B");
   const clientA = await createApiClient(userA, orgA.id, "Release B client A"); const clientB = await createApiClient(userB, orgB.id, "Release B client B");
   const keyA = await createApiKey(userA, orgA.id, clientA.id, "Release B key A", ["*"]); const keyB = await createApiKey(userB, orgB.id, clientB.id, "Release B key B", ["*"]);
@@ -27,9 +28,12 @@ integration("Public API v1 authenticates, executes on BullMQ, isolates tenants a
   const form = (label = "a") => { const value = new FormData(); value.set("toolId", "compress-pdf"); value.set("files", new File([bytes as BlobPart], `${label}.pdf`, { type: "application/pdf" })); return value; };
   try {
     await expectStatus("/v1/tools", keyA.key, 200); await expectStatus("/v1/tools/compress-pdf", keyA.key, 200); await expectStatus("/v1/tools/internal-missing", keyA.key, 404);
+    const insufficient = await request("/v1/jobs", keyB.key, { method: "POST", headers: { "idempotency-key": "release-b-insufficient" }, body: form("insufficient") }); assert.equal(insufficient.status, 402); assert.equal((await insufficient.json() as { error: { code: string } }).error.code, "CREDIT_EXHAUSTED");
     const createdResponse = await request("/v1/jobs", keyA.key, { method: "POST", headers: { "idempotency-key": "release-b-http" }, body: form() }); assert.equal(createdResponse.status, 202);
     const created = await createdResponse.json() as { data: { id: string } }; const jobId = created.data.id;
+    const debitKey = `job:compress-pdf:api:${clientA.id}:release-b-http`; const debit = await db.creditLedger.findUniqueOrThrow({ where: { userId_idempotencyKey: { userId: userA, idempotencyKey: debitKey } } }); assert.equal(Number(debit.amount), -1); assert.equal(Number(debit.balance), 99);
     const replay = await request("/v1/jobs", keyA.key, { method: "POST", headers: { "idempotency-key": "release-b-http" }, body: form() }); assert.equal(replay.status, 200); assert.equal((await replay.json() as { data: { id: string } }).data.id, jobId);
+    assert.equal(await db.creditLedger.count({ where: { userId: userA, idempotencyKey: debitKey } }), 1, "idempotent replay must not double-charge credits");
     const conflict = await request("/v1/jobs", keyA.key, { method: "POST", headers: { "idempotency-key": "release-b-http" }, body: form("different") }); assert.equal(conflict.status, 409); assert.equal((await conflict.json() as { error: { code: string } }).error.code, "CONFLICT");
     assert.equal((await request(`/v1/jobs/${jobId}`, keyB.key)).status, 404); assert.equal((await request(`/v1/jobs/${jobId}/result`, keyB.key)).status, 404);
     let status = ""; for (let index = 0; index < 300; index += 1) { const response = await request(`/v1/jobs/${jobId}`, keyA.key); const body = await response.json() as { data: { status: string } }; status = body.data.status; if (["succeeded", "failed", "cancelled", "expired"].includes(status)) break; await new Promise((resolve) => setTimeout(resolve, 250)); } assert.equal(status, "succeeded");
