@@ -306,6 +306,34 @@ jobs:
           AUTH_SECRET: release-b-browser-secret
           AUTH_BROWSER_E2E: "1"
 
+  groq-evaluation:
+    name: CR-002 Groq evaluation (non-production)
+    runs-on: ubuntu-latest
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GEMINI_MODEL: gemini-3.8-flash
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      GROQ_MODEL: openai/gpt-oss-120b
+      GROQ_EVALUATION_ENABLED: "1"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx prisma generate
+      - name: Run CR-002 contract and corpus tests
+        run: node --import ./scripts/node-platform-compat.mjs --import tsx --test test/ai-gateway.runtime.test.ts test/groq-evaluation.e2e.test.ts
+      - name: Run optional live Gemini versus Groq comparison
+        shell: bash
+        run: |
+          if test -n "$GEMINI_API_KEY" && test -n "$GROQ_API_KEY"; then
+            AI_PROVIDER_EVALUATION_E2E=1 node --import ./scripts/node-platform-compat.mjs --import tsx --test test/groq-evaluation.e2e.test.ts
+          else
+            echo "CR-002 live comparison skipped: both provider credentials are required."
+          fi
+
   release-b-e2e:
     name: Full Release B E2E
     runs-on: ubuntu-latest

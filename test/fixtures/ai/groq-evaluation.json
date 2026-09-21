@@ -1,0 +1,24 @@
+[
+  {
+    "id": "en-contract",
+    "locale": "en",
+    "documentId": "11111111-1111-4111-8111-111111111111",
+    "pages": [
+      "DIP signed a service agreement with Northstar LLC on 12 September 2026.",
+      "The annual contract value is USD 24,000. Payment is due within 30 days.",
+      "Maya Chen is the operational contact. Renewal requires written approval."
+    ],
+    "question": "What is the annual value and when is payment due?"
+  },
+  {
+    "id": "ar-contract",
+    "locale": "ar",
+    "documentId": "22222222-2222-4222-8222-222222222222",
+    "pages": [
+      "وقعت منصة DIP اتفاقية خدمات مع شركة النور بتاريخ 12 سبتمبر 2026.",
+      "تبلغ القيمة السنوية للعقد 24000 دولار أمريكي، ويستحق السداد خلال 30 يوماً.",
+      "جهة الاتصال التشغيلية هي ليلى أحمد، ويتطلب التجديد موافقة خطية."
+    ],
+    "question": "ما قيمة العقد السنوية ومتى يستحق السداد؟"
+  }
+]

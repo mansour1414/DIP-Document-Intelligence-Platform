@@ -11,7 +11,9 @@ import { extractPdfTextServer, serializePdfPages } from "../src/lib/pdf/text-ser
 import { PDFDocument } from "pdf-lib";
 import { normalizePdfJsData } from "../src/lib/pdf/pdfjs-data";
 import { GeminiProviderAdapter } from "../src/lib/ai/gateway/providers/gemini";
-import { defaultGeminiPrice, estimateAiCost } from "../src/lib/ai/gateway/usage";
+import { GroqProviderAdapter } from "../src/lib/ai/gateway/providers/groq";
+import { defaultGeminiPrice, defaultGroqPrice, estimateAiCost, GROQ_GPT_OSS_120B_PRICE_EFFECTIVE_AT, GROQ_GPT_OSS_120B_PRICE_SOURCE } from "../src/lib/ai/gateway/usage";
+import { routeAiEvaluationTask } from "../src/lib/ai/gateway/routing";
 import { toAiQueueError } from "../src/lib/ai/gateway/retry";
 import { UnrecoverableError } from "bullmq";
 import { AI_JOB_RETRY_POLICY } from "../src/lib/queue";
@@ -96,8 +98,64 @@ test("AI queue uses the approved five-attempt exponential retry window with jitt
 
 test("Gemini 3.8 pricing follows the audited effective-date schedule and explicit overrides", () => {
   const input = process.env.GEMINI_INPUT_USD_PER_MILLION; const output = process.env.GEMINI_OUTPUT_USD_PER_MILLION; delete process.env.GEMINI_INPUT_USD_PER_MILLION; delete process.env.GEMINI_OUTPUT_USD_PER_MILLION;
-  try { assert.deepEqual(defaultGeminiPrice("gemini-3.8-flash", new Date("2026-12-31T23:59:59Z")), { inputPerMillion: 0.75, outputPerMillion: 3.75 }); assert.deepEqual(defaultGeminiPrice("gemini-3.8-flash", new Date("2027-01-01T00:00:00Z")), { inputPerMillion: 1.5, outputPerMillion: 7.5 }); assert.equal(estimateAiCost({ model: "gemini-3.8-flash", inputTokens: 1_000_000, outputTokens: 1_000_000 }, new Date("2026-09-21T00:00:00Z")), 4.5); assert.throws(() => estimateAiCost({ model: "override-model", inputTokens: 1, outputTokens: 1 }), /GEMINI_PRICE_NOT_CONFIGURED/); process.env.GEMINI_INPUT_USD_PER_MILLION = "2"; assert.throws(() => estimateAiCost({ model: "gemini-3.8-flash", inputTokens: 1, outputTokens: 1 }), /GEMINI_PRICE_CONFIGURATION_INCOMPLETE/); process.env.GEMINI_OUTPUT_USD_PER_MILLION = "8"; assert.equal(estimateAiCost({ model: "gemini-3.8-flash", inputTokens: 1_000_000, outputTokens: 1_000_000 }), 10); }
+  try { assert.deepEqual(defaultGeminiPrice("gemini-3.8-flash", new Date("2026-12-31T23:59:59Z")), { inputPerMillion: 0.75, outputPerMillion: 3.75 }); assert.deepEqual(defaultGeminiPrice("gemini-3.8-flash", new Date("2027-01-01T00:00:00Z")), { inputPerMillion: 1.5, outputPerMillion: 7.5 }); assert.equal(estimateAiCost({ provider: "gemini", model: "gemini-3.8-flash", inputTokens: 1_000_000, outputTokens: 1_000_000 }, new Date("2026-09-21T00:00:00Z")), 4.5); assert.throws(() => estimateAiCost({ provider: "gemini", model: "override-model", inputTokens: 1, outputTokens: 1 }), /GEMINI_PRICE_NOT_CONFIGURED/); process.env.GEMINI_INPUT_USD_PER_MILLION = "2"; assert.throws(() => estimateAiCost({ provider: "gemini", model: "gemini-3.8-flash", inputTokens: 1, outputTokens: 1 }), /GEMINI_PRICE_CONFIGURATION_INCOMPLETE/); process.env.GEMINI_OUTPUT_USD_PER_MILLION = "8"; assert.equal(estimateAiCost({ provider: "gemini", model: "gemini-3.8-flash", inputTokens: 1_000_000, outputTokens: 1_000_000 }), 10); }
   finally { if (input === undefined) delete process.env.GEMINI_INPUT_USD_PER_MILLION; else process.env.GEMINI_INPUT_USD_PER_MILLION = input; if (output === undefined) delete process.env.GEMINI_OUTPUT_USD_PER_MILLION; else process.env.GEMINI_OUTPUT_USD_PER_MILLION = output; }
+});
+
+test("production routing remains Gemini while Groq is isolated behind the evaluation gate", () => {
+  const names = ["AI_PROVIDER", "GROQ_EVALUATION_ENABLED", "GROQ_MODEL", "GROQ_INPUT_USD_PER_MILLION", "GROQ_OUTPUT_USD_PER_MILLION"] as const;
+  const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+  try {
+    process.env.AI_PROVIDER = "groq";
+    assert.equal(routeAiTask(baseTask).adapter.provider, "gemini");
+    delete process.env.GROQ_EVALUATION_ENABLED;
+    assert.throws(() => routeAiEvaluationTask(baseTask), { code: "AI_EVALUATION_DISABLED" });
+    process.env.GROQ_EVALUATION_ENABLED = "1";
+    const route = routeAiEvaluationTask(baseTask);
+    assert.equal(route.adapter.provider, "groq"); assert.equal(route.model, "openai/gpt-oss-120b");
+  } finally { for (const name of names) { if (previous[name] === undefined) delete process.env[name]; else process.env[name] = previous[name]; } }
+});
+
+test("Groq evaluation uses structured output and actual provider token accounting", async () => {
+  const originalFetch = globalThis.fetch; let body: Record<string, unknown> | undefined; let authorization: string | null = null;
+  globalThis.fetch = async (_input, init) => { body = JSON.parse(String(init?.body)) as Record<string, unknown>; authorization = new Headers(init?.headers).get("authorization"); return Response.json({ choices: [{ message: { content: JSON.stringify({ answer: "Scoped", citations: [{ page: 1 }] }) } }], usage: { prompt_tokens: 11, completion_tokens: 7 } }); };
+  try {
+    const request = buildProviderRequest(baseTask, "openai/gpt-oss-120b"); const response = await new GroqProviderAdapter("test-key").generate(request);
+    assert.equal(response.provider, "groq"); assert.equal(response.inputTokens, 11); assert.equal(response.outputTokens, 7); assert.equal(authorization, "Bearer test-key");
+    const format = body?.response_format as { type?: string; json_schema?: { strict?: boolean; schema?: unknown } }; assert.equal(format.type, "json_schema"); assert.equal(format.json_schema?.strict, false); assert.deepEqual(format.json_schema?.schema, request.responseSchema);
+    assert.doesNotMatch(JSON.stringify(response), /test-key|DIP contract/);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test("Groq safely classifies transient and permanent failures without leaking provider payloads", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const status of [408, 429, 500, 503]) {
+      globalThis.fetch = async () => Response.json({ error: { code: "rate_limit", type: "server_error", message: "PRIVATE_DOCUMENT_TEXT" }, apiKey: "secret" }, { status });
+      const error = await new GroqProviderAdapter("test-key").generate(buildProviderRequest(baseTask, "openai/gpt-oss-120b")).catch((reason: unknown) => reason);
+      assert.ok(error instanceof AiGatewayError); assert.equal(error.retryable, true); assert.equal(error.metadata.provider, "groq"); assert.doesNotMatch(JSON.stringify(error), /PRIVATE_DOCUMENT_TEXT|secret|test-key/);
+    }
+    for (const status of [400, 401, 403, 404, 422]) {
+      globalThis.fetch = async () => Response.json({ error: { code: "invalid_request", type: "invalid_request_error" } }, { status });
+      const error = await new GroqProviderAdapter("test-key").generate(buildProviderRequest(baseTask, "openai/gpt-oss-120b")).catch((reason: unknown) => reason);
+      assert.ok(error instanceof AiGatewayError); assert.equal(error.retryable, false); assert.ok(toAiQueueError(error) instanceof UnrecoverableError);
+    }
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test("Groq evaluation pricing uses the approved effective-date schedule and optional complete overrides", () => {
+  const input = process.env.GROQ_INPUT_USD_PER_MILLION; const output = process.env.GROQ_OUTPUT_USD_PER_MILLION;
+  try {
+    delete process.env.GROQ_INPUT_USD_PER_MILLION; delete process.env.GROQ_OUTPUT_USD_PER_MILLION;
+    assert.equal(GROQ_GPT_OSS_120B_PRICE_EFFECTIVE_AT.toISOString(), "2026-09-21T00:00:00.000Z"); assert.match(GROQ_GPT_OSS_120B_PRICE_SOURCE, /^https:\/\/console\.groq\.com\/docs\//);
+    assert.deepEqual(defaultGroqPrice("openai/gpt-oss-120b", new Date("2026-09-21T00:00:00Z")), { inputPerMillion: 0.15, outputPerMillion: 0.60 });
+    assert.throws(() => defaultGroqPrice("other-model"), /GROQ_PRICE_NOT_CONFIGURED/); assert.throws(() => defaultGroqPrice("openai/gpt-oss-120b", new Date("2026-09-20T23:59:59Z")), /GROQ_PRICE_NOT_CONFIGURED/);
+    assert.equal(estimateAiCost({ provider: "groq", model: "openai/gpt-oss-120b", inputTokens: 1_000_000, outputTokens: 1_000_000 }), 0.75);
+    process.env.GROQ_INPUT_USD_PER_MILLION = "1";
+    assert.throws(() => estimateAiCost({ provider: "groq", model: "openai/gpt-oss-120b", inputTokens: 1, outputTokens: 1 }), /GROQ_PRICE_CONFIGURATION_INCOMPLETE/);
+    process.env.GROQ_OUTPUT_USD_PER_MILLION = "2";
+    assert.equal(estimateAiCost({ provider: "groq", model: "openai/gpt-oss-120b", inputTokens: 1_000_000, outputTokens: 1_000_000 }), 3);
+  } finally { if (input === undefined) delete process.env.GROQ_INPUT_USD_PER_MILLION; else process.env.GROQ_INPUT_USD_PER_MILLION = input; if (output === undefined) delete process.env.GROQ_OUTPUT_USD_PER_MILLION; else process.env.GROQ_OUTPUT_USD_PER_MILLION = output; }
 });
 
 test("all document AI tools preserve English and Arabic structured grounding contracts", () => {
@@ -162,8 +220,9 @@ test("extract-data requires structured output and citations inside page scope", 
   assert.throws(() => validateProviderResponse(task, JSON.stringify({ summary: "x", entities: [], dates: [], amounts: [], contacts: [], actionItems: [], citations: [{ page: 2 }] })), { code: "AI_CITATION_INVALID" });
 });
 
-test("Gemini network call exists only in its provider adapter", async () => {
+test("provider network calls exist only in their AI Gateway adapters", async () => {
   const adapter = await readFile(new URL("../src/lib/ai/gateway/providers/gemini.ts", import.meta.url), "utf8");
+  const groqAdapter = await readFile(new URL("../src/lib/ai/gateway/providers/groq.ts", import.meta.url), "utf8");
   const legacyRoute = await readFile(new URL("../src/app/api/ai/[tool]/route.ts", import.meta.url), "utf8");
-  assert.match(adapter, /generativelanguage\.googleapis\.com/); assert.doesNotMatch(legacyRoute, /Gemini|generativelanguage|runAiTool/);
+  assert.match(adapter, /generativelanguage\.googleapis\.com/); assert.match(groqAdapter, /api\.groq\.com/); assert.doesNotMatch(legacyRoute, /Gemini|Groq|generativelanguage|api\.groq|runAiTool/);
 });

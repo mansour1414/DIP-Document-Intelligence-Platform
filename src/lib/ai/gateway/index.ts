@@ -1,6 +1,6 @@
 import { logger } from "@/lib/logging";
-import { enforceAiPolicy } from "./policy";
-import { routeAiTask, type AiRoute } from "./routing";
+import { enforceAiEvaluationPolicy, enforceAiPolicy } from "./policy";
+import { routeAiEvaluationTask, routeAiTask, type AiRoute } from "./routing";
 import { buildProviderRequest, validateAiTask } from "./task";
 import type { AgentPlanDraft } from "@/lib/agent/types";
 import type { AiRequestContext, AiTask, AgentPlannerTask, GatewayTask, AiValidatedOutput, ProviderResponse } from "./types";
@@ -15,6 +15,7 @@ export type GatewayDependencies = {
 };
 
 const productionDependencies: GatewayDependencies = { policy: enforceAiPolicy, route: routeAiTask, account: recordAiUsageOnce };
+const evaluationDependencies: GatewayDependencies = { policy: enforceAiEvaluationPolicy, route: routeAiEvaluationTask, account: recordAiUsageOnce };
 
 export function executeAiGateway(task: AgentPlannerTask, context: AiRequestContext, dependencies?: GatewayDependencies): Promise<{ output: AgentPlanDraft; response: ProviderResponse; estimatedCost: number }>;
 export function executeAiGateway(task: AiTask, context: AiRequestContext, dependencies?: GatewayDependencies): Promise<{ output: AiValidatedOutput; response: ProviderResponse; estimatedCost: number }>;
@@ -29,6 +30,10 @@ export async function executeAiGateway(task: GatewayTask, context: AiRequestCont
   recordMetric("ai_latency_ms", response.latencyMs, "ms", labels); recordMetric("ai_input_tokens", response.inputTokens, "count", labels); recordMetric("ai_output_tokens", response.outputTokens, "count", labels); recordMetric("ai_estimated_cost", usage.cost, "ratio", labels);
   logger.info("ai.request.completed", { provider: response.provider, model: response.model, input_tokens: response.inputTokens, output_tokens: response.outputTokens, latency_ms: response.latencyMs, estimated_cost: usage.cost, tool_id: context.toolId, job_id: context.jobId, agent_run_id: context.agentRunId, correlation_id: context.correlationId, user_id: context.userId, usage_reused: usage.reused });
   return { output, response, estimatedCost: usage.cost };
+}
+
+export function executeAiEvaluationGateway(task: AiTask, context: AiRequestContext) {
+  return executeAiGateway(task, context, evaluationDependencies) as Promise<{ output: AiValidatedOutput; response: ProviderResponse; estimatedCost: number }>;
 }
 
 export * from "./types";
