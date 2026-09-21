@@ -14,6 +14,7 @@ import { GeminiProviderAdapter } from "../src/lib/ai/gateway/providers/gemini";
 import { defaultGeminiPrice, estimateAiCost } from "../src/lib/ai/gateway/usage";
 import { toAiQueueError } from "../src/lib/ai/gateway/retry";
 import { UnrecoverableError } from "bullmq";
+import { AI_JOB_RETRY_POLICY } from "../src/lib/queue";
 
 const baseTask: AiTask = { toolId: "summarize-pdf", locale: "en", documentId: "11111111-1111-1111-1111-111111111111", documentText: "[PAGE 1]\nDIP contract\n[/PAGE 1]", pageCount: 1 };
 
@@ -89,9 +90,8 @@ test("Gemini network and timeout failures remain retryable", async () => {
   } finally { globalThis.fetch = originalFetch; }
 });
 
-test("AI queue keeps three attempts and adds exponential jitter", async () => {
-  const source = await readFile(new URL("../src/lib/queue/index.ts", import.meta.url), "utf8");
-  assert.match(source, /attempts: 3, backoff: \{ type: "exponential", delay: 2000, jitter: 0\.5 \}/);
+test("AI queue uses the approved five-attempt exponential retry window with jitter", () => {
+  assert.deepEqual(AI_JOB_RETRY_POLICY, { attempts: 5, backoff: { type: "exponential", delay: 2000, jitter: 0.5 } });
 });
 
 test("Gemini 3.8 pricing follows the audited effective-date schedule and explicit overrides", () => {

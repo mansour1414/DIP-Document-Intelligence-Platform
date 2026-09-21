@@ -60,5 +60,5 @@ Alert on readiness, queue depth and oldest age, stuck jobs, latency and terminal
 
 ## AI retry and diagnostics policy
 
-- AI jobs use three BullMQ attempts with 2-second exponential backoff and 50% jitter. HTTP 408, 429, 5xx, network errors, and provider timeouts are retryable; permanent client/provider errors use BullMQ's unrecoverable-error path and stop after the current attempt.
+- AI jobs use five BullMQ attempts with 2-second exponential backoff and 50% jitter. The four nominal retry delays are 2, 4, 8, and 16 seconds; BullMQ jitter randomizes each delay between 50% and 100% of that value. HTTP 408, 429, 5xx, network errors, and provider timeouts are retryable; permanent client/provider errors use BullMQ's unrecoverable-error path and stop after the current attempt. Deterministic PDF, Office, and OCR queue policy is unchanged.
 - Internal failure diagnostics retain only provider, resolved model, HTTP/provider status codes, retryability, attempt number, latency, job/correlation identifiers, and the stable DIP error code. Prompts, document content, credentials, and complete provider payloads must never be logged or persisted.

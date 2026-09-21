@@ -34,8 +34,9 @@ export function waitForRedisReady(connection: Redis, timeoutMs = 10_000) {
 export async function getReadyQueueConnection() { const connection = getQueueConnection(); await waitForRedisReady(connection); return connection; }
 export async function pingQueueConnection() { return (await getReadyQueueConnection()).ping(); }
 const retention = { age: 24 * 60 * 60, count: 1_000 };
+export const AI_JOB_RETRY_POLICY = { attempts: 5, backoff: { type: "exponential", delay: 2000, jitter: 0.5 } } satisfies JobsOptions;
 export function getJobQueue() { return queue ??= new Queue<QueuedJob>(JOB_QUEUE_NAME, { connection: getQueueConnection(), defaultJobOptions: { attempts: 3, backoff: { type: "exponential", delay: 1000 }, removeOnComplete: retention, removeOnFail: retention } }); }
-export function getAiJobQueue() { return aiQueue ??= new Queue<QueuedJob>(AI_JOB_QUEUE_NAME, { connection: getQueueConnection(), defaultJobOptions: { attempts: 3, backoff: { type: "exponential", delay: 2000, jitter: 0.5 }, removeOnComplete: retention, removeOnFail: retention } }); }
+export function getAiJobQueue() { return aiQueue ??= new Queue<QueuedJob>(AI_JOB_QUEUE_NAME, { connection: getQueueConnection(), defaultJobOptions: { ...AI_JOB_RETRY_POLICY, removeOnComplete: retention, removeOnFail: retention } }); }
 export async function queueDepth(queueName: "document" | "ai") { const counts = await (queueName === "ai" ? getAiJobQueue() : getJobQueue()).getJobCounts("wait", "active", "delayed", "failed"); const total = Object.values(counts).reduce((sum, value) => sum + value, 0); recordMetric("queue_depth", total, "count", { queue: queueName }); return { ...counts, total, configuredConcurrency: queueName === "ai" ? runtimeLimits.aiConcurrency : runtimeLimits.documentConcurrency }; }
 export async function enqueueJob(job: QueuedJob, options: JobsOptions = {}) { return getJobQueue().add(job.toolId, job, { ...options, jobId: job.jobId }); }
 export async function enqueueAiJob(job: QueuedJob, options: JobsOptions = {}) { return getAiJobQueue().add(job.toolId, job, { ...options, jobId: job.jobId }); }
