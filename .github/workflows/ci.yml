@@ -325,14 +325,18 @@ jobs:
       - run: npx prisma generate
       - name: Run CR-002 contract and corpus tests
         run: node --import ./scripts/node-platform-compat.mjs --import tsx --test test/ai-gateway.runtime.test.ts test/groq-evaluation.e2e.test.ts
-      - name: Run live Groq evaluation with independent Gemini comparison when available
+      - name: Verify CR-002 live evaluation configuration
         shell: bash
         run: |
-          if test -n "$GROQ_API_KEY"; then
-            AI_PROVIDER_EVALUATION_E2E=1 node --import ./scripts/node-platform-compat.mjs --import tsx --test test/groq-evaluation.e2e.test.ts
-          else
-            echo "CR-002 live evaluation skipped: GROQ_API_KEY is required."
-          fi
+          if test -n "$GROQ_API_KEY"; then echo "GROQ_API_KEY_PRESENT=true"; else echo "GROQ_API_KEY_PRESENT=false"; fi
+          if test "$GROQ_EVALUATION_ENABLED" = "1"; then echo "GROQ_EVALUATION_ENABLED=true"; else echo "GROQ_EVALUATION_ENABLED=false"; fi
+          test -n "$GROQ_API_KEY" || { echo "CR-002 configuration error: GROQ_API_KEY is missing from this job."; exit 1; }
+          test "$GROQ_EVALUATION_ENABLED" = "1" || { echo "CR-002 configuration error: Groq evaluation is disabled."; exit 1; }
+          test "$GROQ_MODEL" = "openai/gpt-oss-120b" || { echo "CR-002 configuration error: unexpected Groq evaluation model."; exit 1; }
+      - name: Run required live Groq evaluation with independent Gemini comparison when available
+        env:
+          AI_PROVIDER_EVALUATION_E2E: "1"
+        run: node --import ./scripts/node-platform-compat.mjs --import tsx --test test/groq-evaluation.e2e.test.ts
 
   release-b-e2e:
     name: Full Release B E2E

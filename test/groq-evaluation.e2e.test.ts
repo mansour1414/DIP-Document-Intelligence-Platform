@@ -96,6 +96,8 @@ function assertGroqEvaluationGate(results: EvaluationResult[], fixtureCount: num
 
 live("CR-002 compares Gemini and Groq independently across the bilingual document-AI corpus", { timeout: 900_000 }, async () => {
   assert.ok(process.env.GROQ_API_KEY, "GROQ_API_KEY is required for Groq evaluation");
+  assert.equal(process.env.GROQ_EVALUATION_ENABLED, "1", "GROQ_EVALUATION_ENABLED=1 is required for live Groq evaluation");
+  assert.equal(process.env.GROQ_MODEL, "openai/gpt-oss-120b", "CR-002 live evaluation requires openai/gpt-oss-120b");
   const fixtures = JSON.parse(await readFile(new URL("fixtures/ai/groq-evaluation.json", import.meta.url), "utf8")) as Fixture[];
   const providers: Provider[] = [
     { name: "groq", model: process.env.GROQ_MODEL ?? "openai/gpt-oss-120b", adapter: new GroqProviderAdapter() },
@@ -104,6 +106,18 @@ live("CR-002 compares Gemini and Groq independently across the bilingual documen
   const results = await evaluateCorpus(fixtures, providers);
   console.log(JSON.stringify({ event: "cr002.ai_evaluation.completed", results, comparison: comparisonSummary(results) }));
   assertGroqEvaluationGate(results, fixtures.length);
+});
+
+test("CR-002 CI requires the live run and fails closed on missing Groq configuration", async () => {
+  const workflow = await readFile(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8");
+  const job = workflow.split("  groq-evaluation:")[1]?.split("  release-b-e2e:")[0] ?? "";
+  assert.match(job, /GROQ_API_KEY: \$\{\{ secrets\.GROQ_API_KEY \}\}/);
+  assert.match(job, /GROQ_EVALUATION_ENABLED: "1"/);
+  assert.match(job, /GROQ_API_KEY_PRESENT=true/);
+  assert.match(job, /GROQ_EVALUATION_ENABLED=true/);
+  assert.match(job, /test -n "\$GROQ_API_KEY" \|\|/);
+  assert.match(job, /AI_PROVIDER_EVALUATION_E2E: "1"/);
+  assert.doesNotMatch(job, /live evaluation skipped|if test -n "\$GROQ_API_KEY" &&/);
 });
 
 test("Gemini failure does not prevent Groq calls or determine Groq's gate result", async () => {
