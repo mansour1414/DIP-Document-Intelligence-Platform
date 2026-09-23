@@ -2,13 +2,13 @@
 
 ## Decision
 
-Gemini remains DIP's initial and only production-routed AI provider. CR-002 authorizes a Groq adapter for evaluation and testing of `openai/gpt-oss-120b`; it does not authorize production routing, fallback, or closure of the Full Release B production gate.
+At the time of CR-002, Gemini was DIP's initial and only production-routed AI provider. CR-002 authorized evaluation and testing of Groq `openai/gpt-oss-120b`; CR-003 subsequently approved Groq production routing after the live gate passed. CR-002 itself did not authorize fallback.
 
 ## Evaluation boundary
 
 The evaluation covers Summarize PDF, Chat with PDF, and Extract Data in Arabic and English. All calls retain the existing Task → Policy → Routing → Provider Adapter → Response Validation → Usage Accounting sequence, document-scoped prompts, structured output validation, citation page checks, token limits, credit boundary, safe diagnostics, and the existing five-attempt queue policy.
 
-Production `routeAiTask` always resolves Gemini. Groq is reachable only through `routeAiEvaluationTask`/`executeAiEvaluationGateway`, requires `GROQ_EVALUATION_ENABLED=1`, and rejects Agent planning. Groq is never a production fallback under this CR.
+The CR-002 evaluation path remains isolated behind `routeAiEvaluationTask`/`executeAiEvaluationGateway` and `GROQ_EVALUATION_ENABLED=1`. Production routing is governed separately by CR-003, and Groq is not an automatic fallback.
 
 ## Pricing and accounting
 
@@ -22,4 +22,4 @@ The optional live comparison evaluates each provider/task/locale independently. 
 
 The CI live step requires `GROQ_API_KEY`; it compares Gemini when `GEMINI_API_KEY` is available, but Gemini is not a prerequisite for Groq evaluation. The automated Groq gate fails if any Groq case fails validation, citation/grounding checks, usage accounting, or provider availability. Human review remains required for the full Evaluation Gate.
 
-Groq passes the Evaluation Gate only after the expanded live comparison succeeds with approved pricing and a human-reviewed result demonstrates acceptable Arabic and English accuracy, structured extraction, citation grounding, prompt-injection resistance, latency, rate-limit behavior, and commercial/data-handling terms. The existing 6/6 structural live result predates these quality checks and does not satisfy the expanded gate. Automated contract tests alone do not pass the gate. To avoid logging private outputs, perform human review in an access-controlled evaluation session using only the synthetic corpus; do not print answers or prompts into CI logs.
+Groq passed the expanded live Evaluation Gate before CR-003 approval. Automated contract tests alone do not establish ongoing model quality; retain the bilingual live corpus and access-controlled human review for material model or prompt changes, without printing answers or prompts into CI logs.

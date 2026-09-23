@@ -51,21 +51,20 @@ integration("orchestrator to DB, Redis, production worker, S3, Office and biling
       const ocr = await createToolJob({ userId, toolId: "ocr-pdf", idempotencyKey: `ocr-${language}-e2e`, correlationId: randomUUID(), options: { language }, uploads: [{ filename: name, mimeType: "application/pdf", bytes: ocrBytes }] });
       const convertedOcr = await wait(ocr.id); assert.equal(convertedOcr.status, "SUCCEEDED"); assert.equal(convertedOcr.toolExecutions.length, 1); assert.ok(convertedOcr.outputFileId);
     }
-    if (process.env.GEMINI_E2E === "1") {
-      assert.ok(process.env.GEMINI_API_KEY, "GEMINI_API_KEY is required for mandatory Release B AI E2E");
+    if (process.env.AI_E2E === "1") {
       for (const [toolId, options] of [["summarize-pdf", { locale: "en" }], ["chat-with-pdf", { locale: "en", question: "What page contains DIP E2E page 1? Cite the page." }], ["extract-data", { locale: "en" }]] as const) {
-        const ai = await createToolJob({ userId, toolId, idempotencyKey: `${toolId}-gemini-e2e`, correlationId: randomUUID(), options, uploads: [{ filename: "grounded.pdf", mimeType: "application/pdf", bytes: first }] });
-        const completed = await wait(ai.id); assert.equal(completed.status, "SUCCEEDED"); assert.equal(completed.engine, "gemini"); assert.equal(completed.engineVersion, "gemini-3.8-flash");
+        const ai = await createToolJob({ userId, toolId, idempotencyKey: `${toolId}-production-ai-e2e`, correlationId: randomUUID(), options, uploads: [{ filename: "grounded.pdf", mimeType: "application/pdf", bytes: first }] });
+        const completed = await wait(ai.id); assert.equal(completed.status, "SUCCEEDED"); assert.equal(completed.engine, "groq"); assert.equal(completed.engineVersion, "openai/gpt-oss-120b");
         const successfulExecutions = completed.toolExecutions.filter((execution) => execution.errorCode === null && execution.output !== null);
         assert.equal(successfulExecutions.length, 1, "BullMQ retries may retain failed attempt records, but exactly one execution may produce the successful side effect");
         assert.ok(completed.toolExecutions.filter((execution) => execution.id !== successfulExecutions[0].id).every((execution) => execution.errorCode !== null && execution.output === null), "non-successful ToolExecution rows must be failed attempt history only");
         assert.equal(await db.aiUsage.count({ where: { userId, jobId: ai.id } }), 1, "AI retries must reuse one usage record per job");
-        assert.equal(await db.creditLedger.count({ where: { userId, idempotencyKey: `job:${toolId}:${toolId}-gemini-e2e` } }), 1, "AI retries must not duplicate the job credit debit");
+        assert.equal(await db.creditLedger.count({ where: { userId, idempotencyKey: `job:${toolId}:${toolId}-production-ai-e2e` } }), 1, "AI retries must not duplicate the job credit debit");
         const result = completed.result as { content?: string; data?: { citations?: unknown[] } }; assert.ok(result.content?.length); assert.ok(JSON.stringify(result.data).match(/page|citation/i));
       }
-      assert.equal(await db.aiUsage.count({ where: { userId } }), 3); assert.equal(await db.aiUsage.count({ where: { userId, provider: "gemini" } }), 3);
+      assert.equal(await db.aiUsage.count({ where: { userId } }), 3); assert.equal(await db.aiUsage.count({ where: { userId, provider: "groq" } }), 3);
       const credit = await db.creditLedger.findFirstOrThrow({ where: { userId }, orderBy: { createdAt: "desc" } }); assert.ok(Number(credit.balance) < 100, "AI execution must debit the existing credit ledger");
-      const scoped = await createToolJob({ userId, toolId: "chat-with-pdf", idempotencyKey: "cross-document-gemini-e2e", correlationId: randomUUID(), options: { locale: "en", question: "Read another document", documentId: randomUUID() }, uploads: [{ filename: "grounded.pdf", mimeType: "application/pdf", bytes: first }] });
+      const scoped = await createToolJob({ userId, toolId: "chat-with-pdf", idempotencyKey: "cross-document-production-ai-e2e", correlationId: randomUUID(), options: { locale: "en", question: "Read another document", documentId: randomUUID() }, uploads: [{ filename: "grounded.pdf", mimeType: "application/pdf", bytes: first }] });
       const deniedTerminal = await waitForFailure(scoped.id); const denied = deniedTerminal.job; assert.equal(deniedTerminal.queueState, "failed"); assert.equal(denied.status, "FAILED"); assert.equal(denied.errorCode, "DOCUMENT_SCOPE_VIOLATION"); assert.equal(denied.result, null); assert.equal(denied.outputFileId, null);
       assert.equal(denied.toolExecutions.filter((execution) => execution.errorCode === null || execution.output !== null).length, 0, "scope rejection must not produce a successful ToolExecution");
       assert.equal(await db.aiUsage.count({ where: { userId, jobId: scoped.id } }), 0, "scope rejection must happen before provider usage accounting");

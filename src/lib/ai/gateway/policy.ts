@@ -1,6 +1,7 @@
 import { db } from "@/lib/db";
 import { withTenant } from "@/lib/db/tenant";
 import { AiGatewayError, type AiRequestContext, type GatewayTask } from "./types";
+import { productionAiProvider } from "./routing";
 
 export function assertDocumentScope(input: { taskDocumentId: string; fileDocumentId: string; ownerId: string; requesterId: string; inputCount: number }) {
   if (input.inputCount !== 1 || input.taskDocumentId !== input.fileDocumentId || input.ownerId !== input.requesterId) throw new AiGatewayError("DOCUMENT_SCOPE_VIOLATION", "The requested document is outside the job scope.");
@@ -20,7 +21,8 @@ async function enforceCommonAiPolicy(task: GatewayTask, context: AiRequestContex
 }
 
 export async function enforceAiPolicy(task: GatewayTask, context: AiRequestContext) {
-  if (process.env.GEMINI_ENABLED === "false" || await explicitlyDisabled("ai.provider.gemini.enabled")) throw new AiGatewayError("AI_PROVIDER_DISABLED", "The AI provider is disabled.");
+  const provider = productionAiProvider();
+  if (process.env[`${provider.toUpperCase()}_ENABLED`] === "false" || await explicitlyDisabled(`ai.provider.${provider}.enabled`)) throw new AiGatewayError("AI_PROVIDER_DISABLED", "The AI provider is disabled.");
   await enforceCommonAiPolicy(task, context);
 }
 

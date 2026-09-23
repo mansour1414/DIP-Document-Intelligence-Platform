@@ -343,8 +343,9 @@ jobs:
     name: Full Release B E2E
     runs-on: ubuntu-latest
     env:
-      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      GEMINI_MODEL: gemini-3.8-flash
+      AI_PROVIDER: groq
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      GROQ_MODEL: openai/gpt-oss-120b
     services:
       postgres:
         image: postgres:16-alpine
@@ -369,12 +370,13 @@ jobs:
           python-version: "3.12"
       - run: npm ci
       - run: npx prisma generate
-      - name: Require protected Gemini credential
-        run: test -n "$GEMINI_API_KEY"
-      - name: Verify Release B Gemini route
+      - name: Require protected Groq credential
+        run: test -n "$GROQ_API_KEY"
+      - name: Verify Release B production AI route
         run: |
-          test "$GEMINI_MODEL" = "gemini-3.8-flash"
-          echo "Release B resolved Gemini model: $GEMINI_MODEL"
+          test "$AI_PROVIDER" = "groq"
+          test "$GROQ_MODEL" = "openai/gpt-oss-120b"
+          echo "Release B resolved production provider/model: groq/openai-gpt-oss-120b"
       - name: Generate safe Office and OCR corpus
         run: |
           python -m pip install python-docx openpyxl python-pptx pillow
@@ -414,7 +416,7 @@ jobs:
           --env STORAGE_ACCESS_KEY=minioadmin --env STORAGE_SECRET_KEY=minioadmin --env STORAGE_REGION=us-east-1
           --env CLAMD_HOST=127.0.0.1 --env CLAMD_PORT=3310 --env AUTH_SECRET=release-b-ci-only-secret
           --env NEXT_PUBLIC_APP_URL=http://127.0.0.1:3000
-          --env GEMINI_API_KEY --env GEMINI_MODEL
+          --env AI_PROVIDER --env GROQ_API_KEY --env GROQ_MODEL
           dip-document-worker:release-b
       - name: Build and start standalone Public API
         env:
@@ -430,6 +432,9 @@ jobs:
           AUTH_SECRET: release-b-ci-only-secret
           API_KEY_PEPPER: release-b-ci-only-pepper
           NEXT_PUBLIC_APP_URL: http://127.0.0.1:3000
+          AI_PROVIDER: groq
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GROQ_MODEL: openai/gpt-oss-120b
         run: |
           npm run build
           nohup node scripts/start-browser-e2e.mjs >/tmp/dip-release-b-web.log 2>&1 &
@@ -442,7 +447,7 @@ jobs:
         env:
           FULL_PROCESSING_E2E: "1"
           EXTERNAL_WORKER_E2E: "1"
-          GEMINI_E2E: "1"
+          AI_E2E: "1"
           DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/dip_release_b
           REDIS_URL: redis://127.0.0.1:6379
           STORAGE_ENDPOINT: http://127.0.0.1:9000
@@ -490,7 +495,7 @@ jobs:
         if: failure()
         run: |
           set +e
-          echo "Release B resolved Gemini model: $GEMINI_MODEL"
+          echo "Release B resolved production provider/model: $AI_PROVIDER/$GROQ_MODEL"
           docker ps -a
           if docker container inspect dip-release-b-worker >/dev/null 2>&1; then
             docker logs dip-release-b-worker 2>&1 | sed -E 's#(Bearer )[A-Za-z0-9._~-]+#\1[REDACTED]#g; s#(postgres(ql)?://)[^@[:space:]]+@#\1[REDACTED]@#g; s#dip_v1_[A-Za-z0-9_-]+#[REDACTED_API_KEY]#g'

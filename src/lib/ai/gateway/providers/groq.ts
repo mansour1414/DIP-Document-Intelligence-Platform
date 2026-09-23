@@ -33,7 +33,7 @@ export class GroqProviderAdapter implements AiProviderAdapter {
   constructor(private readonly apiKey = process.env.GROQ_API_KEY) {}
 
   async generate(request: ProviderRequest): Promise<ProviderResponse> {
-    if (!this.apiKey) throw new AiGatewayError("AI_PROVIDER_NOT_CONFIGURED", "Groq evaluation is not configured.", false, { provider: this.provider, model: request.model });
+    if (!this.apiKey) throw new AiGatewayError("AI_PROVIDER_NOT_CONFIGURED", "Groq is not configured.", false, { provider: this.provider, model: request.model });
     const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), timeoutFor("ai")); const started = Date.now();
     try {
       const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {

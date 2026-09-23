@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { executeAiGateway, AiGatewayError, type AiProviderAdapter, type AiRequestContext, type AiTask } from "../src/lib/ai/gateway";
+import { executeAiGateway, AiGatewayError, type AgentPlannerTask, type AiProviderAdapter, type AiRequestContext, type AiTask } from "../src/lib/ai/gateway";
 import { assertDocumentScope } from "../src/lib/ai/gateway/policy";
 import { buildProviderRequest } from "../src/lib/ai/gateway/task";
 import { routeAiTask } from "../src/lib/ai/gateway/routing";
@@ -20,23 +20,23 @@ import { AI_JOB_RETRY_POLICY } from "../src/lib/queue";
 
 const baseTask: AiTask = { toolId: "summarize-pdf", locale: "en", documentId: "11111111-1111-1111-1111-111111111111", documentText: "[PAGE 1]\nDIP contract\n[/PAGE 1]", pageCount: 1 };
 
-test("document AI routes default to the supported Gemini model without bypassing route classes", () => {
-  const names = ["GEMINI_MODEL", "GEMINI_MODEL_ECONOMY", "GEMINI_MODEL_BALANCED", "GEMINI_MODEL_HIGH_ACCURACY"] as const;
+test("production AI routes default to approved Groq without bypassing route classes", () => {
+  const names = ["AI_PROVIDER", "GROQ_MODEL", "GROQ_MODEL_ECONOMY", "GROQ_MODEL_BALANCED", "GROQ_MODEL_HIGH_ACCURACY"] as const;
   const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
   for (const name of names) delete process.env[name];
   try {
     for (const toolId of ["summarize-pdf", "chat-with-pdf", "extract-data"] as const) {
       const route = routeAiTask({ ...baseTask, toolId, ...(toolId === "chat-with-pdf" ? { question: "Cite the document." } : {}) });
-      assert.equal(route.model, "gemini-3.8-flash");
+      assert.equal(route.adapter.provider, "groq"); assert.equal(route.model, "openai/gpt-oss-120b");
     }
   } finally {
     for (const name of names) { if (previous[name] === undefined) delete process.env[name]; else process.env[name] = previous[name]; }
   }
 });
 
-test("global and route-class Gemini model overrides remain authoritative", () => {
-  const names = ["GEMINI_MODEL", "GEMINI_MODEL_ECONOMY", "GEMINI_MODEL_BALANCED", "GEMINI_MODEL_HIGH_ACCURACY"] as const; const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
-  try { process.env.GEMINI_MODEL = "global-model"; process.env.GEMINI_MODEL_BALANCED = "balanced-model"; assert.equal(routeAiTask(baseTask).model, "global-model"); assert.equal(routeAiTask({ ...baseTask, toolId: "chat-with-pdf", question: "Cite it." }).model, "balanced-model"); }
+test("global and route-class Groq model overrides remain authoritative", () => {
+  const names = ["AI_PROVIDER", "GROQ_MODEL", "GROQ_MODEL_ECONOMY", "GROQ_MODEL_BALANCED", "GROQ_MODEL_HIGH_ACCURACY", "GROQ_INPUT_USD_PER_MILLION", "GROQ_OUTPUT_USD_PER_MILLION"] as const; const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+  try { process.env.AI_PROVIDER = "groq"; process.env.GROQ_MODEL = "global-model"; process.env.GROQ_MODEL_BALANCED = "balanced-model"; process.env.GROQ_INPUT_USD_PER_MILLION = "0.15"; process.env.GROQ_OUTPUT_USD_PER_MILLION = "0.60"; assert.equal(routeAiTask(baseTask).model, "global-model"); assert.equal(routeAiTask({ ...baseTask, toolId: "chat-with-pdf", question: "Cite it." }).model, "balanced-model"); }
   finally { for (const name of names) { if (previous[name] === undefined) delete process.env[name]; else process.env[name] = previous[name]; } }
 });
 
@@ -102,18 +102,38 @@ test("Gemini 3.8 pricing follows the audited effective-date schedule and explici
   finally { if (input === undefined) delete process.env.GEMINI_INPUT_USD_PER_MILLION; else process.env.GEMINI_INPUT_USD_PER_MILLION = input; if (output === undefined) delete process.env.GEMINI_OUTPUT_USD_PER_MILLION; else process.env.GEMINI_OUTPUT_USD_PER_MILLION = output; }
 });
 
-test("production routing remains Gemini while Groq is isolated behind the evaluation gate", () => {
+test("production routing defaults to Groq, keeps Gemini selectable, and has no automatic fallback", () => {
   const names = ["AI_PROVIDER", "GROQ_EVALUATION_ENABLED", "GROQ_MODEL", "GROQ_INPUT_USD_PER_MILLION", "GROQ_OUTPUT_USD_PER_MILLION"] as const;
   const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
   try {
-    process.env.AI_PROVIDER = "groq";
+    delete process.env.AI_PROVIDER;
+    assert.equal(routeAiTask(baseTask).adapter.provider, "groq");
+    process.env.AI_PROVIDER = "gemini";
     assert.equal(routeAiTask(baseTask).adapter.provider, "gemini");
+    process.env.AI_PROVIDER = "unsupported";
+    assert.throws(() => routeAiTask(baseTask), { code: "AI_PROVIDER_NOT_REGISTERED" });
+    process.env.AI_PROVIDER = "groq";
     delete process.env.GROQ_EVALUATION_ENABLED;
     assert.throws(() => routeAiEvaluationTask(baseTask), { code: "AI_EVALUATION_DISABLED" });
     process.env.GROQ_EVALUATION_ENABLED = "1";
     const route = routeAiEvaluationTask(baseTask);
     assert.equal(route.adapter.provider, "groq"); assert.equal(route.model, "openai/gpt-oss-120b");
   } finally { for (const name of names) { if (previous[name] === undefined) delete process.env[name]; else process.env[name] = previous[name]; } }
+});
+
+test("Full Release B injects Groq into the production worker and Public API without an evaluation bypass", async () => {
+  const workflow = await readFile(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8");
+  const job = workflow.split("  release-b-e2e:")[1] ?? "";
+  assert.match(job, /AI_PROVIDER: groq/); assert.match(job, /GROQ_API_KEY: \$\{\{ secrets\.GROQ_API_KEY \}\}/); assert.match(job, /GROQ_MODEL: openai\/gpt-oss-120b/);
+  assert.match(job, /--env AI_PROVIDER --env GROQ_API_KEY --env GROQ_MODEL/);
+  assert.match(job, /AI_E2E: "1"/); assert.doesNotMatch(job, /GEMINI_E2E|executeAiEvaluationGateway|GROQ_EVALUATION_ENABLED/);
+});
+
+test("Agent Planner uses the same production Groq route", () => {
+  const previous = process.env.AI_PROVIDER; delete process.env.AI_PROVIDER;
+  const task: AgentPlannerTask = { toolId: "agent-planner", locale: "en", request: "Summarize the supplied document", planId: "plan", planVersion: 1, maxSteps: 3, maxOutputTokens: 512, inputs: [], tools: [{ toolId: "summarize-pdf", version: "1", inputMime: ["application/pdf"], outputMime: ["application/json"], maxFiles: 1, resourceCost: "ai", ai: true }] };
+  try { const route = routeAiTask(task); assert.equal(route.adapter.provider, "groq"); assert.equal(route.model, "openai/gpt-oss-120b"); }
+  finally { if (previous === undefined) delete process.env.AI_PROVIDER; else process.env.AI_PROVIDER = previous; }
 });
 
 test("Groq evaluation uses structured output and actual provider token accounting", async () => {
