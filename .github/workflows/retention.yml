@@ -16,6 +16,21 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npx prisma generate
+      - name: Validate retention configuration
+        shell: bash
+        env:
+          RETENTION_DATABASE_URL: ${{ secrets.RETENTION_DATABASE_URL }}
+          RETENTION_STORAGE_ENDPOINT: ${{ secrets.RETENTION_STORAGE_ENDPOINT }}
+          RETENTION_STORAGE_BUCKET: ${{ secrets.RETENTION_STORAGE_BUCKET }}
+          RETENTION_STORAGE_ACCESS_KEY: ${{ secrets.RETENTION_STORAGE_ACCESS_KEY }}
+          RETENTION_STORAGE_SECRET_KEY: ${{ secrets.RETENTION_STORAGE_SECRET_KEY }}
+        run: |
+          failed=0
+          for name in RETENTION_DATABASE_URL RETENTION_STORAGE_ENDPOINT RETENTION_STORAGE_BUCKET RETENTION_STORAGE_ACCESS_KEY RETENTION_STORAGE_SECRET_KEY; do
+            if test -n "${!name}"; then echo "${name}_PRESENT=true"; else echo "${name}_PRESENT=false"; failed=1; fi
+          done
+          if test "${{ vars.RETENTION_APPLY }}" = "1"; then echo "RETENTION_APPLY_ENABLED=true"; else echo "RETENTION_APPLY_ENABLED=false"; failed=1; fi
+          test "$failed" = 0 || { echo "Retention configuration error: required secret(s) or RETENTION_APPLY=1 are missing."; exit 1; }
       - run: npm run jobs:cleanup
         env:
           DATABASE_URL: ${{ secrets.RETENTION_DATABASE_URL }}

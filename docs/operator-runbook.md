@@ -24,7 +24,7 @@ Keep secrets in the deployment secret manager, never Git or images.
 - App: set the canonical HTTPS `NEXT_PUBLIC_APP_URL` at build and runtime.
 - Limits: review all `API_RATE_LIMIT_*`, `MAX_*`, worker concurrency/timeouts, BullMQ stalled settings, retention/apply flag, and cost-rate settings against measured capacity.
 - Monitoring: configure `SENTRY_DSN`, sampling, and every `ALERT_*` threshold. Verify logs and metrics reach the selected backend without content or credentials.
-- Scheduler: review a dry run, then run `npm run jobs:cleanup` daily with `RETENTION_APPLY=1`.
+- Scheduler: the retention migration creates `dip_retention` as `NOSUPERUSER NOBYPASSRLS` with only the cross-tenant reads and column updates needed by cleanup. Provision its password outside Git, store its URL as `RETENTION_DATABASE_URL`, and configure the five `RETENTION_STORAGE_*` secrets. Review a dry run, then set the repository variable `RETENTION_APPLY=1`; the scheduled workflow fails closed when any requirement is absent. Never use the owner or `dip_app` URL for this scheduler.
 
 ## Migration and rollback
 

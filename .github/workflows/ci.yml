@@ -94,7 +94,7 @@ jobs:
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dip_test
       - name: Configure ephemeral runtime role
-        run: psql "$DATABASE_URL" --set=ON_ERROR_STOP=1 --command="ALTER ROLE dip_app PASSWORD 'dip_test_runtime'"
+        run: psql "$DATABASE_URL" --set=ON_ERROR_STOP=1 --command="ALTER ROLE dip_app PASSWORD 'dip_test_runtime'; ALTER ROLE dip_retention PASSWORD 'dip_test_retention'"
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dip_test
       - name: Verify application dependencies are ready
@@ -108,6 +108,7 @@ jobs:
           REDIS_URL: redis://localhost:6379
           DIP_RLS_TEST_OWNER_URL: postgresql://postgres:postgres@localhost:5432/dip_test
           DIP_RLS_TEST_DATABASE_URL: postgresql://dip_app:dip_test_runtime@localhost:5432/dip_test
+          DIP_RETENTION_TEST_DATABASE_URL: postgresql://dip_retention:dip_test_retention@localhost:5432/dip_test
 
   processing-integration:
     name: Integration / Processing
