@@ -35,7 +35,7 @@ RUN apt-get update \
       "ocrmypdf==${OCRMYPDF_VERSION}" "pypdfium2==${PYPDFIUM2_VERSION}" \
  && test ! -e /usr/bin/gs \
  && test ! -e /usr/local/bin/gs \
- && test "$(dpkg-query -W -f='$${Version}' qpdf)" = "${QPDF_DEBIAN_VERSION}" \
+ && test "$(dpkg-query -W -f='${Version}' qpdf)" = "${QPDF_DEBIAN_VERSION}" \
  && rm -rf /var/lib/apt/lists/* /root/.cache
 
 WORKDIR /app

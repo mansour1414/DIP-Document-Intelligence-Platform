@@ -23,7 +23,20 @@ test("Extract Images PoC records that display rendering is not byte-faithful ori
 test("qpdf is exactly pinned while Ghostscript remains prohibited and security tools remain unregistered", () => {
   const dockerfile = readFileSync(new URL("../Dockerfile.worker", import.meta.url), "utf8");
   assert.match(dockerfile, /QPDF_DEBIAN_VERSION=11\.3\.0-1\+deb12u1/); assert.match(dockerfile, /qpdf=\$\{QPDF_DEBIAN_VERSION\}/);
+  assert.match(dockerfile, /dpkg-query -W -f='\$\{Version\}' qpdf/); assert.doesNotMatch(dockerfile, /\$\$\{Version\}/);
   assert.match(dockerfile, /test ! -e \/usr\/bin\/gs/); assert.doesNotMatch(dockerfile, /apt-get install[^\n]*ghostscript/i);
   const registry = readFileSync(new URL("../src/lib/tools/registry.ts", import.meta.url), "utf8");
   for (const tool of ["protect-pdf", "unlock-pdf", "pdf-permissions", "repair-pdf", "grayscale-pdf", "extract-images"]) assert.doesNotMatch(registry, new RegExp(`\\"${tool}\\"`));
+});
+
+test("CI S3-compatible storage uses the reviewed immutable Silo image", () => {
+  const workflow = readFileSync(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8");
+  const image = "docker.io/pgsty/silo:RELEASE.2026-09-16T00-00-00Z@sha256:635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46";
+  assert.equal(workflow.split(image).length - 1, 2);
+  assert.doesNotMatch(workflow, /(?:minio\/minio|pgsty\/silo):latest/);
+  assert.doesNotMatch(workflow, /quay\.io\/minio\/minio/);
+  const licenses = readFileSync(new URL("../docs/license-registry.md", import.meta.url), "utf8");
+  assert.match(licenses, /PGSTY Silo \(MinIO-compatible CI service\)/);
+  assert.match(licenses, /AGPL-3\.0-or-later/);
+  assert.ok(licenses.includes(image));
 });
