@@ -1,6 +1,7 @@
 import { planCanUseTool, type Entitlements } from "@/lib/entitlements/policy";
 import { toolRegistry, workerToolIds } from "@/lib/tools/registry";
 import type { WorkflowDefinition, WorkflowNode, WorkflowValidationIssue, WorkflowValidationResult } from "./types";
+import { ToolOptionsValidationError, validateToolOptions } from "@/lib/tools/options";
 
 export const MAX_WORKFLOW_NODES = 20;
 const NODE_ID = /^[a-zA-Z][a-zA-Z0-9_-]{0,99}$/;
@@ -37,6 +38,7 @@ export function validateWorkflowDefinition(value: unknown, entitlements?: Entitl
       else issue(issues, "WORKFLOW_BINDING_SOURCE_INVALID", bindingPath, "Only workflow and node artifact sources are supported.");
     });
     if (node.options !== undefined && (!node.options || typeof node.options !== "object" || Array.isArray(node.options))) issue(issues, "WORKFLOW_PARAMETERS_INVALID", `${path}.options`, "Options must be an object.");
+    else if (tool) { try { validateToolOptions(node.toolId, node.options ?? {}); } catch (error) { const message = error instanceof ToolOptionsValidationError ? error.message : "Options are invalid."; issue(issues, "WORKFLOW_PARAMETERS_INVALID", `${path}.options`, message); } }
   });
   const indegree = new Map(nodes.map((node) => [node.id, 0])); const outgoing = new Map(nodes.map((node) => [node.id, [] as string[]]));
   nodes.forEach((node, index) => {

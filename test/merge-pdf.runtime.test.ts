@@ -8,6 +8,7 @@ import { createCanvas, loadImage } from "@napi-rs/canvas";
 import { createServerWatermarkPng } from "../src/lib/pdf/server-canvas";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { toolsConfig } from "../src/config";
 
 async function fixture(text: string) { const pdf = await PDFDocument.create(); pdf.addPage().drawText(text); return pdf.save(); }
 
@@ -23,10 +24,10 @@ test("Merge PDF rejects invalid magic bytes before storage", async () => {
   await assert.rejects(() => validateUpload({ toolId: "merge-pdf", declaredMime: "application/pdf", bytes: new Uint8Array([1, 2, 3]) }), { code: "MAGIC_BYTES_INVALID" });
 });
 
-test("registry covers the complete 18-tool catalog and first worker batch", () => {
-  assert.equal(Object.keys(toolRegistry).length, 18);
-  assert.equal(workerToolIds.size, 18);
-  for (const tool of Object.values(toolRegistry)) assert.ok(tool.inputSchema && tool.outputSchema && tool.mime.input.length && tool.locales.includes("ar"));
+test("registry covers the complete catalog and worker batch", () => {
+  assert.equal(Object.keys(toolRegistry).length, toolsConfig.length);
+  assert.equal(workerToolIds.size, toolsConfig.length);
+  for (const tool of Object.values(toolRegistry)) { assert.ok(tool.inputSchema && tool.outputSchema && tool.mime.input.length && tool.locales.includes("ar")); assert.equal(tool.optionSchemaVersion, "1"); }
 });
 
 test("Batch 2 renders PDF pages as independent JPEG outputs", async () => {

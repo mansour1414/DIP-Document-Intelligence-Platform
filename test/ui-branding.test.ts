@@ -72,11 +72,11 @@ test("theme defaults to system, persists preference, and initializes before hydr
   assert.match(layout, /localStorage\.getItem\('dip-theme'\)\|\|'system'/);
 });
 
-test("homepage catalog contains exactly the 18 official localized tools", async () => {
+test("homepage catalog contains every official localized tool", async () => {
   const { mvpToolIds } = await import("../src/lib/seo/tool-content");
   const { toolGroups } = await import("../src/components/tools/tool-catalog");
-  assert.equal(mvpToolIds.length, 18);
-  assert.equal(new Set(toolGroups.flatMap((group) => group.tools)).size, 18);
+  assert.ok(mvpToolIds.length >= 24);
+  assert.equal(new Set(toolGroups.flatMap((group) => group.tools)).size, mvpToolIds.length);
   assert.deepEqual(new Set(toolGroups.flatMap((group) => group.tools)), new Set(mvpToolIds));
   const card = read("src/components/tools/tool-card.tsx");
   assert.match(card, /`\/\$\{locale\}\/tools\/\$\{toolId\}`/);

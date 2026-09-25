@@ -16,6 +16,7 @@ import { captureOperationalError } from "@/lib/observability/errors";
 import { configuredCostRates, estimateJobCost } from "@/lib/cost/model";
 import { withTenant } from "@/lib/db/tenant";
 import { isUnrecoverableAiQueueError, toAiQueueError } from "@/lib/ai/gateway/retry";
+import { validateToolOptions } from "@/lib/tools/options";
 
 async function processDocumentJob(message: QueuedJob) {
   if (!message.userId) throw Object.assign(new Error("Worker job requires a tenant identity"), { code: "TENANT_CONTEXT_REQUIRED" });
@@ -34,15 +35,15 @@ async function processDocumentJob(message: QueuedJob) {
     const files = await tenant((tx) => tx.file.findMany({ where: { id: { in: ids } }, include: { document: true } }));
     if (files.length !== ids.length) throw Object.assign(new Error("Input file is missing"), { code: "INPUT_NOT_FOUND" });
     const inputById = new Map(files.map((file) => [file.id, file]));
-    const bytes = await Promise.all(ids.map((id) => getStorage().get(inputById.get(id)!.storageKey))); const options: Record<string, unknown> = { ...(params.options ?? {}), inputMimeTypes: ids.map((id) => inputById.get(id)!.mimeType) };
+    const bytes = await Promise.all(ids.map((id) => getStorage().get(inputById.get(id)!.storageKey))); const options: Record<string, unknown> = { ...validateToolOptions(job.toolId, params.options ?? {}), inputMimeTypes: ids.map((id) => inputById.get(id)!.mimeType) };
     const started = Date.now(); let engine = "pdf-lib"; let engineVersion = "1.17.1";
-    const pdfTools = new Set(["merge-pdf", "split-pdf", "organize-pdf", "rotate-pdf", "delete-pages", "extract-pages", "jpg-to-pdf", "compress-pdf", "pdf-to-jpg", "watermark-pdf"]);
+    const pdfTools = new Set(["merge-pdf", "split-pdf", "organize-pdf", "rotate-pdf", "delete-pages", "extract-pages", "jpg-to-pdf", "compress-pdf", "pdf-to-jpg", "watermark-pdf", "crop-pdf", "page-numbers", "header-footer", "resize-pages", "alternate-mix", "flip-pages", "split-pdf-by-size", "split-pdf-by-bookmarks", "split-pdf-by-text", "n-up-pdf", "remove-annotations"]);
     const documentTools = new Set(["word-to-pdf", "pdf-to-word", "excel-to-pdf", "powerpoint-to-pdf", "ocr-pdf"]);
     let outputs: Array<{ name: string; mimeType: string; bytes: Uint8Array }>;
     if (pdfTools.has(job.toolId)) { const pdfTool = job.toolId as PdfWorkerTool; outputs = await withTimeout(job.toolId, timeoutFor("pdf"), runPdfWorkerTool(pdfTool, bytes, options)); ({ engine, engineVersion } = pdfWorkerEngine(pdfTool)); }
     else if (documentTools.has(job.toolId)) { const input = inputById.get(ids[0])!; const result = await processServerDocument(job.toolId as ServerToolId, new File([bytes[0] as BlobPart], input.originalName, { type: input.mimeType }), typeof options.language === "string" ? options.language : "ara+eng"); outputs = [{ name: result.filename, mimeType: result.contentType, bytes: result.bytes }]; engine = job.toolId === "ocr-pdf" ? "ocrmypdf" : "libreoffice"; engineVersion = "host"; }
     else throw Object.assign(new Error("Tool is not enabled on this worker"), { code: "TOOL_NOT_WORKER_ENABLED" });
-    const preservePages = ["compress-pdf", "rotate-pdf", "watermark-pdf", "ocr-pdf"].includes(job.toolId) ? files[0]?.pageCount ?? undefined : undefined;
+    const preservePages = ["compress-pdf", "rotate-pdf", "watermark-pdf", "crop-pdf", "page-numbers", "header-footer", "resize-pages", "flip-pages", "remove-annotations", "ocr-pdf"].includes(job.toolId) ? files[0]?.pageCount ?? undefined : undefined;
     const validated = await validateWorkerOutputs(outputs, preservePages);
     recordMetric("storage_bytes_out", validated.totalBytes, "bytes", { tool_id: job.toolId, engine, engine_version: engineVersion, status: "succeeded" });
     if (job.toolId === "compress-pdf") recordMetric("compression_ratio", validated.totalBytes / bytes[0].byteLength, "ratio", { tool_id: job.toolId, engine, engine_version: engineVersion });

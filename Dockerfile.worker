@@ -10,6 +10,7 @@ RUN npm ci && npx prisma generate && npm prune --omit=dev
 FROM ${NODE_IMAGE} AS runtime
 ARG OCRMYPDF_VERSION=17.10.0
 ARG PYPDFIUM2_VERSION=5.13.0
+ARG QPDF_DEBIAN_VERSION=11.3.0-1+deb12u1
 
 ENV NODE_ENV=production \
     PATH="/opt/dip-ocr/bin:${PATH}"
@@ -24,7 +25,7 @@ RUN apt-get update \
       libreoffice-writer \
       python3 \
       python3-venv \
-      qpdf \
+      "qpdf=${QPDF_DEBIAN_VERSION}" \
       tesseract-ocr \
       tesseract-ocr-ara \
       tesseract-ocr-eng \
@@ -34,6 +35,7 @@ RUN apt-get update \
       "ocrmypdf==${OCRMYPDF_VERSION}" "pypdfium2==${PYPDFIUM2_VERSION}" \
  && test ! -e /usr/bin/gs \
  && test ! -e /usr/local/bin/gs \
+ && test "$(dpkg-query -W -f='$${Version}' qpdf)" = "${QPDF_DEBIAN_VERSION}" \
  && rm -rf /var/lib/apt/lists/* /root/.cache
 
 WORKDIR /app

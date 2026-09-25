@@ -3,6 +3,7 @@ import { IdempotencyConflictError } from "@/lib/api-platform/idempotency";
 import { MonetizationError } from "@/lib/usage/errors";
 import { UploadValidationError } from "@/lib/uploads/validation";
 import { MalwareScanError } from "@/lib/malware";
+import { ToolOptionsValidationError } from "@/lib/tools/options";
 
 export type PublicErrorCode = "VALIDATION_ERROR" | "UNSUPPORTED_FORMAT" | "SIZE_LIMIT_EXCEEDED" | "PAGE_LIMIT_EXCEEDED" | "MALWARE_DETECTED" | "TIMEOUT" | "PROVIDER_ERROR" | "CREDIT_EXHAUSTED" | "RATE_LIMITED" | "UNAUTHORIZED" | "FORBIDDEN" | "NOT_FOUND" | "CONFLICT" | "INTERNAL_ERROR";
 export class PublicApiError extends Error { constructor(readonly code: PublicErrorCode, message: string, readonly status: number, readonly details?: Record<string, string | number | boolean>) { super(message); } }
@@ -11,6 +12,7 @@ export function mapPublicError(error: unknown): PublicApiError {
   if (error instanceof PublicApiError) return error;
   if (error instanceof ApiAuthenticationError) return new PublicApiError("UNAUTHORIZED", "A valid API key is required.", 401);
   if (error instanceof IdempotencyConflictError) return new PublicApiError("CONFLICT", "The idempotency key was already used with a different request.", 409);
+  if (error instanceof ToolOptionsValidationError) return new PublicApiError("VALIDATION_ERROR", error.message, 422);
   if (error instanceof UploadValidationError) {
     if (error.code === "PAGE_LIMIT_EXCEEDED") return new PublicApiError("PAGE_LIMIT_EXCEEDED", "A file exceeds the allowed page limit.", 422);
     if (error.code === "SIZE_LIMIT_EXCEEDED") return new PublicApiError("SIZE_LIMIT_EXCEEDED", "A file exceeds the allowed size limit.", 413);

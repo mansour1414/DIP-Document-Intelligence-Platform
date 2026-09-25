@@ -3,6 +3,7 @@ import { requireUser } from "@/lib/auth/user";
 import { createToolJob } from "@/lib/jobs/orchestrator";
 import { workerToolIds } from "@/lib/tools/registry";
 import { UploadValidationError } from "@/lib/uploads/validation";
+import { ToolOptionsValidationError } from "@/lib/tools/options";
 
 export const runtime = "nodejs";
 export async function POST(request: Request, { params }: { params: Promise<{ tool: string }> }) {
@@ -16,7 +17,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ too
     const job = await createToolJob({ userId: user.id, toolId: tool, idempotencyKey, correlationId, options, uploads: await Promise.all(files.map(async (file) => ({ filename: file.name, mimeType: file.type, bytes: new Uint8Array(await file.arrayBuffer()) }))) });
     return Response.json({ jobId: job.id, status: job.status.toLowerCase(), correlationId, reused: job.reused }, { status: job.reused ? 200 : 202 });
   } catch (error) {
-    const auth = error instanceof Error && error.message === "AUTH_REQUIRED"; const known = error instanceof UploadValidationError;
-    return Response.json({ code: auth ? "AUTH_REQUIRED" : known ? error.code : error instanceof Error ? error.message : "INTERNAL_ERROR", message: auth ? "Sign in to process documents." : known ? error.message : "Unable to queue tool job." }, { status: auth ? 401 : known ? 422 : 400 });
+    const auth = error instanceof Error && error.message === "AUTH_REQUIRED"; const upload = error instanceof UploadValidationError; const options = error instanceof ToolOptionsValidationError;
+    return Response.json({ code: auth ? "AUTH_REQUIRED" : upload ? error.code : options ? error.code : error instanceof Error ? error.message : "INTERNAL_ERROR", message: auth ? "Sign in to process documents." : upload || options ? error.message : "Unable to queue tool job." }, { status: auth ? 401 : upload || options ? 422 : 400 });
   }
 }

@@ -1,6 +1,7 @@
 import { effectiveToolLimits, planCanUseTool } from "@/lib/entitlements/policy";
 import { toolRegistry } from "@/lib/tools/registry";
 import type { AgentPlanDraft, AgentValidationIssue, AgentValidationResult, ResolvedAgentScope, TrustedAgentContext } from "./types";
+import { ToolOptionsValidationError, validateToolOptions } from "@/lib/tools/options";
 
 const add = (issues: AgentValidationIssue[], code: string, path: string, message: string) => issues.push({ code, path, message });
 export function validateAgentPlan(draft: AgentPlanDraft, scope: ResolvedAgentScope, context: TrustedAgentContext): AgentValidationResult {
@@ -8,7 +9,7 @@ export function validateAgentPlan(draft: AgentPlanDraft, scope: ResolvedAgentSco
   draft.steps.forEach((step, index) => { const path = `steps[${index}]`; if (byId.has(step.stepId)) add(issues, "AGENT_DEPENDENCY_INVALID", `${path}.stepId`, `Duplicate step ID ${step.stepId}.`); else byId.set(step.stepId, step);
     const tool = toolRegistry[step.toolId];
     if (!tool) add(issues, "AGENT_TOOL_NOT_REGISTERED", `${path}.toolId`, "Tool is not registered.");
-    else { tools[step.stepId] = tool; if (step.toolVersion !== tool.version) add(issues, "AGENT_TOOL_VERSION_UNSUPPORTED", `${path}.toolVersion`, `Expected version ${tool.version}.`); if (!context.allowedToolIds.has(step.toolId)) add(issues, "AGENT_TOOL_NOT_ALLOWED", `${path}.toolId`, "Tool is outside the trusted Agent allowlist."); if (!planCanUseTool(context.entitlements, step.toolId) || (tool.aiFlag && !context.entitlements.aiAccess)) add(issues, "AGENT_ENTITLEMENT_DENIED", `${path}.toolId`, "Server-derived entitlements deny this tool."); if (!tool.locales.includes(context.locale)) add(issues, "AGENT_PLAN_INVALID", `${path}.toolId`, `Tool does not support locale ${context.locale}.`); if (!tool.inputSchema || !tool.outputSchema) add(issues, "AGENT_PLAN_INVALID", `${path}.toolId`, "Tool Registry contracts are incomplete."); }
+    else { tools[step.stepId] = tool; if (step.toolVersion !== tool.version) add(issues, "AGENT_TOOL_VERSION_UNSUPPORTED", `${path}.toolVersion`, `Expected version ${tool.version}.`); if (!context.allowedToolIds.has(step.toolId)) add(issues, "AGENT_TOOL_NOT_ALLOWED", `${path}.toolId`, "Tool is outside the trusted Agent allowlist."); if (!planCanUseTool(context.entitlements, step.toolId) || (tool.aiFlag && !context.entitlements.aiAccess)) add(issues, "AGENT_ENTITLEMENT_DENIED", `${path}.toolId`, "Server-derived entitlements deny this tool."); if (!tool.locales.includes(context.locale)) add(issues, "AGENT_PLAN_INVALID", `${path}.toolId`, `Tool does not support locale ${context.locale}.`); if (!tool.inputSchema || !tool.outputSchema) add(issues, "AGENT_PLAN_INVALID", `${path}.toolId`, "Tool Registry contracts are incomplete."); try { validateToolOptions(step.toolId, step.options ?? {}); } catch (error) { add(issues, "AGENT_PLAN_INVALID", `${path}.options`, error instanceof ToolOptionsValidationError ? error.message : "Options are invalid."); } }
   });
   const indegree = new Map([...byId.keys()].map((id) => [id, 0])), outgoing = new Map([...byId.keys()].map((id) => [id, [] as string[]]));
   draft.steps.forEach((step, index) => { const path = `steps[${index}]`, declared = new Set(step.dependsOn);

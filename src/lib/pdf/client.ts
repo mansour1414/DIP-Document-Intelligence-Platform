@@ -10,7 +10,18 @@ export type PdfOperation =
   | "extract-pages"
   | "jpg-to-pdf"
   | "pdf-to-jpg"
-  | "watermark-pdf";
+  | "watermark-pdf"
+  | "crop-pdf"
+  | "page-numbers"
+  | "header-footer"
+  | "resize-pages"
+  | "alternate-mix"
+  | "flip-pages"
+  | "split-pdf-by-size"
+  | "split-pdf-by-bookmarks"
+  | "split-pdf-by-text"
+  | "n-up-pdf"
+  | "remove-annotations";
 
 export type PdfOptions = {
   pages?: string;

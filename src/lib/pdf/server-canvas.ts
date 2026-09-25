@@ -49,3 +49,19 @@ export function createServerWatermarkPng(text: string) {
   do { context.font = `700 ${size}px ${family}`; size -= 2; } while (size > 30 && context.measureText(text).width > canvas.width - 80);
   context.fillText(text, canvas.width / 2, canvas.height / 2, canvas.width - 80); return canvas.toBuffer("image/png");
 }
+
+export function createServerTextPng(text: string, options: { width: number; fontSize: number; alignment: "left" | "center" | "right"; rotation?: 0 | 90 | 180 | 270 }) {
+  registerWatermarkFonts();
+  const scale = 4; const canvasWidth = Math.max(160, Math.min(8_000, Math.ceil(options.width * scale))); const canvasHeight = Math.ceil(options.fontSize * scale * 2);
+  const canvas = createCanvas(canvasWidth, canvasHeight); const context = canvas.getContext("2d"); const hasArabic = /[\u0600-\u06ff]/u.test(text);
+  context.clearRect(0, 0, canvas.width, canvas.height); context.fillStyle = "#1f2937"; context.textBaseline = "middle"; context.direction = hasArabic ? "rtl" : "ltr";
+  context.textAlign = options.alignment; const family = hasArabic ? '"DIP Noto Arabic", "DIP Noto Latin"' : '"DIP Noto Latin", "DIP Noto Arabic"'; context.font = `700 ${options.fontSize * scale}px ${family}`;
+  const padding = options.fontSize * scale; const x = options.alignment === "left" ? padding : options.alignment === "right" ? canvas.width - padding : canvas.width / 2;
+  context.fillText(text, x, canvas.height / 2, canvas.width - padding * 2);
+  const rotation = options.rotation ?? 0; if (!rotation) return canvas.toBuffer("image/png");
+  const rotated = createCanvas(rotation === 180 ? canvas.width : canvas.height, rotation === 180 ? canvas.height : canvas.width); const target = rotated.getContext("2d");
+  if (rotation === 90) { target.translate(rotated.width, 0); target.rotate(Math.PI / 2); }
+  else if (rotation === 180) { target.translate(rotated.width, rotated.height); target.rotate(Math.PI); }
+  else { target.translate(0, rotated.height); target.rotate(-Math.PI / 2); }
+  target.drawImage(canvas, 0, 0); return rotated.toBuffer("image/png");
+}
