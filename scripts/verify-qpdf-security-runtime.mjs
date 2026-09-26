@@ -17,7 +17,7 @@ try {
   const version = spawnSync("qpdf", ["--version"], { shell: false, encoding: "utf8" }); if (version.status !== 0 || !version.stdout.startsWith("qpdf version 11.3.0")) throw new Error("unexpected qpdf executable version");
   const debian = spawnSync("dpkg-query", ["-W", "-f=${Version}", "qpdf"], { shell: false, encoding: "utf8" }); if (debian.status !== 0 || debian.stdout !== EXPECTED_DEBIAN) throw new Error("unexpected qpdf Debian package version");
 
-  const pdf = await PDFDocument.create(); const font = await pdf.embedFont(StandardFonts.Helvetica); const page = pdf.addPage([320, 240]); page.drawText("DIP qpdf production gate", { x: 24, y: 180, font }); const plain = join(directory, "plain.pdf"); await writeFile(plain, await pdf.save(), { mode: 0o600 });
+  const pdf = await PDFDocument.create(); const font = await pdf.embedFont(StandardFonts.Helvetica); const page = pdf.addPage([320, 240]); page.drawText("DIP qpdf production gate", { x: 24, y: 180, font }); const plain = join(directory, "plain.pdf"); await writeFile(plain, await pdf.save({ useObjectStreams: false }), { mode: 0o600 });
   const protectedPdf = join(directory, "protected.pdf"); const decrypted = join(directory, "decrypted.pdf"); const unicodeDecrypted = join(directory, "unicode-decrypted.pdf");
   const userPassword = "gate-user-42"; const ownerPassword = "gate-owner-84"; const unicodePassword = "كلمة-مرور-آمنة-٤٢";
   await run([plain, "--password-mode=unicode", "--encrypt", userPassword, ownerPassword, "256", "--", protectedPdf]);

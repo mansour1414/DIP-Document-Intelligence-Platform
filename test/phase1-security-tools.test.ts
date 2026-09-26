@@ -73,6 +73,7 @@ test("Extract Images emits decoded embedded PNGs, deduplicates, reports policy, 
 });
 
 test("production qpdf gate proves exact version, safe argfiles, AES-256, Unicode, permissions, repair, sandbox, Ghostscript absence, and SBOM", () => {
-  const workflow = readFileSync(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8"); const gate = readFileSync(new URL("../scripts/verify-qpdf-security-runtime.mjs", import.meta.url), "utf8");
+  const workflow = readFileSync(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8"); const gate = readFileSync(new URL("../scripts/verify-qpdf-security-runtime.mjs", import.meta.url), "utf8"); const fullE2e = readFileSync(new URL("./full-processing.e2e.test.ts", import.meta.url), "utf8");
   assert.match(workflow, /verify-qpdf-security-runtime\.mjs/); assert.match(workflow, /--read-only/); assert.match(workflow, /qpdf-worker\.spdx\.json/); assert.match(gate, /11\.3\.0-1\+deb12u1/); assert.match(gate, /AESv3/); assert.match(gate, /R\\s\*=\\s\*6/u); assert.doesNotMatch(gate, /--force-R6/u); assert.match(gate, /كلمة-مرور-آمنة/); assert.match(gate, /--suppress-password-recovery/u); assert.match(gate, /wrongPasswordRejected/); assert.match(gate, /modify annotations: not allowed/); assert.match(gate, /repairUnrecoverableRejected/); assert.match(gate, /Ghostscript is present/); assert.match(gate, /Apache-2\.0/); assert.doesNotMatch(gate, /shell:\s*true/u);
+  assert.match(gate, /save\(\{ useObjectStreams: false \}\)/u); assert.match(fullE2e, /fixture\(2, false\)/u);
 });
