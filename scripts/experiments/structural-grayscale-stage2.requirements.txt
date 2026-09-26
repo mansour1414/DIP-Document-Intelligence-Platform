@@ -1,0 +1,9 @@
+# Isolated Stage 2 PoC only. Not referenced by the application or worker.
+pikepdf==10.13.0.post1
+Pillow==12.3.0
+lxml==6.1.3
+packaging==26.3
+reportlab==4.4.9
+pypdf==6.10.0
+pypdfium2==5.13.0
+uharfbuzz==0.56.2
