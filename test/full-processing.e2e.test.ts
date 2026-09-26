@@ -14,7 +14,8 @@ integration("orchestrator to DB, Redis, production worker, S3, Office and biling
   const { db } = await import("../src/lib/db/index"); const { createToolJob } = await import("../src/lib/jobs/orchestrator"); const { getStorage } = await import("../src/lib/storage/index"); const { getJobQueue, getAiJobQueue } = await import("../src/lib/queue/index");
   const localWorkers = process.env.EXTERNAL_WORKER_E2E === "1" ? null : await import("../workers/document-worker");
   const userId = randomUUID(); const email = `phase6-${userId}@example.invalid`; const storage = getStorage();
-  await db.user.create({ data: { id: userId, email, creditLedger: { create: { type: "BONUS", amount: 100, balance: 100, idempotencyKey: "e2e-seed", reason: "PROMOTIONAL_GRANT" } } } });
+  const proPlan = await db.planCatalog.findUniqueOrThrow({ where: { code: "PRO" }, select: { id: true } });
+  await db.user.create({ data: { id: userId, email, subscriptions: { create: { planId: proPlan.id, status: "ACTIVE" } }, creditLedger: { create: { type: "BONUS", amount: 100, balance: 100, idempotencyKey: "e2e-seed", reason: "PROMOTIONAL_GRANT" } } } });
   const wait = async (id: string) => {
     for (let i = 0; i < 600; i += 1) {
       const job = await db.job.findUniqueOrThrow({ where: { id }, include: { steps: true, toolExecutions: true } });
