@@ -42,7 +42,7 @@ function encryptionArgs(input: string, output: string, userPassword: string, own
     `--print=${permissionOptions.printing}`, `--extract=${permissionOptions.extraction ? "y" : "n"}`, `--assemble=${permissionOptions.assembly ? "y" : "n"}`,
     `--form=${permissionOptions.forms ? "y" : "n"}`, `--annotate=${permissionOptions.annotations ? "y" : "n"}`, "--accessibility=y", "--modify-other=n",
   ] : [];
-  return [input, "--password-mode=unicode", "--encrypt", userPassword, ownerPassword, "256", "--force-R6", ...permissions, "--", output];
+  return [input, "--password-mode=unicode", "--encrypt", userPassword, ownerPassword, "256", ...permissions, "--", output];
 }
 
 export async function runQpdfTool(tool: QpdfTool, inputBytes: Uint8Array, options: Record<string, unknown>, secrets?: Phase1SecretPayload) {
