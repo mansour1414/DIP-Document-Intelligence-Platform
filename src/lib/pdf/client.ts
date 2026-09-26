@@ -21,7 +21,12 @@ export type PdfOperation =
   | "split-pdf-by-bookmarks"
   | "split-pdf-by-text"
   | "n-up-pdf"
-  | "remove-annotations";
+  | "remove-annotations"
+  | "extract-images"
+  | "protect-pdf"
+  | "unlock-pdf"
+  | "pdf-permissions"
+  | "repair-pdf";
 
 export type PdfOptions = {
   pages?: string;

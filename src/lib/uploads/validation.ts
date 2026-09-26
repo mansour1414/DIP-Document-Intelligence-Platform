@@ -20,6 +20,8 @@ export async function validateUpload(input: { toolId: string; declaredMime: stri
   if (!mimeType) throw new UploadValidationError("MAGIC_BYTES_INVALID", "File signature does not match an accepted format.");
   let pageCount: number | undefined;
   if (mimeType === "application/pdf") {
+    const controlledWorkerPreflight = input.toolId === "unlock-pdf" || input.toolId === "repair-pdf";
+    if (controlledWorkerPreflight) return { mimeType, pageCount, checksum: createHash("sha256").update(input.bytes).digest("base64"), controlledWorkerPreflight: true };
     try { pageCount = (await PDFDocument.load(input.bytes, { ignoreEncryption: false })).getPageCount(); } catch { throw new UploadValidationError("PDF_INVALID", "PDF cannot be parsed."); }
     if (tool.limits.maxPages && pageCount > tool.limits.maxPages) throw new UploadValidationError("PAGE_LIMIT_EXCEEDED", "PDF exceeds the page limit.");
   }

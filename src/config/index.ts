@@ -261,6 +261,36 @@ export const toolsConfig = [
     supportedMimeTypes: PDF, limits: BASE_LIMITS, capabilities: ["pdf-structure"], securityClass: "restricted", aiEnabled: false, locales: ["en", "ar"],
   },
   {
+    id: "extract-images", name: "Extract Images", nameAr: "استخراج الصور",
+    description: "Extract safely decoded embedded image objects without rendering page screenshots", descriptionAr: "استخراج كائنات الصور المضمنة المفكوكة بأمان دون تحويل الصفحات إلى لقطات",
+    icon: "Images", category: "convert", execution: "server" as const, href: "/extract-images", version: 1,
+    supportedMimeTypes: PDF, limits: { ...BASE_LIMITS, maxFiles: 1 }, capabilities: ["pdf-images", "multiple-outputs"], securityClass: "isolated", aiEnabled: false, locales: ["en", "ar"],
+  },
+  {
+    id: "protect-pdf", name: "Protect PDF", nameAr: "حماية PDF",
+    description: "Encrypt a PDF with AES-256 using securely handed-off passwords", descriptionAr: "تشفير PDF بخوارزمية AES-256 باستخدام كلمات مرور منقولة بأمان",
+    icon: "ShieldCheck", category: "edit", execution: "server" as const, href: "/protect-pdf", version: 1,
+    supportedMimeTypes: PDF, limits: { ...BASE_LIMITS, maxFiles: 1 }, capabilities: ["qpdf", "aes-256", "ephemeral-secrets"], securityClass: "restricted", aiEnabled: false, locales: ["en", "ar"],
+  },
+  {
+    id: "unlock-pdf", name: "Unlock PDF", nameAr: "فتح حماية PDF",
+    description: "Decrypt an authorized PDF using the valid password you provide", descriptionAr: "فك تشفير PDF المصرح لك بمعالجته باستخدام كلمة المرور الصحيحة التي تقدمها",
+    icon: "LockOpen", category: "edit", execution: "server" as const, href: "/unlock-pdf", version: 1,
+    supportedMimeTypes: PDF, limits: { ...BASE_LIMITS, maxFiles: 1 }, capabilities: ["qpdf", "ephemeral-secrets", "authorized-use-only"], securityClass: "restricted", aiEnabled: false, locales: ["en", "ar"],
+  },
+  {
+    id: "pdf-permissions", name: "PDF Permissions", nameAr: "صلاحيات PDF",
+    description: "Apply viewer-enforced PDF permissions with AES-256 encryption", descriptionAr: "تطبيق صلاحيات PDF التي يفرضها برنامج العرض مع تشفير AES-256",
+    icon: "FileLock2", category: "edit", execution: "server" as const, href: "/pdf-permissions", version: 1,
+    supportedMimeTypes: PDF, limits: { ...BASE_LIMITS, maxFiles: 1 }, capabilities: ["qpdf", "aes-256", "ephemeral-secrets"], securityClass: "restricted", aiEnabled: false, locales: ["en", "ar"],
+  },
+  {
+    id: "repair-pdf", name: "Repair PDF", nameAr: "إصلاح PDF",
+    description: "Attempt a controlled qpdf structural recovery and reject unsafe or unrecoverable files", descriptionAr: "محاولة استعادة بنية PDF عبر qpdf بشكل مضبوط ورفض الملفات غير الآمنة أو غير القابلة للإصلاح",
+    icon: "Wrench", category: "edit", execution: "server" as const, href: "/repair-pdf", version: 1,
+    supportedMimeTypes: PDF, limits: { ...BASE_LIMITS, maxFiles: 1 }, capabilities: ["qpdf", "structural-recovery"], securityClass: "isolated", aiEnabled: false, locales: ["en", "ar"],
+  },
+  {
     id: "word-to-pdf",
     name: "Word to PDF",
     nameAr: "Word إلى PDF",

@@ -33,6 +33,8 @@ export function mapPublicError(error: unknown): PublicApiError {
   if (["API_FORBIDDEN", "TOOL_NOT_PUBLIC", "PLAN_LIMIT_EXCEEDED"].includes(code)) return new PublicApiError("FORBIDDEN", "The requested operation is not permitted.", 403);
   if (["NOT_FOUND", "JOB_NOT_FOUND"].includes(code)) return new PublicApiError("NOT_FOUND", "The requested resource was not found.", 404);
   if (["INVALID_INPUT", "INVALID_IDEMPOTENCY_KEY", "INPUT_FILE_COUNT_INVALID"].includes(code)) return new PublicApiError("VALIDATION_ERROR", "The request is invalid.", 400);
+  if (["SECRET_INPUT_INVALID", "SECRET_HANDOFF_UNAVAILABLE"].includes(code)) return new PublicApiError("VALIDATION_ERROR", "The secure password input is invalid or unavailable.", 422);
+  if (code === "UNLOCK_RATE_LIMITED") return new PublicApiError("RATE_LIMITED", "Unlock requests are temporarily rate limited.", 429);
   if (["TOTAL_SIZE_LIMIT_EXCEEDED"].includes(code)) return new PublicApiError("SIZE_LIMIT_EXCEEDED", "The request exceeds the allowed size.", 413);
   if (/TIMEOUT/i.test(code)) return new PublicApiError("TIMEOUT", "Processing timed out.", 504);
   if (/PROVIDER/i.test(code)) return new PublicApiError("PROVIDER_ERROR", "An upstream provider failed.", 502);

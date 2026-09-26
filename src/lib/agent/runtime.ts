@@ -24,6 +24,7 @@ import { logger } from "@/lib/logging";
 
 const json = (value: unknown) => value as Prisma.InputJsonValue;
 const terminal = new Set(["SUCCEEDED", "FAILED", "CANCELLED"]);
+const agentExcludedTools = new Set(["protect-pdf", "unlock-pdf", "pdf-permissions"]);
 type Planner = (task: AgentPlannerTask, context: { agentRunId: string; correlationId: string; userId: string; toolId: "agent-planner" }) => Promise<{ output: AgentPlanDraft; estimatedCost: number }>;
 const productionPlanner: Planner = (task, context) => executeAiGateway(task, context);
 
@@ -41,7 +42,7 @@ function trustedBudget(entitlements: Awaited<ReturnType<typeof resolvePlan>>["en
 }
 
 function allowedTools(entitlements: Awaited<ReturnType<typeof resolvePlan>>["entitlements"], locale: "ar" | "en") {
-  return Object.values(toolRegistry).filter((tool) => workerToolIds.has(tool.toolId) && planCanUseTool(entitlements, tool.toolId) && (!tool.aiFlag || entitlements.aiAccess) && tool.locales.includes(locale));
+  return Object.values(toolRegistry).filter((tool) => workerToolIds.has(tool.toolId) && !agentExcludedTools.has(tool.toolId) && planCanUseTool(entitlements, tool.toolId) && (!tool.aiFlag || entitlements.aiAccess) && tool.locales.includes(locale));
 }
 
 function plannerTask(runId: string, request: AgentRequest, scope: ResolvedAgentScope, budget: AgentBudget, tools: ReturnType<typeof allowedTools>): AgentPlannerTask {

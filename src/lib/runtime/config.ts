@@ -6,6 +6,7 @@ function boundedInteger(name: string, fallback: number, minimum: number, maximum
 export const runtimeLimits = {
   maxInputBytes: boundedInteger("MAX_INPUT_BYTES", 100 * 1024 * 1024, 1024, 500 * 1024 * 1024),
   maxPages: boundedInteger("MAX_PDF_PAGES", 500, 1, 2_000),
+  maxPdfObjects: boundedInteger("MAX_PDF_OBJECTS", 100_000, 100, 1_000_000),
   maxRenderedPixelsPerPage: boundedInteger("MAX_RENDERED_PIXELS_PER_PAGE", 40_000_000, 1_000_000, 100_000_000),
   maxOutputFiles: boundedInteger("MAX_OUTPUT_FILES", 500, 1, 2_000),
   maxOutputBytes: boundedInteger("MAX_OUTPUT_BYTES", 250 * 1024 * 1024, 1024, 1024 * 1024 * 1024),

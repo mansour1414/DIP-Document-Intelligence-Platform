@@ -5,6 +5,7 @@ import { ToolOptionsValidationError, validateToolOptions } from "@/lib/tools/opt
 
 export const MAX_WORKFLOW_NODES = 20;
 const NODE_ID = /^[a-zA-Z][a-zA-Z0-9_-]{0,99}$/;
+const secretTools = new Set(["protect-pdf", "unlock-pdf", "pdf-permissions"]);
 
 function issue(issues: WorkflowValidationIssue[], code: string, path: string, message: string) { issues.push({ code, path, message }); }
 function isNode(value: unknown): value is WorkflowNode { return Boolean(value && typeof value === "object" && !Array.isArray(value)); }
@@ -25,6 +26,7 @@ export function validateWorkflowDefinition(value: unknown, entitlements?: Entitl
     if (!tool) issue(issues, "TOOL_NOT_REGISTERED", `${path}.toolId`, "Referenced tool is not registered.");
     else {
       if (!workerToolIds.has(node.toolId)) issue(issues, "TOOL_DISABLED", `${path}.toolId`, "Referenced tool is disabled for workflow execution.");
+      if (secretTools.has(node.toolId)) issue(issues, "WORKFLOW_SECRET_INPUT_UNSUPPORTED", `${path}.toolId`, "Secret-bearing tools require interactive ephemeral input and cannot be persisted in workflows.");
       if (node.toolVersion !== tool.version) issue(issues, "TOOL_VERSION_UNSUPPORTED", `${path}.toolVersion`, `Expected tool version ${tool.version}.`);
       if (entitlements && !planCanUseTool(entitlements, node.toolId)) issue(issues, "PLAN_LIMIT_EXCEEDED", `${path}.toolId`, "The active plan cannot use this tool.");
     }

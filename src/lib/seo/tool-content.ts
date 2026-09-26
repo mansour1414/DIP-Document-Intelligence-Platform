@@ -6,7 +6,7 @@ export type Locale = (typeof locales)[number];
 export const mvpToolIds = [
   "merge-pdf", "split-pdf", "compress-pdf", "organize-pdf", "rotate-pdf", "delete-pages", "extract-pages",
   "jpg-to-pdf", "pdf-to-jpg", "watermark-pdf", "crop-pdf", "page-numbers", "header-footer", "resize-pages", "alternate-mix", "flip-pages", "split-pdf-by-size", "split-pdf-by-bookmarks", "split-pdf-by-text", "n-up-pdf", "remove-annotations", "word-to-pdf", "pdf-to-word", "excel-to-pdf", "powerpoint-to-pdf", "ocr-pdf",
-  "summarize-pdf", "chat-with-pdf", "extract-data",
+  "extract-images", "protect-pdf", "unlock-pdf", "pdf-permissions", "repair-pdf", "summarize-pdf", "chat-with-pdf", "extract-data",
 ] as const;
 export type MvpToolId = (typeof mvpToolIds)[number];
 
@@ -27,6 +27,8 @@ const related: Record<MvpToolId, MvpToolId[]> = {
   "resize-pages": ["crop-pdf", "flip-pages"], "alternate-mix": ["merge-pdf", "organize-pdf"], "flip-pages": ["rotate-pdf", "resize-pages"],
   "split-pdf-by-size": ["split-pdf", "compress-pdf"], "split-pdf-by-bookmarks": ["split-pdf", "extract-pages"], "split-pdf-by-text": ["split-pdf", "ocr-pdf"],
   "n-up-pdf": ["resize-pages", "page-numbers"], "remove-annotations": ["organize-pdf", "watermark-pdf"],
+  "extract-images": ["pdf-to-jpg", "extract-pages"], "protect-pdf": ["unlock-pdf", "pdf-permissions"], "unlock-pdf": ["protect-pdf", "repair-pdf"],
+  "pdf-permissions": ["protect-pdf", "unlock-pdf"], "repair-pdf": ["unlock-pdf", "organize-pdf"],
   "word-to-pdf": ["pdf-to-word", "excel-to-pdf"], "pdf-to-word": ["word-to-pdf", "ocr-pdf"],
   "excel-to-pdf": ["word-to-pdf", "powerpoint-to-pdf"], "powerpoint-to-pdf": ["word-to-pdf", "excel-to-pdf"],
   "ocr-pdf": ["extract-data", "summarize-pdf"], "summarize-pdf": ["chat-with-pdf", "ocr-pdf"],
@@ -55,6 +57,11 @@ const enDetails: Record<MvpToolId, { intent: string; result: string; use: string
   "split-pdf-by-text": { intent: "start a new part before each page containing literal text", result: "text-delimited PDF parts", use: "repeated section headings in searchable PDFs", caveat: "Matching is literal and deterministic; image-only pages are not OCRed automatically." },
   "n-up-pdf": { intent: "compose 2, 4, 6, or 9 source pages on each output sheet", result: "a compact imposed PDF", use: "handouts and print review", caveat: "Interactive links, forms, and annotations are not preserved as interactive objects." },
   "remove-annotations": { intent: "selectively remove comment annotations while preserving form widgets", result: "a PDF with the chosen comments removed", use: "clean review copies", caveat: "Signed PDFs are rejected because rewriting may invalidate signature integrity; links are removed only when explicitly selected." },
+  "extract-images": { intent: "extract supported embedded image objects as decoded PNG files", result: "actual decoded embedded images plus a capability report", use: "reusing supported images without rendering full pages", caveat: "Outputs are decoded images, not byte-identical original streams; unsupported inline or undecodable objects are reported and page screenshots are never substituted." },
+  "protect-pdf": { intent: "encrypt a PDF with AES-256", result: "a password-protected PDF", use: "authorized confidential document sharing", caveat: "Passwords are handed off ephemerally and cannot be recovered; retain them securely." },
+  "unlock-pdf": { intent: "decrypt a PDF with a valid supplied password", result: "an unencrypted PDF", use: "documents you own or are authorized to process", caveat: "The tool never guesses, cracks, brute-forces, bypasses, or recovers passwords and rejects incorrect credentials." },
+  "pdf-permissions": { intent: "apply AES-256 PDF permission flags", result: "an encrypted PDF with viewer-enforced restrictions", use: "communicating intended printing and modification limits", caveat: "PDF permissions are viewer-enforced restrictions and are not absolute DRM; accessibility remains enabled." },
+  "repair-pdf": { intent: "attempt controlled structural recovery with qpdf", result: "a reopened structurally validated PDF when recovery is reliable", use: "recoverable malformed cross-reference and structure errors", caveat: "Not every damaged PDF can be repaired; signed, encrypted, unsafe, and unrecoverable inputs are rejected." },
   "word-to-pdf": { intent: "convert Word documents to a consistent PDF", result: "a shareable PDF", use: "contracts, reports, and final copies", caveat: "Complex fonts or layouts can render differently from Word." },
   "pdf-to-word": { intent: "convert PDF content into an editable Word document", result: "a DOCX file", use: "reusing text from straightforward PDFs", caveat: "This beta works best on simple layouts; complex formatting may need correction." },
   "excel-to-pdf": { intent: "convert Excel spreadsheets into shareable PDF documents", result: "a PDF rendered from the workbook", use: "reports, tables, and spreadsheet distribution", caveat: "Wide sheets, print areas, charts, fonts, and page breaks may render differently and should be reviewed." },
@@ -87,6 +94,11 @@ const arDetails: Record<MvpToolId, { intent: string; result: string; use: string
   "split-pdf-by-text": { intent: "بدء جزء جديد قبل كل صفحة تحتوي نصًا حرفيًا", result: "أجزاء PDF تفصلها مطابقة النص", use: "العناوين المتكررة في ملفات PDF القابلة للبحث", caveat: "المطابقة حرفية وحتمية ولا يُشغّل OCR تلقائيًا للصفحات المصورة." },
   "n-up-pdf": { intent: "تجميع صفحتين أو 4 أو 6 أو 9 صفحات مصدر في كل ورقة ناتجة", result: "ملف PDF مدمج للعرض أو الطباعة", use: "النشرات والمراجعة المطبوعة", caveat: "لا تُحفظ الروابط والنماذج والتعليقات كعناصر تفاعلية." },
   "remove-annotations": { intent: "إزالة تعليقات توضيحية منتقاة مع الحفاظ على عناصر النماذج", result: "ملف PDF أزيلت منه التعليقات المختارة", use: "إنشاء نسخ مراجعة نظيفة", caveat: "تُرفض الملفات الموقعة لأن إعادة الكتابة قد تبطل التوقيع، ولا تزال الروابط إلا باختيار صريح." },
+  "extract-images": { intent: "استخراج كائنات الصور المضمنة المدعومة إلى PNG بعد فكها", result: "صور مضمنة فعلية مفكوكة مع تقرير قدرات", use: "إعادة استخدام الصور المدعومة دون تصوير الصفحة كاملة", caveat: "النواتج صور مفكوكة وليست تدفقات أصلية مطابقة للبايتات؛ تُذكر الكائنات غير المدعومة ولا تُستبدل بلقطات صفحات." },
+  "protect-pdf": { intent: "تشفير PDF بخوارزمية AES-256", result: "ملف PDF محمي بكلمة مرور", use: "مشاركة المستندات السرية المصرح بها", caveat: "تُنقل كلمات المرور مؤقتًا ولا يمكن استعادتها؛ احتفظ بها بأمان." },
+  "unlock-pdf": { intent: "فك تشفير PDF باستخدام كلمة مرور صحيحة مقدمة", result: "ملف PDF غير مشفر", use: "الملفات التي تملكها أو تملك تصريح معالجتها", caveat: "لا تخمّن الأداة كلمات المرور ولا تكسرها أو تجربها بالقوة أو تتجاوز التشفير، وترفض بيانات الاعتماد الخاطئة." },
+  "pdf-permissions": { intent: "تطبيق أعلام صلاحيات PDF مع تشفير AES-256", result: "ملف مشفر بقيود يطبقها برنامج العرض", use: "توضيح حدود الطباعة والتعديل المقصودة", caveat: "صلاحيات PDF قيود يفرضها برنامج العرض وليست DRM مطلقة، وتظل إمكانية الوصول مفعلة." },
+  "repair-pdf": { intent: "محاولة استعادة بنيوية مضبوطة عبر qpdf", result: "ملف PDF معاد فتحه ومتحقق من بنيته عندما يكون الإصلاح موثوقًا", use: "أخطاء بنية وجداول مراجع قابلة للاستعادة", caveat: "لا يمكن إصلاح كل ملف تالف؛ وتُرفض الملفات الموقعة أو المشفرة أو غير الآمنة أو غير القابلة للاستعادة." },
   "word-to-pdf": { intent: "تحويل مستند Word إلى PDF ثابت", result: "ملف PDF سهل المشاركة", use: "العقود والتقارير والنسخ النهائية", caveat: "قد تختلف الخطوط أو التخطيطات المعقدة عن Word." },
   "pdf-to-word": { intent: "تحويل محتوى PDF إلى مستند Word قابل للتحرير", result: "ملف DOCX", use: "إعادة استخدام نصوص الملفات البسيطة", caveat: "هذه نسخة تجريبية تناسب التخطيطات البسيطة؛ وقد تحتاج التنسيقات المعقدة إلى تصحيح." },
   "excel-to-pdf": { intent: "تحويل جداول Excel إلى مستندات PDF قابلة للمشاركة", result: "ملف PDF منشأ من المصنف", use: "التقارير والجداول وتوزيع بيانات جداول البيانات", caveat: "قد تختلف الأوراق العريضة ومناطق الطباعة والمخططات والخطوط وفواصل الصفحات، لذا راجع الناتج." },

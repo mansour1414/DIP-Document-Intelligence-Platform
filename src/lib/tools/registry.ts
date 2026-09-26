@@ -10,6 +10,7 @@ export type ToolDefinition = {
 function outputMime(toolId: string) {
   if (toolId === "pdf-to-word") return ["application/vnd.openxmlformats-officedocument.wordprocessingml.document"];
   if (toolId === "pdf-to-jpg") return ["image/jpeg", "application/zip"];
+  if (toolId === "extract-images") return ["image/png", "application/json"];
   if (["summarize-pdf", "chat-with-pdf", "extract-data"].includes(toolId)) return ["application/json"];
   return ["application/pdf"];
 }
@@ -28,7 +29,7 @@ export const toolRegistry = Object.fromEntries(toolsConfig.map((tool) => [tool.i
   toolId: tool.id, name: tool.name, version: String(tool.version),
   inputSchema: inputSchema(tool.id, tool.limits.maxFiles),
   outputSchema: outputSchema(tool.id),
-  executionMode: tool.execution, mime: { input: [...tool.supportedMimeTypes], output: outputMime(tool.id) }, limits: { ...tool.limits, maxObjects: tool.limits.maxFiles },
+  executionMode: tool.execution, mime: { input: [...tool.supportedMimeTypes], output: outputMime(tool.id) }, limits: { ...tool.limits, maxObjects: tool.id === "extract-images" ? 100 : tool.limits.maxFiles },
   capabilities: [...tool.capabilities], securityClass: tool.securityClass, resourceCost: tool.aiEnabled || tool.securityClass === "isolated" ? "high" : tool.capabilities.length ? "medium" : "low",
   aiFlag: tool.aiEnabled, locales: [...tool.locales], enabled: true, apiEligible: tool.execution !== "client", optionSchemaVersion: toolOptionContracts[tool.id].version, optionSchema: optionJsonSchema(toolOptionContracts[tool.id]),
 }])) as Record<string, ToolDefinition>;
@@ -38,6 +39,7 @@ export const workerToolIds = new Set([
   "merge-pdf", "split-pdf", "organize-pdf", "rotate-pdf", "delete-pages", "extract-pages", "jpg-to-pdf",
   "compress-pdf", "pdf-to-jpg", "watermark-pdf", "crop-pdf", "page-numbers", "header-footer", "resize-pages", "alternate-mix", "flip-pages",
   "split-pdf-by-size", "split-pdf-by-bookmarks", "split-pdf-by-text", "n-up-pdf", "remove-annotations",
+  "extract-images", "protect-pdf", "unlock-pdf", "pdf-permissions", "repair-pdf",
   "word-to-pdf", "pdf-to-word", "excel-to-pdf", "powerpoint-to-pdf", "ocr-pdf",
   "summarize-pdf", "chat-with-pdf", "extract-data",
 ]);

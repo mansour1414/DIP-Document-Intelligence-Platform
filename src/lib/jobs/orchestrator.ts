@@ -9,10 +9,11 @@ import { measure, recordMetric } from "@/lib/observability/metrics";
 import { withTenant } from "@/lib/db/tenant";
 import { requireCleanUpload } from "@/lib/malware";
 import { validateToolOptions } from "@/lib/tools/options";
+import { deletePhase1Secret, enforceUnlockRateLimit, phase1SecretToolIds, putPhase1Secret, type Phase1SecretPayload, type Phase1SecretPurpose } from "@/lib/secrets/phase1";
 
 type Upload = { filename: string; mimeType: string; bytes: Uint8Array };
 function minimumFilesFor(toolId: string) { return ["merge-pdf", "alternate-mix"].includes(toolId) ? 2 : 1; }
-export async function createToolJob(input: { userId: string; toolId: string; uploads: Upload[]; options?: Record<string, string | number | boolean>; idempotencyKey: string; correlationId?: string; organizationId?: string; apiClientId?: string }) {
+export async function createToolJob(input: { userId: string; toolId: string; uploads: Upload[]; options?: Record<string, string | number | boolean>; secrets?: Phase1SecretPayload; idempotencyKey: string; correlationId?: string; organizationId?: string; apiClientId?: string }) {
   const apiStarted = performance.now();
   const tool = getToolDefinition(input.toolId);
   const options = validateToolOptions(tool.toolId, input.options ?? {});
@@ -22,6 +23,8 @@ export async function createToolJob(input: { userId: string; toolId: string; upl
   const correlationId = input.correlationId ?? randomUUID();
   const existing = await measure("db_job_idempotency_query", { tool_id: tool.toolId }, () => withTenant({ userId: input.userId }, (tx) => tx.job.findUnique({ where: { toolId_idempotencyKey: { toolId: tool.toolId, idempotencyKey: input.idempotencyKey } }, select: { id: true, status: true } })));
   if (existing) return { ...existing, reused: true };
+  if (phase1SecretToolIds.has(tool.toolId) !== Boolean(input.secrets)) throw Object.assign(new Error("Secure secret input does not match this tool."), { code: "SECRET_INPUT_INVALID" });
+  if (tool.toolId === "unlock-pdf") await enforceUnlockRateLimit(input.userId);
   const storage = getStorage();
   const prepared = await Promise.all(input.uploads.map(async (upload) => {
     const validation = await validateUpload({ toolId: tool.toolId, declaredMime: upload.mimeType, bytes: upload.bytes });
@@ -30,21 +33,24 @@ export async function createToolJob(input: { userId: string; toolId: string; upl
   }));
   const monetization = await enforceJobCreation({ userId: input.userId, toolId: tool.toolId, idempotencyKey: input.idempotencyKey, correlationId, options, files: prepared.map(({upload,validation})=>({size:upload.bytes.byteLength,pageCount:validation.pageCount})) });
   const stored: Array<{ key: string; bucket: string; upload: Upload; validation: Awaited<ReturnType<typeof validateUpload>> }> = [];
+  let secretRef: string | undefined;
   try {
     for (const item of prepared) { const key = storage.createUploadKey({ userId: input.userId, filename: item.upload.filename }); const object = await storage.put({ key, bytes: item.upload.bytes, contentType: item.validation.mimeType, checksum: item.validation.checksum }); stored.push({ key: object.key, bucket: object.bucket, upload: item.upload, validation: item.validation }); }
+    const jobId = randomUUID();
+    if (input.secrets) secretRef = await putPhase1Secret({ tenantId: input.userId, jobId, purpose: tool.toolId as Phase1SecretPurpose, payload: input.secrets });
     const job = await withTenant({ userId: input.userId }, async (tx) => {
       const document = await tx.document.create({ data: { userId: input.userId, organizationId: input.organizationId, title: `${tool.name} input` } });
       const files = await Promise.all(stored.map(async (item) => { const file = await tx.file.create({ data: { document: { connect: { id: document.id } }, originalName: item.upload.filename.slice(0, 255), mimeType: item.validation.mimeType, size: BigInt(item.upload.bytes.byteLength), storageKey: item.key, checksum: item.validation.checksum, pageCount: item.validation.pageCount, storageObject: { connectOrCreate: { where: { provider_bucket_objectKey: { provider: "s3", bucket: item.bucket, objectKey: item.key } }, create: { provider: "s3", bucket: item.bucket, objectKey: item.key, size: BigInt(item.upload.bytes.byteLength), checksum: item.validation.checksum } } } } }); await tx.fileVersion.create({ data: { fileId: file.id, ownerId: input.userId, version: 1, storageKey: item.key, checksum: item.validation.checksum } }); return file; }));
-      return tx.job.create({ data: { toolId: tool.toolId, idempotencyKey: input.idempotencyKey, requesterId: input.userId, organizationId: input.organizationId, apiClientId: input.apiClientId, inputFileId: files[0].id, status: "QUEUED", params: { inputFileIds: files.map((file) => file.id), options }, correlationId, steps: { create: { name: tool.toolId, idempotencyKey: `${input.idempotencyKey}:${tool.toolId}`, status: "QUEUED", correlationId } } }, select: { id: true, status: true } });
+      return tx.job.create({ data: { id: jobId, toolId: tool.toolId, idempotencyKey: input.idempotencyKey, requesterId: input.userId, organizationId: input.organizationId, apiClientId: input.apiClientId, inputFileId: files[0].id, status: "QUEUED", params: { inputFileIds: files.map((file) => file.id), options, ...(secretRef ? { secretRef } : {}) }, correlationId, steps: { create: { name: tool.toolId, idempotencyKey: `${input.idempotencyKey}:${tool.toolId}`, status: "QUEUED", correlationId } } }, select: { id: true, status: true } });
     });
     const queuedJob = { jobId: job.id, toolId: tool.toolId, idempotencyKey: input.idempotencyKey, correlationId, userId: input.userId };
-    const queueOptions = { priority: monetization.entitlements.processingPriority === "high" ? 1 : 5 };
+    const queueOptions = { priority: monetization.entitlements.processingPriority === "high" ? 1 : 5, ...(secretRef ? { attempts: 1 } : {}) };
     if (tool.aiFlag) await enqueueAiJob(queuedJob, queueOptions); else await enqueueJob(queuedJob, queueOptions);
     logger.info("job.queued", { job_id: job.id, correlation_id: correlationId, tool_id: tool.toolId });
     recordMetric("api_job_creation_latency_ms", performance.now() - apiStarted, "ms", { tool_id: tool.toolId });
     recordMetric("jobs_total", 1, "count", { tool_id: tool.toolId });
     return { ...job, reused: false };
-  } catch (error) { await Promise.all(stored.map((object) => storage.deleteObject(object.key).catch(() => undefined))); throw error; }
+  } catch (error) { await Promise.all([deletePhase1Secret(secretRef).catch(() => undefined), ...stored.map((object) => storage.deleteObject(object.key).catch(() => undefined))]); throw error; }
 }
 
 export function createMergePdfJob(input: { userId: string; uploads: Upload[]; idempotencyKey: string; correlationId?: string }) {
@@ -54,6 +60,7 @@ export function createMergePdfJob(input: { userId: string; uploads: Upload[]; id
 /** Trusted internal-file boundary used by workflows. Browser-provided storage keys are never accepted. */
 export async function createToolJobFromFiles(input: { userId: string; toolId: string; fileIds: string[]; options?: Record<string, string | number | boolean>; idempotencyKey: string; correlationId: string; workflowRunId: string; workflowNodeId: string }) {
   const tool = getToolDefinition(input.toolId);
+  if (phase1SecretToolIds.has(tool.toolId)) throw Object.assign(new Error("Secret-bearing tools are not available in persisted workflows."), { code: "WORKFLOW_SECRET_INPUT_UNSUPPORTED" });
   const options = validateToolOptions(tool.toolId, input.options ?? {});
   const existing = await withTenant({ userId: input.userId }, (tx) => tx.job.findUnique({ where: { toolId_idempotencyKey: { toolId: tool.toolId, idempotencyKey: input.idempotencyKey } }, select: { id: true, status: true } }));
   if (existing) return { ...existing, reused: true };

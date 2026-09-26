@@ -17,6 +17,8 @@ import { configuredCostRates, estimateJobCost } from "@/lib/cost/model";
 import { withTenant } from "@/lib/db/tenant";
 import { isUnrecoverableAiQueueError, toAiQueueError } from "@/lib/ai/gateway/retry";
 import { validateToolOptions } from "@/lib/tools/options";
+import { deletePhase1Secret, takePhase1Secret, type Phase1SecretPurpose } from "@/lib/secrets/phase1";
+import { APPROVED_QPDF_VERSION, runQpdfTool } from "@/lib/pdf/qpdf";
 
 async function processDocumentJob(message: QueuedJob) {
   if (!message.userId) throw Object.assign(new Error("Worker job requires a tenant identity"), { code: "TENANT_CONTEXT_REQUIRED" });
@@ -24,27 +26,30 @@ async function processDocumentJob(message: QueuedJob) {
   const job = await tenant((tx) => tx.job.findUnique({ where: { id: message.jobId }, include: { steps: true } }));
   if (!job) throw new Error("JOB_NOT_FOUND");
   const context = { job_id: job.id, correlation_id: job.correlationId ?? message.correlationId, tool_id: job.toolId };
+  const rawParams = job.params as { inputFileIds?: string[]; options?: Record<string, unknown>; secretRef?: string };
   if (job.status === "SUCCEEDED" || job.outputFileId) { logger.info("job.idempotent_skip", context); return; }
-  if (job.status === "CANCELLED" || job.status === "EXPIRED") return;
+  if (job.status === "CANCELLED" || job.status === "EXPIRED") { await deletePhase1Secret(rawParams.secretRef).catch(() => undefined); return; }
   const step = job.steps.find((item) => item.name === job.toolId);
   try {
     await tenant((tx) => tx.job.update({ where: { id: job.id }, data: { status: "RUNNING", startedAt: job.startedAt ?? new Date(), error: undefined, errorCode: null } }));
     if (step) await tenant((tx) => tx.jobStep.update({ where: { id: step.id }, data: { status: "RUNNING", startedAt: new Date() } }));
-    const params = job.params as { inputFileIds?: string[]; options?: Record<string, unknown> }; const ids = params.inputFileIds;
+    const params = rawParams; const ids = params.inputFileIds;
     if (!ids?.length) throw Object.assign(new Error("Unsupported job payload"), { code: "INVALID_JOB_INPUT" });
     const files = await tenant((tx) => tx.file.findMany({ where: { id: { in: ids } }, include: { document: true } }));
     if (files.length !== ids.length) throw Object.assign(new Error("Input file is missing"), { code: "INPUT_NOT_FOUND" });
     const inputById = new Map(files.map((file) => [file.id, file]));
     const bytes = await Promise.all(ids.map((id) => getStorage().get(inputById.get(id)!.storageKey))); const options: Record<string, unknown> = { ...validateToolOptions(job.toolId, params.options ?? {}), inputMimeTypes: ids.map((id) => inputById.get(id)!.mimeType) };
     const started = Date.now(); let engine = "pdf-lib"; let engineVersion = "1.17.1";
-    const pdfTools = new Set(["merge-pdf", "split-pdf", "organize-pdf", "rotate-pdf", "delete-pages", "extract-pages", "jpg-to-pdf", "compress-pdf", "pdf-to-jpg", "watermark-pdf", "crop-pdf", "page-numbers", "header-footer", "resize-pages", "alternate-mix", "flip-pages", "split-pdf-by-size", "split-pdf-by-bookmarks", "split-pdf-by-text", "n-up-pdf", "remove-annotations"]);
+    const pdfTools = new Set(["merge-pdf", "split-pdf", "organize-pdf", "rotate-pdf", "delete-pages", "extract-pages", "jpg-to-pdf", "compress-pdf", "pdf-to-jpg", "watermark-pdf", "crop-pdf", "page-numbers", "header-footer", "resize-pages", "alternate-mix", "flip-pages", "split-pdf-by-size", "split-pdf-by-bookmarks", "split-pdf-by-text", "n-up-pdf", "remove-annotations", "extract-images"]);
+    const qpdfTools = new Set(["protect-pdf", "unlock-pdf", "pdf-permissions", "repair-pdf"]);
     const documentTools = new Set(["word-to-pdf", "pdf-to-word", "excel-to-pdf", "powerpoint-to-pdf", "ocr-pdf"]);
     let outputs: Array<{ name: string; mimeType: string; bytes: Uint8Array }>;
     if (pdfTools.has(job.toolId)) { const pdfTool = job.toolId as PdfWorkerTool; outputs = await withTimeout(job.toolId, timeoutFor("pdf"), runPdfWorkerTool(pdfTool, bytes, options)); ({ engine, engineVersion } = pdfWorkerEngine(pdfTool)); }
+    else if (qpdfTools.has(job.toolId)) { const secret = params.secretRef ? await takePhase1Secret({ reference: params.secretRef, tenantId: message.userId, jobId: job.id, purpose: job.toolId as Phase1SecretPurpose }) : undefined; outputs = [await withTimeout(job.toolId, timeoutFor("pdf"), runQpdfTool(job.toolId as "protect-pdf" | "unlock-pdf" | "pdf-permissions" | "repair-pdf", bytes[0], options, secret))]; engine = "qpdf"; engineVersion = APPROVED_QPDF_VERSION; }
     else if (documentTools.has(job.toolId)) { const input = inputById.get(ids[0])!; const result = await processServerDocument(job.toolId as ServerToolId, new File([bytes[0] as BlobPart], input.originalName, { type: input.mimeType }), typeof options.language === "string" ? options.language : "ara+eng"); outputs = [{ name: result.filename, mimeType: result.contentType, bytes: result.bytes }]; engine = job.toolId === "ocr-pdf" ? "ocrmypdf" : "libreoffice"; engineVersion = "host"; }
     else throw Object.assign(new Error("Tool is not enabled on this worker"), { code: "TOOL_NOT_WORKER_ENABLED" });
     const preservePages = ["compress-pdf", "rotate-pdf", "watermark-pdf", "crop-pdf", "page-numbers", "header-footer", "resize-pages", "flip-pages", "remove-annotations", "ocr-pdf"].includes(job.toolId) ? files[0]?.pageCount ?? undefined : undefined;
-    const validated = await validateWorkerOutputs(outputs, preservePages);
+    const validated = await validateWorkerOutputs(outputs, preservePages, { encryptedPdfAlreadyValidated: job.toolId === "protect-pdf" || job.toolId === "pdf-permissions" });
     recordMetric("storage_bytes_out", validated.totalBytes, "bytes", { tool_id: job.toolId, engine, engine_version: engineVersion, status: "succeeded" });
     if (job.toolId === "compress-pdf") recordMetric("compression_ratio", validated.totalBytes / bytes[0].byteLength, "ratio", { tool_id: job.toolId, engine, engine_version: engineVersion });
     const storage = getStorage();
@@ -74,7 +79,7 @@ async function processDocumentJob(message: QueuedJob) {
     if (step) await tenant((tx) => tx.jobStep.update({ where: { id: step.id }, data: { status: "FAILED", errorCode, error: { message: error instanceof Error ? error.message : "Processing failed" }, completedAt: new Date() } }));
     recordMetric("jobs_failure_total", 1, "count", { tool_id: job.toolId, status: "failed" });
     logger.error("job.failed", { ...context, error_code: errorCode, status: "failed" }); throw error;
-  }
+  } finally { await deletePhase1Secret(rawParams.secretRef).catch(() => undefined); }
 }
 
 export const documentWorker = new Worker<QueuedJob>(JOB_QUEUE_NAME, async (message) => { recordMetric("queue_wait_ms", Math.max(0, Date.now() - message.timestamp), "ms", { tool_id: message.data.toolId, queue: "document" }); return processDocumentJob(message.data); }, { connection: getQueueConnection(), concurrency: runtimeLimits.documentConcurrency, stalledInterval: runtimeLimits.stalledIntervalMs, maxStalledCount: runtimeLimits.maxStalledCount, lockDuration: Math.min(runtimeLimits.jobTimeoutMs, 10 * 60_000) });

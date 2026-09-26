@@ -2,6 +2,7 @@ import { degrees, PDFDocument } from "pdf-lib";
 import { PdfToolError } from "@/lib/pdf/client";
 import { createServerTextPng, createServerWatermarkPng, renderPdfToJpegs } from "@/lib/pdf/server-canvas";
 import { nUpPdf, removePdfAnnotations, splitPdfByBookmarks, splitPdfBySize, splitPdfByText } from "@/lib/pdf/phase1";
+import { extractEmbeddedImages } from "@/lib/pdf/extract-images";
 
 export async function mergePdfBytes(inputs: Uint8Array[]) {
   if (inputs.length < 2) throw new PdfToolError("VALIDATION_ERROR", "Merge requires at least two PDFs.");
@@ -10,9 +11,9 @@ export async function mergePdfBytes(inputs: Uint8Array[]) {
   return output.save({ useObjectStreams: true });
 }
 
-export type PdfWorkerTool = "merge-pdf" | "split-pdf" | "organize-pdf" | "rotate-pdf" | "delete-pages" | "extract-pages" | "jpg-to-pdf" | "compress-pdf" | "pdf-to-jpg" | "watermark-pdf" | "crop-pdf" | "page-numbers" | "header-footer" | "resize-pages" | "alternate-mix" | "flip-pages" | "split-pdf-by-size" | "split-pdf-by-bookmarks" | "split-pdf-by-text" | "n-up-pdf" | "remove-annotations";
+export type PdfWorkerTool = "merge-pdf" | "split-pdf" | "organize-pdf" | "rotate-pdf" | "delete-pages" | "extract-pages" | "jpg-to-pdf" | "compress-pdf" | "pdf-to-jpg" | "watermark-pdf" | "crop-pdf" | "page-numbers" | "header-footer" | "resize-pages" | "alternate-mix" | "flip-pages" | "split-pdf-by-size" | "split-pdf-by-bookmarks" | "split-pdf-by-text" | "n-up-pdf" | "remove-annotations" | "extract-images";
 type WorkerOutput = { name: string; mimeType: string; bytes: Uint8Array };
-export function pdfWorkerEngine(tool: PdfWorkerTool) { if (["compress-pdf", "pdf-to-jpg"].includes(tool)) return { engine: "pdfjs-dist+@napi-rs/canvas", engineVersion: "6.3.289+1.0.9" }; if (["watermark-pdf", "page-numbers", "header-footer"].includes(tool)) return { engine: "pdf-lib+@napi-rs/canvas", engineVersion: "1.17.1+1.0.9" }; return { engine: "pdf-lib", engineVersion: "1.17.1" }; }
+export function pdfWorkerEngine(tool: PdfWorkerTool) { if (["compress-pdf", "pdf-to-jpg", "extract-images"].includes(tool)) return { engine: "pdfjs-dist+@napi-rs/canvas", engineVersion: "6.3.289+1.0.9" }; if (["watermark-pdf", "page-numbers", "header-footer"].includes(tool)) return { engine: "pdf-lib+@napi-rs/canvas", engineVersion: "1.17.1+1.0.9" }; return { engine: "pdf-lib", engineVersion: "1.17.1" }; }
 function pageIndexes(value: string | undefined, count: number, ordered = false) {
   if (!value) throw new PdfToolError("VALIDATION_ERROR", "Pages are required."); const result: number[] = [];
   for (const token of value.split(",").map((item) => item.trim()).filter(Boolean)) { const match = token.match(/^(\d+)(?:-(\d+))?$/); if (!match) throw new PdfToolError("VALIDATION_ERROR", `Invalid page range: ${token}`); const start = Number(match[1]); const end = Number(match[2] ?? start); if (start < 1 || end < start || end > count) throw new PdfToolError("VALIDATION_ERROR", `Page range is outside the document: ${token}`); for (let page = start; page <= end; page += 1) result.push(page - 1); }
@@ -90,6 +91,7 @@ export async function runPdfWorkerTool(tool: PdfWorkerTool, inputs: Uint8Array[]
   if (tool === "split-pdf-by-text") return splitPdfByText(inputs[0], String(options.matchText ?? ""), options.caseSensitive === true);
   if (tool === "n-up-pdf") return nUpPdf(inputs[0], { layout: Number(options.layout ?? 2), orientation: String(options.orientation ?? "portrait"), pageSize: String(options.pageSize ?? "a4"), margin: Number(options.margin ?? 18), order: String(options.order ?? "row") });
   if (tool === "remove-annotations") return removePdfAnnotations(inputs[0], options.policy === "comments-and-links");
+  if (tool === "extract-images") return extractEmbeddedImages(inputs[0]);
   const source = await onePdf(inputs[0]);
   if (tool === "pdf-to-jpg") { const images = await renderPdfToJpegs(inputs[0], qualityOption(options.quality, 0.9)); return images.map((image, index) => ({ name: `page-${index + 1}.jpg`, mimeType: "image/jpeg", bytes: image.bytes })); }
   if (tool === "compress-pdf") { const images = await renderPdfToJpegs(inputs[0], qualityOption(options.quality, 0.72)); const compressed = await PDFDocument.create(); for (const rendered of images) { const image = await compressed.embedJpg(rendered.bytes); const page = compressed.addPage([rendered.pageWidth, rendered.pageHeight]); page.drawImage(image, { x: 0, y: 0, width: rendered.pageWidth, height: rendered.pageHeight }); } return [{ name: "compressed.pdf", mimeType: "application/pdf", bytes: await compressed.save({ useObjectStreams: true }) }]; }

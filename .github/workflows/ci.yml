@@ -237,6 +237,17 @@ jobs:
           docker run --rm --read-only --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777 --tmpfs /tmp/dip:rw,nosuid,nodev,noexec,size=256m,uid=10001,gid=10001,mode=0700 --entrypoint python3 dip-document-worker:release-a -c "from pathlib import Path; from tempfile import TemporaryDirectory; d=TemporaryDirectory(dir='/tmp/dip'); p=Path(d.name)/'probe'; p.write_text('ok'); assert p.read_text() == 'ok'; d.cleanup()"
           docker run --rm --read-only --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777 --tmpfs /tmp/dip:rw,nosuid,nodev,noexec,size=256m,uid=10001,gid=10001,mode=0700 --entrypoint python3 dip-document-worker:release-a scripts/verify-ocr-runtime.py
           docker run --rm --read-only --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777 --tmpfs /tmp/dip:rw,nosuid,nodev,noexec,size=256m,uid=10001,gid=10001,mode=0700 --entrypoint sh dip-document-worker:release-a -c 'test "$(id -u):$(id -g)" = "10001:10001"; test "$(stat -c %a /tmp)" = "1777"; test "$(stat -c %a /tmp/dip)" = "700"; awk '\''$2 == "/" && $4 ~ /(^|,)ro(,|$)/ { root=1 } $2 == "/tmp" && $4 ~ /size=65536k/ { tmp=1 } $2 == "/tmp/dip" && $4 ~ /size=262144k/ { dip=1 } END { exit !(root && tmp && dip) }'\'' /proc/mounts; soffice -env:UserInstallation=file:///tmp/dip/lo-startup-profile --headless --terminate_after_init'
+      - name: Verify qpdf security capabilities in the production worker
+        run: |
+          mkdir -p "$RUNNER_TEMP/qpdf-sbom"
+          chmod 0777 "$RUNNER_TEMP/qpdf-sbom"
+          docker run --rm --read-only --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777 --tmpfs /tmp/dip:rw,nosuid,nodev,noexec,size=256m,uid=10001,gid=10001,mode=0700 --mount type=bind,source="$RUNNER_TEMP/qpdf-sbom",target=/sbom --env QPDF_SBOM_PATH=/sbom/qpdf-worker.spdx.json --entrypoint node dip-document-worker:release-a scripts/verify-qpdf-security-runtime.mjs
+          test -s "$RUNNER_TEMP/qpdf-sbom/qpdf-worker.spdx.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qpdf-production-worker-sbom
+          path: ${{ runner.temp }}/qpdf-sbom/qpdf-worker.spdx.json
+          if-no-files-found: error
       - name: Print immutable worker dependency versions
         run: |
           docker run --rm --entrypoint node dip-document-worker:release-a --version
@@ -259,6 +270,7 @@ jobs:
           CLAMD_E2E: "1"
           CLAMD_HOST: 127.0.0.1
           CLAMD_PORT: "3310"
+          PHASE1_SECRET_ENCRYPTION_KEY: MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
 
   browser-accessibility:
     name: Browser / Accessibility
@@ -415,6 +427,7 @@ jobs:
           --env STORAGE_ENDPOINT=http://127.0.0.1:9000 --env STORAGE_BUCKET=dip-release-b
           --env STORAGE_ACCESS_KEY=minioadmin --env STORAGE_SECRET_KEY=minioadmin --env STORAGE_REGION=us-east-1
           --env CLAMD_HOST=127.0.0.1 --env CLAMD_PORT=3310 --env AUTH_SECRET=release-b-ci-only-secret
+          --env PHASE1_SECRET_ENCRYPTION_KEY=MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
           --env NEXT_PUBLIC_APP_URL=http://127.0.0.1:3000
           --env AI_PROVIDER --env GROQ_API_KEY --env GROQ_MODEL
           dip-document-worker:release-b
@@ -430,6 +443,7 @@ jobs:
           CLAMD_HOST: 127.0.0.1
           CLAMD_PORT: "3310"
           AUTH_SECRET: release-b-ci-only-secret
+          PHASE1_SECRET_ENCRYPTION_KEY: MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
           API_KEY_PEPPER: release-b-ci-only-pepper
           NEXT_PUBLIC_APP_URL: http://127.0.0.1:3000
           AI_PROVIDER: groq
@@ -447,6 +461,8 @@ jobs:
         env:
           FULL_PROCESSING_E2E: "1"
           EXTERNAL_WORKER_E2E: "1"
+          QPDF_SECURITY_E2E: "1"
+          PHASE1_SECRET_ENCRYPTION_KEY: MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
           AI_E2E: "1"
           DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/dip_release_b
           REDIS_URL: redis://127.0.0.1:6379

@@ -4,6 +4,7 @@ import { createToolJob } from "@/lib/jobs/orchestrator";
 import { workerToolIds } from "@/lib/tools/registry";
 import { UploadValidationError } from "@/lib/uploads/validation";
 import { ToolOptionsValidationError } from "@/lib/tools/options";
+import { phase1SecretsFromForm } from "@/lib/secrets/phase1";
 
 export const runtime = "nodejs";
 export async function POST(request: Request, { params }: { params: Promise<{ tool: string }> }) {
@@ -14,10 +15,11 @@ export async function POST(request: Request, { params }: { params: Promise<{ too
     const rawOptions = form.get("options"); let options: Record<string, string | number | boolean> = {};
     if (typeof rawOptions === "string" && rawOptions) { const parsed = JSON.parse(rawOptions) as unknown; if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("INVALID_OPTIONS"); options = parsed as Record<string, string | number | boolean>; }
     const idempotencyKey = request.headers.get("idempotency-key") ?? randomUUID(); const correlationId = request.headers.get("x-correlation-id") ?? randomUUID();
-    const job = await createToolJob({ userId: user.id, toolId: tool, idempotencyKey, correlationId, options, uploads: await Promise.all(files.map(async (file) => ({ filename: file.name, mimeType: file.type, bytes: new Uint8Array(await file.arrayBuffer()) }))) });
+    const job = await createToolJob({ userId: user.id, toolId: tool, idempotencyKey, correlationId, options, secrets: phase1SecretsFromForm(tool, form), uploads: await Promise.all(files.map(async (file) => ({ filename: file.name, mimeType: file.type, bytes: new Uint8Array(await file.arrayBuffer()) }))) });
     return Response.json({ jobId: job.id, status: job.status.toLowerCase(), correlationId, reused: job.reused }, { status: job.reused ? 200 : 202 });
   } catch (error) {
     const auth = error instanceof Error && error.message === "AUTH_REQUIRED"; const upload = error instanceof UploadValidationError; const options = error instanceof ToolOptionsValidationError;
-    return Response.json({ code: auth ? "AUTH_REQUIRED" : upload ? error.code : options ? error.code : error instanceof Error ? error.message : "INTERNAL_ERROR", message: auth ? "Sign in to process documents." : upload || options ? error.message : "Unable to queue tool job." }, { status: auth ? 401 : upload || options ? 422 : 400 });
+    const coded = typeof error === "object" && error && "code" in error ? String(error.code) : undefined;
+    return Response.json({ code: auth ? "AUTH_REQUIRED" : upload ? error.code : options ? error.code : coded ?? "INTERNAL_ERROR", message: auth ? "Sign in to process documents." : upload || options ? error.message : "Unable to queue tool job." }, { status: auth ? 401 : upload || options || coded === "SECRET_INPUT_INVALID" ? 422 : coded === "UNLOCK_RATE_LIMITED" ? 429 : 400 });
   }
 }

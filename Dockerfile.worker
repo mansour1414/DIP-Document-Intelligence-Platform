@@ -52,6 +52,7 @@ COPY --chown=dipworker:dipworker prisma ./prisma
 COPY --chown=dipworker:dipworker src ./src
 COPY --chown=dipworker:dipworker workers ./workers
 COPY --chown=dipworker:dipworker scripts/verify-ocr-runtime.py ./scripts/verify-ocr-runtime.py
+COPY --chown=dipworker:dipworker scripts/verify-qpdf-security-runtime.mjs ./scripts/verify-qpdf-security-runtime.mjs
 
 RUN python3 scripts/verify-ocr-runtime.py \
  && soffice --version \

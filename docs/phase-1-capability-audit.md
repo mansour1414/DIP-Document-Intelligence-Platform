@@ -14,18 +14,19 @@ This record applies to the remaining Page & Security tools and does not change t
 
 The approved stack can rasterize pages, but reconstruction from rendered pixels removes searchable text, vector objects, links, forms, and other document semantics. `pdf-lib` 1.17.1 has no supported content-stream/color-space transformation API that can reliably convert arbitrary PDF color operators, embedded images, transparency groups, patterns, shadings, and ICC color spaces while preserving those semantics. Shipping rasterization as ordinary grayscale success would violate the approved quality requirement. No tool is registered or advertised.
 
-## Extract Images PoC — CAPABILITY/PoC BLOCKER
+## Extract Images PoC — supported subset implemented
 
-PDF.js 6.3.289 exposes rendering operator/image data for display, not a stable API for byte-faithful extraction of every original image stream. That route cannot safely promise original JPEG/PNG-compatible bytes across inline images, JPX, JBIG2, masks, ICC/color spaces, and deduplicated XObjects. qpdf 11.3.0 is structural and does not provide the required general image-decoding/export surface. Page screenshots are explicitly not treated as image extraction. No tool is registered or advertised until an approved capability can enforce decompression, dimensions, output count, and total-byte limits without misleading output.
+PDF.js 6.3.289 operator data supports a useful, bounded subset: decoded image XObjects exposed as 1-bit grayscale, RGB, or RGBA pixel buffers. DIP exports those objects as PNG, deduplicates identical decoded pixels, and emits an explicit JSON capability report. It does not claim byte-identical original streams and never substitutes rendered page screenshots. Inline images and objects that PDF.js does not expose as a bounded supported pixel buffer are counted as unsupported. Per-image dimensions/pixels, output count, and total bytes are bounded before persistence.
 
-## qpdf security gate — SECURITY GATE / ENVIRONMENT-GATED TEST
+## qpdf security gate — implemented; production CI verification required
 
 - The worker package is pinned to Debian `qpdf=11.3.0-1+deb12u1`; the build checks the installed Debian package version.
-- The established CI prints qpdf's runtime version and the existing verifier fails if qpdf is missing or Ghostscript resolves.
-- This local host has neither qpdf nor Docker. The private CI logs are not accessible from this environment, so the current production image's successful output-password job-JSON behavior, AES-256 output, permission mappings, repair corpus, and password/open validation cannot be proven in this run.
-- Protect, Unlock, PDF Permissions, and Repair remain unregistered and unavailable. No password is accepted, stored, logged, placed in `jobs.params`, frozen into an Agent plan, or passed in process arguments.
-- Before enabling these tools, CI must exercise the pinned image with private mode-0600 job JSON/password material in a mode-0700 temporary directory, argument arrays only, cleanup in `finally`, correct/wrong Arabic/Unicode password cases, AES-256 inspection, permission mapping inspection, repair corpus classification, and a repeated Ghostscript-absence check.
+- The production-image CI gate runs qpdf as UID/GID 10001 under a read-only root filesystem and bounded `/tmp/dip` tmpfs. It verifies the exact executable/package version, AES-256/R6, correct and wrong credentials, Arabic/Unicode credentials, permission mappings, recoverable and unrecoverable repair cases, and Ghostscript absence.
+- Passwords are AES-256-GCM encrypted in short-lived Redis records referenced by opaque IDs bound through authenticated additional data to tenant, job, and purpose. Retrieval is one-time. Success, failure, cancellation, and TTL expiration all remove or expire the record. Only the opaque reference is persisted; BullMQ continues to carry only job identity and routing metadata.
+- qpdf receives one private mode-0600 argument file by `@file`; the process argument array never contains a password and `shell` is disabled. The private mode-0700 directory is removed in `finally`.
+- Protect, Unlock, PDF Permissions, and Repair are registered for direct Web/Public API and the worker. The three secret-bearing tools are deliberately rejected by persisted Workflows and excluded from Agent plans. Repair requires no secret and remains available where policy permits.
+- This local host has neither qpdf nor Docker. The gate is implemented but its production-image result remains environment-gated until the extended GitHub job runs successfully.
 
 ## Architecture result
 
-The existing output manifest already supports multiple `outputFileIds`; no contract redesign or ZIP dependency was required. No new package, AI path, qpdf call, or Ghostscript path was introduced.
+The existing output manifest already supports multiple `outputFileIds`; no contract redesign or ZIP dependency was required. No new package, AI path, or Ghostscript path was introduced. qpdf is invoked only through the already approved pinned production package and the controlled argument-file wrapper.

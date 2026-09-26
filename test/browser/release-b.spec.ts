@@ -2,7 +2,7 @@ import AxeBuilder from "@axe-core/playwright";
 import { expect, test } from "@playwright/test";
 import { createHmac } from "node:crypto";
 
-const phase1Remaining = ["split-pdf-by-size", "split-pdf-by-bookmarks", "split-pdf-by-text", "n-up-pdf", "remove-annotations"];
+const phase1Remaining = ["split-pdf-by-size", "split-pdf-by-bookmarks", "split-pdf-by-text", "n-up-pdf", "remove-annotations", "extract-images", "protect-pdf", "unlock-pdf", "pdf-permissions", "repair-pdf"];
 const publicPages = ["/en", "/en/tools", "/en/tools/merge-pdf", "/en/tools/crop-pdf", "/en/tools/page-numbers", "/en/tools/header-footer", "/en/tools/resize-pages", "/en/tools/alternate-mix", "/en/tools/flip-pages", ...phase1Remaining.map((tool) => `/en/tools/${tool}`), "/en/tools/ocr-pdf", "/en/tools/summarize-pdf", "/en/login", "/ar", "/ar/tools", "/ar/tools/merge-pdf", "/ar/tools/crop-pdf", "/ar/tools/page-numbers", "/ar/tools/header-footer", "/ar/tools/resize-pages", "/ar/tools/alternate-mix", "/ar/tools/flip-pages", ...phase1Remaining.map((tool) => `/ar/tools/${tool}`), "/ar/tools/ocr-pdf", "/ar/tools/summarize-pdf", "/ar/login"];
 
 for (const path of publicPages) {

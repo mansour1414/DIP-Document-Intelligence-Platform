@@ -12,21 +12,20 @@ test("grayscale PoC proves the available raster route destroys searchable text s
   const rasterBytes = await raster.save({ useObjectStreams: true }); assert.equal((await extractPdfTextServer(rasterBytes))[0].text, "");
 });
 
-test("Extract Images PoC records that display rendering is not byte-faithful original extraction", async () => {
+test("Extract Images PoC keeps page screenshots out of the implementation", async () => {
   const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
   assert.equal(typeof pdfjs.getDocument, "function"); assert.equal("extractOriginalImages" in pdfjs, false);
-  const audit = readFileSync(new URL("../docs/phase-1-capability-audit.md", import.meta.url), "utf8");
-  assert.match(audit, /Page screenshots are explicitly not treated as image extraction/);
-  assert.match(audit, /JPX, JBIG2, masks, ICC\/color spaces/);
+  const implementation = readFileSync(new URL("../src/lib/pdf/extract-images.ts", import.meta.url), "utf8");
+  assert.match(implementation, /paintImageXObject/); assert.doesNotMatch(implementation, /page\.render/);
 });
 
-test("qpdf is exactly pinned while Ghostscript remains prohibited and security tools remain unregistered", () => {
+test("qpdf is exactly pinned, production-gated, and Ghostscript remains prohibited", () => {
   const dockerfile = readFileSync(new URL("../Dockerfile.worker", import.meta.url), "utf8");
   assert.match(dockerfile, /QPDF_DEBIAN_VERSION=11\.3\.0-1\+deb12u1/); assert.match(dockerfile, /qpdf=\$\{QPDF_DEBIAN_VERSION\}/);
   assert.match(dockerfile, /dpkg-query -W -f='\$\{Version\}' qpdf/); assert.doesNotMatch(dockerfile, /\$\$\{Version\}/);
   assert.match(dockerfile, /test ! -e \/usr\/bin\/gs/); assert.doesNotMatch(dockerfile, /apt-get install[^\n]*ghostscript/i);
   const registry = readFileSync(new URL("../src/lib/tools/registry.ts", import.meta.url), "utf8");
-  for (const tool of ["protect-pdf", "unlock-pdf", "pdf-permissions", "repair-pdf", "grayscale-pdf", "extract-images"]) assert.doesNotMatch(registry, new RegExp(`\\"${tool}\\"`));
+  for (const tool of ["protect-pdf", "unlock-pdf", "pdf-permissions", "repair-pdf", "extract-images"]) assert.match(registry, new RegExp(`\\"${tool}\\"`)); assert.doesNotMatch(registry, /"grayscale-pdf"/);
 });
 
 test("CI S3-compatible storage uses the reviewed immutable Silo image", () => {
