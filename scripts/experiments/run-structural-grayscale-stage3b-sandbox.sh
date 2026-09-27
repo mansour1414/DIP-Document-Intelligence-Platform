@@ -96,8 +96,11 @@ timeout --signal=TERM --kill-after=10s 420s docker run --rm \
     export DIP_STAGE3A_FIXTURE_DIR=/stage3b/fixtures
     export DIP_STAGE3C_WIDGET_FIXTURE_DIR=/stage3b/widget-fixtures
     test -r "$DIP_STAGE3A_CMYK_ICC_PROFILE"
+    test -r "$DIP_STAGE3A_PDFJS_MODULE"
     test "$(sha256sum "$DIP_STAGE3A_CMYK_ICC_PROFILE" | cut -d " " -f 1)" = \
       "73e1ba37d2bad5bab2a964f40a9eed96209666efc067c3322626214bbef234a0"
+    node scripts/experiments/structural-grayscale-stage3a-browser.mjs probe-pdfjs \
+      >/output/pdfjs-runtime.json
     timeout --signal=TERM --kill-after=5s 300s \
       /opt/dip-gray-stage3b/bin/python scripts/experiments/structural-grayscale-stage3c.py \
       --self-test --corpus-root "$corpus" --artifact-dir /output/metrics

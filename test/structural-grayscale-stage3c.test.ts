@@ -35,6 +35,56 @@ test("Stage 3C reviewed ICC fixture provisioning is pinned and fail-closed", () 
   assert.match(diagnostics, /OK/u);
 });
 
+test("Stage 3C subprocess diagnostics fail closed and redact sensitive data", () => {
+  const python = process.platform === "win32" ? "python" : "python3";
+  const result = spawnSync(python, ["test/structural-grayscale-stage3c-subprocess.py"], {
+    cwd: repoRoot,
+    encoding: "utf8",
+  });
+  const diagnostics = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+
+  assert.equal(result.error, undefined, diagnostics || result.error?.message);
+  assert.equal(result.status, 0, diagnostics);
+  assert.match(diagnostics, /Ran 3 tests/u);
+  assert.match(diagnostics, /OK/u);
+});
+
+test("Stage 3C PDF.js runtime probe is real and browser-helper failures are sanitized", () => {
+  const helper = fileURLToPath(
+    new URL("../scripts/experiments/structural-grayscale-stage3a-browser.mjs", import.meta.url),
+  );
+  const success = spawnSync(process.execPath, [helper, "probe-pdfjs"], {
+    cwd: repoRoot,
+    encoding: "utf8",
+  });
+  assert.equal(success.status, 0, success.stderr);
+  assert.deepEqual(JSON.parse(success.stdout), {
+    operation: "pdfjs-runtime-probe",
+    status: "passed",
+    package: "pdfjs-dist",
+    version: "6.3.289",
+  });
+
+  const secret = "STAGE3C_SECRET_MUST_NOT_LEAK";
+  const failure = spawnSync(process.execPath, [helper, "probe-pdfjs"], {
+    cwd: repoRoot,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      DIP_STAGE3A_PDFJS_MODULE: "/missing/stage3c/pdfjs-dist/legacy/build/pdf.mjs",
+      GROQ_API_KEY: secret,
+    },
+  });
+  assert.notEqual(failure.status, 0);
+  assert.equal(failure.stdout, "");
+  assert.doesNotMatch(failure.stderr, new RegExp(secret, "u"));
+  const diagnostic = JSON.parse(failure.stderr);
+  assert.equal(diagnostic.operation, "pdfjs-runtime-probe");
+  assert.equal(diagnostic.status, "failed");
+  assert.equal(diagnostic.code, "ERR_MODULE_NOT_FOUND");
+  assert.match(diagnostic.message, /Cannot find module '\[PDFJS_MODULE\]'/u);
+});
+
 test("Stage 3C CI is isolated, fail-closed, and preserves the production worker", () => {
   const workflow = read("../.github/workflows/ci.yml");
   const runner = read("../scripts/experiments/run-structural-grayscale-stage3b-sandbox.sh");
@@ -66,6 +116,8 @@ test("Stage 3C CI is isolated, fail-closed, and preserves the production worker"
   assert.match(derivative, /FROM dip-document-worker:stage3b-base/u);
   assert.match(derivative, /--no-index --find-links=\/wheels/u);
   assert.match(derivative, /DIP_STAGE3A_CMYK_ICC_PROFILE=\/stage3b\/fixtures\/CGATS001Compat-v2-micro\.icc/u);
+  assert.match(derivative, /DIP_STAGE3A_PDFJS_MODULE=\/app\/node_modules\/pdfjs-dist\/legacy\/build\/pdf\.mjs/u);
+  assert.match(runner, /probe-pdfjs[\s\\]+>\/output\/pdfjs-runtime\.json/u);
   assert.match(production, /QPDF_DEBIAN_VERSION=11\.3\.0-1\+deb12u1/u);
 });
 
@@ -75,6 +127,7 @@ test("Stage 3C evidence checks native inventory, SBOM, cleanup, and Ghostscript 
   const audit = read("../scripts/experiments/structural-grayscale-stage3b-wheel-audit.py");
   const fixtureManifest = read("../scripts/experiments/structural-grayscale-stage3c-icc-fixture.json");
   const stage3a = read("../scripts/experiments/structural-grayscale-stage3a.py");
+  const subprocessDiagnostics = read("../scripts/experiments/structural_grayscale_subprocess.py");
 
   assert.match(probe, /EXPECTED_QPDF_PACKAGE = "11\.3\.0-1\+deb12u1"/u);
   assert.match(probe, /EXPECTED_EMBEDDED_LIBQPDF = "12\.3\.2"/u);
@@ -93,6 +146,10 @@ test("Stage 3C evidence checks native inventory, SBOM, cleanup, and Ghostscript 
   assert.match(stage3a, /reviewed_cmyk_icc_profile/u);
   assert.match(stage3a, /reviewed CMYK ICC fixture profile checksum is invalid/u);
   assert.match(stage3a, /ImageCms\.ImageCmsProfile/u);
+  assert.match(stage3a, /operation="pdfjs-text-extraction"/u);
+  assert.match(subprocessDiagnostics, /"exit_status": result\.returncode/u);
+  assert.match(subprocessDiagnostics, /"stderr": sanitize_stderr\(result\.stderr\)/u);
+  assert.doesNotMatch(subprocessDiagnostics, /"arguments"/u);
 });
 
 test("Stage 2 rejects malformed page Contents without partial-output fallbacks", () => {

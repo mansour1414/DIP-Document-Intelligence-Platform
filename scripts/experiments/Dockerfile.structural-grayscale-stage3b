@@ -9,6 +9,7 @@ COPY scripts/experiments/structural-grayscale-stage1.py /stage3b/scripts/experim
 COPY scripts/experiments/structural-grayscale-stage2.py /stage3b/scripts/experiments/
 COPY scripts/experiments/structural-grayscale-stage3a.py /stage3b/scripts/experiments/
 COPY scripts/experiments/structural-grayscale-stage3a-browser.mjs /stage3b/scripts/experiments/
+COPY scripts/experiments/structural_grayscale_subprocess.py /stage3b/scripts/experiments/
 COPY scripts/experiments/structural-grayscale-stage3b.py /stage3b/scripts/experiments/
 COPY scripts/experiments/structural-grayscale-stage3c.py /stage3b/scripts/experiments/
 COPY scripts/experiments/structural-grayscale-stage3c-sandbox-probe.py /stage3b/scripts/experiments/
@@ -21,7 +22,8 @@ COPY .stage3c-fixtures/CGATS001Compat-v2-micro.provenance.json /stage3b/fixtures
 COPY output/pdf/structural-grayscale-stage3c-widgets /stage3b/widget-fixtures
 COPY .stage3c-wheelhouse /wheels
 
-ENV DIP_STAGE3A_CMYK_ICC_PROFILE=/stage3b/fixtures/CGATS001Compat-v2-micro.icc
+ENV DIP_STAGE3A_CMYK_ICC_PROFILE=/stage3b/fixtures/CGATS001Compat-v2-micro.icc \
+    DIP_STAGE3A_PDFJS_MODULE=/app/node_modules/pdfjs-dist/legacy/build/pdf.mjs
 
 # The derivative uses a separate venv and does not alter /opt/dip-ocr.
 RUN python3 -m venv /opt/dip-gray-stage3b \
@@ -30,6 +32,7 @@ RUN python3 -m venv /opt/dip-gray-stage3b \
       -r /stage3b/scripts/experiments/structural-grayscale-stage3b.requirements.txt \
  && /opt/dip-gray-stage3b/bin/python -m pip check \
  && test -s /wheels/wheel-manifest.json \
+ && test -r /app/node_modules/pdfjs-dist/legacy/build/pdf.mjs \
  && test ! -e /usr/bin/gs \
  && test ! -e /usr/local/bin/gs \
  && chown -R 10001:10001 /stage3b

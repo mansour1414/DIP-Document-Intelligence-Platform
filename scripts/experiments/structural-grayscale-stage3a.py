@@ -14,7 +14,6 @@ import importlib.util
 import json
 import math
 import os
-import subprocess
 import sys
 import tempfile
 import unicodedata
@@ -26,6 +25,8 @@ import pikepdf
 import pypdfium2 as pdfium
 from PIL import Image, ImageChops, ImageCms, ImageStat
 from pypdf import PdfReader, PdfWriter
+
+from structural_grayscale_subprocess import run_checked
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -306,12 +307,12 @@ def canonical_search_text(value: str) -> str:
     return "".join(character for character in normalized if not character.isspace())
 
 
-def run_checked(arguments: list[str], *, cwd: Path = ROOT) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(arguments, cwd=cwd, check=True, capture_output=True, text=True, encoding="utf-8")
-
-
 def pdfjs_text(path: Path) -> str:
-    result = run_checked(["node", str(BROWSER_HELPER), "extract", str(path)])
+    result = run_checked(
+        ["node", str(BROWSER_HELPER), "extract", str(path)],
+        operation="pdfjs-text-extraction",
+        cwd=ROOT,
+    )
     return json.loads(result.stdout)["text"]
 
 
@@ -825,7 +826,11 @@ def self_test(output: Path) -> Stage3Result:
     temporary_path: Path | None = None
     with tempfile.TemporaryDirectory(prefix="dip-gray-stage3a-", dir=str(output.parent)) as temporary:
         temporary_path = Path(temporary)
-        run_checked(["node", str(BROWSER_HELPER), "generate", str(output)])
+        run_checked(
+            ["node", str(BROWSER_HELPER), "generate", str(output)],
+            operation="chromium-arabic-fixture-generation",
+            cwd=ROOT,
+        )
         arabic_source = output / "arabic-logical-source.pdf"
         arabic_expected = output / "arabic-logical-expected.pdf"
         add_logical_actual_text(arabic_source)

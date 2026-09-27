@@ -4,6 +4,48 @@
 
 import fs from "node:fs/promises";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+const PDFJS_MODULE = "pdfjs-dist/legacy/build/pdf.mjs";
+const EXPECTED_PDFJS_VERSION = "6.3.289";
+
+function sanitizeErrorMessage(error) {
+  let value = error instanceof Error ? error.message : String(error);
+  const configuredModule = process.env.DIP_STAGE3A_PDFJS_MODULE;
+  if (configuredModule) {
+    const resolvedModule = path.resolve(configuredModule);
+    value = value.replaceAll(configuredModule, "[PDFJS_MODULE]");
+    value = value.replaceAll(resolvedModule, "[PDFJS_MODULE]");
+    value = value.replaceAll(pathToFileURL(resolvedModule).href, "[PDFJS_MODULE]");
+  }
+  return value
+    .replace(/(?:file:\/\/)?[^\s"']+\.pdf\b/giu, "[PDF_PATH]")
+    .replace(/(authorization|credential|password|secret|token|api[_-]?key)(\s*[:=]\s*)([^\s,;]+)/giu, "$1$2[REDACTED]")
+    .slice(0, 1_200);
+}
+
+async function loadPdfjs() {
+  const configuredModule = process.env.DIP_STAGE3A_PDFJS_MODULE;
+  const specifier = configuredModule
+    ? pathToFileURL(path.resolve(configuredModule)).href
+    : PDFJS_MODULE;
+  return import(specifier);
+}
+
+async function probePdfjs() {
+  const pdfjs = await loadPdfjs();
+  if (pdfjs.version !== EXPECTED_PDFJS_VERSION) {
+    const error = new Error(`unexpected PDF.js version: ${pdfjs.version ?? "unknown"}`);
+    error.code = "DIP_PDFJS_VERSION_MISMATCH";
+    throw error;
+  }
+  process.stdout.write(JSON.stringify({
+    operation: "pdfjs-runtime-probe",
+    status: "passed",
+    package: "pdfjs-dist",
+    version: pdfjs.version,
+  }));
+}
 
 function clamp(value) {
   return Math.max(0, Math.min(1, value));
@@ -131,7 +173,7 @@ async function generateStage3cWidgets(directory) {
 }
 
 async function extract(pdfPath) {
-  const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+  const pdfjs = await loadPdfjs();
   const data = new Uint8Array(await fs.readFile(pdfPath));
   const loadingTask = pdfjs.getDocument({ data, disableWorker: true });
   const document = await loadingTask.promise;
@@ -149,12 +191,35 @@ async function extract(pdfPath) {
 }
 
 const [command, target] = process.argv.slice(2);
-if (command === "generate" && target) {
-  await generate(path.resolve(target));
-} else if (command === "generate-stage3c-widgets" && target) {
-  await generateStage3cWidgets(path.resolve(target));
-} else if (command === "extract" && target) {
-  await extract(path.resolve(target));
-} else {
-  throw new Error("usage: structural-grayscale-stage3a-browser.mjs generate <dir> | generate-stage3c-widgets <dir> | extract <pdf>");
+const operations = {
+  extract: "pdfjs-text-extraction",
+  generate: "chromium-arabic-fixture-generation",
+  "generate-stage3c-widgets": "chromium-widget-fixture-generation",
+  "probe-pdfjs": "pdfjs-runtime-probe",
+};
+
+try {
+  if (command === "generate" && target) {
+    await generate(path.resolve(target));
+  } else if (command === "generate-stage3c-widgets" && target) {
+    await generateStage3cWidgets(path.resolve(target));
+  } else if (command === "extract" && target) {
+    await extract(path.resolve(target));
+  } else if (command === "probe-pdfjs" && !target) {
+    await probePdfjs();
+  } else {
+    const error = new Error("invalid or incomplete Stage 3A browser-helper operation");
+    error.code = "DIP_INVALID_OPERATION";
+    throw error;
+  }
+} catch (error) {
+  const diagnostic = {
+    operation: operations[command] ?? "unknown-browser-helper-operation",
+    status: "failed",
+    name: error instanceof Error ? error.name : "Error",
+    code: typeof error?.code === "string" ? error.code : "DIP_BROWSER_HELPER_FAILURE",
+    message: sanitizeErrorMessage(error),
+  };
+  process.stderr.write(`${JSON.stringify(diagnostic)}\n`);
+  process.exitCode = 1;
 }
