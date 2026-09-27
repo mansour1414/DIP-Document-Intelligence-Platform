@@ -6,6 +6,7 @@ set -eu
 repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 artifact_root="${RUNNER_TEMP:-/tmp}/dip-gray-stage3c-output"
 wheelhouse="$repository_root/.stage3c-wheelhouse"
+icc_fixture_root="$repository_root/.stage3c-fixtures"
 container_name="dip-gray-stage3c-poc"
 result="failed"
 
@@ -13,6 +14,7 @@ cleanup_host() {
   exit_code=$?
   docker rm --force "$container_name" >/dev/null 2>&1 || true
   rm -rf "$wheelhouse"
+  rm -rf "$icc_fixture_root"
   mkdir -p "$artifact_root"
   printf '{"scope":"isolated-stage3c-ci-gate-only","result":"%s","exit_code":%s}\n' \
     "$result" "$exit_code" >"$artifact_root/ci-diagnostic.json"
@@ -35,6 +37,14 @@ python3 scripts/experiments/structural-grayscale-stage3b-wheel-audit.py \
   --wheel-dir "$wheelhouse" \
   --output "$artifact_root/licensing/wheel-audit.json"
 cp "$artifact_root/licensing/wheel-manifest.json" "$wheelhouse/wheel-manifest.json"
+
+test -s "$icc_fixture_root/CGATS001Compat-v2-micro.icc"
+test -s "$icc_fixture_root/CGATS001Compat-v2-micro.LICENSE.txt"
+test -s "$icc_fixture_root/CGATS001Compat-v2-micro.provenance.json"
+cp "$icc_fixture_root/CGATS001Compat-v2-micro.provenance.json" \
+  "$artifact_root/licensing/reviewed-cmyk-icc-fixture.json"
+cp "$icc_fixture_root/CGATS001Compat-v2-micro.LICENSE.txt" \
+  "$artifact_root/licensing/reviewed-cmyk-icc-fixture.LICENSE.txt"
 
 test -s output/pdf/structural-grayscale-stage3a/arabic-logical-source.pdf
 test -s output/pdf/structural-grayscale-stage3a/arabic-logical-expected.pdf
@@ -85,6 +95,9 @@ timeout --signal=TERM --kill-after=10s 420s docker run --rm \
     export DIP_GRAYSCALE_CORPUS_ROOT="$corpus"
     export DIP_STAGE3A_FIXTURE_DIR=/stage3b/fixtures
     export DIP_STAGE3C_WIDGET_FIXTURE_DIR=/stage3b/widget-fixtures
+    test -r "$DIP_STAGE3A_CMYK_ICC_PROFILE"
+    test "$(sha256sum "$DIP_STAGE3A_CMYK_ICC_PROFILE" | cut -d " " -f 1)" = \
+      "73e1ba37d2bad5bab2a964f40a9eed96209666efc067c3322626214bbef234a0"
     timeout --signal=TERM --kill-after=5s 300s \
       /opt/dip-gray-stage3b/bin/python scripts/experiments/structural-grayscale-stage3c.py \
       --self-test --corpus-root "$corpus" --artifact-dir /output/metrics

@@ -21,6 +21,20 @@ test("Stage 3C read-only-root probe fails closed without invalid cleanup", () =>
   assert.match(diagnostics, /OK/u);
 });
 
+test("Stage 3C reviewed ICC fixture provisioning is pinned and fail-closed", () => {
+  const python = process.platform === "win32" ? "python" : "python3";
+  const result = spawnSync(python, ["test/structural-grayscale-stage3c-icc-fixture.py"], {
+    cwd: repoRoot,
+    encoding: "utf8",
+  });
+  const diagnostics = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+
+  assert.equal(result.error, undefined, diagnostics || result.error?.message);
+  assert.equal(result.status, 0, diagnostics);
+  assert.match(diagnostics, /Ran 3 tests/u);
+  assert.match(diagnostics, /OK/u);
+});
+
 test("Stage 3C CI is isolated, fail-closed, and preserves the production worker", () => {
   const workflow = read("../.github/workflows/ci.yml");
   const runner = read("../scripts/experiments/run-structural-grayscale-stage3b-sandbox.sh");
@@ -30,6 +44,7 @@ test("Stage 3C CI is isolated, fail-closed, and preserves the production worker"
   assert.match(workflow, /structural-grayscale-stage3c:/u);
   assert.match(workflow, /Execute fail-closed Stage 3C production-sandbox gate/u);
   assert.match(workflow, /generate-stage3c-widgets/u);
+  assert.match(workflow, /Provision and verify reviewed CMYK ICC fixture/u);
   assert.match(workflow, /structural-grayscale-stage3c-widgets[^\n]+wc -l\)" -eq 8/u);
   assert.doesNotMatch(workflow, /structural-grayscale-stage3c:[\s\S]*continue-on-error:/u);
   assert.match(runner, /docker build --file Dockerfile\.worker/u);
@@ -46,8 +61,11 @@ test("Stage 3C CI is isolated, fail-closed, and preserves the production worker"
     "--tmpfs /tmp/dip:",
   ]) assert.ok(runner.includes(required), `missing sandbox constraint: ${required}`);
   assert.match(runner, /test -z "\$\(find \/output -type f -name "\*\.pdf"/u);
+  assert.match(runner, /sha256sum "\$DIP_STAGE3A_CMYK_ICC_PROFILE"/u);
+  assert.match(runner, /73e1ba37d2bad5bab2a964f40a9eed96209666efc067c3322626214bbef234a0/u);
   assert.match(derivative, /FROM dip-document-worker:stage3b-base/u);
   assert.match(derivative, /--no-index --find-links=\/wheels/u);
+  assert.match(derivative, /DIP_STAGE3A_CMYK_ICC_PROFILE=\/stage3b\/fixtures\/CGATS001Compat-v2-micro\.icc/u);
   assert.match(production, /QPDF_DEBIAN_VERSION=11\.3\.0-1\+deb12u1/u);
 });
 
@@ -55,6 +73,8 @@ test("Stage 3C evidence checks native inventory, SBOM, cleanup, and Ghostscript 
   const probe = read("../scripts/experiments/structural-grayscale-stage3c-sandbox-probe.py");
   const runner = read("../scripts/experiments/run-structural-grayscale-stage3b-sandbox.sh");
   const audit = read("../scripts/experiments/structural-grayscale-stage3b-wheel-audit.py");
+  const fixtureManifest = read("../scripts/experiments/structural-grayscale-stage3c-icc-fixture.json");
+  const stage3a = read("../scripts/experiments/structural-grayscale-stage3a.py");
 
   assert.match(probe, /EXPECTED_QPDF_PACKAGE = "11\.3\.0-1\+deb12u1"/u);
   assert.match(probe, /EXPECTED_EMBEDDED_LIBQPDF = "12\.3\.2"/u);
@@ -68,6 +88,11 @@ test("Stage 3C evidence checks native inventory, SBOM, cleanup, and Ghostscript 
   assert.match(audit, /wheel-manifest\.json/u);
   assert.match(audit, /365b94f2be7e2857c6cb5445b56dc52dc7417ba9f06c8a4282d9f521cb2d0fb8/u);
   assert.match(audit, /23d27a3e0307ec2244cc51e7287b919aa68d097504ebe19df4e76a98a3eea5bd/u);
+  assert.match(fixtureManifest, /73e1ba37d2bad5bab2a964f40a9eed96209666efc067c3322626214bbef234a0/u);
+  assert.match(fixtureManifest, /"license": "CC0-1\.0"/u);
+  assert.match(stage3a, /reviewed_cmyk_icc_profile/u);
+  assert.match(stage3a, /reviewed CMYK ICC fixture profile checksum is invalid/u);
+  assert.match(stage3a, /ImageCms\.ImageCmsProfile/u);
 });
 
 test("Stage 2 rejects malformed page Contents without partial-output fallbacks", () => {

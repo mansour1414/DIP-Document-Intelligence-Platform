@@ -7,3 +7,4 @@ out/
 next-env.d.ts
 .neon
 .stage3c-wheelhouse/
+.stage3c-fixtures/

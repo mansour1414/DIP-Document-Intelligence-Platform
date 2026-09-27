@@ -15,8 +15,13 @@ COPY scripts/experiments/structural-grayscale-stage3c-sandbox-probe.py /stage3b/
 COPY scripts/experiments/structural-grayscale-stage3b.requirements.txt /stage3b/scripts/experiments/
 COPY output/pdf/structural-grayscale-stage3a/arabic-logical-source.pdf /stage3b/fixtures/arabic-logical-source.pdf
 COPY output/pdf/structural-grayscale-stage3a/arabic-logical-expected.pdf /stage3b/fixtures/arabic-logical-expected.pdf
+COPY .stage3c-fixtures/CGATS001Compat-v2-micro.icc /stage3b/fixtures/CGATS001Compat-v2-micro.icc
+COPY .stage3c-fixtures/CGATS001Compat-v2-micro.LICENSE.txt /stage3b/fixtures/CGATS001Compat-v2-micro.LICENSE.txt
+COPY .stage3c-fixtures/CGATS001Compat-v2-micro.provenance.json /stage3b/fixtures/CGATS001Compat-v2-micro.provenance.json
 COPY output/pdf/structural-grayscale-stage3c-widgets /stage3b/widget-fixtures
 COPY .stage3c-wheelhouse /wheels
+
+ENV DIP_STAGE3A_CMYK_ICC_PROFILE=/stage3b/fixtures/CGATS001Compat-v2-micro.icc
 
 # The derivative uses a separate venv and does not alter /opt/dip-ocr.
 RUN python3 -m venv /opt/dip-gray-stage3b \

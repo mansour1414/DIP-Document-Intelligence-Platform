@@ -288,6 +288,8 @@ jobs:
         with:
           python-version: "3.11"
       - run: npm ci
+      - name: Provision and verify reviewed CMYK ICC fixture
+        run: python scripts/experiments/provision-structural-grayscale-stage3c-icc.py
       - name: Install Chromium for independent Arabic fixture generation
         run: npx playwright install --with-deps chromium
       - name: Generate independent Chromium Arabic fixtures

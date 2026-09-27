@@ -34,6 +34,8 @@ STAGE2_PATH = Path(__file__).with_name("structural-grayscale-stage2.py")
 BROWSER_HELPER = Path(__file__).with_name("structural-grayscale-stage3a-browser.mjs")
 MAX_JPEG_BYTES = 2_000_000
 MAX_ICC_BYTES = 1_000_000
+REVIEWED_CMYK_ICC_SHA256 = "73e1ba37d2bad5bab2a964f40a9eed96209666efc067c3322626214bbef234a0"
+REVIEWED_CMYK_ICC_SIZE = 8464
 ARABIC_LOGICAL_TEXT = "مرحلة المحرك البنيوي الثالثة تحافظ على النص العربي القابل للبحث والنسخ."
 ARABIC_PAGE_TEXT = (
     "اختبار الترتيب المنطقي للنص العربي\n"
@@ -56,6 +58,34 @@ def load_stage2():
 stage2 = load_stage2()
 UnsupportedPdf = stage2.UnsupportedPdf
 original_color_spec = stage2.color_spec
+
+
+def reviewed_cmyk_icc_profile() -> Path:
+    configured = os.environ.get("DIP_STAGE3A_CMYK_ICC_PROFILE")
+    path = (
+        Path(configured)
+        if configured
+        else ROOT / "node_modules" / "pdfjs-dist" / "iccs" / "CGATS001Compat-v2-micro.icc"
+    )
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError as error:
+        raise RuntimeError("reviewed CMYK ICC fixture profile is unavailable") from error
+    if len(data) != REVIEWED_CMYK_ICC_SIZE:
+        raise RuntimeError("reviewed CMYK ICC fixture profile size is invalid")
+    if hashlib.sha256(data).hexdigest() != REVIEWED_CMYK_ICC_SHA256:
+        raise RuntimeError("reviewed CMYK ICC fixture profile checksum is invalid")
+    if data[0:4] != len(data).to_bytes(4, "big") or data[36:40] != b"acsp":
+        raise RuntimeError("reviewed CMYK ICC fixture profile header is invalid")
+    if data[12:16] != b"scnr" or data[16:20] != b"CMYK" or data[20:24] != b"Lab ":
+        raise RuntimeError("reviewed CMYK ICC fixture profile is not the approved CMYK input profile")
+    try:
+        cms_profile = ImageCms.ImageCmsProfile(BytesIO(data)).profile
+    except Exception as error:
+        raise RuntimeError("reviewed CMYK ICC fixture profile is not LittleCMS-compatible") from error
+    if cms_profile.xcolor_space != "CMYK" or cms_profile.connection_space != "Lab ":
+        raise RuntimeError("reviewed CMYK ICC fixture profile reports incompatible color spaces")
+    return path
 
 
 def lab_to_gray(values: tuple[float, ...], white: tuple[float, float, float], ranges: tuple[float, float, float, float]) -> float:
@@ -791,9 +821,7 @@ class Stage3Result:
 
 def self_test(output: Path) -> Stage3Result:
     output.mkdir(parents=True, exist_ok=True)
-    cmyk_profile = ROOT / "node_modules" / "pdfjs-dist" / "iccs" / "CGATS001Compat-v2-micro.icc"
-    if not cmyk_profile.exists():
-        raise RuntimeError("reviewed CMYK ICC fixture profile is unavailable")
+    cmyk_profile = reviewed_cmyk_icc_profile()
     temporary_path: Path | None = None
     with tempfile.TemporaryDirectory(prefix="dip-gray-stage3a-", dir=str(output.parent)) as temporary:
         temporary_path = Path(temporary)

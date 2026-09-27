@@ -1,0 +1,33 @@
+{
+  "fixture": "CGATS001Compat-v2-micro.icc",
+  "purpose": "reviewed CMYK input profile for the isolated Stage 3A/3C ICCBased fixture",
+  "sourcePackage": {
+    "name": "pdfjs-dist",
+    "version": "6.3.289",
+    "lockedTarball": "https://registry.npmjs.org/pdfjs-dist/-/pdfjs-dist-6.3.289.tgz",
+    "lockedIntegrity": "sha512-ZHjSVpDa3D6izMq8/04lvkhkATUmL9px6ChPaXc1k6nU2Mrhlg1/7F0bdUqCwUjw3NsPTfPZsMDUU6ZIcRaeQw==",
+    "path": "iccs/CGATS001Compat-v2-micro.icc"
+  },
+  "upstream": {
+    "project": "saucecontrol/Compact-ICC-Profiles",
+    "creator": "Clinton Ingram (saucecontrol)",
+    "originalSource": "https://github.com/saucecontrol/Compact-ICC-Profiles/blob/master/profiles/CGATS001Compat-v2-micro.icc",
+    "originalLicense": "https://github.com/saucecontrol/Compact-ICC-Profiles/blob/master/license",
+    "pdfjsVendoredSource": "https://github.com/mozilla/pdf.js/blob/v6.3.289/external/iccs/CGATS001Compat-v2-micro.icc",
+    "pdfjsLicense": "https://github.com/mozilla/pdf.js/blob/v6.3.289/external/iccs/LICENSE"
+  },
+  "license": "CC0-1.0",
+  "profile": {
+    "size": 8464,
+    "sha256": "73e1ba37d2bad5bab2a964f40a9eed96209666efc067c3322626214bbef234a0",
+    "deviceClass": "scnr",
+    "colorSpace": "CMYK",
+    "connectionSpace": "Lab ",
+    "iccVersion": "2.1"
+  },
+  "licenseFile": {
+    "path": "iccs/LICENSE",
+    "size": 6553,
+    "sha256": "286e4fd7b447330b2c88e23890e3cd0a9d38cb398d4a59cb247f578ccbda3213"
+  }
+}
