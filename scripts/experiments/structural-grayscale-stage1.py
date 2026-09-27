@@ -22,6 +22,8 @@ import pikepdf
 import pypdfium2 as pdfium
 from PIL import Image, ImageChops, ImageStat, features
 from pypdf import PdfReader
+
+from structural_grayscale_evidence import print_sanitized_summary
 from reportlab.lib.colors import CMYKColor, Color
 from reportlab.pdfgen.canvas import Canvas
 
@@ -544,9 +546,25 @@ def main() -> int:
     if not args.self_test:
         parser.error("Stage 1 exposes only --self-test; it is not a production converter")
     metrics = self_test(args.output_dir)
-    print(json.dumps(asdict(metrics), ensure_ascii=False, indent=2))
+    print_sanitized_summary({
+        "stage": "stage1",
+        "status": "passed",
+        "pages": metrics.pages,
+        "transformed_instructions": metrics.transformed_instructions,
+        "fail_closed_cases": len(metrics.fail_closed_cases),
+        "elapsed_ms": metrics.elapsed_ms,
+        "temporary_cleanup_verified": metrics.temporary_cleanup_verified,
+    })
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception as error:
+        print_sanitized_summary({
+            "operation": "stage1-self-test",
+            "status": "failed",
+            "error_type": type(error).__name__,
+        }, stream=sys.stderr)
+        raise SystemExit(1) from None

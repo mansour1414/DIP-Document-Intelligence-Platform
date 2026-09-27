@@ -28,7 +28,11 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
-from structural_grayscale_evidence import sanitize_json_file, write_sanitized_json
+from structural_grayscale_evidence import (
+    print_sanitized_summary,
+    sanitize_json_file,
+    write_sanitized_json,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -561,7 +565,7 @@ def run_stage3c(corpus_root: Path, artifact_dir: Path) -> dict[str, object]:
         "temp_cleanup_verified": True,
     }
     write_sanitized_json(artifact_dir / "stage3c-metrics.json", result)
-    print(json.dumps({
+    print_sanitized_summary({
         "scope": result["scope"],
         "production_adoption_approved": False,
         "bounded_fuzz": {
@@ -575,7 +579,7 @@ def run_stage3c(corpus_root: Path, artifact_dir: Path) -> dict[str, object]:
             )
         },
         "temp_cleanup_verified": result["temp_cleanup_verified"],
-    }, ensure_ascii=True, separators=(",", ":")))
+    })
     return result
 
 
@@ -592,4 +596,12 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except Exception as error:
+        print_sanitized_summary({
+            "operation": "stage3c-sandbox-gate",
+            "status": "failed",
+            "error_type": type(error).__name__,
+        }, stream=sys.stderr)
+        raise SystemExit(1) from None

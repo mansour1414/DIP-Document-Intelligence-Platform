@@ -305,12 +305,35 @@ jobs:
           test "$(find output/pdf/structural-grayscale-stage3c-widgets -name '*.pdf' | wc -l)" -eq 8
       - name: Execute fail-closed Stage 3C production-sandbox gate
         run: sh scripts/experiments/run-structural-grayscale-stage3b-sandbox.sh
-      - name: Publish sanitized Stage 3C evidence
-        if: always()
+      - name: Verify completed Stage 3C evidence before publication
+        if: success()
+        run: |
+          test -s "${RUNNER_TEMP}/dip-gray-stage3c-output/stage3c-complete.json"
+          python scripts/experiments/verify-structural-grayscale-stage3c-artifacts.py \
+            "${RUNNER_TEMP}/dip-gray-stage3c-output"
+      - name: Publish validated Stage 3C evidence
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: structural-grayscale-stage3c-evidence
           path: ${{ runner.temp }}/dip-gray-stage3c-output
+          if-no-files-found: error
+          retention-days: 14
+      - name: Prepare minimal Stage 3C failure diagnostic
+        if: failure()
+        run: |
+          mkdir -p "${RUNNER_TEMP}/dip-gray-stage3c-failure"
+          if [ ! -s "${RUNNER_TEMP}/dip-gray-stage3c-failure/ci-diagnostic.json" ]; then
+            printf '%s\n' \
+              '{"scope":"isolated-stage3c-ci-gate-only","result":"failed","failure_stage":"ci-evidence-gate"}' \
+              >"${RUNNER_TEMP}/dip-gray-stage3c-failure/ci-diagnostic.json"
+          fi
+      - name: Publish minimal Stage 3C failure diagnostic
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: structural-grayscale-stage3c-failure
+          path: ${{ runner.temp }}/dip-gray-stage3c-failure/ci-diagnostic.json
           if-no-files-found: error
           retention-days: 14
 

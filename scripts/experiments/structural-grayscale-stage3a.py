@@ -27,6 +27,7 @@ from PIL import Image, ImageChops, ImageCms, ImageStat
 from pypdf import PdfReader, PdfWriter
 
 from structural_grayscale_subprocess import run_checked
+from structural_grayscale_evidence import print_sanitized_summary
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -965,9 +966,25 @@ def main() -> int:
     if not args.self_test:
         parser.error("Stage 3A exposes only --self-test; it is not a production converter")
     result = self_test(args.output_dir.resolve())
-    print(json.dumps(asdict(result), ensure_ascii=True, indent=2))
+    print_sanitized_summary({
+        "stage": "stage3a",
+        "status": "passed",
+        "arabic_logical_order_gate": result.arabic_logical_order_gate,
+        "arabic_semantics_equal": result.arabic_semantics_equal,
+        "structural_semantics_equal": result.structural_semantics_equal,
+        "fail_closed_cases": len(result.fail_closed_cases),
+        "temp_cleanup_verified": result.temp_cleanup_verified,
+    })
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except Exception as error:
+        print_sanitized_summary({
+            "operation": "stage3a-self-test",
+            "status": "failed",
+            "error_type": type(error).__name__,
+        }, stream=sys.stderr)
+        raise SystemExit(1) from None

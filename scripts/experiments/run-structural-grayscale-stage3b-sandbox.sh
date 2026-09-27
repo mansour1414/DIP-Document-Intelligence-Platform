@@ -5,6 +5,7 @@ set -eu
 # actual production worker and never changes Dockerfile.worker.
 repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 artifact_root="${RUNNER_TEMP:-/tmp}/dip-gray-stage3c-output"
+failure_artifact_root="${RUNNER_TEMP:-/tmp}/dip-gray-stage3c-failure"
 wheelhouse="$repository_root/.stage3c-wheelhouse"
 icc_fixture_root="$repository_root/.stage3c-fixtures"
 container_name="dip-gray-stage3c-poc"
@@ -15,14 +16,20 @@ cleanup_host() {
   docker rm --force "$container_name" >/dev/null 2>&1 || true
   rm -rf "$wheelhouse"
   rm -rf "$icc_fixture_root"
-  mkdir -p "$artifact_root"
-  printf '{"scope":"isolated-stage3c-ci-gate-only","result":"%s","exit_code":%s}\n' \
-    "$result" "$exit_code" >"$artifact_root/ci-diagnostic.json"
+  if [ "$result" = "passed" ] && [ "$exit_code" -eq 0 ]; then
+    printf '{"scope":"isolated-stage3c-ci-gate-only","result":"passed","exit_code":0}\n' \
+      >"$artifact_root/ci-diagnostic.json"
+  else
+    rm -rf "$artifact_root" "$failure_artifact_root"
+    mkdir -p "$failure_artifact_root"
+    printf '{"scope":"isolated-stage3c-ci-gate-only","result":"failed","exit_code":%s}\n' \
+      "$exit_code" >"$failure_artifact_root/ci-diagnostic.json"
+  fi
   exit "$exit_code"
 }
 trap cleanup_host EXIT HUP INT TERM
 
-rm -rf "$artifact_root" "$wheelhouse"
+rm -rf "$artifact_root" "$failure_artifact_root" "$wheelhouse"
 mkdir -p "$artifact_root/licensing" "$wheelhouse"
 chmod 0777 "$artifact_root" "$artifact_root/licensing"
 

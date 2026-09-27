@@ -60,7 +60,7 @@ test("Stage 3C evidence artifacts are sanitized and fail closed", () => {
 
   assert.equal(result.error, undefined, diagnostics || result.error?.message);
   assert.equal(result.status, 0, diagnostics);
-  assert.match(diagnostics, /Ran 4 tests/u);
+  assert.match(diagnostics, /Ran 6 tests/u);
   assert.match(diagnostics, /OK/u);
 });
 
@@ -147,6 +147,12 @@ test("Stage 3C CI is isolated, fail-closed, and preserves the production worker"
   assert.match(workflow, /Provision and verify reviewed CMYK ICC fixture/u);
   assert.match(workflow, /structural-grayscale-stage3c-widgets[^\n]+wc -l\)" -eq 8/u);
   assert.doesNotMatch(workflow, /structural-grayscale-stage3c:[\s\S]*continue-on-error:/u);
+  const stage3cJob = workflow.match(/structural-grayscale-stage3c:[\s\S]*?\n  browser-accessibility:/u)?.[0] ?? "";
+  assert.doesNotMatch(stage3cJob, /Publish sanitized Stage 3C evidence[\s\S]*if: always\(\)/u);
+  assert.match(stage3cJob, /Verify completed Stage 3C evidence before publication[\s\S]*if: success\(\)/u);
+  assert.match(stage3cJob, /Publish validated Stage 3C evidence[\s\S]*if: success\(\)/u);
+  assert.match(stage3cJob, /Prepare minimal Stage 3C failure diagnostic[\s\S]*if: failure\(\)/u);
+  assert.match(stage3cJob, /Publish minimal Stage 3C failure diagnostic[\s\S]*if: failure\(\)/u);
   assert.match(runner, /docker build --file Dockerfile\.worker/u);
   for (const required of [
     "--user 10001:10001",
@@ -171,7 +177,23 @@ test("Stage 3C CI is isolated, fail-closed, and preserves the production worker"
   assert.match(runner, /structural-grayscale-stage3c-timeout-probe\.sh "\$timeout_root"/u);
   assert.doesNotMatch(runner, /trap ['\\]+['\\]+rm -rf "\$probe"/u);
   assert.match(runner, /verify-structural-grayscale-stage3c-artifacts\.py "\$artifact_root"/u);
+  assert.match(runner, /rm -rf "\$artifact_root" "\$failure_artifact_root"/u);
+  assert.match(runner, /"\$failure_artifact_root\/ci-diagnostic\.json"/u);
   assert.match(production, /QPDF_DEBIAN_VERSION=11\.3\.0-1\+deb12u1/u);
+});
+
+test("Stage 3C command-line paths never print raw metrics or exception messages", () => {
+  for (const source of [
+    "../scripts/experiments/structural-grayscale-stage1.py",
+    "../scripts/experiments/structural-grayscale-stage2.py",
+    "../scripts/experiments/structural-grayscale-stage3a.py",
+    "../scripts/experiments/structural-grayscale-stage3b.py",
+    "../scripts/experiments/structural-grayscale-stage3c.py",
+  ]) {
+    const content = read(source);
+    assert.doesNotMatch(content, /print\(json\.dumps\(asdict\(/u, source);
+    assert.doesNotMatch(content, /print\(f["']\{type\(error\)\.__name__\}: \{error\}/u, source);
+  }
 });
 
 test("Stage 3C evidence checks native inventory, SBOM, cleanup, and Ghostscript absence", () => {

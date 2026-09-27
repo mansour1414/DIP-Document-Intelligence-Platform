@@ -33,6 +33,8 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
+from structural_grayscale_evidence import print_sanitized_summary
+
 
 ROOT = Path(__file__).resolve().parents[2]
 STAGE3A_PATH = Path(__file__).with_name("structural-grayscale-stage3a.py")
@@ -472,7 +474,15 @@ def self_test(output: Path) -> Stage3BResult:
         temp_cleanup_verified=True,
     )
     (output / "metrics.json").write_text(json.dumps(asdict(result), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps(asdict(result), ensure_ascii=True, indent=2))
+    print_sanitized_summary({
+        "stage": "stage3b",
+        "status": "passed",
+        "jpeg_cases": len(result.jpeg_inventory),
+        "mutation_cases": result.mutation_probes["cases"],
+        "mutation_timeouts": result.mutation_probes["timeouts"],
+        "mutation_partial_outputs": result.mutation_probes["partial_outputs"],
+        "temp_cleanup_verified": result.temp_cleanup_verified,
+    })
     return result
 
 
@@ -480,7 +490,11 @@ def transform_one(source: Path, output: Path) -> int:
     try:
         stage2.transform(source, output)
     except Exception as error:
-        print(f"{type(error).__name__}: {error}", file=sys.stderr)
+        print_sanitized_summary({
+            "operation": "stage3b-transform-one",
+            "status": "safely-rejected",
+            "error_type": type(error).__name__,
+        }, stream=sys.stderr)
         return 2
     return 0
 
@@ -500,4 +514,12 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except Exception as error:
+        print_sanitized_summary({
+            "operation": "stage3b-self-test",
+            "status": "failed",
+            "error_type": type(error).__name__,
+        }, stream=sys.stderr)
+        raise SystemExit(1) from None
