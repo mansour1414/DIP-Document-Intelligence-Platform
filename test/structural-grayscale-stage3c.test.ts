@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
@@ -47,6 +48,55 @@ test("Stage 3C subprocess diagnostics fail closed and redact sensitive data", ()
   assert.equal(result.status, 0, diagnostics);
   assert.match(diagnostics, /Ran 3 tests/u);
   assert.match(diagnostics, /OK/u);
+});
+
+test("Stage 3C evidence artifacts are sanitized and fail closed", () => {
+  const python = process.platform === "win32" ? "python" : "python3";
+  const result = spawnSync(python, ["test/structural-grayscale-stage3c-artifacts.py"], {
+    cwd: repoRoot,
+    encoding: "utf8",
+  });
+  const diagnostics = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+
+  assert.equal(result.error, undefined, diagnostics || result.error?.message);
+  assert.equal(result.status, 0, diagnostics);
+  assert.match(diagnostics, /Ran 4 tests/u);
+  assert.match(diagnostics, /OK/u);
+});
+
+test("Stage 3C POSIX timeout probe preserves strict unset handling, cleanup, and exit status", () => {
+  const shell = process.platform === "win32" ? "C:\\Program Files\\Git\\bin\\sh.exe" : "/bin/sh";
+  assert.ok(existsSync(shell), `required POSIX shell is unavailable: ${shell}`);
+  const script = fileURLToPath(
+    new URL("../scripts/experiments/structural-grayscale-stage3c-timeout-probe.sh", import.meta.url),
+  );
+  const root = mkdtempSync(path.join(repoRoot, ".dip-stage3c-shell-"));
+  const relativeRoot = path.basename(root);
+  try {
+    for (const [mode, expectedStatus] of [["success", 0], ["failure", 23]] as const) {
+      const probe = path.join(root, mode);
+      const result = spawnSync(shell, [script, `${relativeRoot}/${mode}`, mode], {
+        cwd: repoRoot,
+        encoding: "utf8",
+      });
+      assert.equal(result.status, expectedStatus, `${mode}: ${result.stderr}`);
+      assert.equal(existsSync(probe), false, `${mode} probe was not cleaned`);
+    }
+
+    const unsetProbe = path.join(root, "unset");
+    const environment = { ...process.env };
+    delete environment.DIP_STAGE3C_INTENTIONALLY_UNSET;
+    const unset = spawnSync(shell, [script, `${relativeRoot}/unset`, "unset"], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      env: environment,
+    });
+    assert.notEqual(unset.status, 0, unset.stderr);
+    assert.match(unset.stderr, /DIP_STAGE3C_INTENTIONALLY_UNSET/u);
+    assert.equal(existsSync(unsetProbe), false, "unset-variable probe was not cleaned");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("Stage 3C PDF.js runtime probe is real and browser-helper failures are sanitized", () => {
@@ -118,6 +168,9 @@ test("Stage 3C CI is isolated, fail-closed, and preserves the production worker"
   assert.match(derivative, /DIP_STAGE3A_CMYK_ICC_PROFILE=\/stage3b\/fixtures\/CGATS001Compat-v2-micro\.icc/u);
   assert.match(derivative, /DIP_STAGE3A_PDFJS_MODULE=\/app\/node_modules\/pdfjs-dist\/legacy\/build\/pdf\.mjs/u);
   assert.match(runner, /probe-pdfjs[\s\\]+>\/output\/pdfjs-runtime\.json/u);
+  assert.match(runner, /structural-grayscale-stage3c-timeout-probe\.sh "\$timeout_root"/u);
+  assert.doesNotMatch(runner, /trap ['\\]+['\\]+rm -rf "\$probe"/u);
+  assert.match(runner, /verify-structural-grayscale-stage3c-artifacts\.py "\$artifact_root"/u);
   assert.match(production, /QPDF_DEBIAN_VERSION=11\.3\.0-1\+deb12u1/u);
 });
 

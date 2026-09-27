@@ -13,6 +13,9 @@ COPY scripts/experiments/structural_grayscale_subprocess.py /stage3b/scripts/exp
 COPY scripts/experiments/structural-grayscale-stage3b.py /stage3b/scripts/experiments/
 COPY scripts/experiments/structural-grayscale-stage3c.py /stage3b/scripts/experiments/
 COPY scripts/experiments/structural-grayscale-stage3c-sandbox-probe.py /stage3b/scripts/experiments/
+COPY scripts/experiments/structural-grayscale-stage3c-timeout-probe.sh /stage3b/scripts/experiments/
+COPY scripts/experiments/structural_grayscale_evidence.py /stage3b/scripts/experiments/
+COPY scripts/experiments/verify-structural-grayscale-stage3c-artifacts.py /stage3b/scripts/experiments/
 COPY scripts/experiments/structural-grayscale-stage3b.requirements.txt /stage3b/scripts/experiments/
 COPY output/pdf/structural-grayscale-stage3a/arabic-logical-source.pdf /stage3b/fixtures/arabic-logical-source.pdf
 COPY output/pdf/structural-grayscale-stage3a/arabic-logical-expected.pdf /stage3b/fixtures/arabic-logical-expected.pdf

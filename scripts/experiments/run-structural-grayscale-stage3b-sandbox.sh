@@ -116,33 +116,35 @@ timeout --signal=TERM --kill-after=10s 420s docker run --rm \
     set -e
     test "$failure_code" -ne 0
     test ! -e "$failure_root/unexpected-output.pdf"
-    printf '{"safe_rejection":true,"partial_output":false,"exit_code":%s}\n' "$failure_code" \
+    printf "%s\n" "{\"safe_rejection\":true,\"partial_output\":false,\"exit_code\":$failure_code}" \
       >/output/failure-cleanup.json
     rm -rf "$failure_root"
 
     set +e
-    timeout --signal=TERM --kill-after=1s 2s /bin/sh -c '\''
-      set -eu
-      probe=/tmp/dip/stage3c-timeout
-      trap '\''\''rm -rf "$probe"'\''\'' EXIT HUP INT TERM
-      mkdir -p "$probe"
-      printf started >"$probe/marker"
-      sleep 30
-    '\''
+    timeout --signal=TERM --kill-after=1s 2s /bin/sh \
+      scripts/experiments/structural-grayscale-stage3c-timeout-probe.sh "$timeout_root"
     timeout_code=$?
     set -e
     test "$timeout_code" -eq 124 -o "$timeout_code" -eq 143
     test ! -e "$timeout_root"
-    printf '{"timeout_enforced":true,"cleanup_verified":true,"exit_code":%s}\n' "$timeout_code" \
+    printf "%s\n" "{\"timeout_enforced\":true,\"cleanup_verified\":true,\"exit_code\":$timeout_code}" \
       >/output/timeout-cleanup.json
 
     cp /wheels/wheel-manifest.json /output/licensing/installed-wheel-manifest.json
     test ! -e /usr/bin/gs
     test ! -e /usr/local/bin/gs
     test -z "$(find /output -type f -name "*.pdf" -print -quit)"
+    artifact_audit=$(/opt/dip-gray-stage3b/bin/python \
+      scripts/experiments/verify-structural-grayscale-stage3c-artifacts.py /output)
+    printf "%s\n" "$artifact_audit" >/output/artifact-audit.json
+    printf "%s\n" "{\"all_required_gates_completed\":true}" \
+      >/output/stage3c-complete.json
     cleanup_runtime
     test -z "$(find /tmp/dip -mindepth 1 -maxdepth 1 -print -quit)"
     trap - EXIT HUP INT TERM
   '
 
+test -s "$artifact_root/stage3c-complete.json"
+python3 scripts/experiments/verify-structural-grayscale-stage3c-artifacts.py "$artifact_root" \
+  >/dev/null
 result="passed"

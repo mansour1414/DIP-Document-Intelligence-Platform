@@ -28,6 +28,8 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
+from structural_grayscale_evidence import sanitize_json_file, write_sanitized_json
+
 
 ROOT = Path(__file__).resolve().parents[2]
 STAGE3B_PATH = Path(__file__).with_name("structural-grayscale-stage3b.py")
@@ -541,7 +543,7 @@ def run_stage3c(corpus_root: Path, artifact_dir: Path) -> dict[str, object]:
         (stage3a_dir / "metrics.json", "stage3a-metrics.json"),
         (stage3b_dir / "metrics.json", "stage3b-metrics.json"),
     ):
-        shutil.copyfile(source, artifact_dir / name)
+        sanitize_json_file(source, artifact_dir / name)
 
     result = {
         "scope": "isolated-stage3c-ci-gate-only",
@@ -558,10 +560,22 @@ def run_stage3c(corpus_root: Path, artifact_dir: Path) -> dict[str, object]:
         "unsupported": stage3a_result.unsupported,
         "temp_cleanup_verified": True,
     }
-    (artifact_dir / "stage3c-metrics.json").write_text(
-        json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
-    print(json.dumps(result, ensure_ascii=True, indent=2))
+    write_sanitized_json(artifact_dir / "stage3c-metrics.json", result)
+    print(json.dumps({
+        "scope": result["scope"],
+        "production_adoption_approved": False,
+        "bounded_fuzz": {
+            key: result["bounded_fuzz"][key]
+            for key in (
+                "cases",
+                "accepted_and_validated",
+                "rejected",
+                "timeout_killed_safe_rejections",
+                "partial_outputs",
+            )
+        },
+        "temp_cleanup_verified": result["temp_cleanup_verified"],
+    }, ensure_ascii=True, separators=(",", ":")))
     return result
 
 
