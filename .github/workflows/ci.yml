@@ -272,6 +272,46 @@ jobs:
           CLAMD_PORT: "3310"
           PHASE1_SECRET_ENCRYPTION_KEY: MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
 
+  structural-grayscale-stage3c:
+    name: Structural Grayscale Stage 3C sandbox
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - run: npm ci
+      - name: Install Chromium for independent Arabic fixture generation
+        run: npx playwright install --with-deps chromium
+      - name: Generate independent Chromium Arabic fixtures
+        run: |
+          mkdir -p output/pdf/structural-grayscale-stage3a
+          mkdir -p output/pdf/structural-grayscale-stage3c-widgets
+          node scripts/experiments/structural-grayscale-stage3a-browser.mjs \
+            generate output/pdf/structural-grayscale-stage3a
+          node scripts/experiments/structural-grayscale-stage3a-browser.mjs \
+            generate-stage3c-widgets output/pdf/structural-grayscale-stage3c-widgets
+          test -s output/pdf/structural-grayscale-stage3a/arabic-logical-source.pdf
+          test -s output/pdf/structural-grayscale-stage3a/arabic-logical-expected.pdf
+          test "$(find output/pdf/structural-grayscale-stage3c-widgets -name '*.pdf' | wc -l)" -eq 8
+      - name: Execute fail-closed Stage 3C production-sandbox gate
+        run: sh scripts/experiments/run-structural-grayscale-stage3b-sandbox.sh
+      - name: Publish sanitized Stage 3C evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: structural-grayscale-stage3c-evidence
+          path: ${{ runner.temp }}/dip-gray-stage3c-output
+          if-no-files-found: error
+          retention-days: 14
+
   browser-accessibility:
     name: Browser / Accessibility
     runs-on: ubuntu-latest

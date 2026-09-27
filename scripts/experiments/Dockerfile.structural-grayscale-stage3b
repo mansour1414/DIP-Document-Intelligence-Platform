@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1.7
-# Isolated derivative only. Build Dockerfile.worker as dip-document-worker:stage3b-base first.
-# This file is not referenced by production builds or CI.
+# Isolated Stage 3C derivative only. Build Dockerfile.worker as
+# dip-document-worker:stage3b-base first. This does not alter the production
+# worker image or its dependency environment.
 FROM dip-document-worker:stage3b-base
 
 USER root
@@ -9,20 +10,26 @@ COPY scripts/experiments/structural-grayscale-stage2.py /stage3b/scripts/experim
 COPY scripts/experiments/structural-grayscale-stage3a.py /stage3b/scripts/experiments/
 COPY scripts/experiments/structural-grayscale-stage3a-browser.mjs /stage3b/scripts/experiments/
 COPY scripts/experiments/structural-grayscale-stage3b.py /stage3b/scripts/experiments/
+COPY scripts/experiments/structural-grayscale-stage3c.py /stage3b/scripts/experiments/
+COPY scripts/experiments/structural-grayscale-stage3c-sandbox-probe.py /stage3b/scripts/experiments/
 COPY scripts/experiments/structural-grayscale-stage3b.requirements.txt /stage3b/scripts/experiments/
-COPY output/pdf/structural-grayscale-stage2 /stage3b/output/pdf/structural-grayscale-stage2
-COPY output/pdf/structural-grayscale-stage3a /stage3b/output/pdf/structural-grayscale-stage3a
+COPY output/pdf/structural-grayscale-stage3a/arabic-logical-source.pdf /stage3b/fixtures/arabic-logical-source.pdf
+COPY output/pdf/structural-grayscale-stage3a/arabic-logical-expected.pdf /stage3b/fixtures/arabic-logical-expected.pdf
+COPY output/pdf/structural-grayscale-stage3c-widgets /stage3b/widget-fixtures
+COPY .stage3c-wheelhouse /wheels
 
 # The derivative uses a separate venv and does not alter /opt/dip-ocr.
 RUN python3 -m venv /opt/dip-gray-stage3b \
  && /opt/dip-gray-stage3b/bin/pip install --no-cache-dir --disable-pip-version-check \
+      --no-index --find-links=/wheels \
       -r /stage3b/scripts/experiments/structural-grayscale-stage3b.requirements.txt \
  && /opt/dip-gray-stage3b/bin/python -m pip check \
+ && test -s /wheels/wheel-manifest.json \
  && test ! -e /usr/bin/gs \
  && test ! -e /usr/local/bin/gs \
  && chown -R 10001:10001 /stage3b
 
 WORKDIR /stage3b
 USER 10001:10001
-ENTRYPOINT ["/opt/dip-gray-stage3b/bin/python", "scripts/experiments/structural-grayscale-stage3b.py"]
-CMD ["--self-test", "--output-dir", "/tmp/dip/stage3b-output"]
+ENTRYPOINT ["/opt/dip-gray-stage3b/bin/python", "scripts/experiments/structural-grayscale-stage3c.py"]
+CMD ["--self-test", "--corpus-root", "/tmp/dip/stage3c-corpus", "--artifact-dir", "/output/metrics"]

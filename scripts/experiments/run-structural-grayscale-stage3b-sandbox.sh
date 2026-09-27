@@ -1,68 +1,132 @@
 #!/bin/sh
 set -eu
 
-# Review-only reproduction recipe. It does not alter Dockerfile.worker.
+# Stage 3C review-only reproduction recipe. It builds a derivative from the
+# actual production worker and never changes Dockerfile.worker.
+repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+artifact_root="${RUNNER_TEMP:-/tmp}/dip-gray-stage3c-output"
+wheelhouse="$repository_root/.stage3c-wheelhouse"
+container_name="dip-gray-stage3c-poc"
+result="failed"
+
+cleanup_host() {
+  exit_code=$?
+  docker rm --force "$container_name" >/dev/null 2>&1 || true
+  rm -rf "$wheelhouse"
+  mkdir -p "$artifact_root"
+  printf '{"scope":"isolated-stage3c-ci-gate-only","result":"%s","exit_code":%s}\n' \
+    "$result" "$exit_code" >"$artifact_root/ci-diagnostic.json"
+  exit "$exit_code"
+}
+trap cleanup_host EXIT HUP INT TERM
+
+rm -rf "$artifact_root" "$wheelhouse"
+mkdir -p "$artifact_root/licensing" "$wheelhouse"
+chmod 0777 "$artifact_root" "$artifact_root/licensing"
+
+cd "$repository_root"
+python3 -c 'import sys; assert sys.version_info[:2] == (3, 11), sys.version'
+python3 -m pip download \
+  --disable-pip-version-check \
+  --only-binary=:all: \
+  --dest "$wheelhouse" \
+  --requirement scripts/experiments/structural-grayscale-stage3b.requirements.txt
+python3 scripts/experiments/structural-grayscale-stage3b-wheel-audit.py \
+  --wheel-dir "$wheelhouse" \
+  --output "$artifact_root/licensing/wheel-audit.json"
+cp "$artifact_root/licensing/wheel-manifest.json" "$wheelhouse/wheel-manifest.json"
+
+test -s output/pdf/structural-grayscale-stage3a/arabic-logical-source.pdf
+test -s output/pdf/structural-grayscale-stage3a/arabic-logical-expected.pdf
+test "$(find output/pdf/structural-grayscale-stage3c-widgets -name '*.pdf' | wc -l)" -eq 8
+
 docker build --file Dockerfile.worker --tag dip-document-worker:stage3b-base .
-docker build --file scripts/experiments/Dockerfile.structural-grayscale-stage3b --tag dip-gray-stage3b:poc .
+docker build --file scripts/experiments/Dockerfile.structural-grayscale-stage3b --tag dip-gray-stage3c:poc .
+docker image inspect dip-document-worker:stage3b-base --format '{{json .RepoDigests}}' \
+  >"$artifact_root/production-base-image-digests.json"
+docker image inspect dip-document-worker:stage3b-base --format '{{json .Id}}' \
+  >"$artifact_root/production-base-image-id.json"
+docker image inspect dip-gray-stage3c:poc --format '{{json .Id}}' \
+  >"$artifact_root/stage3c-image-id.json"
 
-output_dir="${RUNNER_TEMP:-/tmp}/dip-gray-stage3b-output"
-mkdir -p "$output_dir"
-chmod 0777 "$output_dir"
-
-docker run --rm \
-  --name dip-gray-stage3b-poc \
+timeout --signal=TERM --kill-after=10s 420s docker run --rm \
+  --name "$container_name" \
   --user 10001:10001 \
   --network none \
   --read-only \
+  --security-opt no-new-privileges \
+  --cap-drop ALL \
   --cpus 1 \
   --memory 768m \
   --memory-swap 768m \
   --pids-limit 128 \
+  --ulimit cpu=300:300 \
+  --ulimit nofile=1024:1024 \
+  --ulimit nproc=128:128 \
   --stop-timeout 5 \
   --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777 \
   --tmpfs /tmp/dip:rw,nosuid,nodev,noexec,size=256m,uid=10001,gid=10001,mode=0700 \
-  --mount "type=bind,source=$output_dir,target=/output" \
+  --mount "type=bind,source=$artifact_root,target=/output" \
   --entrypoint /bin/sh \
-  dip-gray-stage3b:poc -c '
+  dip-gray-stage3c:poc -c '
     set -eu
-    test "$(id -u):$(id -g)" = "10001:10001"
-    test ! -e /usr/bin/gs && test ! -e /usr/local/bin/gs
-    awk '\''$2 == "/" && $4 ~ /(^|,)ro(,|$)/ { root=1 }
-             $2 == "/tmp" && $4 ~ /size=65536k/ { tmp=1 }
-             $2 == "/tmp/dip" && $4 ~ /size=262144k/ { dip=1 }
-             END { exit !(root && tmp && dip) }'\'' /proc/mounts
-    test ! -e /proc/net/route || ! awk '\''$2 == "00000000" { found=1 } END { exit !found }'\'' /proc/net/route
-    test "$(cat /sys/fs/cgroup/memory.max)" = "805306368"
-    test "$(cat /sys/fs/cgroup/pids.max)" = "128"
-    test "$(awk '\''{print $1}'\'' /sys/fs/cgroup/cpu.max)" != "max"
-    /opt/dip-gray-stage3b/bin/python - <<'\''PY'\''
-import json, os, pathlib, resource, subprocess
-assert os.getuid() == 10001 and os.getgid() == 10001
-inventory = {}
-for command in (
-    ["/opt/dip-gray-stage3b/bin/python", "-m", "pip", "freeze", "--all"],
-    ["/bin/sh", "-c", "ldd /opt/dip-gray-stage3b/lib/python3.11/site-packages/pikepdf/_core*.so"],
-    ["/bin/sh", "-c", "ldd /opt/dip-gray-stage3b/lib/python3.11/site-packages/PIL/_imaging*.so"],
-):
-    completed = subprocess.run(command, check=True, capture_output=True, text=True)
-    inventory[" ".join(command)] = completed.stdout
-inventory["rlimits"] = {name: resource.getrlimit(value) for name, value in {
-    "cpu": resource.RLIMIT_CPU,
-    "address_space": resource.RLIMIT_AS,
-    "processes": resource.RLIMIT_NPROC,
-    "files": resource.RLIMIT_NOFILE,
-}.items()}
-inventory["cgroup"] = {
-    name: pathlib.Path(path).read_text().strip()
-    for name, path in {
-        "cpu.max": "/sys/fs/cgroup/cpu.max",
-        "memory.max": "/sys/fs/cgroup/memory.max",
-        "pids.max": "/sys/fs/cgroup/pids.max",
-    }.items()
-}
-pathlib.Path("/output/native-inventory.json").write_text(json.dumps(inventory, indent=2))
-PY
-    timeout --signal=TERM --kill-after=5s 180s \
-      /opt/dip-gray-stage3b/bin/python scripts/experiments/structural-grayscale-stage3b.py \
-      --self-test --output-dir /output
+    corpus=/tmp/dip/stage3c-corpus
+    failure_root=/tmp/dip/stage3c-failure
+    timeout_root=/tmp/dip/stage3c-timeout
+    cleanup_runtime() {
+      rm -rf "$corpus" "$failure_root" "$timeout_root"
+    }
+    trap cleanup_runtime EXIT HUP INT TERM
+
+    /opt/dip-gray-stage3b/bin/python \
+      scripts/experiments/structural-grayscale-stage3c-sandbox-probe.py \
+      /output/sandbox-evidence.json
+
+    export DIP_GRAYSCALE_CORPUS_ROOT="$corpus"
+    export DIP_STAGE3A_FIXTURE_DIR=/stage3b/fixtures
+    export DIP_STAGE3C_WIDGET_FIXTURE_DIR=/stage3b/widget-fixtures
+    timeout --signal=TERM --kill-after=5s 300s \
+      /opt/dip-gray-stage3b/bin/python scripts/experiments/structural-grayscale-stage3c.py \
+      --self-test --corpus-root "$corpus" --artifact-dir /output/metrics
+
+    mkdir -p "$failure_root"
+    head -c 128 "$corpus/structural-grayscale-stage3b/natural-jpeg-source.pdf" \
+      >"$failure_root/malformed.pdf"
+    set +e
+    /opt/dip-gray-stage3b/bin/python scripts/experiments/structural-grayscale-stage3b.py \
+      --transform-one "$failure_root/malformed.pdf" "$failure_root/unexpected-output.pdf" \
+      >/dev/null 2>"$failure_root/diagnostic.txt"
+    failure_code=$?
+    set -e
+    test "$failure_code" -ne 0
+    test ! -e "$failure_root/unexpected-output.pdf"
+    printf '{"safe_rejection":true,"partial_output":false,"exit_code":%s}\n' "$failure_code" \
+      >/output/failure-cleanup.json
+    rm -rf "$failure_root"
+
+    set +e
+    timeout --signal=TERM --kill-after=1s 2s /bin/sh -c '\''
+      set -eu
+      probe=/tmp/dip/stage3c-timeout
+      trap '\''\''rm -rf "$probe"'\''\'' EXIT HUP INT TERM
+      mkdir -p "$probe"
+      printf started >"$probe/marker"
+      sleep 30
+    '\''
+    timeout_code=$?
+    set -e
+    test "$timeout_code" -eq 124 -o "$timeout_code" -eq 143
+    test ! -e "$timeout_root"
+    printf '{"timeout_enforced":true,"cleanup_verified":true,"exit_code":%s}\n' "$timeout_code" \
+      >/output/timeout-cleanup.json
+
+    cp /wheels/wheel-manifest.json /output/licensing/installed-wheel-manifest.json
+    test ! -e /usr/bin/gs
+    test ! -e /usr/local/bin/gs
+    test -z "$(find /output -type f -name "*.pdf" -print -quit)"
+    cleanup_runtime
+    test -z "$(find /tmp/dip -mindepth 1 -maxdepth 1 -print -quit)"
+    trap - EXIT HUP INT TERM
   '
+
+result="passed"

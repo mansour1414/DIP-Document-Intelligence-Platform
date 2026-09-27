@@ -16,6 +16,10 @@ from pathlib import Path
 
 
 DT_NEEDED = 1
+EXPECTED_WHEEL_HASHES = {
+    "pikepdf": "365b94f2be7e2857c6cb5445b56dc52dc7417ba9f06c8a4282d9f521cb2d0fb8",
+    "pillow": "23d27a3e0307ec2244cc51e7287b919aa68d097504ebe19df4e76a98a3eea5bd",
+}
 
 
 def sha256(path: Path) -> str:
@@ -199,6 +203,26 @@ def main() -> int:
             "legal_approval_claimed": False,
         },
     }
+    actual_hashes = {
+        "pikepdf": result["pikepdf"]["sha256"],
+        "pillow": result["pillow"]["sha256"],
+    }
+    if actual_hashes != EXPECTED_WHEEL_HASHES:
+        raise RuntimeError(f"reviewed wheel hash mismatch: {actual_hashes}")
+    wheel_manifest = {
+        "scope": "isolated-stage3c-wheelhouse",
+        "wheels": [
+            {
+                "filename": wheel.name,
+                "sha256": hashlib.sha256(wheel.read_bytes()).hexdigest(),
+                "bytes": wheel.stat().st_size,
+            }
+            for wheel in sorted(args.wheel_dir.glob("*.whl"))
+        ],
+        "reviewed_runtime_hashes": actual_hashes,
+    }
+    if not wheel_manifest["wheels"]:
+        raise RuntimeError("wheelhouse is empty")
     supplemental_sbom = {
         "bomFormat": "CycloneDX",
         "specVersion": "1.5",
@@ -269,6 +293,9 @@ def main() -> int:
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    args.output.with_name("wheel-manifest.json").write_text(
+        json.dumps(wheel_manifest, indent=2) + "\n", encoding="utf-8"
+    )
     args.output.with_name("supplemental-sbom.cdx.json").write_text(
         json.dumps(supplemental_sbom, indent=2) + "\n", encoding="utf-8"
     )

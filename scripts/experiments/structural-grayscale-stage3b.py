@@ -12,6 +12,7 @@ import argparse
 import importlib.util
 import json
 import math
+import os
 import random
 import shutil
 import subprocess
@@ -35,7 +36,8 @@ from reportlab.pdfgen import canvas
 
 ROOT = Path(__file__).resolve().parents[2]
 STAGE3A_PATH = Path(__file__).with_name("structural-grayscale-stage3a.py")
-STAGE3A_OUTPUT = ROOT / "output" / "pdf" / "structural-grayscale-stage3a"
+CORPUS_ROOT = Path(os.environ.get("DIP_GRAYSCALE_CORPUS_ROOT", ROOT / "output" / "pdf"))
+STAGE3A_OUTPUT = CORPUS_ROOT / "structural-grayscale-stage3a"
 ARABIC_QUERY = "مرحلة المحرك البنيوي الثالثة تحافظ على النص العربي القابل للبحث والنسخ."
 
 

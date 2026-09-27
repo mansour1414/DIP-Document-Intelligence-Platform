@@ -4,7 +4,6 @@
 
 import fs from "node:fs/promises";
 import path from "node:path";
-import { chromium } from "playwright";
 
 function clamp(value) {
   return Math.max(0, Math.min(1, value));
@@ -54,6 +53,14 @@ a { color: ${colors[1]}; }
 
 async function generate(directory) {
   await fs.mkdir(directory, { recursive: true });
+  const fixtureDirectory = process.env.DIP_STAGE3A_FIXTURE_DIR;
+  if (fixtureDirectory) {
+    for (const name of ["arabic-logical-source.pdf", "arabic-logical-expected.pdf"]) {
+      await fs.copyFile(path.join(fixtureDirectory, name), path.join(directory, name));
+    }
+    return;
+  }
+  const { chromium } = await import("playwright");
   const browser = await chromium.launch({ headless: true });
   try {
     for (const [name, grayscale] of [["arabic-logical-source.pdf", false], ["arabic-logical-expected.pdf", true]]) {
@@ -67,6 +74,56 @@ async function generate(directory) {
         tagged: true,
       });
       await page.close();
+    }
+  } finally {
+    await browser.close();
+  }
+}
+
+function widgetHtml(value, grayscale) {
+  const color = grayscale ? gray(194, 26, 89) : null;
+  const cssColor = grayscale ? `rgb(${color},${color},${color})` : "rgb(194,26,89)";
+  return `<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8">
+<style>
+@page { size: 500px 70px; margin: 0; }
+html, body { width: 500px; height: 70px; margin: 0; overflow: hidden; }
+body { box-sizing: border-box; padding: 18px 12px; color: ${cssColor};
+  font: 16px/1.5 "Noto Sans Arabic", "Arial", sans-serif; white-space: nowrap; }
+</style></head><body>${value}</body></html>`;
+}
+
+async function generateStage3cWidgets(directory) {
+  await fs.mkdir(directory, { recursive: true });
+  const original = [
+    "قيمة عربية قابلة للتحرير والبحث",
+    "DIP 3C قيمة مختلطة 12345 test@example.com",
+  ];
+  const edited = [
+    "تم تعديل القيمة العربية بأمان",
+    "Edited آمن 67890 grayscale@example.com",
+  ];
+  const groups = [
+    ["source", original, false],
+    ["expected", original, true],
+    ["edited-gray", edited, true],
+    ["edited-color", edited, false],
+  ];
+  const { chromium } = await import("playwright");
+  const browser = await chromium.launch({ headless: true });
+  try {
+    for (const [variant, values, grayscale] of groups) {
+      for (const [index, value] of values.entries()) {
+        const page = await browser.newPage({ locale: "ar-SA" });
+        await page.setContent(widgetHtml(value, grayscale), { waitUntil: "load" });
+        await page.pdf({
+          path: path.join(directory, `${variant}-${index}.pdf`),
+          width: "500px",
+          height: "70px",
+          printBackground: true,
+          tagged: true,
+        });
+        await page.close();
+      }
     }
   } finally {
     await browser.close();
@@ -94,8 +151,10 @@ async function extract(pdfPath) {
 const [command, target] = process.argv.slice(2);
 if (command === "generate" && target) {
   await generate(path.resolve(target));
+} else if (command === "generate-stage3c-widgets" && target) {
+  await generateStage3cWidgets(path.resolve(target));
 } else if (command === "extract" && target) {
   await extract(path.resolve(target));
 } else {
-  throw new Error("usage: structural-grayscale-stage3a-browser.mjs generate <dir> | extract <pdf>");
+  throw new Error("usage: structural-grayscale-stage3a-browser.mjs generate <dir> | generate-stage3c-widgets <dir> | extract <pdf>");
 }

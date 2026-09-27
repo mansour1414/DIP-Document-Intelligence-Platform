@@ -13,6 +13,7 @@ import hashlib
 import importlib.util
 import json
 import math
+import os
 import subprocess
 import sys
 import tempfile
@@ -28,6 +29,7 @@ from pypdf import PdfReader, PdfWriter
 
 
 ROOT = Path(__file__).resolve().parents[2]
+CORPUS_ROOT = Path(os.environ.get("DIP_GRAYSCALE_CORPUS_ROOT", ROOT / "output" / "pdf"))
 STAGE2_PATH = Path(__file__).with_name("structural-grayscale-stage2.py")
 BROWSER_HELPER = Path(__file__).with_name("structural-grayscale-stage3a-browser.mjs")
 MAX_JPEG_BYTES = 2_000_000
@@ -869,8 +871,8 @@ def self_test(output: Path) -> Stage3Result:
         regenerated_result.update(policy_snapshot)
         regenerated_result["field_value"] = str(fields["customer_note"].get("/V"))
 
-        stage2_expected = ROOT / "output" / "pdf" / "structural-grayscale-stage2" / "en-expected.pdf"
-        stage2_output = ROOT / "output" / "pdf" / "structural-grayscale-stage2" / "en-output.pdf"
+        stage2_expected = CORPUS_ROOT / "structural-grayscale-stage2" / "en-expected.pdf"
+        stage2_output = CORPUS_ROOT / "structural-grayscale-stage2" / "en-output.pdf"
         if not stage2_expected.exists() or not stage2_output.exists():
             raise RuntimeError("Stage 2 render-difference fixtures are unavailable")
         stage2_difference = difference_metrics(
