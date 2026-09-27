@@ -54,6 +54,26 @@ class UnsupportedPdf(RuntimeError):
     """Stage 2 cannot safely transform the requested PDF feature."""
 
 
+def page_content_streams(page_obj: pikepdf.Object) -> list[pikepdf.Stream]:
+    """Return validated page content streams without dropping malformed entries."""
+    if "/Contents" not in page_obj:
+        return []
+    contents = page_obj["/Contents"]
+    if contents is None:
+        raise UnsupportedPdf("page Contents is null")
+    if isinstance(contents, pikepdf.Stream):
+        return [contents]
+    if not isinstance(contents, pikepdf.Array):
+        raise UnsupportedPdf("page Contents must be a stream or an array of streams")
+
+    streams: list[pikepdf.Stream] = []
+    for index, entry in enumerate(contents):
+        if not isinstance(entry, pikepdf.Stream):
+            raise UnsupportedPdf(f"page Contents entry {index} is not a stream")
+        streams.append(entry)
+    return streams
+
+
 @dataclass
 class Budget:
     decoded_bytes: int = 0
@@ -783,10 +803,14 @@ class StructuralTransformer:
             resources = page.obj.get("/Resources")
             if resources is None:
                 resources = pikepdf.Dictionary()
-            contents = page.obj.get("/Contents")
-            if contents is not None:
+            content_streams = page_content_streams(page.obj)
+            if content_streams:
+                contents = page.obj["/Contents"]
                 if isinstance(contents, pikepdf.Array):
-                    decoded = b"\n".join(bytes(stream.read_bytes()) for stream in contents)
+                    try:
+                        decoded = b"\n".join(bytes(stream.read_bytes()) for stream in content_streams)
+                    except (pikepdf.PdfError, RuntimeError, ValueError) as error:
+                        raise UnsupportedPdf("page Contents stream cannot be decoded") from error
                     self.budget.add_decoded(len(decoded))
                     page.obj["/Contents"] = self.pdf.make_stream(decoded)
                 output = filtered_stream(page.obj["/Contents"], resources, self.stats, self.budget)
@@ -807,6 +831,13 @@ class StructuralTransformer:
                 self.transform_field_tree(field_obj, default_resources, 1)
 
 
+# Stage 3A deliberately extends these symbols in-process. Keep immutable
+# references so Stage 2's own regression corpus always evaluates Stage 2 policy.
+STAGE2_COLOR_SPEC = color_spec
+STAGE2_IMAGE_TO_GRAY = image_to_gray
+STAGE2_STRUCTURAL_TRANSFORMER = StructuralTransformer
+
+
 def inspect_structure(pdf: pikepdf.Pdf, source_size: int) -> None:
     if source_size <= 0 or source_size > MAX_INPUT_BYTES:
         raise UnsupportedPdf("input byte limit exceeded")
@@ -817,6 +848,10 @@ def inspect_structure(pdf: pikepdf.Pdf, source_size: int) -> None:
         raise UnsupportedPdf("object limit exceeded")
     if sum(isinstance(obj, pikepdf.Stream) for obj in objects) > MAX_STREAMS:
         raise UnsupportedPdf("stream limit exceeded")
+    # Validate every page before any content stream is transformed. A malformed
+    # later page therefore cannot produce an in-memory partial transformation.
+    for page in pdf.pages:
+        page_content_streams(page.obj)
     inspected: set[tuple[object, ...]] = set()
 
     def inspect(obj: pikepdf.Object, depth: int) -> None:
@@ -1294,6 +1329,11 @@ def validate_corpus(locale: str, source: Path, expected: Path, output: Path, wor
 
 def verify_fail_closed(source: Path, workdir: Path) -> list[str]:
     cases: list[tuple[str, Path]] = []
+
+    def append_content(pdf: pikepdf.Pdf, page: pikepdf.Page, payload: bytes) -> None:
+        streams = page_content_streams(page.obj)
+        page.obj["/Contents"] = pikepdf.Array([*streams, pdf.make_stream(payload)])
+
     with pikepdf.Pdf.open(source) as pdf:
         page = pdf.pages[0]
         bad_image = pdf.make_stream(
@@ -1301,7 +1341,7 @@ def verify_fail_closed(source: Path, workdir: Path) -> list[str]:
             pikepdf.Dictionary(Type=pikepdf.Name.XObject, Subtype=pikepdf.Name.Image, Width=1, Height=1, BitsPerComponent=8, ColorSpace=pikepdf.Name.DeviceRGB, Filter=pikepdf.Name.JPXDecode),
         )
         page.Resources.XObject["/Unsupported"] = bad_image
-        page.obj["/Contents"] = pikepdf.Array([page.obj["/Contents"], pdf.make_stream(b"/Unsupported Do")])
+        append_content(pdf, page, b"/Unsupported Do")
         path = workdir / "unsupported-image-filter.pdf"
         pdf.save(path)
         cases.append(("unsupported-image-filter", path))
@@ -1327,28 +1367,55 @@ def verify_fail_closed(source: Path, workdir: Path) -> list[str]:
     malformed.write_bytes(data[: len(data) // 4])
     cases.append(("malformed", malformed))
     with pikepdf.Pdf.open(source) as pdf:
+        pdf.pages[0].obj["/Contents"] = pikepdf.Array([None])
+        path = workdir / "null-page-contents.pdf"
+        pdf.save(path)
+        cases.append(("null-page-contents", path))
+    with pikepdf.Pdf.open(source) as pdf:
+        pdf.pages[0].obj["/Contents"] = pikepdf.Dictionary()
+        path = workdir / "malformed-page-contents.pdf"
+        pdf.save(path)
+        cases.append(("malformed-page-contents", path))
+    with pikepdf.Pdf.open(source) as pdf:
+        invalid_later_page = pdf.add_blank_page()
+        invalid_later_page.obj["/Contents"] = pikepdf.Array([pdf.make_stream(b"q Q"), None])
+        path = workdir / "mixed-page-contents.pdf"
+        pdf.save(path)
+        cases.append(("mixed-page-contents", path))
+    with pikepdf.Pdf.open(source) as pdf:
         page = pdf.pages[0]
         page.Resources.ColorSpace["/Spot"] = pikepdf.Array([pikepdf.Name.Separation, pikepdf.Name.Spot, pikepdf.Name.DeviceRGB, pikepdf.Dictionary(FunctionType=2, Domain=pikepdf.Array([0, 1]), C0=pikepdf.Array([0, 0, 0]), C1=pikepdf.Array([1, 0, 0]), N=1)])
-        page.obj["/Contents"] = pikepdf.Array([page.obj["/Contents"], pdf.make_stream(b"/Spot cs .5 scn")])
+        append_content(pdf, page, b"/Spot cs .5 scn")
         path = workdir / "spot-color.pdf"
         pdf.save(path)
         cases.append(("spot-color", path))
 
+    explicit_contents_rejections = {
+        "null-page-contents",
+        "malformed-page-contents",
+        "mixed-page-contents",
+    }
     rejected: list[str] = []
     for name, candidate in cases:
         destination = workdir / f"unexpected-{name}.pdf"
         try:
             transform(candidate, destination)
-        except (UnsupportedPdf, pikepdf.PdfError, TimeoutError):
+        except UnsupportedPdf:
             if destination.exists():
                 raise AssertionError(f"{name} left a partial output")
+            rejected.append(name)
+        except (pikepdf.PdfError, TimeoutError):
+            if destination.exists():
+                raise AssertionError(f"{name} left a partial output")
+            if name in explicit_contents_rejections:
+                raise AssertionError(f"{name} was not rejected by explicit page Contents validation")
             rejected.append(name)
         else:
             raise AssertionError(f"{name} did not fail closed")
     return rejected
 
 
-def self_test(output_directory: Path) -> Stage2Result:
+def _self_test(output_directory: Path) -> Stage2Result:
     output_directory.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
     temp_root: Path | None = None
@@ -1387,6 +1454,18 @@ def self_test(output_directory: Path) -> Stage2Result:
     )
     (output_directory / "metrics.json").write_text(json.dumps(asdict(result), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return result
+
+
+def self_test(output_directory: Path) -> Stage2Result:
+    """Run Stage 2 with its baseline policy even when Stage 3A is also loaded."""
+    active_policy = (color_spec, image_to_gray, StructuralTransformer)
+    try:
+        globals()["color_spec"] = STAGE2_COLOR_SPEC
+        globals()["image_to_gray"] = STAGE2_IMAGE_TO_GRAY
+        globals()["StructuralTransformer"] = STAGE2_STRUCTURAL_TRANSFORMER
+        return _self_test(output_directory)
+    finally:
+        globals()["color_spec"], globals()["image_to_gray"], globals()["StructuralTransformer"] = active_policy
 
 
 def main() -> int:

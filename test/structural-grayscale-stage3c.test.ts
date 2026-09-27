@@ -70,6 +70,26 @@ test("Stage 3C evidence checks native inventory, SBOM, cleanup, and Ghostscript 
   assert.match(audit, /23d27a3e0307ec2244cc51e7287b919aa68d097504ebe19df4e76a98a3eea5bd/u);
 });
 
+test("Stage 2 rejects malformed page Contents without partial-output fallbacks", () => {
+  const stage2 = read("../scripts/experiments/structural-grayscale-stage2.py");
+
+  assert.match(stage2, /def page_content_streams\(/u);
+  assert.match(stage2, /page Contents entry \{index\} is not a stream/u);
+  assert.match(stage2, /for page in pdf\.pages:\n\s+page_content_streams\(page\.obj\)/u);
+  assert.match(stage2, /STAGE2_STRUCTURAL_TRANSFORMER = StructuralTransformer/u);
+  assert.match(stage2, /was not rejected by explicit page Contents validation/u);
+  assert.match(stage2, /Run Stage 2 with its baseline policy even when Stage 3A is also loaded/u);
+  for (const fixture of [
+    "null-page-contents",
+    "malformed-page-contents",
+    "mixed-page-contents",
+  ]) assert.ok(stage2.includes(fixture), `missing malformed Contents regression: ${fixture}`);
+  assert.doesNotMatch(
+    stage2,
+    /pikepdf\.Array\(\[page\.obj\["\/Contents"\], pdf\.make_stream/u,
+  );
+});
+
 test("Stage 3C remains an experiment and Grayscale is not registered", () => {
   const registry = read("../src/lib/tools/registry.ts");
   const stage3c = read("../scripts/experiments/structural-grayscale-stage3c.py");
