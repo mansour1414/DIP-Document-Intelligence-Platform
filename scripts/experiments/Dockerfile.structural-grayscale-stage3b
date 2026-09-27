@@ -1,0 +1,28 @@
+# syntax=docker/dockerfile:1.7
+# Isolated derivative only. Build Dockerfile.worker as dip-document-worker:stage3b-base first.
+# This file is not referenced by production builds or CI.
+FROM dip-document-worker:stage3b-base
+
+USER root
+COPY scripts/experiments/structural-grayscale-stage1.py /stage3b/scripts/experiments/
+COPY scripts/experiments/structural-grayscale-stage2.py /stage3b/scripts/experiments/
+COPY scripts/experiments/structural-grayscale-stage3a.py /stage3b/scripts/experiments/
+COPY scripts/experiments/structural-grayscale-stage3a-browser.mjs /stage3b/scripts/experiments/
+COPY scripts/experiments/structural-grayscale-stage3b.py /stage3b/scripts/experiments/
+COPY scripts/experiments/structural-grayscale-stage3b.requirements.txt /stage3b/scripts/experiments/
+COPY output/pdf/structural-grayscale-stage2 /stage3b/output/pdf/structural-grayscale-stage2
+COPY output/pdf/structural-grayscale-stage3a /stage3b/output/pdf/structural-grayscale-stage3a
+
+# The derivative uses a separate venv and does not alter /opt/dip-ocr.
+RUN python3 -m venv /opt/dip-gray-stage3b \
+ && /opt/dip-gray-stage3b/bin/pip install --no-cache-dir --disable-pip-version-check \
+      -r /stage3b/scripts/experiments/structural-grayscale-stage3b.requirements.txt \
+ && /opt/dip-gray-stage3b/bin/python -m pip check \
+ && test ! -e /usr/bin/gs \
+ && test ! -e /usr/local/bin/gs \
+ && chown -R 10001:10001 /stage3b
+
+WORKDIR /stage3b
+USER 10001:10001
+ENTRYPOINT ["/opt/dip-gray-stage3b/bin/python", "scripts/experiments/structural-grayscale-stage3b.py"]
+CMD ["--self-test", "--output-dir", "/tmp/dip/stage3b-output"]

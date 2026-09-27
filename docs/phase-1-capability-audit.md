@@ -46,3 +46,4 @@ PDF.js 6.3.289 operator data supports a useful, bounded subset: decoded image XO
 ## Architecture result
 
 The existing output manifest already supports multiple `outputFileIds`; no contract redesign or ZIP dependency was required. No new package, AI path, or Ghostscript path was introduced. qpdf is invoked only through the already approved pinned production package and the controlled argument-file wrapper.
+Stage 3B experimentally confirmed that PDFium's Arabic visual-order behavior is present identically before and after grayscale transformation, generated a supplemental libqpdf SBOM inventory, proved the exact Pillow 12.3.0 Linux wheel does not bundle/link/use libimagequant on the tested path, and passed a nine-JPEG/two-renderer corpus plus bounded mutation probes. Production sandbox execution and Unicode widget-appearance fidelity remain gated; see `docs/structural-grayscale-stage3b-readiness.md`.
