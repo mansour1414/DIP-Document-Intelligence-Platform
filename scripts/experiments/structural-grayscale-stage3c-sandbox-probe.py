@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import errno
 import glob
 import importlib.metadata
 import json
@@ -57,21 +58,31 @@ def cgroup_value(name: str) -> str:
     return path.read_text(encoding="utf-8").strip()
 
 
+def verify_read_only_root(root_probe: pathlib.Path) -> bool:
+    """Prove that a root-path write is rejected for a read-only filesystem."""
+    try:
+        root_probe.write_text("forbidden", encoding="utf-8")
+    except OSError as error:
+        if error.errno not in {errno.EROFS, errno.EACCES}:
+            raise
+        return True
+
+    # A successful write is always a gate failure. Cleanup is attempted only
+    # after write_text returned successfully, never after an expected rejection.
+    try:
+        root_probe.unlink()
+    except Exception as error:
+        raise AssertionError("root filesystem is writable and probe cleanup failed") from error
+    raise AssertionError("root filesystem is writable")
+
+
 def main() -> int:
     output = pathlib.Path(sys.argv[1])
     output.parent.mkdir(parents=True, exist_ok=True)
     if (os.getuid(), os.getgid()) != (10001, 10001):
         raise AssertionError("Stage 3C must run as UID/GID 10001")
-    root_read_only = False
     root_probe = pathlib.Path("/stage3b/stage3c-root-write-probe")
-    try:
-        root_probe.write_text("forbidden", encoding="utf-8")
-    except OSError:
-        root_read_only = True
-    finally:
-        root_probe.unlink(missing_ok=True)
-    if not root_read_only:
-        raise AssertionError("root filesystem is writable")
+    root_read_only = verify_read_only_root(root_probe)
 
     mounts = pathlib.Path("/proc/mounts").read_text(encoding="utf-8")
     required_mounts = {

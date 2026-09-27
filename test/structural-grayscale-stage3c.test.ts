@@ -1,8 +1,25 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 const read = (path: string) => readFileSync(new URL(path, import.meta.url), "utf8");
+const repoRoot = fileURLToPath(new URL("../", import.meta.url));
+
+test("Stage 3C read-only-root probe fails closed without invalid cleanup", () => {
+  const python = process.platform === "win32" ? "python" : "python3";
+  const result = spawnSync(python, ["test/structural-grayscale-stage3c-root-probe.py"], {
+    cwd: repoRoot,
+    encoding: "utf8",
+  });
+  const diagnostics = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+
+  assert.equal(result.error, undefined, diagnostics || result.error?.message);
+  assert.equal(result.status, 0, diagnostics);
+  assert.match(diagnostics, /Ran 3 tests/u);
+  assert.match(diagnostics, /OK/u);
+});
 
 test("Stage 3C CI is isolated, fail-closed, and preserves the production worker", () => {
   const workflow = read("../.github/workflows/ci.yml");
