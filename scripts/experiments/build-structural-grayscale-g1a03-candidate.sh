@@ -63,8 +63,8 @@ docker run --rm --entrypoint sh "$candidate_tag" -c \
 docker run --rm --entrypoint sh "$candidate_tag" -c \
   "tar -C / -czf - \$(find /usr/share/doc -type f -name copyright -printf '%P\n' | sed 's#^#usr/share/doc/#' | sort)" \
   >"$evidence/debian-notices.tar.gz"
-docker run --rm --entrypoint node "$candidate_tag" -e \
-  "const fs=require('fs'),p=require('path');function walk(d,o=[]){for(const n of fs.readdirSync(d)){const q=p.join(d,n);if(n.startsWith('.'))continue;const s=fs.statSync(q);if(s.isDirectory()){const f=p.join(q,'package.json');if(fs.existsSync(f)){const j=JSON.parse(fs.readFileSync(f));o.push({name:j.name,version:j.version,license:j.license||'NOASSERTION',path:q})}if(n!=='node_modules'||d==='/app')walk(q,o)}}return o}console.log(JSON.stringify(walk('/app/node_modules').sort((a,b)=>a.name.localeCompare(b.name)),null,2))" \
+docker run --rm --interactive --entrypoint node "$candidate_tag" - /app/node_modules \
+  <"$root/scripts/experiments/collect-node-inventory-g1a03b.mjs" \
   >"$evidence/inventory/node-packages.json"
 
 syft "$candidate_tag" -o spdx-json="$evidence/candidate-image.spdx.json"

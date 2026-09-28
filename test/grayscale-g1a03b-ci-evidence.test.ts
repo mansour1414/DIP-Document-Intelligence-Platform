@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 const text = (path: string) => readFileSync(new URL(`../${path}`, import.meta.url), "utf8");
@@ -7,6 +11,7 @@ const workflow = text(".github/workflows/g1a03b-candidate-evidence.yml");
 const runner = text("scripts/experiments/build-structural-grayscale-g1a03-candidate.sh");
 const report = text("docs/g1a-03b-ci-candidate-evidence-and-security-triage.md");
 const triage = JSON.parse(text("docs/evidence/g1a03b/pypdf-6.10.0-security-triage.json"));
+const nodeCollector = new URL("../scripts/experiments/collect-node-inventory-g1a03b.mjs", import.meta.url);
 
 test("G1-A/03B is a dispatchable and path-filtered isolated ubuntu-24.04 evidence workflow", () => {
   assert.match(workflow, /workflow_dispatch:/);
@@ -30,6 +35,52 @@ test("candidate evidence includes inventories, SBOMs, scan, notices, and reconci
   for (const marker of ["debian-packages.tsv", "python-packages.json", "node-packages.json", "python-native-sha256.txt", "debian-notices-sha256.txt", "candidate-image.spdx.json", "candidate-image.cdx.json", "vulnerability-scan.grype.json", "reconciliation.json"])
     assert.match(runner, new RegExp(marker.replaceAll(".", "\\.")));
   assert.match(workflow, /actions\/upload-artifact@v4/);
+});
+
+test("Node inventory retains missing names and nested packages deterministically", (context) => {
+  const fixture = mkdtempSync(path.join(tmpdir(), "dip-g1a03b-node-inventory-"));
+  context.after(() => rmSync(fixture, { recursive: true, force: true }));
+  const modules = path.join(fixture, "node_modules");
+  const noManifest = path.join(modules, "no-manifest");
+  const unnamed = path.join(modules, "unnamed-package");
+  const parent = path.join(modules, "parent-package");
+  const nested = path.join(parent, "node_modules", "nested-package");
+  mkdirSync(noManifest, { recursive: true });
+  mkdirSync(unnamed, { recursive: true });
+  mkdirSync(nested, { recursive: true });
+  writeFileSync(path.join(unnamed, "package.json"), JSON.stringify({ version: "1.0.0", license: "MIT" }));
+  writeFileSync(path.join(parent, "package.json"), JSON.stringify({ name: "parent-package", version: "2.0.0" }));
+  writeFileSync(path.join(nested, "package.json"), JSON.stringify({ name: "nested-package", version: "3.0.0" }));
+
+  const run = () => spawnSync(process.execPath, [fileURLToPath(nodeCollector), modules], { encoding: "utf8" });
+  const first = run();
+  const second = run();
+  assert.equal(first.status, 0, first.stderr);
+  assert.equal(second.status, 0, second.stderr);
+  assert.equal(first.stdout, second.stdout);
+  const inventory = JSON.parse(first.stdout);
+  assert.deepEqual(inventory.map((item: { path: string }) => item.path), [
+    "node_modules/no-manifest",
+    "node_modules/parent-package",
+    "node_modules/parent-package/node_modules/nested-package",
+    "node_modules/unnamed-package",
+  ]);
+  assert.equal(inventory[0].status, "MISSING_METADATA");
+  assert.deepEqual(inventory[0].missing_fields, ["package.json"]);
+  assert.equal(inventory[0].diagnostic, "MISSING_OR_UNREADABLE_PACKAGE_JSON");
+  const unnamedRecord = inventory.at(-1);
+  assert.equal(unnamedRecord.name, null);
+  assert.equal(unnamedRecord.status, "MISSING_METADATA");
+  assert.deepEqual(unnamedRecord.missing_fields, ["name"]);
+  assert.equal(inventory[2].name, "nested-package");
+  assert.equal(inventory[2].status, "COMPLETE");
+});
+
+test("reconciliation fails closed for incomplete Node metadata", () => {
+  const reconciliation = text("scripts/experiments/verify-structural-grayscale-g1a03b-evidence.py");
+  assert.match(reconciliation, /node_metadata_gaps/);
+  assert.match(reconciliation, /not node_metadata_gaps/);
+  assert.match(reconciliation, /EMPTY_OR_INVALID_NODE_INVENTORY/);
 });
 
 test("pypdf aliases are deduplicated and reachability is not overstated", () => {

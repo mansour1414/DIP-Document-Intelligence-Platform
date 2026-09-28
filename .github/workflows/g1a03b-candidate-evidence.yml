@@ -10,6 +10,7 @@ on:
       - scripts/experiments/build-structural-grayscale-g1a03-candidate.sh
       - scripts/experiments/collect-structural-grayscale-g1a02-evidence.py
       - scripts/experiments/collect-structural-grayscale-g1a03-notices.py
+      - scripts/experiments/collect-node-inventory-g1a03b.mjs
       - scripts/experiments/verify-structural-grayscale-g1a03b-evidence.py
       - scripts/experiments/structural-grayscale-stage3b.requirements.txt
       - docs/evidence/g1a02/g1a02-python-native-inventory.json
