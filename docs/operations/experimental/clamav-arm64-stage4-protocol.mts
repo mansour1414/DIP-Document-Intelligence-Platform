@@ -15,8 +15,8 @@
 // ============================================================================
 import net from "node:net";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
-import { ClamdScanner } from "/app/src/lib/malware/clamd";
-import type { MalwareScanResultCode } from "/app/src/lib/malware/types";
+import { ClamdScanner } from "../../../src/lib/malware/clamd";
+import type { MalwareScanResultCode } from "../../../src/lib/malware/types";
 
 const HOST = process.env.CLAMD_HOST ?? "clamav-stage4";
 const PORT = Number(process.env.CLAMD_PORT ?? 3310);

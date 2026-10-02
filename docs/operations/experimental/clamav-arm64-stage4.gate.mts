@@ -29,10 +29,10 @@
 //      "INSTREAM size limit exceeded. ERROR" response.
 // ============================================================================
 import { createHash } from "node:crypto";
-import { requireCleanUpload } from "/app/src/lib/malware";
-import { MalwareScanError } from "/app/src/lib/malware/types";
-import { ClamdScanner } from "/app/src/lib/malware/clamd";
-import type { MalwareScanner, MalwareScanResultCode } from "/app/src/lib/malware/types";
+import { requireCleanUpload } from "../../../src/lib/malware";
+import { MalwareScanError } from "../../../src/lib/malware/types";
+import { ClamdScanner } from "../../../src/lib/malware/clamd";
+import type { MalwareScanner, MalwareScanResultCode } from "../../../src/lib/malware/types";
 
 const HOST = process.env.CLAMD_HOST ?? "clamav-poc-clamd";
 const PORT = Number(process.env.CLAMD_PORT ?? 3310);
