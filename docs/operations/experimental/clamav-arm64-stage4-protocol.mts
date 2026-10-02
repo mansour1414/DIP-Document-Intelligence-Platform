@@ -29,7 +29,7 @@ const MiB = 1024 * 1024;
 const rows: Array<Record<string, unknown>> = [];
 let failures = 0;
 
-function record(name: string, expected: MalwareScanResultCode, got: string, extra: Record<string, unknown> = {}, ok?: boolean) {
+function record(name: string, expected: MalwareScanResultCode | "clamd ERROR" | "n/a", got: string, extra: Record<string, unknown> = {}, ok?: boolean) {
   const pass = ok ?? got === expected;
   if (!pass) failures++;
   rows.push({ test: name, expected, actual: got, pass, ...extra });
