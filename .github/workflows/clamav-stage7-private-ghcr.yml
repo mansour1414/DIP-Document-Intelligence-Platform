@@ -69,6 +69,7 @@ jobs:
           sha256sum \
             .github/workflows/clamav-stage7-private-ghcr.yml \
             docs/operations/experimental/clamav-arm64-stage4-candidate.Dockerfile \
+            docs/operations/experimental/clamav-arm64-stage4-candidate.Dockerfile.dockerignore \
             docs/operations/experimental/clamav-arm64-stage4-candidate.conf \
             docs/operations/experimental/clamd-freshness-gate.sh \
             docs/operations/experimental/test-clamd-freshness-gate.sh \
