@@ -1,0 +1,11 @@
+# Deny the repository by default. The explicit exceptions below are the complete
+# local input boundary for the Stage 7 candidate image build.
+**
+
+!docs/
+!docs/operations/
+!docs/operations/experimental/
+!docs/operations/experimental/clamav-arm64-stage4-candidate.Dockerfile
+!docs/operations/experimental/clamav-arm64-stage4-candidate.Dockerfile.dockerignore
+!docs/operations/experimental/clamav-arm64-stage4-candidate.conf
+!docs/operations/experimental/clamd-freshness-gate.sh
