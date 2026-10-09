@@ -69,7 +69,16 @@ for f in "${REQUIRED[@]}"; do
   IFS=: read -r magic build_time _ <<<"$header"
   [[ "$magic" == "ClamAV-VDB" && -n "$build_time" ]] || \
     fail "signature-database-invalid" "$p does not contain a valid ClamAV CVD/CLD header"
-  build_epoch=$(date -u -d "$build_time" +%s 2>/dev/null) || \
+  # ClamAV VDB headers encode the clock portion as HH-MM rather than the
+  # HH:MM form accepted by GNU date. Normalize only that documented field;
+  # reject any other shape instead of letting date guess.
+  if [[ "$build_time" =~ ^([0-9]{2}[[:space:]][A-Za-z]{3}[[:space:]][0-9]{4}[[:space:]][0-9]{2})-([0-9]{2}[[:space:]][+-][0-9]{4})$ ]]; then
+    normalized_build_time="${BASH_REMATCH[1]}:${BASH_REMATCH[2]}"
+  else
+    fail "signature-database-invalid-build-time" \
+      "$p has an unparseable database build time: $build_time"
+  fi
+  build_epoch=$(date -u -d "$normalized_build_time" +%s 2>/dev/null) || \
     fail "signature-database-invalid-build-time" \
       "$p has an unparseable database build time: $build_time"
   BUILD_EPOCH["$f"]="$build_epoch"
