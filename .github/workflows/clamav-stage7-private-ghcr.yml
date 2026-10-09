@@ -82,6 +82,7 @@ jobs:
             docs/operations/experimental/collect-clamav-stage6-evidence.sh \
             scripts/experiments/analyze-clamav-stage6-closure.mjs \
             scripts/experiments/generate-clamav-stage7-fixtures.py \
+            scripts/experiments/verify-ghcr-package-metadata.mjs \
             src/lib/malware/clamd.ts \
             src/lib/malware/index.ts \
             src/lib/malware/types.ts \
@@ -195,20 +196,12 @@ jobs:
       - name: Verify package remains private and linked to this repository
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_POSTCHECK_MAX_ATTEMPTS: "12"
+          GHCR_POSTCHECK_RETRY_SECONDS: "5"
         shell: bash
         run: |
           set -euo pipefail
-          package_json=""
-          for attempt in $(seq 1 12); do
-            if package_json="$(gh api /users/mansour1414/packages/container/dip-clamav 2>/dev/null)"; then
-              break
-            fi
-            sleep 5
-          done
-          test -n "$package_json"
-          test "$(jq -r '.visibility' <<<"$package_json")" = private
-          test "$(jq -r '.repository.full_name // ""' <<<"$package_json")" = "$EXPECTED_REPOSITORY"
-          printf '%s\n' "$package_json" > "$EVIDENCE_DIR/package-post-publish.json"
+          node scripts/experiments/verify-ghcr-package-metadata.mjs
 
       - name: Pull only by immutable registry digest and verify identity
         shell: bash
