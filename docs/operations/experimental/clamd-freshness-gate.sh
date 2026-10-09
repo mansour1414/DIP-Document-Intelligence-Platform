@@ -47,6 +47,8 @@ fail() {
 # mandatory: accepting a fresh daily.* without main.* would pass freshness while
 # silently omitting the base signatures.
 REQUIRED=()
+declare -A BUILD_EPOCH=()
+declare -A BUILD_TIME=()
 for base in daily main; do
   found=""
   for ext in cvd cld; do
@@ -63,31 +65,51 @@ for f in "${REQUIRED[@]}"; do
   p="$DBDIR/$f"
   [[ -s "$p" ]] || fail "signature-database-empty" "$p is zero-length (a failed freshclam run leaves this behind)"
   [[ -r "$p" ]] || fail "signature-database-unreadable" "$p is not readable by uid $(id -u); check volume ownership"
-  header=$(head -c 11 "$p" 2>/dev/null || true)
-  [[ "$header" == "ClamAV-VDB:" ]] || fail "signature-database-invalid" \
-    "$p does not contain a valid ClamAV CVD/CLD header"
+  header=$(head -c 512 "$p" 2>/dev/null || true)
+  IFS=: read -r magic build_time _ <<<"$header"
+  [[ "$magic" == "ClamAV-VDB" && -n "$build_time" ]] || \
+    fail "signature-database-invalid" "$p does not contain a valid ClamAV CVD/CLD header"
+  build_epoch=$(date -u -d "$build_time" +%s 2>/dev/null) || \
+    fail "signature-database-invalid-build-time" \
+      "$p has an unparseable database build time: $build_time"
+  BUILD_EPOCH["$f"]="$build_epoch"
+  BUILD_TIME["$f"]="$build_time"
 done
 
-# Freshness is determined by daily.*, not by the newest arbitrary file. main.*
-# changes infrequently and cannot substitute for an outdated daily database.
+# Freshness is determined by daily.*, not by the newest arbitrary file. Check
+# both the signed database header's build time and the filesystem mtime. A copy
+# or restore can refresh mtime without refreshing signatures; accepting that
+# would turn an old database into an apparently fresh one.
 daily_name="${REQUIRED[0]}"
 daily_mtime=$(stat -c %Y "$DBDIR/$daily_name" 2>/dev/null) || \
   fail "signature-database-unstat-able" "cannot stat $DBDIR/$daily_name"
-age_hours=$(( ( $(date +%s) - daily_mtime ) / 3600 ))
+daily_build_epoch="${BUILD_EPOCH[$daily_name]}"
+daily_build_time="${BUILD_TIME[$daily_name]}"
+now_epoch=$(date +%s)
+mtime_age_hours=$(( ( now_epoch - daily_mtime ) / 3600 ))
+signature_age_hours=$(( ( now_epoch - daily_build_epoch ) / 3600 ))
 
-# A future mtime means a skewed clock or a bad restore; treat it as untrusted
-# rather than as infinitely fresh.
-if (( daily_mtime > $(date +%s) + 300 )); then
+# A future timestamp means a skewed clock or a bad restore; treat it as
+# untrusted rather than as infinitely fresh.
+if (( daily_build_epoch > now_epoch + 300 )); then
+  fail "signature-database-build-time-in-future" \
+    "$daily_name build time $daily_build_time is ahead of the system clock"
+fi
+if (( daily_mtime > now_epoch + 300 )); then
   fail "signature-database-timestamp-in-future" \
     "$daily_name has mtime $(date -d "@$daily_mtime" -u +%Y-%m-%dT%H:%M:%SZ), ahead of the system clock"
 fi
 
-if (( age_hours > MAX_AGE_HOURS )); then
+if (( signature_age_hours > MAX_AGE_HOURS )); then
+  fail "signature-database-signatures-stale" \
+    "daily signature database ($daily_name) was built ${signature_age_hours}h ago, limit is ${MAX_AGE_HOURS}h"
+fi
+if (( mtime_age_hours > MAX_AGE_HOURS )); then
   fail "signature-database-stale" \
-    "daily signature file ($daily_name) is ${age_hours}h old, limit is ${MAX_AGE_HOURS}h; freshclam has not succeeded recently"
+    "daily signature file ($daily_name) has an mtime ${mtime_age_hours}h old, limit is ${MAX_AGE_HOURS}h"
 fi
 
-echo "FRESHNESS_GATE=PASS freshness_file=$daily_name age_hours=$age_hours limit_hours=$MAX_AGE_HOURS files=${REQUIRED[*]}"
+echo "FRESHNESS_GATE=PASS freshness_file=$daily_name signature_age_hours=$signature_age_hours mtime_age_hours=$mtime_age_hours limit_hours=$MAX_AGE_HOURS files=${REQUIRED[*]}"
 
 if [[ "${1:-}" == "--exec" ]]; then
   shift

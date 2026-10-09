@@ -63,6 +63,30 @@ run_case() {
   fi
 }
 
+rewrite_database_build_time() {
+  local path="$1" build_time="$2"
+  python3 - "$path" "$build_time" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+build_time = sys.argv[2]
+with path.open("r+b") as database:
+    header = database.read(512)
+    fields = header.decode("ascii").split(":")
+    if fields[0] != "ClamAV-VDB" or len(fields) < 3:
+        raise SystemExit(f"invalid ClamAV database header: {path}")
+    if len(build_time.encode("ascii")) != len(fields[1].encode("ascii")):
+        raise SystemExit(f"replacement build time length mismatch: {path}")
+    fields[1] = build_time
+    replacement = ":".join(fields).encode("ascii")
+    if len(replacement) != 512:
+        raise SystemExit(f"rewritten header length mismatch: {path}")
+    database.seek(0)
+    database.write(replacement)
+PY
+}
+
 for representation in "${representations[@]}"; do
   main_name="main.$representation"
   daily_name="daily.$representation"
@@ -78,8 +102,12 @@ for representation in "${representations[@]}"; do
   printf 'not-a-clamav-db' >"$fixture_root/$representation/invalid-main/$main_name"
   printf 'not-a-clamav-db' >"$fixture_root/$representation/invalid-daily/$daily_name"
   : >"$fixture_root/$representation/zero-main/$main_name"
-  touch -d '5 days ago' "$fixture_root/$representation/stale-daily/$daily_name"
-  touch -d '3 days' "$fixture_root/$representation/future-daily/$daily_name"
+  rewrite_database_build_time \
+    "$fixture_root/$representation/stale-daily/$daily_name" \
+    "$(date -u -d '5 days ago' '+%d %b %Y %H-%M +0000')"
+  rewrite_database_build_time \
+    "$fixture_root/$representation/future-daily/$daily_name" \
+    "$(date -u -d '3 days' '+%d %b %Y %H-%M +0000')"
   chmod 000 "$fixture_root/$representation/unreadable-daily/$daily_name"
 
   representation_passes=0
