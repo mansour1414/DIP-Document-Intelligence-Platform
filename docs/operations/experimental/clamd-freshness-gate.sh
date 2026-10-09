@@ -15,13 +15,13 @@
 #   receives SCANNER_UNAVAILABLE and job intake stays closed.
 #
 # MAX-AGE RATIONALE (read before changing CLAMAV_MAX_DB_AGE_HOURS)
-#   clamav-daily.cvd is published Monday, Tuesday, Wednesday, Friday and Saturday.
+#   clamav daily.* is published Monday, Tuesday, Wednesday, Friday and Saturday.
 #   It is NOT published on Thursday or Sunday. The largest natural gap between
 #   published daily signatures is therefore 2 days (Wed->Fri, Sat->Mon).
 #   The default below is 72h, which leaves one full day of margin for exactly one
 #   missed or failed freshclam update before the gate trips. Setting this to 24h
 #   or 48h would fail-closed every Thursday and Sunday — an outage created by the
-#   control itself. main.cvd is updated far less often and is deliberately not
+#   control itself. main.* is updated far less often and is deliberately not
 #   used as the freshness signal.
 #
 # USAGE
@@ -40,6 +40,14 @@ fail() {
 }
 
 [[ -d "$DBDIR" ]] || fail "db-dir-missing" "$DBDIR does not exist or is not a directory"
+[[ "$MAX_AGE_HOURS" =~ ^[0-9]{1,4}$ ]] || \
+  fail "freshness-policy-invalid" "CLAMAV_MAX_DB_AGE_HOURS must be an integer from 1 through 8760"
+MAX_AGE_HOURS_VALUE=$((10#$MAX_AGE_HOURS))
+(( MAX_AGE_HOURS_VALUE >= 1 && MAX_AGE_HOURS_VALUE <= 8760 )) || \
+  fail "freshness-policy-invalid" "CLAMAV_MAX_DB_AGE_HOURS must be an integer from 1 through 8760"
+MAX_AGE_SECONDS=$((MAX_AGE_HOURS_VALUE * 3600))
+FUTURE_TOLERANCE_SECONDS=300
+now_epoch=$(date -u +%s) || fail "system-clock-unavailable"
 
 # The database files clamd must be able to load a meaningful rule set from.
 # main.* is the base database; daily.* carries the frequently-updated rules and
@@ -48,14 +56,17 @@ fail() {
 # silently omitting the base signatures.
 REQUIRED=()
 declare -A BUILD_EPOCH=()
-declare -A BUILD_TIME=()
+declare -A FILE_MTIME=()
 for base in daily main; do
-  found=""
+  matches=()
   for ext in cvd cld; do
-    [[ -e "$DBDIR/$base.$ext" ]] && { found="$base.$ext"; break; }
+    [[ -e "$DBDIR/$base.$ext" ]] && matches+=("$base.$ext")
   done
-  [[ -n "$found" ]] || fail "signature-database-family-missing" \
+  (( ${#matches[@]} > 0 )) || fail "signature-database-family-missing" \
     "required $base.cvd/.cld is missing from $DBDIR"
+  (( ${#matches[@]} == 1 )) || fail "signature-database-family-ambiguous" \
+    "required exactly one $base.cvd/.cld in $DBDIR; found ${#matches[@]}"
+  found="${matches[0]}"
   REQUIRED+=("$found")
 done
 
@@ -81,8 +92,23 @@ for f in "${REQUIRED[@]}"; do
   build_epoch=$(date -u -d "$normalized_build_time" +%s 2>/dev/null) || \
     fail "signature-database-invalid-build-time" \
       "$p has an unparseable database build time: $build_time"
+  [[ "$build_epoch" =~ ^-?[0-9]+$ ]] || \
+    fail "signature-database-invalid-build-time" \
+      "$p produced a non-numeric database build time"
+  if (( build_epoch > now_epoch + FUTURE_TOLERANCE_SECONDS )); then
+    fail "signature-database-build-time-in-future" \
+      "$f build time $build_time is ahead of the system clock"
+  fi
+  file_mtime=$(stat -c %Y "$p" 2>/dev/null) || \
+    fail "signature-database-unstat-able" "cannot stat $p"
+  [[ "$file_mtime" =~ ^-?[0-9]+$ ]] || \
+    fail "signature-database-unstat-able" "$p produced a non-numeric mtime"
+  if (( file_mtime > now_epoch + FUTURE_TOLERANCE_SECONDS )); then
+    fail "signature-database-timestamp-in-future" \
+      "$f has mtime $(date -d "@$file_mtime" -u +%Y-%m-%dT%H:%M:%SZ), ahead of the system clock"
+  fi
   BUILD_EPOCH["$f"]="$build_epoch"
-  BUILD_TIME["$f"]="$build_time"
+  FILE_MTIME["$f"]="$file_mtime"
 done
 
 # Freshness is determined by daily.*, not by the newest arbitrary file. Check
@@ -90,35 +116,25 @@ done
 # or restore can refresh mtime without refreshing signatures; accepting that
 # would turn an old database into an apparently fresh one.
 daily_name="${REQUIRED[0]}"
-daily_mtime=$(stat -c %Y "$DBDIR/$daily_name" 2>/dev/null) || \
-  fail "signature-database-unstat-able" "cannot stat $DBDIR/$daily_name"
+daily_mtime="${FILE_MTIME[$daily_name]}"
 daily_build_epoch="${BUILD_EPOCH[$daily_name]}"
-daily_build_time="${BUILD_TIME[$daily_name]}"
-now_epoch=$(date +%s)
-mtime_age_hours=$(( ( now_epoch - daily_mtime ) / 3600 ))
-signature_age_hours=$(( ( now_epoch - daily_build_epoch ) / 3600 ))
+mtime_age_seconds=$((now_epoch - daily_mtime))
+signature_age_seconds=$((now_epoch - daily_build_epoch))
+# Timestamps up to five minutes ahead are tolerated for host clock skew and
+# reported as age zero; anything further ahead was already refused above.
+mtime_age_hours=$((mtime_age_seconds > 0 ? mtime_age_seconds / 3600 : 0))
+signature_age_hours=$((signature_age_seconds > 0 ? signature_age_seconds / 3600 : 0))
 
-# A future timestamp means a skewed clock or a bad restore; treat it as
-# untrusted rather than as infinitely fresh.
-if (( daily_build_epoch > now_epoch + 300 )); then
-  fail "signature-database-build-time-in-future" \
-    "$daily_name build time $daily_build_time is ahead of the system clock"
-fi
-if (( daily_mtime > now_epoch + 300 )); then
-  fail "signature-database-timestamp-in-future" \
-    "$daily_name has mtime $(date -d "@$daily_mtime" -u +%Y-%m-%dT%H:%M:%SZ), ahead of the system clock"
-fi
-
-if (( signature_age_hours > MAX_AGE_HOURS )); then
+if (( signature_age_seconds > MAX_AGE_SECONDS )); then
   fail "signature-database-signatures-stale" \
-    "daily signature database ($daily_name) was built ${signature_age_hours}h ago, limit is ${MAX_AGE_HOURS}h"
+    "daily signature database ($daily_name) was built ${signature_age_hours}h ago, limit is ${MAX_AGE_HOURS_VALUE}h"
 fi
-if (( mtime_age_hours > MAX_AGE_HOURS )); then
+if (( mtime_age_seconds > MAX_AGE_SECONDS )); then
   fail "signature-database-stale" \
-    "daily signature file ($daily_name) has an mtime ${mtime_age_hours}h old, limit is ${MAX_AGE_HOURS}h"
+    "daily signature file ($daily_name) has an mtime ${mtime_age_hours}h old, limit is ${MAX_AGE_HOURS_VALUE}h"
 fi
 
-echo "FRESHNESS_GATE=PASS freshness_file=$daily_name signature_age_hours=$signature_age_hours mtime_age_hours=$mtime_age_hours limit_hours=$MAX_AGE_HOURS files=${REQUIRED[*]}"
+echo "FRESHNESS_GATE=PASS freshness_file=$daily_name signature_age_hours=$signature_age_hours mtime_age_hours=$mtime_age_hours limit_hours=$MAX_AGE_HOURS_VALUE files=${REQUIRED[*]}"
 
 if [[ "${1:-}" == "--exec" ]]; then
   shift

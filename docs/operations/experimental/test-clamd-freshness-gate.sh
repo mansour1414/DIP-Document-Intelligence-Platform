@@ -39,8 +39,8 @@ mkdir -p "$fixture_root" "$(dirname "$evidence_file")"
 
 cases=(complete missing-main missing-daily invalid-main invalid-daily zero-main stale-daily future-daily unreadable-daily)
 # The freshness gate's contract is extension-independent: it validates the
-# ClamAV-VDB header, readability, size, and daily mtime. Preserve the selected
-# source bytes while exercising that same contract under each supported name.
+# ClamAV-VDB build timestamp, readability, size, and filesystem mtime. Preserve
+# the selected source bytes while exercising that contract under each name.
 representations=(cvd cld)
 total_passes=0
 total_failures=0
@@ -65,6 +65,9 @@ run_case() {
 
 rewrite_database_build_time() {
   local path="$1" build_time="$2"
+  # Parser-level fixture only: changing the signed VDB header can invalidate the
+  # database signature, so mutated stale/future files are never used to start
+  # clamd. Real, unmodified FreshClam databases cover the clamd-loadable path.
   python3 - "$path" "$build_time" <<'PY'
 import pathlib
 import sys
