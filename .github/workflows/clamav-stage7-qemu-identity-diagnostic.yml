@@ -1,0 +1,85 @@
+name: Temporary Stage 7 QEMU PID1 Identity Diagnostic
+
+on:
+  push:
+    branches:
+      - codex/clamav-stage7-qemu-runtime-identity-fix
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  identity:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Authenticate for pull-only access
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Capture sanitized QEMU runtime identity
+        env:
+          IMAGE: ghcr.io/mansour1414/dip-clamav@sha256:f3c66bf7049f57a7a187ca43fa08276316f9c39fbf2cfeda88477c7a6b96af91
+          CONTAINER: clamav-stage7-qemu-identity
+          NETWORK: dip-stage7-qemu-identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          db_dir="$RUNNER_TEMP/clamav-stage7-qemu-db"
+          mkdir -p "$db_dir"
+          chmod 0777 "$db_dir"
+
+          docker pull --platform linux/arm64 "$IMAGE"
+          docker run --rm --platform linux/arm64 \
+            --network bridge \
+            -v "$db_dir:/var/lib/clamav" \
+            --entrypoint /usr/bin/freshclam \
+            "$IMAGE" --datadir=/var/lib/clamav
+
+          docker network create "$NETWORK"
+          docker run -d --name "$CONTAINER" \
+            --platform linux/arm64 \
+            --network "$NETWORK" \
+            --read-only \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            --memory 3g --cpus 2 --pids-limit 256 \
+            --tmpfs /tmp:rw,noexec,nosuid,size=1g,uid=101,gid=102 \
+            --tmpfs /run/clamav:rw,noexec,nosuid,size=64m,uid=101,gid=102 \
+            --tmpfs /var/log/clamav:rw,noexec,nosuid,size=64m,uid=101,gid=102 \
+            -v "$db_dir:/var/lib/clamav:ro" \
+            "$IMAGE"
+
+          for attempt in $(seq 1 80); do
+            health="$(docker inspect "$CONTAINER" --format '{{.State.Health.Status}}')"
+            [[ "$health" == healthy ]] && break
+            [[ "$health" == unhealthy ]] && { docker logs "$CONTAINER"; exit 5; }
+            sleep 3
+          done
+          test "$(docker inspect "$CONTAINER" --format '{{.State.Health.Status}}')" = healthy
+
+          docker inspect "$CONTAINER" --format 'PID1_IDENTITY docker_path={{json .Path}} docker_args={{json .Args}}'
+          docker image inspect "$IMAGE" --format 'PID1_IDENTITY image_architecture={{json .Architecture}} image_entrypoint={{json .Config.Entrypoint}} image_cmd={{json .Config.Cmd}}'
+          docker exec "$CONTAINER" cat /proc/1/cmdline > "$RUNNER_TEMP/pid1.cmdline.bin"
+          node -e 'const fs=require("fs"); const a=fs.readFileSync(process.argv[1]).toString("utf8").split("\0").filter(Boolean); console.log("PID1_IDENTITY proc_cmdline="+JSON.stringify(a));' "$RUNNER_TEMP/pid1.cmdline.bin"
+          printf 'PID1_IDENTITY proc_exe='; docker exec "$CONTAINER" readlink /proc/1/exe
+          printf 'PID1_IDENTITY proc_comm='; docker exec "$CONTAINER" cat /proc/1/comm
+          docker exec "$CONTAINER" grep -E '^(Name|State|Pid|PPid|TracerPid|NoNewPrivs|Seccomp):' /proc/1/status \
+            | sed 's/^/PID1_STATUS /'
+
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: |
+          docker rm -f clamav-stage7-qemu-identity 2>/dev/null || true
+          docker network rm dip-stage7-qemu-identity 2>/dev/null || true
