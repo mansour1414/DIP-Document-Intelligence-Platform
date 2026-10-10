@@ -91,6 +91,7 @@ jobs:
             scripts/experiments/analyze-clamav-stage6-closure.mjs \
             scripts/experiments/generate-clamav-stage7-fixtures.py \
             scripts/experiments/verify-ghcr-package-metadata.mjs \
+            scripts/experiments/verify-clamav-runtime-isolation.mjs \
             src/lib/malware/clamd.ts \
             src/lib/malware/index.ts \
             src/lib/malware/types.ts \
@@ -283,16 +284,14 @@ jobs:
           docker logs clamav-stage7 > "$EVIDENCE_DIR/clamd-runtime.log" 2>&1
 
       - name: Assert non-root and runtime isolation
+        env:
+          CLAMAV_CONTAINER_NAME: clamav-stage7
+          CLAMAV_IMAGE: ${{ env.IMAGE_BY_DIGEST }}
+          CLAMAV_RUNTIME_LOG: ${{ env.EVIDENCE_DIR }}/clamd-runtime.log
         shell: bash
         run: |
           set -euo pipefail
-          test "$(docker image inspect "$IMAGE_BY_DIGEST" --format '{{.Config.User}}')" = clamav
-          test "$(docker inspect clamav-stage7 --format '{{.HostConfig.ReadonlyRootfs}}')" = true
-          docker inspect clamav-stage7 --format '{{json .HostConfig.CapDrop}}' | jq -e 'index("ALL") != null'
-          docker inspect clamav-stage7 --format '{{json .HostConfig.SecurityOpt}}' | jq -e 'map(select(startswith("no-new-privileges"))) | length == 1'
-          test "$(docker inspect clamav-stage7 --format '{{len .HostConfig.PortBindings}}')" = 0
-          test "$(docker exec clamav-stage7 id -u)" = 101
-          grep -Fq 'AlertExceedsMax: enabled' "$EVIDENCE_DIR/clamd-runtime.log"
+          node scripts/experiments/verify-clamav-runtime-isolation.mjs
 
       - name: Build the unchanged ARM64 worker test harness
         shell: bash
