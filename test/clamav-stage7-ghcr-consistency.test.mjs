@@ -1,41 +1,61 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
 import {
   EXIT_CODES,
-  GhcrPostcheckError,
-  verifyPackageMetadata,
+  GhcrVerificationError,
+  verifyGhcrPackageTrust,
 } from "../scripts/experiments/verify-ghcr-package-metadata.mjs";
 
 const EXPECTED_REPOSITORY = "mansour1414/DIP-Document-Intelligence-Platform";
+const EXPECTED_OWNER = "mansour1414";
+const EXPECTED_PACKAGE = "dip-clamav";
+const DIGEST = `sha256:${"a".repeat(64)}`;
+const EXPECTED_SOURCE = `https://github.com/${EXPECTED_REPOSITORY}`;
 
 function packageResponse(options = {}) {
   const visibility = options.visibility ?? "private";
   const repository = Object.hasOwn(options, "repository")
     ? options.repository
     : EXPECTED_REPOSITORY;
-  const payload = { visibility };
-  if (repository !== undefined) payload.repository = { full_name: repository };
+  const payload = {
+    id: 123,
+    name: EXPECTED_PACKAGE,
+    package_type: "container",
+    visibility,
+    owner: { login: EXPECTED_OWNER },
+    html_url: "https://github.com/users/mansour1414/packages/container/package/dip-clamav",
+    version_count: 3,
+  };
+  if (repository !== undefined) payload.repository = repository === null ? null : { full_name: repository };
   return { ok: true, body: JSON.stringify(payload) };
+}
+
+function probeResponse(overrides = {}) {
+  return {
+    ok: true,
+    accessVerified: true,
+    registryDigest: DIGEST,
+    arm64ManifestDigest: `sha256:${"b".repeat(64)}`,
+    labels: {
+      "org.opencontainers.image.source": EXPECTED_SOURCE,
+      "org.opencontainers.image.revision": "revision",
+      "org.opencontainers.image.version": "run-tag",
+      "io.dip.workflow-run-id": "run-id",
+    },
+    ...overrides,
+  };
 }
 
 function sequenceFetcher(sequence) {
   let calls = 0;
   return {
-    fetchPackage: async () => {
-      const item = sequence[Math.min(calls, sequence.length - 1)];
-      calls += 1;
-      return item;
-    },
+    fetchPackage: async () => sequence[Math.min(calls++, sequence.length - 1)],
     calls: () => calls,
   };
-}
-
-function silentLogger() {
-  return { log() {}, warn() {}, error() {} };
 }
 
 async function withEvidence(run) {
@@ -47,130 +67,107 @@ async function withEvidence(run) {
   }
 }
 
+function verify(evidenceDir, { fetchPackage, probeImage = async () => probeResponse(), attempts = 3 }) {
+  return verifyGhcrPackageTrust({
+    phase: "post-publish",
+    expectedRepository: EXPECTED_REPOSITORY,
+    expectedOwner: EXPECTED_OWNER,
+    expectedPackage: EXPECTED_PACKAGE,
+    imageName: `ghcr.io/${EXPECTED_OWNER}/${EXPECTED_PACKAGE}`,
+    digest: DIGEST,
+    expectedSource: EXPECTED_SOURCE,
+    expectedRevision: "revision",
+    expectedRunId: "run-id",
+    expectedVersion: "run-tag",
+    evidenceDir,
+    maxAttempts: attempts,
+    retryDelayMs: 0,
+    fetchPackage,
+    probeImage,
+    sleep: async () => {},
+    now: () => "2026-10-10T00:00:00.000Z",
+    logger: { log() {}, warn() {}, error() {} },
+  });
+}
+
 async function expectFailure(promise, exitCode, classification) {
   await assert.rejects(promise, (error) => {
-    assert.ok(error instanceof GhcrPostcheckError);
+    assert.ok(error instanceof GhcrVerificationError);
     assert.equal(error.exitCode, exitCode);
     assert.equal(error.classification, classification);
     return true;
   });
 }
 
-function runVerification(evidenceDir, fetchPackage, maxAttempts) {
-  return verifyPackageMetadata({
-    expectedRepository: EXPECTED_REPOSITORY,
-    evidenceDir,
-    fetchPackage,
-    maxAttempts,
-    retryDelayMs: 0,
-    sleep: async () => {},
-    now: () => "2026-10-09T00:00:00.000Z",
-    logger: silentLogger(),
-  });
-}
-
-test("retries unavailable API responses until private correctly linked metadata appears", async () => {
+test("post-publish retries transient API failures and then passes", async () => {
   await withEvidence(async (evidenceDir) => {
     const sequence = sequenceFetcher([
-      { ok: false, retryable: true, reason: "not_yet_visible" },
+      { ok: false, retryable: true, reason: "not_visible_to_token" },
       { ok: false, retryable: true, reason: "server_error" },
       packageResponse(),
     ]);
-    const result = await runVerification(evidenceDir, sequence.fetchPackage, 3);
-    assert.equal(result.attempts, 3);
+    const result = await verify(evidenceDir, { fetchPackage: sequence.fetchPackage });
     assert.equal(sequence.calls(), 3);
+    assert.equal(result.repositoryMetadata, "expected");
   });
 });
 
-test("waits for an empty repository link and then passes", async () => {
-  await withEvidence(async (evidenceDir) => {
-    const sequence = sequenceFetcher([
-      packageResponse({ repository: undefined }),
-      packageResponse(),
-    ]);
-    const result = await runVerification(evidenceDir, sequence.fetchPackage, 2);
-    assert.equal(result.attempts, 2);
-    const saved = JSON.parse(await readFile(join(evidenceDir, "package-post-publish.json"), "utf8"));
-    assert.equal(saved.repository.full_name, EXPECTED_REPOSITORY);
-  });
-});
-
-test("times out when a private package link remains pending", async () => {
-  await withEvidence(async (evidenceDir) => {
-    const sequence = sequenceFetcher([packageResponse({ repository: undefined })]);
-    await expectFailure(
-      runVerification(evidenceDir, sequence.fetchPackage, 3),
-      EXIT_CODES.consistencyTimeout,
-      "metadata_consistency_timeout",
-    );
-    assert.equal(sequence.calls(), 3);
-    const diagnostic = JSON.parse(
-      await readFile(join(evidenceDir, "package-post-publish-diagnostic.json"), "utf8"),
-    );
-    assert.equal(diagnostic.failureClassification, "metadata_consistency_timeout");
-    assert.equal(diagnostic.finalObservedRepositoryLink, "pending");
-  });
-});
-
-for (const visibility of ["public", "internal"]) {
-  test(`refuses ${visibility} visibility immediately`, async () => {
+for (const repository of [undefined, null, ""]) {
+  test(`post-publish resolves repository metadata ${String(repository)} with independent signals`, async () => {
     await withEvidence(async (evidenceDir) => {
-      const sequence = sequenceFetcher([packageResponse({ visibility })]);
-      await expectFailure(
-        runVerification(evidenceDir, sequence.fetchPackage, 12),
-        EXIT_CODES.unsafeVisibility,
-        "unsafe_visibility",
-      );
-      assert.equal(sequence.calls(), 1);
+      const result = await verify(evidenceDir, {
+        fetchPackage: async () => packageResponse({ repository }),
+      });
+      assert.notEqual(result.repositoryMetadata, "expected");
+      assert.equal(result.probe.accessVerified, true);
     });
   });
 }
 
-test("refuses an explicit wrong repository immediately", async () => {
+for (const visibility of ["public", "internal"]) {
+  test(`post-publish refuses ${visibility} immediately`, async () => {
+    await withEvidence(async (evidenceDir) => {
+      await expectFailure(
+        verify(evidenceDir, { fetchPackage: async () => packageResponse({ visibility }) }),
+        EXIT_CODES.unsafeVisibility,
+        "unsafe_visibility",
+      );
+    });
+  });
+}
+
+test("post-publish refuses explicit wrong repository", async () => {
   await withEvidence(async (evidenceDir) => {
-    const sequence = sequenceFetcher([
-      packageResponse({ repository: "mansour1414/not-dip" }),
-    ]);
     await expectFailure(
-      runVerification(evidenceDir, sequence.fetchPackage, 12),
+      verify(evidenceDir, {
+        fetchPackage: async () => packageResponse({ repository: "mansour1414/not-dip" }),
+      }),
       EXIT_CODES.wrongRepository,
       "wrong_repository",
     );
-    assert.equal(sequence.calls(), 1);
   });
 });
 
-test("passes immediately for a private correctly linked package", async () => {
+test("post-publish fails closed on malformed API JSON", async () => {
   await withEvidence(async (evidenceDir) => {
-    const sequence = sequenceFetcher([packageResponse()]);
-    const result = await runVerification(evidenceDir, sequence.fetchPackage, 12);
-    assert.equal(result.attempts, 1);
-    assert.equal(sequence.calls(), 1);
-  });
-});
-
-test("malformed API JSON remains fail-closed after bounded retries", async () => {
-  await withEvidence(async (evidenceDir) => {
-    const sequence = sequenceFetcher([{ ok: true, body: "not-json" }]);
     await expectFailure(
-      runVerification(evidenceDir, sequence.fetchPackage, 2),
-      EXIT_CODES.consistencyTimeout,
-      "malformed_metadata_timeout",
+      verify(evidenceDir, { fetchPackage: async () => ({ ok: true, body: "not-json" }) }),
+      EXIT_CODES.malformedMetadata,
+      "malformed_package_metadata",
     );
-    assert.equal(sequence.calls(), 2);
   });
 });
 
-test("terminal API authorization failures fail immediately", async () => {
+test("post-publish refuses wrong source provenance", async () => {
   await withEvidence(async (evidenceDir) => {
-    const sequence = sequenceFetcher([
-      { ok: false, retryable: false, reason: "http_403" },
-    ]);
+    const probeImage = async () => probeResponse({
+      labels: { ...probeResponse().labels, "org.opencontainers.image.source": "https://github.com/other/repo" },
+    });
+    const expectedClassification = "provenance_org_opencontainers_image_source_mismatch";
     await expectFailure(
-      runVerification(evidenceDir, sequence.fetchPackage, 12),
-      EXIT_CODES.apiFailure,
-      "api_failure",
+      verify(evidenceDir, { fetchPackage: async () => packageResponse(), probeImage }),
+      EXIT_CODES.provenanceMismatch,
+      expectedClassification,
     );
-    assert.equal(sequence.calls(), 1);
   });
 });

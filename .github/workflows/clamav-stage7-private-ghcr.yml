@@ -28,6 +28,14 @@ jobs:
       CANDIDATE_TAG: stage7-arm64-candidate
       RUN_TAG: stage7-arm64-candidate-run-${{ github.run_id }}
       EXPECTED_REPOSITORY: mansour1414/DIP-Document-Intelligence-Platform
+      EXPECTED_PACKAGE_OWNER: mansour1414
+      EXPECTED_PACKAGE_NAME: dip-clamav
+      EXPECTED_PACKAGE_TYPE: container
+      EXPECTED_IMAGE_SOURCE: https://github.com/mansour1414/DIP-Document-Intelligence-Platform
+      PREFLIGHT_REGISTRY_DIGEST: sha256:a3927e07032824899944ea42d42848482a917a1cb9326a229b55eddff9329b7a
+      PREFLIGHT_REVISION: 5eae943518c4d504dc30b323c040b325a216815e
+      PREFLIGHT_RUN_ID: "37934221552"
+      PREFLIGHT_RUN_TAG: stage7-arm64-candidate-run-37934221552
       EVIDENCE_DIR: ${{ github.workspace }}/output/clamav-stage7
       SYFT_VERSION: 1.52.0
       SYFT_LINUX_AMD64_SHA256: caeedb81fb0491615f1ebd1761e4145d41ee86dd2cc7bf80669f9f5ad9d6133d
@@ -104,32 +112,21 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Refuse an existing public or incorrectly linked package
+      - name: Verify the existing private package with independent trust signals
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_VERIFY_PHASE: preflight
+          GHCR_VERIFY_DIGEST: ${{ env.PREFLIGHT_REGISTRY_DIGEST }}
+          GHCR_EXPECTED_SOURCE: ${{ env.EXPECTED_IMAGE_SOURCE }}
+          GHCR_EXPECTED_REVISION: ${{ env.PREFLIGHT_REVISION }}
+          GHCR_EXPECTED_RUN_ID: ${{ env.PREFLIGHT_RUN_ID }}
+          GHCR_EXPECTED_VERSION: ${{ env.PREFLIGHT_RUN_TAG }}
+          GHCR_VERIFY_MAX_ATTEMPTS: "12"
+          GHCR_VERIFY_RETRY_SECONDS: "5"
         shell: bash
         run: |
           set -euo pipefail
-          error_file="$RUNNER_TEMP/ghcr-preflight-error.txt"
-          if package_json="$(gh api /users/mansour1414/packages/container/dip-clamav 2>"$error_file")"; then
-            visibility="$(jq -r '.visibility' <<<"$package_json")"
-            repository="$(jq -r '.repository.full_name // ""' <<<"$package_json")"
-            test "$visibility" = private || {
-              echo "Refusing to publish: existing package visibility is $visibility" >&2
-              exit 3
-            }
-            test "$repository" = "$EXPECTED_REPOSITORY" || {
-              echo "Refusing to publish: existing package is linked to '$repository'" >&2
-              exit 3
-            }
-            printf '%s\n' "$package_json" > "$EVIDENCE_DIR/package-preflight.json"
-          elif grep -q 'HTTP 404' "$error_file"; then
-            printf '%s\n' '{"status":"absent-before-first-publish","expected_visibility":"private"}' \
-              > "$EVIDENCE_DIR/package-preflight.json"
-          else
-            cat "$error_file" >&2
-            exit 3
-          fi
+          node scripts/experiments/verify-ghcr-package-metadata.mjs
 
       - name: Build and publish the ARM64 candidate from source
         id: publish
@@ -193,14 +190,20 @@ jobs:
             echo "IMAGE_CONFIG_DIGEST=$config_digest"
           } >> "$GITHUB_ENV"
 
-      - name: Verify package remains private and linked to this repository
+      - name: Verify the published package with the same independent trust policy
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GHCR_POSTCHECK_MAX_ATTEMPTS: "12"
-          GHCR_POSTCHECK_RETRY_SECONDS: "5"
+          GHCR_VERIFY_PHASE: post-publish
+          GHCR_EXPECTED_SOURCE: ${{ env.EXPECTED_IMAGE_SOURCE }}
+          GHCR_EXPECTED_REVISION: ${{ github.sha }}
+          GHCR_EXPECTED_RUN_ID: ${{ github.run_id }}
+          GHCR_EXPECTED_VERSION: ${{ env.RUN_TAG }}
+          GHCR_VERIFY_MAX_ATTEMPTS: "12"
+          GHCR_VERIFY_RETRY_SECONDS: "5"
         shell: bash
         run: |
           set -euo pipefail
+          export GHCR_VERIFY_DIGEST="$REGISTRY_INDEX_DIGEST"
           node scripts/experiments/verify-ghcr-package-metadata.mjs
 
       - name: Pull only by immutable registry digest and verify identity
