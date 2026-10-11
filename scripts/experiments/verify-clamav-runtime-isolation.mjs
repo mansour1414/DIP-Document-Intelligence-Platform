@@ -12,6 +12,12 @@ const EXPECTED = Object.freeze({
   nanoCpus: 2_000_000_000,
   pidsLimit: 256,
   databaseDestination: "/var/lib/clamav",
+  imageArchitecture: "arm64",
+  imageOs: "linux",
+  runtimeWrapper: "/usr/local/bin/clamd-freshness-gate",
+  daemonExecutable: "/usr/sbin/clamd",
+  runtimeConfig: "/etc/clamav/clamd.conf",
+  qemuExecutable: "/usr/bin/qemu-aarch64",
   tmpfs: Object.freeze({
     "/tmp": 1024 * 1024 * 1024,
     "/run/clamav": 64 * 1024 * 1024,
@@ -51,16 +57,15 @@ function parseJsonArray(value, classification) {
   return parsed[0];
 }
 
-export function parseClamdCommandLine(commandLine) {
-  const args = String(commandLine).split("\0").filter(Boolean);
-  requireCondition(args.length > 0, "runtime_config_unresolved", "empty_pid1_cmdline");
-  requireCondition(posix.basename(args[0]) === "clamd", "runtime_config_unresolved", "pid1_is_not_clamd");
-
+function parseClamdArguments(args) {
+  requireCondition(Array.isArray(args) && args.length > 0, "pid1_identity_unresolved", "empty_clamd_command");
+  requireCondition(args.every((value) => typeof value === "string" && value.length > 0), "pid1_identity_unresolved", "malformed_clamd_command");
+  requireCondition(args[0] === EXPECTED.daemonExecutable, "pid1_identity_unresolved", `daemon=${sanitizeDiagnostic(args[0])}`);
   const configPaths = [];
   for (let index = 1; index < args.length; index += 1) {
     if (args[index] === "--config-file") {
       if (index + 1 >= args.length) {
-        fail("runtime_config_unresolved", "config_argument_missing_value");
+        fail("config_argument_unresolved", "config_argument_missing_value");
       }
       configPaths.push(args[index + 1]);
       index += 1;
@@ -69,12 +74,126 @@ export function parseClamdCommandLine(commandLine) {
     }
   }
 
-  requireCondition(configPaths.length === 1, "runtime_config_unresolved", `config_argument_count=${configPaths.length}`);
+  if (configPaths.length > 1) {
+    fail("config_path_conflict", `config_argument_count=${configPaths.length}`);
+  }
+  requireCondition(configPaths.length === 1, "config_argument_unresolved", "config_argument_count=0");
   const configPath = configPaths[0];
-  requireCondition(configPath.startsWith("/"), "runtime_config_unresolved", "config_path_not_absolute");
-  requireCondition(posix.normalize(configPath) === configPath, "runtime_config_unresolved", "config_path_not_normalized");
-  requireCondition(posix.basename(configPath) === "clamd.conf", "runtime_config_unresolved", "config_filename_not_clamd_conf");
+  requireCondition(configPath.startsWith("/"), "config_argument_unresolved", "config_path_not_absolute");
+  requireCondition(posix.normalize(configPath) === configPath, "config_argument_unresolved", "config_path_not_normalized");
+  requireCondition(configPath === EXPECTED.runtimeConfig, "config_argument_unresolved", `config_path=${sanitizeDiagnostic(configPath)}`);
   return { args, configPath };
+}
+
+export function parseClamdCommandLine(commandLine) {
+  return parseClamdArguments(String(commandLine).split("\0").filter(Boolean));
+}
+
+function arraysEqual(left, right) {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function requireStringArray(value, classification, detail) {
+  requireCondition(Array.isArray(value), classification, detail);
+  requireCondition(value.every((item) => typeof item === "string"), classification, detail);
+  return value;
+}
+
+export function parseProcStatus(statusText) {
+  const allowed = new Set(["Name", "State", "Pid", "PPid", "TracerPid", "NoNewPrivs", "Seccomp"]);
+  const status = {};
+  for (const line of String(statusText).split(/\r?\n/)) {
+    const match = line.match(/^([A-Za-z]+):\s*(.*)$/);
+    if (match && allowed.has(match[1])) status[match[1]] = match[2].trim();
+  }
+  for (const required of allowed) {
+    requireCondition(status[required] !== undefined, "pid1_identity_unresolved", `proc_status_${required.toLowerCase()}_missing`);
+  }
+  return status;
+}
+
+function verifyDeclaredRuntimeCommand({ dockerPath, dockerArgs, imageEntrypoint, imageCmd }) {
+  const entrypoint = requireStringArray(imageEntrypoint, "docker_runtime_command_mismatch", "image_entrypoint_invalid");
+  const cmd = imageCmd === null ? [] : requireStringArray(imageCmd, "docker_runtime_command_mismatch", "image_cmd_invalid");
+  const declaredImageCommand = [...entrypoint, ...cmd];
+  requireCondition(declaredImageCommand.length > 0, "docker_runtime_command_mismatch", "image_command_empty");
+  requireCondition(dockerPath === declaredImageCommand[0], "docker_runtime_command_mismatch", "docker_path_differs_from_image");
+  requireCondition(arraysEqual(dockerArgs, declaredImageCommand.slice(1)), "docker_runtime_command_mismatch", "docker_args_differ_from_image");
+  requireCondition(dockerPath === EXPECTED.runtimeWrapper, "unexpected_runtime_wrapper", `path=${sanitizeDiagnostic(dockerPath)}`);
+  requireCondition(dockerArgs[0] === "--exec", "unexpected_runtime_wrapper", "exec_boundary_missing");
+  requireCondition(dockerArgs[1] === EXPECTED.daemonExecutable, "unexpected_runtime_wrapper", `target=${sanitizeDiagnostic(dockerArgs[1])}`);
+
+  const daemonCommand = dockerArgs.slice(1);
+  const { configPath } = parseClamdArguments(daemonCommand);
+  return { daemonCommand, configPath };
+}
+
+export function verifyRuntimeProcessIdentity({
+  dockerPath,
+  dockerArgs,
+  imageArchitecture,
+  imageOs,
+  imageEntrypoint,
+  imageCmd,
+  hostArchitecture,
+  proc1Cmdline,
+  proc1Exe,
+  proc1Comm,
+  proc1Status,
+}) {
+  requireCondition(imageArchitecture === EXPECTED.imageArchitecture, "pid1_identity_unresolved", `image_architecture=${sanitizeDiagnostic(imageArchitecture)}`);
+  requireCondition(imageOs === EXPECTED.imageOs, "pid1_identity_unresolved", `image_os=${sanitizeDiagnostic(imageOs)}`);
+  requireStringArray(dockerArgs, "docker_runtime_command_mismatch", "docker_args_invalid");
+  const declared = verifyDeclaredRuntimeCommand({ dockerPath, dockerArgs, imageEntrypoint, imageCmd });
+  const procArgs = String(proc1Cmdline).split("\0").filter(Boolean);
+  requireCondition(procArgs.length > 0, "pid1_identity_unresolved", "empty_proc_cmdline");
+  const status = parseProcStatus(proc1Status);
+  requireCondition(proc1Comm.trim() === "clamd", "pid1_identity_unresolved", `proc_comm=${sanitizeDiagnostic(proc1Comm.trim())}`);
+  requireCondition(status.Name === "clamd", "pid1_identity_unresolved", `proc_status_name=${sanitizeDiagnostic(status.Name)}`);
+  requireCondition(status.Pid === "1" && status.PPid === "0" && status.TracerPid === "0", "pid1_identity_unresolved", "proc_status_pid_relationship");
+  requireCondition(status.NoNewPrivs === "1", "pid1_identity_unresolved", `proc_status_no_new_privs=${sanitizeDiagnostic(status.NoNewPrivs)}`);
+  requireCondition(status.Seccomp === "2", "pid1_identity_unresolved", `proc_status_seccomp=${sanitizeDiagnostic(status.Seccomp)}`);
+
+  const normalizedHostArchitecture = String(hostArchitecture).trim().toLowerCase();
+  if (proc1Exe.trim() === EXPECTED.daemonExecutable) {
+    requireCondition(["arm64", "aarch64"].includes(normalizedHostArchitecture), "pid1_identity_unresolved", `native_host_architecture=${sanitizeDiagnostic(normalizedHostArchitecture)}`);
+    const observedNative = parseClamdArguments(procArgs);
+    requireCondition(observedNative.configPath === declared.configPath, "config_path_conflict", "native_and_declared_config_differ");
+    requireCondition(arraysEqual(procArgs, declared.daemonCommand), "docker_runtime_command_mismatch", "native_proc_command_differs_from_declared_guest");
+    return {
+      mode: "native-clamd",
+      logicalExecutable: EXPECTED.daemonExecutable,
+      configPath: declared.configPath,
+      procArgs,
+      status,
+    };
+  }
+
+  if (proc1Exe.trim() === EXPECTED.qemuExecutable) {
+    requireCondition(["amd64", "x86_64"].includes(normalizedHostArchitecture), "pid1_identity_unresolved", `qemu_host_architecture=${sanitizeDiagnostic(normalizedHostArchitecture)}`);
+    const expectedQemuCommand = [
+      EXPECTED.qemuExecutable,
+      EXPECTED.daemonExecutable,
+      ...declared.daemonCommand,
+    ];
+    requireCondition(procArgs[1] === EXPECTED.daemonExecutable, "qemu_guest_target_unresolved", `guest=${sanitizeDiagnostic(procArgs[1])}`);
+    requireCondition(procArgs[2] === EXPECTED.daemonExecutable, "qemu_guest_target_unresolved", `guest_argv0=${sanitizeDiagnostic(procArgs[2])}`);
+    const observedGuest = parseClamdArguments(procArgs.slice(2));
+    requireCondition(observedGuest.configPath === declared.configPath, "config_path_conflict", "qemu_and_declared_config_differ");
+    requireCondition(arraysEqual(procArgs, expectedQemuCommand), "qemu_guest_target_unresolved", "observed_shape_mismatch");
+    return {
+      mode: "qemu-arm64-clamd",
+      logicalExecutable: EXPECTED.daemonExecutable,
+      configPath: declared.configPath,
+      procArgs,
+      status,
+    };
+  }
+
+  if (posix.basename(proc1Exe.trim()).startsWith("qemu-")) {
+    fail("qemu_guest_target_unresolved", `emulator=${sanitizeDiagnostic(proc1Exe.trim())}`);
+  }
+  fail("unexpected_runtime_wrapper", `proc_exe=${sanitizeDiagnostic(proc1Exe.trim())}`);
 }
 
 export function parseAlertExceedsMaxDefinitions(configText) {
@@ -193,12 +312,12 @@ function invokeDocker(docker, args, classification, detail) {
   }
 }
 
-export function verifyClamdConfiguration({ commandLine, configText, clamconfOutput, runtimeLog = "" }) {
-  const { configPath } = parseClamdCommandLine(commandLine);
+export function verifyClamdConfiguration({ commandLine, configPath, configText, clamconfOutput, runtimeLog = "" }) {
+  const resolvedConfigPath = configPath ?? parseClamdCommandLine(commandLine).configPath;
   const rawConfig = parseAlertExceedsMaxDefinitions(configText);
-  const effectiveValue = parseClamconfAlertExceedsMax(clamconfOutput, posix.basename(configPath));
+  const effectiveValue = parseClamconfAlertExceedsMax(clamconfOutput, posix.basename(resolvedConfigPath));
   const supplementalLog = classifySupplementalRuntimeLog(runtimeLog);
-  return { configPath, rawConfig, effectiveValue, supplementalLog };
+  return { configPath: resolvedConfigPath, rawConfig, effectiveValue, supplementalLog };
 }
 
 export function verifyRuntimeIsolation({
@@ -259,13 +378,54 @@ export function verifyRuntimeIsolation({
   requireCondition(state.Health?.Status === "healthy", "container_health_invalid", `value=${sanitizeDiagnostic(state.Health?.Status)}`);
   logger.log("RUNTIME_ISOLATION_PASS health=healthy");
 
+  const hostArchitecture = invokeDocker(
+    docker,
+    ["info", "--format", "{{.Architecture}}"],
+    "pid1_identity_unresolved",
+    "docker_host_architecture_unreadable",
+  ).trim();
   const commandLine = invokeDocker(
     docker,
     ["exec", containerName, "cat", "/proc/1/cmdline"],
-    "runtime_config_unresolved",
+    "pid1_identity_unresolved",
     "pid1_cmdline_unreadable",
   );
-  const { configPath } = parseClamdCommandLine(commandLine);
+  const proc1Exe = invokeDocker(
+    docker,
+    ["exec", containerName, "readlink", "/proc/1/exe"],
+    "pid1_identity_unresolved",
+    "pid1_exe_unreadable",
+  ).trim();
+  const proc1Comm = invokeDocker(
+    docker,
+    ["exec", containerName, "cat", "/proc/1/comm"],
+    "pid1_identity_unresolved",
+    "pid1_comm_unreadable",
+  ).trim();
+  const proc1Status = invokeDocker(
+    docker,
+    ["exec", containerName, "cat", "/proc/1/status"],
+    "pid1_identity_unresolved",
+    "pid1_status_unreadable",
+  );
+  const identity = verifyRuntimeProcessIdentity({
+    dockerPath: containerInspect.Path,
+    dockerArgs: containerInspect.Args,
+    imageArchitecture: imageInspect.Architecture,
+    imageOs: imageInspect.Os,
+    imageEntrypoint: imageInspect.Config?.Entrypoint,
+    imageCmd: imageInspect.Config?.Cmd ?? null,
+    hostArchitecture,
+    proc1Cmdline: commandLine,
+    proc1Exe,
+    proc1Comm,
+    proc1Status,
+  });
+  logger.log(`PID1_IDENTITY docker_path=${sanitizeDiagnostic(containerInspect.Path)} docker_args=${sanitizeDiagnostic(JSON.stringify(containerInspect.Args))}`);
+  logger.log(`PID1_IDENTITY image_architecture=${sanitizeDiagnostic(imageInspect.Architecture)} image_entrypoint=${sanitizeDiagnostic(JSON.stringify(imageInspect.Config?.Entrypoint))} image_cmd=${sanitizeDiagnostic(JSON.stringify(imageInspect.Config?.Cmd ?? null))}`);
+  logger.log(`PID1_IDENTITY proc_cmdline=${sanitizeDiagnostic(JSON.stringify(identity.procArgs))} proc_exe=${sanitizeDiagnostic(proc1Exe)} proc_comm=${sanitizeDiagnostic(proc1Comm)}`);
+  logger.log(`CLAMD_IDENTITY_PASS mode=${identity.mode} logical_executable=${identity.logicalExecutable}`);
+  const configPath = identity.configPath;
   const configText = invokeDocker(
     docker,
     ["exec", containerName, "cat", configPath],
@@ -286,9 +446,9 @@ export function verifyRuntimeIsolation({
     `config_dir=${configDirectory}`,
   );
   const runtimeLog = runtimeLogPath ? readFileSync(runtimeLogPath, "utf8") : "";
-  const clamd = verifyClamdConfiguration({ commandLine, configText, clamconfOutput, runtimeLog });
+  const clamd = verifyClamdConfiguration({ configPath, configText, clamconfOutput, runtimeLog });
 
-  logger.log(`CLAMD_CONFIG_PASS runtime_config=${clamd.configPath} source=pid1_cmdline`);
+  logger.log(`CLAMD_CONFIG_PASS runtime_config=${clamd.configPath} source=proven_runtime_identity`);
   logger.log(`CLAMD_CONFIG_PASS AlertExceedsMax=${clamd.effectiveValue} source=clamconf definitions=${clamd.rawConfig.definitions.length}`);
   if (clamd.supplementalLog.semanticMessage) {
     logger.log("SUPPLEMENTAL_RUNTIME_LOG_EVIDENCE semantic_alert_exceeds_max=present");
@@ -302,6 +462,22 @@ export function verifyRuntimeIsolation({
     result: "pass",
     imageUser: imageInspect.Config.User,
     runtime: { uid, gid, health: state.Health.Status },
+    runtimeProcess: {
+      mode: identity.mode,
+      dockerPath: containerInspect.Path,
+      dockerArgs: containerInspect.Args,
+      imageArchitecture: imageInspect.Architecture,
+      imageOs: imageInspect.Os,
+      imageEntrypoint: imageInspect.Config.Entrypoint,
+      imageCmd: imageInspect.Config.Cmd ?? null,
+      hostArchitecture,
+      proc1Cmdline: identity.procArgs,
+      proc1Exe,
+      proc1Comm,
+      proc1Status: identity.status,
+      logicalExecutable: identity.logicalExecutable,
+      configPath: identity.configPath,
+    },
     isolation: {
       readonlyRootfs: host.ReadonlyRootfs,
       capDrop: host.CapDrop,
@@ -316,11 +492,12 @@ export function verifyRuntimeIsolation({
       tmpfs: host.Tmpfs,
     },
     clamd: {
-      pid1Executable: "clamd",
+      logicalExecutable: identity.logicalExecutable,
+      runtimeMode: identity.mode,
       runtimeConfigPath: clamd.configPath,
       alertExceedsMax: clamd.effectiveValue,
       rawDefinitionCount: clamd.rawConfig.definitions.length,
-      verificationSource: "clamconf-effective-config-bound-to-pid1-config-path",
+      verificationSource: "clamconf-effective-config-bound-to-proven-runtime-identity",
       supplementalRuntimeLog: clamd.supplementalLog,
     },
   };
@@ -342,8 +519,9 @@ if (isDirectExecution()) {
     });
   } catch (error) {
     if (error instanceof RuntimeVerificationError) {
-      const configFailure = /^(alert_exceeds_max|clamconf_|runtime_config_)/.test(error.classification);
-      const prefix = configFailure ? "CLAMD_CONFIG_FAIL" : "RUNTIME_ISOLATION_FAIL";
+      const configFailure = /^(alert_exceeds_max|clamconf_|config_)/.test(error.classification);
+      const identityFailure = /^(pid1_identity_|unexpected_runtime_wrapper|qemu_guest_target_|docker_runtime_command_)/.test(error.classification);
+      const prefix = configFailure ? "CLAMD_CONFIG_FAIL" : identityFailure ? "CLAMD_IDENTITY_FAIL" : "RUNTIME_ISOLATION_FAIL";
       console.error(`${prefix} classification=${error.classification} detail=${sanitizeDiagnostic(error.detail)}`);
       process.exitCode = 1;
     } else {
