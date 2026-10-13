@@ -341,8 +341,8 @@ jobs:
               -e CLAMD_HOST=clamav-stage7 \
               -e PAYLOAD_DIR=/payloads \
               -v "$RUNNER_TEMP/stage7-payloads:/payloads:ro" \
-              -v "$GITHUB_WORKSPACE/docs/operations/experimental/clamav-arm64-stage4-protocol.mts:/evidence/protocol.mts:ro" \
-              dip-worker:stage7-arm64 node --import tsx /evidence/protocol.mts \
+              -v "$GITHUB_WORKSPACE/docs/operations/experimental:/app/docs/operations/experimental:ro" \
+              dip-worker:stage7-arm64 node --import tsx /app/docs/operations/experimental/clamav-arm64-stage4-protocol.mts \
             | tee "$EVIDENCE_DIR/protocol-20-of-20.log"
           grep -Fq '### FAILURES=0' "$EVIDENCE_DIR/protocol-20-of-20.log"
 
