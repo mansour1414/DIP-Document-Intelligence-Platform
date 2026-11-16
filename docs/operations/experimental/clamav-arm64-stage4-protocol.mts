@@ -27,6 +27,16 @@
 //    "\\0" form, so "stream: OK" is always recognized as CLEAN. A silent CLEAN on a
 //    payload that must trip a limit is therefore reported as the regression FAIL it
 //    is, instead of being masked by the client enum.
+//  * Reply parsing is fully anchored. Only ONE NUL-terminated stanza with nothing
+//    before or after it yields a verdict; "… FOUND trailinggarbage",
+//    "garbage … FOUND", concatenated stanzas, embedded/missing terminators, and
+//    other malformed text are MALFORMED/INCOMPLETE and never satisfy an assertion.
+//    A partial regex match is never accepted as proof of a security limit.
+//  * clamd's prefixless StreamMaxLength refusal is recognized as its own verdict.
+//    Real evidence from Stage 7 run 43937894854 is "INSTREAM size limit exceeded.
+//    ERROR\0" (clamd conn_reply_error() with no path/id prints no "stream:" prefix).
+//    Test 6a requires exactly that reply; a generic or prefixed ERROR is not proof
+//    that StreamMaxLength was enforced.
 //  * Each large ZIP fixture is scanned exactly ONCE, raw, because the raw reply
 //    carries all of the evidence these diagnostics need. The client enum is no
 //    longer consulted for limit attribution, so no fixture is scanned twice.
@@ -78,47 +88,91 @@ const LIMIT_ALERTS: ReadonlySet<string> = new Set<string>([
   MAX_SCAN_TIME_ALERT,
 ]);
 
-// clamd replies are single-line stanzas terminated by NUL:
-//   "stream: OK\0"
-//   "stream: <signature> FOUND\0"
-//   "stream: <message> ERROR\0"
-// A raw reply may reach us with a real NUL terminator, or with the escaped two
-// character form "\0" if it was previously normalized for logging. Both must
-// collapse to the plain stanza; nothing else may be treated as a valid verdict.
+// Accepted clamd reply grammar. A reply must be exactly ONE stanza, terminated by
+// exactly ONE NUL, with nothing before and nothing after it:
+//   "stream: OK\0"                          -> CLEAN
+//   "stream: <signature> FOUND\0"           -> FOUND, or LIMIT_ALERT when the
+//                                              signature is an exact
+//                                              Heuristics.Limits.Exceeded.* name
+//   "stream: <message> ERROR\0"             -> ERROR (generic)
+//   "INSTREAM size limit exceeded. ERROR\0" -> INSTREAM_SIZE_LIMIT
+//
+// The last form is prefixless on purpose. clamd (server-th.c) answers an oversized
+// zINSTREAM chunk with conn_reply_error(conn, "INSTREAM size limit exceeded."), and
+// conn_reply() with no path and no id prints mdprintf("%s %s%c", msg, "ERROR", term).
+// That exact refusal is the ONLY evidence that StreamMaxLength was enforced; a
+// generic error or a prefixed "stream: ... ERROR" is not.
+//
+// Everything else is rejected and can never be a verdict: a missing terminator
+// (INCOMPLETE); embedded, repeated, or mid-text terminators; trailing text after
+// the terminator; multiple lines or concatenated stanzas; and any payload that does
+// not match the grammar end to end (MALFORMED). Matching is anchored on the whole
+// reply, so "… FOUND trailinggarbage", "garbage … FOUND", and concatenated stanzas
+// cannot be read as a limit alert through a partial match.
 export type ClamdWireVerdict =
   | { kind: "CLEAN" }
   | { kind: "FOUND"; signature: string }
   | { kind: "LIMIT_ALERT"; alert: ClamdLimitAlert }
+  | { kind: "INSTREAM_SIZE_LIMIT" }
   | { kind: "ERROR"; detail: string }
   | { kind: "INCOMPLETE"; detail: string }
   | { kind: "MALFORMED"; detail: string };
+
+// Exact wire text clamd sends when StreamMaxLength is exceeded (no prefix).
+export const INSTREAM_SIZE_LIMIT_REFUSAL = "INSTREAM size limit exceeded. ERROR";
 
 export function normalizeClamdWire(wire: string): string {
   return wire.replace(/\0/gu, "").replace(/\\0/gu, "").trim();
 }
 
-// Classifies a raw clamd reply. `terminated` states whether the reply actually
-// ended with a NUL terminator: an unterminated reply is INCOMPLETE and can never
-// be counted as a verdict, let alone as a limit detection.
+// Classifies a raw clamd reply. `terminated` reports whether the socket reader saw a
+// NUL; the captured text is authoritative, so a reply without an actual terminator
+// is INCOMPLETE even if the reader reported a clean end of stream.
 export function classifyClamdWire(wire: string, terminated: boolean): ClamdWireVerdict {
-  const response = normalizeClamdWire(wire);
-  if (!response) return { kind: "INCOMPLETE", detail: "empty response" };
-  if (!terminated) return { kind: "INCOMPLETE", detail: `no NUL terminator: ${response.slice(0, 80)}` };
-  const stanza = /^(stream|instream):[ \t]*(.*)$/iu.exec(response);
-  if (!stanza) return { kind: "MALFORMED", detail: `missing stream: stanza: ${response.slice(0, 80)}` };
-  const payload = stanza[2].trim();
-  if (!payload) return { kind: "MALFORMED", detail: "empty stanza payload" };
+  // The escaped "\0" form is what a previously logged reply looks like. Unify it with
+  // a real NUL so terminator counting is unambiguous.
+  const unified = wire.replace(/\\0/gu, "\0");
+  const terminators = unified.split("\0").length - 1;
+
+  if (terminators === 0) {
+    return {
+      kind: "INCOMPLETE",
+      detail: `no terminator (readerSawNul=${terminated}): ${unified.trim().slice(0, 80)}`,
+    };
+  }
+  if (terminators > 1) {
+    return { kind: "MALFORMED", detail: `multiple stanzas / embedded terminator (${terminators} terminators)` };
+  }
+
+  const terminatorAt = unified.indexOf("\0");
+  const afterTerminator = unified.slice(terminatorAt + 1);
+  if (afterTerminator.trim() !== "") {
+    return { kind: "MALFORMED", detail: `trailing garbage after terminator: ${afterTerminator.trim().slice(0, 80)}` };
+  }
+
+  const body = unified.slice(0, terminatorAt).trim();
+  if (!body) return { kind: "MALFORMED", detail: "empty reply body before terminator" };
+  if (/[\r\n]/u.test(body)) {
+    return { kind: "MALFORMED", detail: "multiple lines / concatenated stanzas in one reply" };
+  }
+
+  if (body === INSTREAM_SIZE_LIMIT_REFUSAL) return { kind: "INSTREAM_SIZE_LIMIT" };
+
+  const stanza = /^(?:stream|instream):[ \t]*(\S(?:[^\r\n]*\S)?)$/iu.exec(body);
+  if (!stanza) return { kind: "MALFORMED", detail: `not a single well-formed clamd stanza: ${body.slice(0, 80)}` };
+  const payload = stanza[1];
+
+  // Anchored whole-payload matches only; nothing may precede or follow the verdict.
   if (/^OK$/iu.test(payload)) return { kind: "CLEAN" };
 
-  // SCAN_ALLMATCHES is not enabled, but allow a comma separated detection list so
-  // a limit alert is still recognized if the engine ever reports more than one.
-  const detections = [...payload.matchAll(/([A-Za-z0-9][A-Za-z0-9_.+-]*)[ \t]+FOUND/gu)].map((m) => m[1]);
-  if (detections.length > 0) {
-    const alert = detections.find((name) => LIMIT_ALERTS.has(name)) as ClamdLimitAlert | undefined;
-    if (alert) return { kind: "LIMIT_ALERT", alert };
-    return { kind: "FOUND", signature: detections[0] };
+  const detection = /^([A-Za-z0-9][A-Za-z0-9_.+-]*) FOUND$/u.exec(payload);
+  if (detection) {
+    const signature = detection[1];
+    if (LIMIT_ALERTS.has(signature)) return { kind: "LIMIT_ALERT", alert: signature as ClamdLimitAlert };
+    return { kind: "FOUND", signature };
   }
-  if (/^.+ERROR$/iu.test(payload)) return { kind: "ERROR", detail: payload };
+
+  if (/^\S.*[ \t]ERROR$/u.test(payload)) return { kind: "ERROR", detail: payload };
   return { kind: "MALFORMED", detail: `unrecognized stanza payload: ${payload.slice(0, 80)}` };
 }
 
@@ -129,6 +183,7 @@ export function isDecisiveVerdict(verdict: ClamdWireVerdict): boolean {
     verdict.kind === "CLEAN" ||
     verdict.kind === "FOUND" ||
     verdict.kind === "LIMIT_ALERT" ||
+    verdict.kind === "INSTREAM_SIZE_LIMIT" ||
     verdict.kind === "ERROR"
   );
 }
@@ -147,6 +202,13 @@ export function limitAlertObserved(outcome: RawScanOutcome, expected: ClamdLimit
   );
 }
 
+// True only when clamd itself refused the stream at StreamMaxLength, proven by its
+// exact prefixless "INSTREAM size limit exceeded. ERROR" reply. A generic ERROR or a
+// prefixed "stream: ... ERROR" is NOT proof that the stream limit was enforced.
+export function instreamSizeLimitRefused(outcome: RawScanOutcome): boolean {
+  return outcome.ok && outcome.verdict.kind === "INSTREAM_SIZE_LIMIT";
+}
+
 export function describeOutcome(outcome: RawScanOutcome): string {
   if (!outcome.ok) return outcome.failure;
   switch (outcome.verdict.kind) {
@@ -156,6 +218,8 @@ export function describeOutcome(outcome: RawScanOutcome): string {
       return `FOUND:${outcome.verdict.signature}`;
     case "LIMIT_ALERT":
       return `LIMIT_ALERT:${outcome.verdict.alert}`;
+    case "INSTREAM_SIZE_LIMIT":
+      return `INSTREAM_SIZE_LIMIT:${INSTREAM_SIZE_LIMIT_REFUSAL}`;
     case "ERROR":
       return `ERROR:${outcome.verdict.detail}`;
     case "INCOMPLETE":
@@ -183,6 +247,8 @@ export function diagnoseLimitOutcome(outcome: RawScanOutcome, expected: ClamdLim
       return "silent CLEAN (stream: OK): no limit alert was raised, so the truncation alert is absent or the limit was never reached";
     case "FOUND":
       return `unrelated malware detection (${outcome.verdict.signature}) is not a size-limit alert`;
+    case "INSTREAM_SIZE_LIMIT":
+      return "the StreamMaxLength refusal (INSTREAM size limit exceeded. ERROR) is not a size-limit heuristic alert";
     case "ERROR":
       return "generic clamd ERROR is not a size-limit alert";
     case "INCOMPLETE":
@@ -200,7 +266,7 @@ function normalizedWireOf(outcome: RawScanOutcome): string {
   return outcome.ok ? normalizeClamdWire(outcome.wire) : `<${outcome.failure}>`;
 }
 
-function record(name: string, expected: MalwareScanResultCode | "clamd ERROR" | "n/a" | ClamdLimitAlert, got: string, extra: Record<string, unknown> = {}, ok?: boolean) {
+function record(name: string, expected: MalwareScanResultCode | "clamd ERROR" | "n/a" | ClamdLimitAlert | typeof INSTREAM_SIZE_LIMIT_REFUSAL, got: string, extra: Record<string, unknown> = {}, ok?: boolean) {
   const pass = ok ?? got === expected;
   if (!pass) failures++;
   rows.push({ test: name, expected, actual: got, pass, ...extra });
@@ -212,6 +278,13 @@ function record(name: string, expected: MalwareScanResultCode | "clamd ERROR" | 
 // Resolves with the verbatim wire text (real NULs preserved) and whether the reply
 // was NUL terminated. Transport problems are reported, never thrown, so a timeout
 // or an unreachable scanner stays distinguishable from a clamd verdict.
+//
+// After the first NUL the socket is drained for a short settle window before the
+// reply is classified. clamd sends exactly one stanza, but a reply that carries
+// extra bytes (a second concatenated stanza, trailing text) must be seen so the
+// anchored parser can reject it instead of silently keeping only the first stanza.
+const REPLY_SETTLE_MS = 40;
+
 function rawInstream(bytes: Buffer, timeoutMs = 120000): Promise<RawScanOutcome> {
   return new Promise((resolve) => {
     const socket = net.connect(PORT, HOST);
@@ -219,9 +292,11 @@ function rawInstream(bytes: Buffer, timeoutMs = 120000): Promise<RawScanOutcome>
     let wire = "";
     let terminated = false;
     let settled = false;
+    let settleTimer: NodeJS.Timeout | null = null;
     const finish = (failure?: "TIMEOUT" | "UNAVAILABLE", detail?: string) => {
       if (settled) return;
       settled = true;
+      if (settleTimer) clearTimeout(settleTimer);
       socket.destroy();
       const elapsedMs = Date.now() - startedAt;
       if (failure) resolve({ ok: false, failure, detail: detail ?? failure, elapsedMs });
@@ -243,10 +318,11 @@ function rawInstream(bytes: Buffer, timeoutMs = 120000): Promise<RawScanOutcome>
     });
     socket.on("data", (chunk) => {
       wire += chunk.toString("utf8");
-      if (wire.includes("\0")) {
-        terminated = true;
-        finish();
-      }
+      if (!wire.includes("\0")) return;
+      terminated = true;
+      // Keep reading briefly so trailing text after the terminator is seen and can
+      // be rejected by the anchored parser.
+      if (settleTimer === null) settleTimer = setTimeout(() => finish(), REPLY_SETTLE_MS);
     });
     socket.on("end", () => finish());
   });
@@ -372,12 +448,19 @@ async function main() {
     const buf = Buffer.alloc(120 * MiB, 0x44);
     const raw = await rawInstream(buf);
     console.log(`### raw zINSTREAM 120 MiB (over StreamMaxLength 110M) -> ${rawWireOf(raw)}`);
-    // A refusal must be a terminated, well-formed clamd ERROR stanza. An
-    // incomplete or missing reply is not proof that clamd enforced the limit.
-    const clamdRefused = raw.ok && raw.terminated && raw.verdict.kind === "ERROR";
-    record("clamd itself refuses a 120 MiB stream (StreamMaxLength 110M)",
-      "clamd ERROR", clamdRefused ? "clamd ERROR" : describeOutcome(raw),
-      { inputBytes: buf.byteLength, normalizedWire: normalizedWireOf(raw) }, clamdRefused);
+    // The refusal must be clamd's exact prefixless StreamMaxLength reply,
+    // "INSTREAM size limit exceeded. ERROR". A generic clamd ERROR (or any other
+    // error text) is NOT proof that StreamMaxLength was enforced, and an
+    // incomplete/malformed reply is no proof at all.
+    const clamdRefused = instreamSizeLimitRefused(raw);
+    record("clamd itself refuses a 120 MiB stream (StreamMaxLength 110M, INSTREAM size limit)",
+      INSTREAM_SIZE_LIMIT_REFUSAL, describeOutcome(raw), {
+        inputBytes: buf.byteLength,
+        normalizedWire: normalizedWireOf(raw),
+        diagnosis: clamdRefused
+          ? "clamd emitted its exact prefixless INSTREAM size-limit refusal"
+          : "no StreamMaxLength refusal: a generic ERROR, a prefixed stream: ERROR, an incomplete reply, or a different verdict does not prove the stream limit was enforced",
+      }, clamdRefused);
 
     // 6b: the production client refuses the same input on its own guard.
     const r = await timedScan(prod, buf);
@@ -574,9 +657,10 @@ async function main() {
 }
 
 // ---------------------------------------------------------------------------
-// Offline self-check: raw reply normalization, exact limit-alert classification,
-// and the negative cases that must never satisfy a limit assertion. Needs no
-// clamd, so the parser can be validated in a bounded local run:
+// Offline self-check: terminator normalization, the anchored reply grammar, exact
+// limit-alert classification, the StreamMaxLength refusal, and every negative case
+// that must never satisfy an assertion. Needs no clamd, so the parser can be
+// validated in a bounded local run:
 //   node --import tsx docs/operations/experimental/clamav-arm64-stage4-protocol.mts --self-test
 // ---------------------------------------------------------------------------
 function okOutcome(wire: string, terminated = true): RawScanOutcome {
@@ -589,7 +673,9 @@ function transportOutcome(failure: "TIMEOUT" | "UNAVAILABLE"): RawScanOutcome {
 
 function runSelfTest(): boolean {
   let failed = 0;
+  let checks = 0;
   const check = (name: string, pass: boolean, detail: string) => {
+    checks++;
     if (!pass) failed++;
     console.log(`${pass ? "PASS" : "FAIL"} | selftest | ${name} | ${detail}`);
   };
@@ -600,6 +686,7 @@ function runSelfTest(): boolean {
     ["escaped \\0 terminator", "stream: OK\\0", "stream: OK"],
     ["CRLF reply with real NUL", "stream: OK\r\n\0", "stream: OK"],
     ["both terminator forms", "stream: Heuristics.Limits.Exceeded.MaxFileSize FOUND\\0\0", "stream: Heuristics.Limits.Exceeded.MaxFileSize FOUND"],
+    ["prefixless INSTREAM refusal", "INSTREAM size limit exceeded. ERROR\0", INSTREAM_SIZE_LIMIT_REFUSAL],
     ["empty reply", "", ""],
   ];
   for (const [name, wire, expected] of normalizationCases) {
@@ -607,22 +694,46 @@ function runSelfTest(): boolean {
     check(`normalize ${name}`, actual === expected, `normalized=${JSON.stringify(actual)} expected=${JSON.stringify(expected)}`);
   }
 
-  // Classification: only a terminated reply carrying the exact alert name counts.
+  // Anchored grammar. A verdict exists only for ONE well-formed, NUL-terminated
+  // stanza with nothing before or after it. Numbered cases 1-10 are the required
+  // coverage from the review finding.
   const verdictCases: Array<{ name: string; wire: string; terminated: boolean; kind: ClamdWireVerdict["kind"]; alert?: ClamdLimitAlert; signature?: string }> = [
-    { name: "real NUL CLEAN", wire: "stream: OK\0", terminated: true, kind: "CLEAN" },
-    { name: "escaped terminator CLEAN", wire: "stream: OK\\0", terminated: true, kind: "CLEAN" },
-    { name: "CLEAN without terminator is INCOMPLETE", wire: "stream: OK", terminated: false, kind: "INCOMPLETE" },
-    { name: "MaxFileSize limit alert", wire: "stream: Heuristics.Limits.Exceeded.MaxFileSize FOUND\0", terminated: true, kind: "LIMIT_ALERT", alert: MAX_FILE_SIZE_ALERT },
-    { name: "MaxScanSize limit alert (escaped terminator)", wire: "stream: Heuristics.Limits.Exceeded.MaxScanSize FOUND\\0", terminated: true, kind: "LIMIT_ALERT", alert: MAX_SCAN_SIZE_ALERT },
-    { name: "MaxFiles limit alert", wire: "stream: Heuristics.Limits.Exceeded.MaxFiles FOUND\0", terminated: true, kind: "LIMIT_ALERT", alert: MAX_FILES_ALERT },
-    { name: "MaxRecursion limit alert", wire: "stream: Heuristics.Limits.Exceeded.MaxRecursion FOUND\0", terminated: true, kind: "LIMIT_ALERT", alert: MAX_RECURSION_ALERT },
-    { name: "MaxScanTime limit alert", wire: "stream: Heuristics.Limits.Exceeded.MaxScanTime FOUND\0", terminated: true, kind: "LIMIT_ALERT", alert: MAX_SCAN_TIME_ALERT },
+    // 1. valid CLEAN with a real NUL
+    { name: "1 valid CLEAN with real NUL", wire: "stream: OK\0", terminated: true, kind: "CLEAN" },
+    { name: "1b valid CLEAN with escaped terminator", wire: "stream: OK\\0", terminated: true, kind: "CLEAN" },
+    // 2. valid exact MaxFileSize alert
+    { name: "2 valid exact MaxFileSize alert", wire: "stream: Heuristics.Limits.Exceeded.MaxFileSize FOUND\0", terminated: true, kind: "LIMIT_ALERT", alert: MAX_FILE_SIZE_ALERT },
+    // 3. valid exact MaxScanSize alert
+    { name: "3 valid exact MaxScanSize alert", wire: "stream: Heuristics.Limits.Exceeded.MaxScanSize FOUND\0", terminated: true, kind: "LIMIT_ALERT", alert: MAX_SCAN_SIZE_ALERT },
+    // 4. the observed prefixless StreamMaxLength refusal (Stage 7 run 43937894854)
+    { name: "4 observed prefixless INSTREAM size-limit refusal", wire: "INSTREAM size limit exceeded. ERROR\0", terminated: true, kind: "INSTREAM_SIZE_LIMIT" },
+    // 5. FOUND with trailing garbage
+    { name: "5 FOUND with trailing garbage", wire: "stream: Heuristics.Limits.Exceeded.MaxFileSize FOUND trailinggarbage\0", terminated: true, kind: "MALFORMED" },
+    { name: "5b FOUND with trailing stanza text", wire: "stream: Heuristics.Limits.Exceeded.MaxScanSize FOUND.\0", terminated: true, kind: "MALFORMED" },
+    // 6. FOUND with leading garbage
+    { name: "6 FOUND with leading garbage", wire: "stream: garbage Heuristics.Limits.Exceeded.MaxFileSize FOUND\0", terminated: true, kind: "MALFORMED" },
+    { name: "6b FOUND with leading prefix junk", wire: "stream: x stream: Heuristics.Limits.Exceeded.MaxFileSize FOUND\0", terminated: true, kind: "MALFORMED" },
+    // 7. multiple concatenated stanzas
+    { name: "7 concatenated CLEAN stanzas", wire: "stream: OK\0stream: OK\0", terminated: true, kind: "MALFORMED" },
+    { name: "7b alert stanza concatenated with CLEAN stanza", wire: "stream: Heuristics.Limits.Exceeded.MaxFileSize FOUND\0stream: OK\0", terminated: true, kind: "MALFORMED" },
+    { name: "7c newline separated stanzas", wire: "stream: OK\nstream: Heuristics.Limits.Exceeded.MaxFileSize FOUND\0", terminated: true, kind: "MALFORMED" },
+    // 8. embedded or missing terminators
+    { name: "8 missing terminator on alert", wire: "stream: Heuristics.Limits.Exceeded.MaxFileSize FOUND", terminated: false, kind: "INCOMPLETE" },
+    { name: "8b missing terminator on CLEAN", wire: "stream: OK", terminated: false, kind: "INCOMPLETE" },
+    { name: "8c embedded terminator followed by garbage", wire: "stream: OK\0garbage", terminated: true, kind: "MALFORMED" },
+    { name: "8d empty body with terminator", wire: "\0", terminated: true, kind: "MALFORMED" },
+    { name: "8e missing stanza prefix", wire: "OK\0", terminated: true, kind: "MALFORMED" },
+    { name: "8f garbage reply", wire: "nonsense\0", terminated: true, kind: "MALFORMED" },
+    // 9. generic ERROR (prefixed, and with a file prefix) - never a limit alert and
+    //    never proof that StreamMaxLength was enforced
+    { name: "9 generic ERROR", wire: "stream: INSTREAM size limit exceeded. ERROR\0", terminated: true, kind: "ERROR" },
+    { name: "9b generic ERROR with file prefix", wire: "stream: Error processing command. ERROR\0", terminated: true, kind: "ERROR" },
+    { name: "9c prefixless refusal with trailing garbage", wire: "INSTREAM size limit exceeded. ERROR trailinggarbage\0", terminated: true, kind: "MALFORMED" },
+    // other valid forms that must keep working
     { name: "genuine EICAR detection", wire: "stream: Win.Test.EICAR_HDB-1 FOUND\0", terminated: true, kind: "FOUND", signature: "Win.Test.EICAR_HDB-1" },
-    { name: "generic clamd ERROR", wire: "stream: INSTREAM size limit exceeded. ERROR\0", terminated: true, kind: "ERROR" },
-    { name: "truncated alert text is INCOMPLETE", wire: "stream: Heuristics.Limits.Exceeded.MaxFileSize", terminated: false, kind: "INCOMPLETE" },
-    { name: "garbage reply is MALFORMED", wire: "nonsense\0", terminated: true, kind: "MALFORMED" },
-    { name: "bare OK without stanza is MALFORMED", wire: "OK\0", terminated: true, kind: "MALFORMED" },
-    { name: "empty reply is INCOMPLETE", wire: "", terminated: true, kind: "INCOMPLETE" },
+    { name: "MaxFiles alert", wire: "stream: Heuristics.Limits.Exceeded.MaxFiles FOUND\0", terminated: true, kind: "LIMIT_ALERT", alert: MAX_FILES_ALERT },
+    { name: "MaxRecursion alert", wire: "stream: Heuristics.Limits.Exceeded.MaxRecursion FOUND\0", terminated: true, kind: "LIMIT_ALERT", alert: MAX_RECURSION_ALERT },
+    { name: "MaxScanTime alert", wire: "stream: Heuristics.Limits.Exceeded.MaxScanTime FOUND\0", terminated: true, kind: "LIMIT_ALERT", alert: MAX_SCAN_TIME_ALERT },
   ];
   for (const testCase of verdictCases) {
     const verdict = classifyClamdWire(testCase.wire, testCase.terminated);
@@ -645,22 +756,49 @@ function runSelfTest(): boolean {
   check("MaxScanSize alert does NOT satisfy MaxFileSize assertion",
     !limitAlertObserved(maxScanSizeOutcome, MAX_FILE_SIZE_ALERT), "cross-alert must fail");
 
+  // 10. Negatives (including timeout and unavailable scanner): none of these may
+  // satisfy a limit assertion, and none may satisfy the StreamMaxLength assertion.
   const negatives: Array<{ name: string; outcome: RawScanOutcome }> = [
-    { name: "CLEAN", outcome: okOutcome("stream: OK\0") },
-    { name: "unrelated FOUND", outcome: okOutcome("stream: Win.Test.EICAR_HDB-1 FOUND\0") },
-    { name: "generic ERROR", outcome: okOutcome("stream: INSTREAM size limit exceeded. ERROR\0") },
-    { name: "INCOMPLETE (unterminated)", outcome: okOutcome("stream: Heuristics.Limits.Exceeded.MaxFileSize FOUND", false) },
-    { name: "MALFORMED", outcome: okOutcome("nonsense\0") },
-    { name: "TIMEOUT", outcome: transportOutcome("TIMEOUT") },
-    { name: "UNAVAILABLE", outcome: transportOutcome("UNAVAILABLE") },
+    { name: "1 CLEAN", outcome: okOutcome("stream: OK\0") },
+    { name: "2 unrelated FOUND", outcome: okOutcome("stream: Win.Test.EICAR_HDB-1 FOUND\0") },
+    { name: "5 FOUND with trailing garbage", outcome: okOutcome("stream: Heuristics.Limits.Exceeded.MaxFileSize FOUND trailinggarbage\0") },
+    { name: "6 FOUND with leading garbage", outcome: okOutcome("stream: garbage Heuristics.Limits.Exceeded.MaxFileSize FOUND\0") },
+    { name: "7 concatenated stanzas", outcome: okOutcome("stream: Heuristics.Limits.Exceeded.MaxFileSize FOUND\0stream: OK\0") },
+    { name: "8 missing terminator", outcome: okOutcome("stream: Heuristics.Limits.Exceeded.MaxFileSize FOUND", false) },
+    { name: "8b already terminated then more text", outcome: okOutcome("stream: OK\0garbage") },
+    { name: "9 generic ERROR", outcome: okOutcome("stream: INSTREAM size limit exceeded. ERROR\0") },
+    { name: "9b generic ERROR with file prefix", outcome: okOutcome("stream: Error processing command. ERROR\0") },
+    { name: "9c prefixless refusal with trailing garbage", outcome: okOutcome("INSTREAM size limit exceeded. ERROR trailinggarbage\0") },
+    { name: "9d malformed reply", outcome: okOutcome("nonsense\0") },
+    { name: "10 TIMEOUT", outcome: transportOutcome("TIMEOUT") },
+    { name: "10b UNAVAILABLE", outcome: transportOutcome("UNAVAILABLE") },
   ];
   for (const negative of negatives) {
-    const rejected = !limitAlertObserved(negative.outcome, MAX_FILE_SIZE_ALERT) && !limitAlertObserved(negative.outcome, MAX_SCAN_SIZE_ALERT);
-    check(`${negative.name} never satisfies a limit assertion`, rejected,
+    const rejected =
+      !limitAlertObserved(negative.outcome, MAX_FILE_SIZE_ALERT) &&
+      !limitAlertObserved(negative.outcome, MAX_SCAN_SIZE_ALERT) &&
+      !instreamSizeLimitRefused(negative.outcome);
+    check(`${negative.name} never satisfies a limit or StreamMaxLength assertion`, rejected,
       `actual=${describeOutcome(negative.outcome)}`);
   }
 
-  console.log(`### SELFTEST_FAILURES=${failed}`);
+  // 4. The StreamMaxLength assertion accepts ONLY the exact prefixless refusal.
+  const refusalOutcome = okOutcome("INSTREAM size limit exceeded. ERROR\0");
+  check("4 prefixless INSTREAM refusal satisfies the StreamMaxLength assertion",
+    instreamSizeLimitRefused(refusalOutcome), describeOutcome(refusalOutcome));
+  check("4b prefixed stream: ERROR does NOT satisfy the StreamMaxLength assertion",
+    !instreamSizeLimitRefused(okOutcome("stream: INSTREAM size limit exceeded. ERROR\0")),
+    "generic ERROR must not prove StreamMaxLength");
+  check("4c refusal without terminator does NOT satisfy the StreamMaxLength assertion",
+    !instreamSizeLimitRefused(okOutcome("INSTREAM size limit exceeded. ERROR", false)),
+    "unterminated refusal must not prove StreamMaxLength");
+  check("4d refusal with trailing garbage does NOT satisfy the StreamMaxLength assertion",
+    !instreamSizeLimitRefused(okOutcome("INSTREAM size limit exceeded. ERROR trailinggarbage\0")),
+    "trailing garbage must not prove StreamMaxLength");
+  check("4e CLEAN does NOT satisfy the StreamMaxLength assertion",
+    !instreamSizeLimitRefused(okOutcome("stream: OK\0")), "CLEAN is not a refusal");
+
+  console.log(`### SELFTEST_CHECKS=${checks} ### SELFTEST_FAILURES=${failed}`);
   return failed === 0;
 }
 
