@@ -146,8 +146,14 @@ export function classifyClamdWire(wire: string, terminated: boolean): ClamdWireV
 
   const terminatorAt = unified.indexOf("\0");
   const afterTerminator = unified.slice(terminatorAt + 1);
-  if (afterTerminator.trim() !== "") {
-    return { kind: "MALFORMED", detail: `trailing garbage after terminator: ${afterTerminator.trim().slice(0, 80)}` };
+  // Nothing may follow the single terminator - not even a space, tab, CR, or LF.
+  // The reply ends at the NUL; any byte after it means the capture is not one
+  // well-formed stanza.
+  if (afterTerminator !== "") {
+    return {
+      kind: "MALFORMED",
+      detail: `bytes after terminator: ${JSON.stringify(afterTerminator.slice(0, 40))}`,
+    };
   }
 
   const body = unified.slice(0, terminatorAt).trim();
@@ -205,8 +211,10 @@ export function limitAlertObserved(outcome: RawScanOutcome, expected: ClamdLimit
 // True only when clamd itself refused the stream at StreamMaxLength, proven by its
 // exact prefixless "INSTREAM size limit exceeded. ERROR" reply. A generic ERROR or a
 // prefixed "stream: ... ERROR" is NOT proof that the stream limit was enforced.
+// The outcome must also be a successful, terminator-confirmed raw read: without a
+// NUL there is no complete reply, whatever verdict text was captured.
 export function instreamSizeLimitRefused(outcome: RawScanOutcome): boolean {
-  return outcome.ok && outcome.verdict.kind === "INSTREAM_SIZE_LIMIT";
+  return outcome.ok && outcome.terminated && outcome.verdict.kind === "INSTREAM_SIZE_LIMIT";
 }
 
 export function describeOutcome(outcome: RawScanOutcome): string {
@@ -722,6 +730,14 @@ function runSelfTest(): boolean {
     { name: "8b missing terminator on CLEAN", wire: "stream: OK", terminated: false, kind: "INCOMPLETE" },
     { name: "8c embedded terminator followed by garbage", wire: "stream: OK\0garbage", terminated: true, kind: "MALFORMED" },
     { name: "8d empty body with terminator", wire: "\0", terminated: true, kind: "MALFORMED" },
+    // 8g-8l: nothing at all may follow the single terminator, not even whitespace
+    { name: "8g space after terminator on CLEAN", wire: "stream: OK\0 ", terminated: true, kind: "MALFORMED" },
+    { name: "8h tab after terminator on CLEAN", wire: "stream: OK\0\t", terminated: true, kind: "MALFORMED" },
+    { name: "8i CRLF after terminator on CLEAN", wire: "stream: OK\0\r\n", terminated: true, kind: "MALFORMED" },
+    { name: "8j space after terminator on alert", wire: "stream: Heuristics.Limits.Exceeded.MaxFileSize FOUND\0 ", terminated: true, kind: "MALFORMED" },
+    { name: "8k trailing newline after terminator on alert", wire: "stream: Heuristics.Limits.Exceeded.MaxScanSize FOUND\0\n", terminated: true, kind: "MALFORMED" },
+    { name: "8l space after terminator on INSTREAM refusal", wire: "INSTREAM size limit exceeded. ERROR\0 ", terminated: true, kind: "MALFORMED" },
+    { name: "8m CRLF before terminator is still valid CLEAN", wire: "stream: OK\r\n\0", terminated: true, kind: "CLEAN" },
     { name: "8e missing stanza prefix", wire: "OK\0", terminated: true, kind: "MALFORMED" },
     { name: "8f garbage reply", wire: "nonsense\0", terminated: true, kind: "MALFORMED" },
     // 9. generic ERROR (prefixed, and with a file prefix) - never a limit alert and
@@ -769,6 +785,11 @@ function runSelfTest(): boolean {
     { name: "9 generic ERROR", outcome: okOutcome("stream: INSTREAM size limit exceeded. ERROR\0") },
     { name: "9b generic ERROR with file prefix", outcome: okOutcome("stream: Error processing command. ERROR\0") },
     { name: "9c prefixless refusal with trailing garbage", outcome: okOutcome("INSTREAM size limit exceeded. ERROR trailinggarbage\0") },
+    { name: "8g space after terminator", outcome: okOutcome("stream: OK\0 ") },
+    { name: "8h tab after terminator", outcome: okOutcome("stream: OK\0\t") },
+    { name: "8i CRLF after terminator", outcome: okOutcome("stream: OK\0\r\n") },
+    { name: "8j space after terminator on alert", outcome: okOutcome("stream: Heuristics.Limits.Exceeded.MaxFileSize FOUND\0 ") },
+    { name: "8k newline after terminator on alert", outcome: okOutcome("stream: Heuristics.Limits.Exceeded.MaxScanSize FOUND\0\n") },
     { name: "9d malformed reply", outcome: okOutcome("nonsense\0") },
     { name: "10 TIMEOUT", outcome: transportOutcome("TIMEOUT") },
     { name: "10b UNAVAILABLE", outcome: transportOutcome("UNAVAILABLE") },
@@ -797,6 +818,27 @@ function runSelfTest(): boolean {
     "trailing garbage must not prove StreamMaxLength");
   check("4e CLEAN does NOT satisfy the StreamMaxLength assertion",
     !instreamSizeLimitRefused(okOutcome("stream: OK\0")), "CLEAN is not a refusal");
+  check("4f refusal with whitespace after terminator does NOT satisfy the StreamMaxLength assertion",
+    !instreamSizeLimitRefused(okOutcome("INSTREAM size limit exceeded. ERROR\0 ")),
+    "bytes after the terminator are not a complete reply");
+  // The predicate must also require a successful, terminator-confirmed read: a verdict
+  // object alone is not enough evidence.
+  const refusalVerdictWithoutTerminator: RawScanOutcome = {
+    ok: true,
+    wire: INSTREAM_SIZE_LIMIT_REFUSAL,
+    terminated: false,
+    elapsedMs: 0,
+    verdict: { kind: "INSTREAM_SIZE_LIMIT" },
+  };
+  check("4g INSTREAM_SIZE_LIMIT without a terminator does NOT satisfy the StreamMaxLength assertion",
+    !instreamSizeLimitRefused(refusalVerdictWithoutTerminator),
+    "terminated=false must fail even if the verdict kind matches");
+  const refusalTransportFailure: RawScanOutcome = transportOutcome("UNAVAILABLE");
+  check("4h transport failure does NOT satisfy the StreamMaxLength assertion",
+    !instreamSizeLimitRefused(refusalTransportFailure), "ok=false must fail");
+  check("4i exact prefixless refusal with a real NUL does satisfy the StreamMaxLength assertion",
+    instreamSizeLimitRefused(okOutcome("INSTREAM size limit exceeded. ERROR\0")),
+    "the legitimate observed reply must still pass");
 
   console.log(`### SELFTEST_CHECKS=${checks} ### SELFTEST_FAILURES=${failed}`);
   return failed === 0;
