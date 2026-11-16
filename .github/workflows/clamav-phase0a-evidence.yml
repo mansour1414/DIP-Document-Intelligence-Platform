@@ -1,0 +1,648 @@
+name: ClamAV Phase 0A Isolated Evidence
+
+# Isolated read-only experimental workflow for Phase 0A ClamAV 1.5.4 evidence.
+# Manual workflow_dispatch on default branch only; no Docker build/push,
+# no GHCR publication, no deployment, no production changes.
+# Security Gate: OPEN | Licensing Gate: OPEN | ClamAV Stage 7: NOT ACCEPTED.
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Type run-phase0a-clamav-evidence to authorize this isolated read-only evidence run
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: clamav-phase0a-evidence
+  cancel-in-progress: false
+
+jobs:
+  phase0a-evidence:
+    name: Collect isolated ClamAV 1.5.4 Phase 0A evidence
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.repository == 'mansour1414/DIP-Document-Intelligence-Platform' &&
+      github.ref == 'refs/heads/main' &&
+      github.ref_name == 'main' &&
+      github.event.inputs.confirmation == 'run-phase0a-clamav-evidence'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      REGISTRY: ghcr.io
+      IMAGE_NAME: ghcr.io/mansour1414/dip-clamav
+      CANDIDATE_DIGEST: sha256:79c668f48507b347acb67cc59cf1c86ea31a1edbd45e8b005dafe41c874a81df
+      CANDIDATE_IMAGE_REF: ghcr.io/mansour1414/dip-clamav@sha256:79c668f48507b347acb67cc59cf1c86ea31a1edbd45e8b005dafe41c874a81df
+      EXPECTED_REPOSITORY: mansour1414/DIP-Document-Intelligence-Platform
+      EXPECTED_DEFAULT_BRANCH: main
+      EXPECTED_CONFIRMATION: run-phase0a-clamav-evidence
+      EXPECTED_PACKAGE_OWNER: mansour1414
+      EXPECTED_PACKAGE_NAME: dip-clamav
+      EXPECTED_PACKAGE_TYPE: container
+      EXPECTED_IMAGE_SOURCE: https://github.com/mansour1414/DIP-Document-Intelligence-Platform
+      EXPECTED_IMAGE_REVISION: aff3548347235d35c58648af8bc605455a0c6437
+      EXPECTED_IMAGE_RUN_ID: "43937894854"
+      EXPECTED_IMAGE_VERSION: stage7-arm64-candidate-run-43937894854
+      EXPECTED_IMAGE_SCOPE: internal-controlled-candidate
+      EXPECTED_CLAMAV_ENGINE_VERSION: "1.5.4"
+      EXPECTED_CLAMAV_PACKAGE_VERSION: 1.5.4+dfsg-0ubuntu0.22.04.1
+      PHASE0A_NETWORK: dip-phase0a-private
+      PYTHONDONTWRITEBYTECODE: "1"
+      EVIDENCE_DIR: ${{ runner.temp }}/clamav-phase0a-evidence
+      WORK_DIR: ${{ runner.temp }}/clamav-phase0a-work
+
+    steps:
+      - name: Check out exact dispatched commit (read-only)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Enforce repository, default-branch, and manual confirmation boundary
+        id: boundary
+        env:
+          CONFIRMATION_INPUT: ${{ github.event.inputs.confirmation }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = "workflow_dispatch"
+          test "$GITHUB_REPOSITORY" = "$EXPECTED_REPOSITORY"
+          test "$GITHUB_REF" = "refs/heads/${EXPECTED_DEFAULT_BRANCH}"
+          test "$GITHUB_REF_NAME" = "$EXPECTED_DEFAULT_BRANCH"
+          test "$CONFIRMATION_INPUT" = "$EXPECTED_CONFIRMATION"
+          test "$CANDIDATE_IMAGE_REF" = "${IMAGE_NAME}@${CANDIDATE_DIGEST}"
+          [[ "$CANDIDATE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          case "$CANDIDATE_IMAGE_REF" in
+            *:latest*|*:production*|*:prod*)
+              echo "Mutable or production-like tags are forbidden" >&2
+              exit 2
+              ;;
+          esac
+          rm -rf "$EVIDENCE_DIR" "$WORK_DIR"
+          mkdir -p "$EVIDENCE_DIR" "$WORK_DIR"
+          chmod 0755 "$WORK_DIR"
+          jq -n \
+            --arg runId "$GITHUB_RUN_ID" \
+            --arg runAttempt "$GITHUB_RUN_ATTEMPT" \
+            --arg commitSha "$GITHUB_SHA" \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg ref "$GITHUB_REF" \
+            --arg workflowRef "$GITHUB_WORKFLOW_REF" \
+            --arg workflowSha "$GITHUB_WORKFLOW_SHA" \
+            --arg imageRef "$CANDIDATE_IMAGE_REF" \
+            '{runId:$runId,runAttempt:$runAttempt,commitSha:$commitSha,repository:$repository,ref:$ref,workflowRef:$workflowRef,workflowSha:$workflowSha,candidateImageRef:$imageRef}' \
+            > "$EVIDENCE_DIR/workflow-identity.json"
+          sha256sum \
+            .github/workflows/clamav-phase0a-evidence.yml \
+            scripts/experiments/clamav-phase0a-evidence.py \
+            scripts/experiments/verify-ghcr-package-metadata.mjs \
+            docs/operations/experimental/clamav-arm64-stage4-candidate.conf \
+            > "$EVIDENCE_DIR/source-files.sha256"
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Verify Python 3.12 runtime and run offline script self-test
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -c 'import sys; assert sys.version_info[:2] == (3, 12), f"Expected Python 3.12, got {sys.version}"'
+          python3 scripts/experiments/clamav-phase0a-evidence.py --self-test \
+            > "$EVIDENCE_DIR/python-selftest.log"
+
+      - name: Set up QEMU for ARM64 execution
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
+        with:
+          platforms: arm64
+
+      - name: Log in read-only to private GHCR with repository token
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify candidate GHCR privacy, digest access, and Stage 7 provenance (fail closed)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_VERIFY_PHASE: phase0a-preflight
+          GHCR_VERIFY_DIGEST: ${{ env.CANDIDATE_DIGEST }}
+          GHCR_EXPECTED_SOURCE: ${{ env.EXPECTED_IMAGE_SOURCE }}
+          GHCR_EXPECTED_REVISION: ${{ env.EXPECTED_IMAGE_REVISION }}
+          GHCR_EXPECTED_RUN_ID: ${{ env.EXPECTED_IMAGE_RUN_ID }}
+          GHCR_EXPECTED_VERSION: ${{ env.EXPECTED_IMAGE_VERSION }}
+          GHCR_VERIFY_MAX_ATTEMPTS: "6"
+          GHCR_VERIFY_RETRY_SECONDS: "5"
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/experiments/verify-ghcr-package-metadata.mjs
+          docker buildx imagetools inspect "$CANDIDATE_IMAGE_REF" --raw \
+            > "$WORK_DIR/registry-index.json"
+          media_type="$(jq -r '.mediaType // empty' "$WORK_DIR/registry-index.json")"
+          if [[ "$media_type" == *image.index* || "$media_type" == *manifest.list* ]]; then
+            arm64_count="$(jq -r '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == "arm64")] | length' "$WORK_DIR/registry-index.json")"
+            test "$arm64_count" = "1"
+            arm64_manifest="$(jq -er '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == "arm64")][0].digest' "$WORK_DIR/registry-index.json")"
+          else
+            arm64_manifest="$CANDIDATE_DIGEST"
+          fi
+          [[ "$arm64_manifest" =~ ^sha256:[a-f0-9]{64}$ ]]
+          docker buildx imagetools inspect "${IMAGE_NAME}@${arm64_manifest}" --raw \
+            > "$WORK_DIR/registry-arm64-manifest.json"
+          config_digest="$(jq -er '.config.digest' "$WORK_DIR/registry-arm64-manifest.json")"
+          [[ "$config_digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+          labels_json="$(docker buildx imagetools inspect "${IMAGE_NAME}@${arm64_manifest}" --format '{{json .Image.Config.Labels}}')"
+          release_scope="$(jq -er '."io.dip.release-scope"' <<<"$labels_json")"
+          test "$release_scope" = "$EXPECTED_IMAGE_SCOPE"
+          jq -n \
+            --arg imageRef "$CANDIDATE_IMAGE_REF" \
+            --arg indexDigest "$CANDIDATE_DIGEST" \
+            --arg arm64ManifestDigest "$arm64_manifest" \
+            --arg configDigest "$config_digest" \
+            --arg expectedRevision "$EXPECTED_IMAGE_REVISION" \
+            --arg expectedRunId "$EXPECTED_IMAGE_RUN_ID" \
+            --arg expectedVersion "$EXPECTED_IMAGE_VERSION" \
+            --arg releaseScope "$release_scope" \
+            --argjson labels "$labels_json" \
+            '{pinnedImageRef:$imageRef,registryIndexDigest:$indexDigest,arm64ManifestDigest:$arm64ManifestDigest,imageConfigDigest:$configDigest,expectedOrigin:{revision:$expectedRevision,stage7RunId:$expectedRunId,version:$expectedVersion,releaseScope:$releaseScope},verifiedLabels:$labels,stage7SecurityAccepted:false}' \
+            > "$EVIDENCE_DIR/candidate-provenance.json"
+          {
+            echo "ARM64_MANIFEST_DIGEST=$arm64_manifest"
+            echo "IMAGE_CONFIG_DIGEST=$config_digest"
+          } >> "$GITHUB_ENV"
+
+      - name: Pull immutable ARM64 candidate by digest and verify architecture, ClamAV 1.5.4, and config hash (fail closed)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull --platform linux/arm64 "$CANDIDATE_IMAGE_REF"
+          local_config="$(docker image inspect "$CANDIDATE_IMAGE_REF" --format '{{.Id}}')"
+          test "$local_config" = "$IMAGE_CONFIG_DIGEST"
+          local_platform="$(docker image inspect "$CANDIDATE_IMAGE_REF" --format '{{.Os}}/{{.Architecture}}')"
+          test "$local_platform" = "linux/arm64"
+          local_user="$(docker image inspect "$CANDIDATE_IMAGE_REF" --format '{{.Config.User}}')"
+          test "$local_user" = "clamav"
+
+          dpkg_out="$(docker run --rm --platform linux/arm64 --network none \
+            --read-only --cap-drop ALL --security-opt no-new-privileges:true \
+            --memory 512m --memory-swap 512m --cpus 1 --pids-limit 64 \
+            --entrypoint /usr/bin/dpkg-query "$CANDIDATE_IMAGE_REF" \
+            -W -f='${binary:Package}\t${Version}\n' \
+            clamav-base clamav-daemon clamav-freshclam)"
+          printf '%s\n' "$dpkg_out" > "$WORK_DIR/dpkg-clamav.tsv"
+          for pkg in clamav-base clamav-daemon clamav-freshclam; do
+            actual_ver="$(awk -F'\t' -v p="$pkg" '$1 == p { print $2 }' "$WORK_DIR/dpkg-clamav.tsv")"
+            test "$actual_ver" = "$EXPECTED_CLAMAV_PACKAGE_VERSION"
+          done
+
+          clamd_ver="$(docker run --rm --platform linux/arm64 --network none \
+            --read-only --cap-drop ALL --security-opt no-new-privileges:true \
+            --memory 512m --memory-swap 512m --cpus 1 --pids-limit 64 \
+            --entrypoint /usr/sbin/clamd "$CANDIDATE_IMAGE_REF" --version)"
+          escaped_engine="${EXPECTED_CLAMAV_ENGINE_VERSION//./\\.}"
+          [[ "$clamd_ver" =~ ^ClamAV[[:space:]]+${escaped_engine}([/[:space:]]|$) ]]
+
+          image_conf_sha="$(docker run --rm --platform linux/arm64 --network none \
+            --read-only --cap-drop ALL --security-opt no-new-privileges:true \
+            --memory 512m --memory-swap 512m --cpus 1 --pids-limit 64 \
+            --entrypoint /usr/bin/sha256sum "$CANDIDATE_IMAGE_REF" /etc/clamav/clamd.conf | awk '{print $1}')"
+          repo_conf_sha="$(sha256sum docs/operations/experimental/clamav-arm64-stage4-candidate.conf | awk '{print $1}')"
+
+          jq -n \
+            --arg imageRef "$CANDIDATE_IMAGE_REF" \
+            --arg localConfigDigest "$local_config" \
+            --arg platform "$local_platform" \
+            --arg user "$local_user" \
+            --arg clamdVersion "$clamd_ver" \
+            --arg expectedPackageVersion "$EXPECTED_CLAMAV_PACKAGE_VERSION" \
+            --arg imageClamdConfSha256 "$image_conf_sha" \
+            --arg repoCandidateConfSha256 "$repo_conf_sha" \
+            --arg dpkgTsv "$dpkg_out" \
+            '{imageRef:$imageRef,localConfigDigest:$localConfigDigest,platform:$platform,user:$user,clamdVersion:$clamdVersion,expectedPackageVersion:$expectedPackageVersion,dpkgVersions:($dpkgTsv | split("\n") | map(select(length>0) | split("\t") | {(.[0]): .[1]}) | add),imageClamdConfSha256:$imageClamdConfSha256,repoCandidateConfSha256:$repoCandidateConfSha256,candidateConfMatchesRepo:(($imageClamdConfSha256 | test("^[a-f0-9]{64}$")) and ($repoCandidateConfSha256 | test("^[a-f0-9]{64}$")) and ($imageClamdConfSha256 == $repoCandidateConfSha256))}' \
+            > "$EVIDENCE_DIR/image-verification.json"
+
+          # BEGIN PHASE0A_CANDIDATE_CONF_HASH_GUARD
+          if [[ ! "$image_conf_sha" =~ ^[a-f0-9]{64}$ ]] || [[ ! "$repo_conf_sha" =~ ^[a-f0-9]{64}$ ]] || [[ "$image_conf_sha" != "$repo_conf_sha" ]]; then
+            echo "FAIL-CLOSED: candidate /etc/clamav/clamd.conf SHA-256 (${image_conf_sha:-missing}) does not match repository approved candidate config SHA-256 (${repo_conf_sha:-missing})" >&2
+            exit 4
+          fi
+          # END PHASE0A_CANDIDATE_CONF_HASH_GUARD
+
+      - name: Download fresh ClamAV signatures and enforce freshness gate (fail closed)
+        shell: bash
+        run: |
+          set -euo pipefail
+          db_dir="$WORK_DIR/clamav-db"
+          cfg_dir="$WORK_DIR/freshclam-cfg"
+          mkdir -p "$db_dir" "$cfg_dir"
+          chmod 0777 "$db_dir"
+          chmod 0755 "$cfg_dir"
+          printf '%s\n' \
+            'DatabaseDirectory /var/lib/clamav' \
+            'DatabaseMirror database.clamav.net' \
+            'DatabaseOwner clamav' \
+            'Checks 24' \
+            'LogTime yes' \
+            > "$cfg_dir/freshclam.conf"
+          chmod 0644 "$cfg_dir/freshclam.conf"
+
+          timeout 300 docker run --rm --platform linux/arm64 \
+            --read-only --cap-drop ALL --security-opt no-new-privileges:true \
+            --memory 1g --memory-swap 1g --cpus 1 --pids-limit 128 \
+            --tmpfs /tmp:rw,noexec,nosuid,size=128m,uid=101,gid=102 \
+            --tmpfs /run/clamav:rw,noexec,nosuid,size=16m,uid=101,gid=102 \
+            --tmpfs /var/log/clamav:rw,noexec,nosuid,size=32m,uid=101,gid=102 \
+            -v "$db_dir:/var/lib/clamav" \
+            -v "$cfg_dir/freshclam.conf:/etc/clamav/freshclam-phase0a.conf:ro" \
+            --entrypoint /usr/bin/freshclam \
+            "$CANDIDATE_IMAGE_REF" \
+            --config-file=/etc/clamav/freshclam-phase0a.conf --stdout
+          chmod 0755 "$db_dir"
+          test -s "$db_dir/main.cvd" || test -s "$db_dir/main.cld"
+          test -s "$db_dir/daily.cvd" || test -s "$db_dir/daily.cld"
+
+          docker run --rm --platform linux/arm64 --network none \
+            --read-only --cap-drop ALL --security-opt no-new-privileges:true \
+            --memory 512m --memory-swap 512m --cpus 1 --pids-limit 64 \
+            -v "$db_dir:/var/lib/clamav:ro" \
+            --entrypoint /usr/local/bin/clamd-freshness-gate \
+            "$CANDIDATE_IMAGE_REF" --check \
+            | tee "$EVIDENCE_DIR/freshness-gate.log"
+          grep -Fq 'FRESHNESS_GATE=PASS' "$EVIDENCE_DIR/freshness-gate.log"
+
+          python3 - "$db_dir" "$EVIDENCE_DIR/signature-db-metadata.json" <<'PY'
+          import hashlib, json, pathlib, sys
+          db_dir = pathlib.Path(sys.argv[1])
+          out_path = pathlib.Path(sys.argv[2])
+          files = []
+          for path in sorted(db_dir.iterdir()):
+              if not path.is_file() or path.suffix not in (".cvd", ".cld"):
+                  continue
+              h = hashlib.sha256()
+              with path.open("rb") as fh:
+                  header = fh.read(512)
+                  h.update(header)
+                  while True:
+                      chunk = fh.read(65536)
+                      if not chunk:
+                          break
+                      h.update(chunk)
+              header_text = header.split(b"\x00", 1)[0].decode("ascii", errors="replace").strip()
+              fields = header_text.split(":")
+              files.append({
+                  "filename": path.name,
+                  "size_bytes": path.stat().st_size,
+                  "sha256": h.hexdigest(),
+                  "vdb_magic": fields[0] if len(fields) > 0 else None,
+                  "vdb_build_time": fields[1] if len(fields) > 1 else None,
+                  "vdb_version": fields[2] if len(fields) > 2 else None,
+                  "vdb_signatures": fields[3] if len(fields) > 3 else None,
+              })
+          out_path.write_text(json.dumps({"database_files": files}, indent=2) + "\n", encoding="utf-8")
+          PY
+          echo "CLAMAV_PHASE0A_DB=$db_dir" >> "$GITHUB_ENV"
+
+      - name: Generate bounded small fixtures and verify binary ZIP32/ZIP64 headers
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/experiments/clamav-phase0a-evidence.py generate-fixtures \
+            --output-dir "$WORK_DIR/fixtures" \
+            --manifest-out "$EVIDENCE_DIR/fixtures-manifest.json" \
+            --require-python-312
+
+      - name: Create restricted internal temporary Docker network
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker network rm "$PHASE0A_NETWORK" 2>/dev/null || true
+          docker network create --driver bridge --internal "$PHASE0A_NETWORK"
+          test "$(docker network inspect "$PHASE0A_NETWORK" --format '{{.Internal}}')" = "true"
+          echo '{}' > "$EVIDENCE_DIR/resource-observations.json"
+
+      - name: Run Part 1 (A-D) against unmodified candidate configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          container="clamav-phase0a-candidate"
+          cleanup() { docker rm -f "$container" 2>/dev/null || true; }
+          trap cleanup EXIT
+          docker rm -f "$container" 2>/dev/null || true
+
+          docker run -d --name "$container" \
+            --platform linux/arm64 \
+            --network "$PHASE0A_NETWORK" \
+            --read-only \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            --memory 3g --memory-swap 3g --cpus 2 --pids-limit 256 \
+            --tmpfs /tmp:rw,noexec,nosuid,size=256m,uid=101,gid=102 \
+            --tmpfs /run/clamav:rw,noexec,nosuid,size=32m,uid=101,gid=102 \
+            --tmpfs /var/log/clamav:rw,noexec,nosuid,size=32m,uid=101,gid=102 \
+            -v "$CLAMAV_PHASE0A_DB:/var/lib/clamav:ro" \
+            "$CANDIDATE_IMAGE_REF"
+
+          for _ in $(seq 1 80); do
+            health="$(docker inspect "$container" --format '{{.State.Health.Status}}')"
+            [[ "$health" == "healthy" ]] && break
+            if [[ "$health" == "unhealthy" ]]; then
+              docker logs --tail 100 "$container" || true
+              exit 5
+            fi
+            sleep 3
+          done
+          test "$(docker inspect "$container" --format '{{.State.Health.Status}}')" = "healthy"
+          test "$(docker exec "$container" id -u)" = "101"
+          test "$(docker exec "$container" id -g)" = "102"
+          test "$(docker inspect "$container" --format '{{.HostConfig.ReadonlyRootfs}}')" = "true"
+          test "$(docker inspect "$container" --format '{{len .HostConfig.PortBindings}}')" = "0"
+          test "$(docker inspect "$container" --format '{{len .NetworkSettings.Networks}}')" = "1"
+          test "$(docker inspect "$container" --format '{{.HostConfig.NetworkMode}}')" = "$PHASE0A_NETWORK"
+          test "$(docker inspect "$container" --format '{{range .Mounts}}{{if eq .Destination "/var/lib/clamav"}}{{.RW}}{{end}}{{end}}')" = "false"
+
+          docker exec "$container" /usr/bin/clamconf --config-dir=/etc/clamav > "$WORK_DIR/candidate-clamconf.txt"
+          docker stats --no-stream --format '{{json .}}' "$container" > "$WORK_DIR/candidate-stats-pre.json"
+          container_ip="$(docker inspect "$container" --format "{{with index .NetworkSettings.Networks \"$PHASE0A_NETWORK\"}}{{.IPAddress}}{{end}}")"
+          test -n "$container_ip"
+
+          python3 scripts/experiments/clamav-phase0a-evidence.py scan-profile \
+            --profile candidate \
+            --host "$container_ip" \
+            --port 3310 \
+            --fixtures-dir "$WORK_DIR/fixtures" \
+            --manifest "$EVIDENCE_DIR/fixtures-manifest.json" \
+            --expected-engine "$EXPECTED_CLAMAV_ENGINE_VERSION" \
+            --clamconf-file "$WORK_DIR/candidate-clamconf.txt" \
+            --expected-alert-exceeds-max yes \
+            --container-stats-file "$WORK_DIR/candidate-stats-pre.json" \
+            --output "$EVIDENCE_DIR/profile-candidate.json"
+
+          docker stats --no-stream --format '{{json .}}' "$container" > "$WORK_DIR/candidate-stats-post.json"
+          jq \
+            --slurpfile pre "$WORK_DIR/candidate-stats-pre.json" \
+            --slurpfile post "$WORK_DIR/candidate-stats-post.json" \
+            '.candidate = {pre_scan: $pre[0], post_scan: $post[0]}' \
+            "$EVIDENCE_DIR/resource-observations.json" > "$WORK_DIR/resource-observations.tmp.json"
+          mv "$WORK_DIR/resource-observations.tmp.json" "$EVIDENCE_DIR/resource-observations.json"
+
+      - name: Run Part 2 (E1) against isolated reduced MaxFileSize config with AlertExceedsMax yes
+        shell: bash
+        run: |
+          set -euo pipefail
+          container="clamav-phase0a-reduced-yes"
+          cleanup() { docker rm -f "$container" 2>/dev/null || true; }
+          trap cleanup EXIT
+          docker rm -f "$container" 2>/dev/null || true
+
+          cfg_dir="$WORK_DIR/configs/reduced-yes"
+          mkdir -p "$cfg_dir"
+          chmod 0755 "$WORK_DIR/configs" "$cfg_dir"
+          printf '%s\n' \
+            'TCPSocket 3310' \
+            'TCPAddr 0.0.0.0' \
+            'StreamMaxLength 1M' \
+            'MaxFileSize 16K' \
+            'MaxScanSize 512K' \
+            'MaxScanTime 25000' \
+            'ReadTimeout 120' \
+            'MaxThreads 4' \
+            'MaxRecursion 16' \
+            'MaxFiles 10000' \
+            'MaxEmbeddedPE 40M' \
+            'MaxHTMLNormalize 40M' \
+            'MaxHTMLNoTags 8M' \
+            'MaxScriptNormalize 20M' \
+            'MaxZipTypeRcg 1M' \
+            'MaxIconsPE 100' \
+            'MaxRecHWP3 16' \
+            'MaxPartitions 50' \
+            'PCREMatchLimit 100000' \
+            'PCRERecMatchLimit 2000' \
+            'PCREMaxFileSize 100M' \
+            'AlertExceedsMax yes' \
+            'ConcurrentDatabaseReload no' \
+            'AlertEncrypted no' \
+            'SelfCheck 3600' \
+            'LogTime yes' \
+            'LogClean no' \
+            'LogFile /var/log/clamav/clamd.log' \
+            'LogFileMaxSize 10M' \
+            'DatabaseDirectory /var/lib/clamav' \
+            'TemporaryDirectory /tmp' \
+            'PidFile /run/clamav/clamd.pid' \
+            > "$cfg_dir/clamd.conf"
+          chmod 0644 "$cfg_dir/clamd.conf"
+
+          docker run -d --name "$container" \
+            --platform linux/arm64 \
+            --network "$PHASE0A_NETWORK" \
+            --read-only \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            --memory 3g --memory-swap 3g --cpus 2 --pids-limit 256 \
+            --tmpfs /tmp:rw,noexec,nosuid,size=256m,uid=101,gid=102 \
+            --tmpfs /run/clamav:rw,noexec,nosuid,size=32m,uid=101,gid=102 \
+            --tmpfs /var/log/clamav:rw,noexec,nosuid,size=32m,uid=101,gid=102 \
+            -v "$CLAMAV_PHASE0A_DB:/var/lib/clamav:ro" \
+            -v "$cfg_dir:/etc/clamav-phase0a:ro" \
+            --entrypoint /usr/local/bin/clamd-freshness-gate \
+            "$CANDIDATE_IMAGE_REF" \
+            --exec /usr/sbin/clamd --config-file=/etc/clamav-phase0a/clamd.conf --foreground
+
+          for _ in $(seq 1 80); do
+            health="$(docker inspect "$container" --format '{{.State.Health.Status}}')"
+            [[ "$health" == "healthy" ]] && break
+            if [[ "$health" == "unhealthy" ]]; then
+              docker logs --tail 100 "$container" || true
+              exit 5
+            fi
+            sleep 3
+          done
+          test "$(docker inspect "$container" --format '{{.State.Health.Status}}')" = "healthy"
+          test "$(docker exec "$container" id -u)" = "101"
+          test "$(docker exec "$container" id -g)" = "102"
+          test "$(docker inspect "$container" --format '{{.HostConfig.ReadonlyRootfs}}')" = "true"
+          test "$(docker inspect "$container" --format '{{len .HostConfig.PortBindings}}')" = "0"
+          test "$(docker inspect "$container" --format '{{len .NetworkSettings.Networks}}')" = "1"
+          test "$(docker inspect "$container" --format '{{.HostConfig.NetworkMode}}')" = "$PHASE0A_NETWORK"
+
+          docker exec "$container" /usr/bin/clamconf --config-dir=/etc/clamav-phase0a > "$WORK_DIR/reduced-yes-clamconf.txt"
+          docker stats --no-stream --format '{{json .}}' "$container" > "$WORK_DIR/reduced-yes-stats-pre.json"
+          container_ip="$(docker inspect "$container" --format "{{with index .NetworkSettings.Networks \"$PHASE0A_NETWORK\"}}{{.IPAddress}}{{end}}")"
+          test -n "$container_ip"
+
+          python3 scripts/experiments/clamav-phase0a-evidence.py scan-profile \
+            --profile reduced_alert_yes \
+            --host "$container_ip" \
+            --port 3310 \
+            --fixtures-dir "$WORK_DIR/fixtures" \
+            --manifest "$EVIDENCE_DIR/fixtures-manifest.json" \
+            --expected-engine "$EXPECTED_CLAMAV_ENGINE_VERSION" \
+            --clamconf-file "$WORK_DIR/reduced-yes-clamconf.txt" \
+            --expected-alert-exceeds-max yes \
+            --container-stats-file "$WORK_DIR/reduced-yes-stats-pre.json" \
+            --output "$EVIDENCE_DIR/profile-reduced-alert-yes.json"
+
+          docker stats --no-stream --format '{{json .}}' "$container" > "$WORK_DIR/reduced-yes-stats-post.json"
+          jq \
+            --slurpfile pre "$WORK_DIR/reduced-yes-stats-pre.json" \
+            --slurpfile post "$WORK_DIR/reduced-yes-stats-post.json" \
+            '.reduced_alert_yes = {pre_scan: $pre[0], post_scan: $post[0]}' \
+            "$EVIDENCE_DIR/resource-observations.json" > "$WORK_DIR/resource-observations.tmp.json"
+          mv "$WORK_DIR/resource-observations.tmp.json" "$EVIDENCE_DIR/resource-observations.json"
+
+      - name: Run Part 3 (E2) against isolated reduced MaxFileSize config with AlertExceedsMax no
+        shell: bash
+        run: |
+          set -euo pipefail
+          container="clamav-phase0a-reduced-no"
+          cleanup() { docker rm -f "$container" 2>/dev/null || true; }
+          trap cleanup EXIT
+          docker rm -f "$container" 2>/dev/null || true
+
+          cfg_dir="$WORK_DIR/configs/reduced-no"
+          mkdir -p "$cfg_dir"
+          chmod 0755 "$WORK_DIR/configs" "$cfg_dir"
+          printf '%s\n' \
+            'TCPSocket 3310' \
+            'TCPAddr 0.0.0.0' \
+            'StreamMaxLength 1M' \
+            'MaxFileSize 16K' \
+            'MaxScanSize 512K' \
+            'MaxScanTime 25000' \
+            'ReadTimeout 120' \
+            'MaxThreads 4' \
+            'MaxRecursion 16' \
+            'MaxFiles 10000' \
+            'MaxEmbeddedPE 40M' \
+            'MaxHTMLNormalize 40M' \
+            'MaxHTMLNoTags 8M' \
+            'MaxScriptNormalize 20M' \
+            'MaxZipTypeRcg 1M' \
+            'MaxIconsPE 100' \
+            'MaxRecHWP3 16' \
+            'MaxPartitions 50' \
+            'PCREMatchLimit 100000' \
+            'PCRERecMatchLimit 2000' \
+            'PCREMaxFileSize 100M' \
+            'AlertExceedsMax no' \
+            'ConcurrentDatabaseReload no' \
+            'AlertEncrypted no' \
+            'SelfCheck 3600' \
+            'LogTime yes' \
+            'LogClean no' \
+            'LogFile /var/log/clamav/clamd.log' \
+            'LogFileMaxSize 10M' \
+            'DatabaseDirectory /var/lib/clamav' \
+            'TemporaryDirectory /tmp' \
+            'PidFile /run/clamav/clamd.pid' \
+            > "$cfg_dir/clamd.conf"
+          chmod 0644 "$cfg_dir/clamd.conf"
+
+          docker run -d --name "$container" \
+            --platform linux/arm64 \
+            --network "$PHASE0A_NETWORK" \
+            --read-only \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            --memory 3g --memory-swap 3g --cpus 2 --pids-limit 256 \
+            --tmpfs /tmp:rw,noexec,nosuid,size=256m,uid=101,gid=102 \
+            --tmpfs /run/clamav:rw,noexec,nosuid,size=32m,uid=101,gid=102 \
+            --tmpfs /var/log/clamav:rw,noexec,nosuid,size=32m,uid=101,gid=102 \
+            -v "$CLAMAV_PHASE0A_DB:/var/lib/clamav:ro" \
+            -v "$cfg_dir:/etc/clamav-phase0a:ro" \
+            --entrypoint /usr/local/bin/clamd-freshness-gate \
+            "$CANDIDATE_IMAGE_REF" \
+            --exec /usr/sbin/clamd --config-file=/etc/clamav-phase0a/clamd.conf --foreground
+
+          for _ in $(seq 1 80); do
+            health="$(docker inspect "$container" --format '{{.State.Health.Status}}')"
+            [[ "$health" == "healthy" ]] && break
+            if [[ "$health" == "unhealthy" ]]; then
+              docker logs --tail 100 "$container" || true
+              exit 5
+            fi
+            sleep 3
+          done
+          test "$(docker inspect "$container" --format '{{.State.Health.Status}}')" = "healthy"
+          test "$(docker exec "$container" id -u)" = "101"
+          test "$(docker exec "$container" id -g)" = "102"
+          test "$(docker inspect "$container" --format '{{.HostConfig.ReadonlyRootfs}}')" = "true"
+          test "$(docker inspect "$container" --format '{{len .HostConfig.PortBindings}}')" = "0"
+          test "$(docker inspect "$container" --format '{{len .NetworkSettings.Networks}}')" = "1"
+          test "$(docker inspect "$container" --format '{{.HostConfig.NetworkMode}}')" = "$PHASE0A_NETWORK"
+
+          docker exec "$container" /usr/bin/clamconf --config-dir=/etc/clamav-phase0a > "$WORK_DIR/reduced-no-clamconf.txt"
+          docker stats --no-stream --format '{{json .}}' "$container" > "$WORK_DIR/reduced-no-stats-pre.json"
+          container_ip="$(docker inspect "$container" --format "{{with index .NetworkSettings.Networks \"$PHASE0A_NETWORK\"}}{{.IPAddress}}{{end}}")"
+          test -n "$container_ip"
+
+          python3 scripts/experiments/clamav-phase0a-evidence.py scan-profile \
+            --profile reduced_alert_no \
+            --host "$container_ip" \
+            --port 3310 \
+            --fixtures-dir "$WORK_DIR/fixtures" \
+            --manifest "$EVIDENCE_DIR/fixtures-manifest.json" \
+            --expected-engine "$EXPECTED_CLAMAV_ENGINE_VERSION" \
+            --clamconf-file "$WORK_DIR/reduced-no-clamconf.txt" \
+            --expected-alert-exceeds-max no \
+            --container-stats-file "$WORK_DIR/reduced-no-stats-pre.json" \
+            --output "$EVIDENCE_DIR/profile-reduced-alert-no.json"
+
+          docker stats --no-stream --format '{{json .}}' "$container" > "$WORK_DIR/reduced-no-stats-post.json"
+          jq \
+            --slurpfile pre "$WORK_DIR/reduced-no-stats-pre.json" \
+            --slurpfile post "$WORK_DIR/reduced-no-stats-post.json" \
+            '.reduced_alert_no = {pre_scan: $pre[0], post_scan: $post[0]}' \
+            "$EVIDENCE_DIR/resource-observations.json" > "$WORK_DIR/resource-observations.tmp.json"
+          mv "$WORK_DIR/resource-observations.tmp.json" "$EVIDENCE_DIR/resource-observations.json"
+
+      - name: Assemble bounded Phase 0A evidence report and enforce fail-closed verdict
+        if: always() && steps.boundary.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain)"
+          rc=0
+          python3 scripts/experiments/clamav-phase0a-evidence.py assemble-report \
+            --evidence-dir "$EVIDENCE_DIR" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --commit-sha "$GITHUB_SHA" \
+            --repository "$GITHUB_REPOSITORY" \
+            --ref "$GITHUB_REF" \
+            --image-ref "$CANDIDATE_IMAGE_REF" \
+            --expected-engine "$EXPECTED_CLAMAV_ENGINE_VERSION" \
+            --expected-package-version "$EXPECTED_CLAMAV_PACKAGE_VERSION" \
+            --fail-on-non-pass || rc=$?
+
+          evidence_bytes="$(du -sb "$EVIDENCE_DIR" | awk '{print $1}')"
+          test "$evidence_bytes" -lt 5242880
+          cat "$EVIDENCE_DIR/phase0a-evidence-summary.md"
+          exit "$rc"
+
+      - name: Upload bounded non-sensitive Phase 0A evidence artifact
+        if: always() && steps.boundary.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: clamav-phase0a-evidence-${{ github.run_id }}-${{ github.sha }}
+          path: ${{ env.EVIDENCE_DIR }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Remove temporary test containers, internal network, and scratch directory
+        if: always()
+        shell: bash
+        run: |
+          docker rm -f \
+            clamav-phase0a-candidate \
+            clamav-phase0a-reduced-yes \
+            clamav-phase0a-reduced-no 2>/dev/null || true
+          docker network rm "$PHASE0A_NETWORK" 2>/dev/null || true
+          rm -rf "$WORK_DIR"
