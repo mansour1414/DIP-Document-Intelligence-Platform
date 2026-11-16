@@ -52,8 +52,6 @@ jobs:
       EXPECTED_CLAMAV_PACKAGE_VERSION: 1.5.4+dfsg-0ubuntu0.22.04.1
       PHASE0A_NETWORK: dip-phase0a-private
       PYTHONDONTWRITEBYTECODE: "1"
-      EVIDENCE_DIR: ${{ runner.temp }}/clamav-phase0a-evidence
-      WORK_DIR: ${{ runner.temp }}/clamav-phase0a-work
 
     steps:
       - name: Check out exact dispatched commit (read-only)
@@ -81,6 +79,13 @@ jobs:
               exit 2
               ;;
           esac
+          test -n "${RUNNER_TEMP:-}"
+          EVIDENCE_DIR="${RUNNER_TEMP%/}/clamav-phase0a-evidence"
+          WORK_DIR="${RUNNER_TEMP%/}/clamav-phase0a-work"
+          {
+            echo "EVIDENCE_DIR=$EVIDENCE_DIR"
+            echo "WORK_DIR=$WORK_DIR"
+          } >> "$GITHUB_ENV"
           rm -rf "$EVIDENCE_DIR" "$WORK_DIR"
           mkdir -p "$EVIDENCE_DIR" "$WORK_DIR"
           chmod 0755 "$WORK_DIR"
@@ -632,7 +637,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: clamav-phase0a-evidence-${{ github.run_id }}-${{ github.sha }}
-          path: ${{ env.EVIDENCE_DIR }}
+          path: ${{ runner.temp }}/clamav-phase0a-evidence
           if-no-files-found: error
           retention-days: 30
 
@@ -640,9 +645,14 @@ jobs:
         if: always()
         shell: bash
         run: |
+          set -euo pipefail
           docker rm -f \
             clamav-phase0a-candidate \
             clamav-phase0a-reduced-yes \
             clamav-phase0a-reduced-no 2>/dev/null || true
-          docker network rm "$PHASE0A_NETWORK" 2>/dev/null || true
-          rm -rf "$WORK_DIR"
+          if [[ -n "${PHASE0A_NETWORK:-}" ]]; then
+            docker network rm "$PHASE0A_NETWORK" 2>/dev/null || true
+          fi
+          if [[ -n "${WORK_DIR:-}" ]]; then
+            rm -rf "$WORK_DIR"
+          fi
