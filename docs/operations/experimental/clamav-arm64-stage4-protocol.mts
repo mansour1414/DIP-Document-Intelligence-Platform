@@ -36,6 +36,18 @@ function record(name: string, expected: MalwareScanResultCode | "clamd ERROR" | 
   console.log(`${pass ? "PASS" : "FAIL"} | ${name} | expected=${expected} | actual=${got} | ${JSON.stringify(extra)}`);
 }
 
+// True when clamd reports an incomplete scan due to a limit (Heuristics.Limits.Exceeded.*)
+// rather than a genuine malware detection or a clean scan.
+// These must be treated as fail-closed (scan not complete), not as CLEAN.
+function isLimitAlert(result: string): boolean {
+  return /Heuristics\.Limits\.Exceeded\./u.test(result);
+}
+
+// True only when clamd reports a genuine malware detection.
+function isGenuineDetection(result: string): boolean {
+  return / FOUND$/u.test(result) && !/Heuristics\.Limits\.Exceeded\./u.test(result);
+}
+
 // Binary INSTREAM framing, exactly as src/lib/malware/clamd.ts does it:
 // repeated 4-byte big-endian length prefixes, terminated by a 4-byte zero length.
 function rawInstream(bytes: Buffer, timeoutMs = 120000): Promise<{ got: string }> {
@@ -228,11 +240,90 @@ async function main() {
       // It must never silently pass as CLEAN while exceeding the scan budget.
       record("bomb (420 MiB decompressed) is not silently CLEAN", "SCAN_ERROR", r.result, {
         inputBytes: buf.byteLength, elapsedMs: r.ms,
-      }, r.result !== "CLEAN" && r.ms < 30000);
-    }
-  }
+          }, r.result !== "CLEAN" && r.ms < 30000);
+        }
+      }
 
-  // ---- 9. SCAN_ERROR: zero-length input --------------------------------
+      // ---- 8a. DIAGNOSTIC: raw clamd wire response for the 420 MiB bomb ----
+      // Capture the exact clamd verdict text on the wire (independent of the
+      // DIP client parser) to distinguish a genuine CLEAN from a truncated
+      // scan that the client collapsed to CLEAN.
+      {
+        const p = `${PAYLOADS}/bomb.zip`;
+        if (existsSync(p)) {
+          const buf = readFileSync(p);
+          const raw = await rawInstream(buf, 120000);
+          console.log(`### RAW wire bomb.zip (420 MiB, ZIP64) -> ${raw.got}`);
+          const rawIsLimitAlert = isLimitAlert(raw.got);
+          const rawIsClean = /stream: OK$/u.test(raw.got.replace(/\0/g, ""));
+          record("bomb.zip raw wire is not silent CLEAN (ZIP64 regression)",
+            "clamd ERROR", rawIsClean ? "silent-CLEAN" : `wire=${raw.got.slice(0, 80)}`,
+            { inputBytes: buf.byteLength, wire: raw.got, isLimitAlert: rawIsLimitAlert },
+            !rawIsClean);
+        }
+      }
+
+      // ---- 8b. DIAGNOSTIC: ZIP32 vs ZIP64 bomb comparison ----
+      // Same 420 MiB member, different archive format. Determines whether the
+      // silent-CLEAN result is specific to the ZIP64 parser path.
+      {
+        const p = `${PAYLOADS}/bomb-zip32.zip`;
+        if (existsSync(p)) {
+          const buf = readFileSync(p);
+          const r = await timedScan(prod, buf);
+          const raw = await rawInstream(buf, 120000);
+          console.log(`### RAW wire bomb-zip32.zip (420 MiB, ZIP32) -> ${raw.got}`);
+          record("bomb-zip32.zip is not silent CLEAN (ZIP32 comparison)",
+            "clamd ERROR", r.result,
+            { inputBytes: buf.byteLength, elapsedMs: r.ms, wire: raw.got,
+              zip32IsLimitAlert: isLimitAlert(r.result) },
+            r.result !== "CLEAN");
+        }
+      }
+
+      // ---- 8c. DIAGNOSTIC: MaxFileSize single-member violation ----
+      // A single member (115 MiB) over MaxFileSize=110M but under MaxScanSize=400M.
+      // CLAM-3102 makes this alert Heuristics.Limits.Exceeded.MaxFileSize when
+      // AlertExceedsMax is enabled. Not in ClamAV 1.5.4 (see root-cause report).
+      {
+        const p = `${PAYLOADS}/oversized-member.zip`;
+        if (existsSync(p)) {
+          const buf = readFileSync(p);
+          const r = await timedScan(prod, buf);
+          const raw = await rawInstream(buf, 120000);
+          console.log(`### RAW wire oversized-member.zip (115 MiB member) -> ${raw.got}`);
+          record("oversized-member.zip reports MaxFileSize limit alert",
+            "clamd ERROR", r.result,
+            { inputBytes: buf.byteLength, elapsedMs: r.ms, wire: raw.got,
+              isLimitAlert: isLimitAlert(r.result),
+              isGenuineDetection: isGenuineDetection(r.result) },
+            isLimitAlert(r.result) || r.result !== "CLEAN");
+        }
+      }
+
+      // ---- 8d. DIAGNOSTIC: aggregate MaxScanSize violation (multi-member) ----
+      // 5 members x 90 MiB = 450 MiB aggregate; each member 90 MiB < 110M
+      // MaxFileSize, aggregate 450 MiB > 400M MaxScanSize. Exercises the
+      // aggregate scan-size limit without any single member exceeding
+      // MaxFileSize. Do NOT use a single 399M/401M member here: that already
+      // exceeds MaxFileSize=110M and would not isolate MaxScanSize.
+      {
+        const p = `${PAYLOADS}/aggregate-scansize.zip`;
+        if (existsSync(p)) {
+          const buf = readFileSync(p);
+          const r = await timedScan(prod, buf);
+          const raw = await rawInstream(buf, 120000);
+          console.log(`### RAW wire aggregate-scansize.zip (450 MiB aggregate) -> ${raw.got}`);
+          record("aggregate-scansize.zip reports MaxScanSize limit alert",
+            "clamd ERROR", r.result,
+            { inputBytes: buf.byteLength, elapsedMs: r.ms, wire: raw.got,
+              isLimitAlert: isLimitAlert(r.result),
+              isGenuineDetection: isGenuineDetection(r.result) },
+            isLimitAlert(r.result) || r.result !== "CLEAN");
+        }
+      }
+
+      // ---- 9. SCAN_ERROR: zero-length input --------------------------------
   {
     const r = await timedScan(prod, Buffer.alloc(0));
     record("SCAN_ERROR (zero-length guard)", "SCAN_ERROR", r.result, {});
