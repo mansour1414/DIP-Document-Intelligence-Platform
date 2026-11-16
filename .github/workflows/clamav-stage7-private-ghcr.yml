@@ -382,18 +382,84 @@ jobs:
 
       - name: Generate digest-bound SPDX, CycloneDX, and CVE evidence
         shell: bash
+        env:
+          SYFT_REGISTRY_AUTH_AUTHORITY: ghcr.io
+          SYFT_REGISTRY_AUTH_USERNAME: ${{ github.actor }}
+          SYFT_REGISTRY_AUTH_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+          GRYPE_REGISTRY_AUTH_AUTHORITY: ghcr.io
+          GRYPE_REGISTRY_AUTH_USERNAME: ${{ github.actor }}
+          GRYPE_REGISTRY_AUTH_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          syft "registry:$IMAGE_BY_DIGEST" --source-name "$IMAGE_BY_DIGEST" \
-            -o "spdx-json=$EVIDENCE_DIR/stage7.spdx.json" \
-            -o "cyclonedx-json=$EVIDENCE_DIR/stage7.cdx.json"
-          grype "registry:$IMAGE_BY_DIGEST" -o json \
-            --file "$EVIDENCE_DIR/stage7.grype.json"
+          # Scanner credentials are supplied by environment only and are never
+          # printed. Raw scanner stderr never enters the evidence directory: it is
+          # captured in a private directory outside the artifact tree (mode 0700),
+          # reduced to an allowlisted classification, and removed on exit.
+          scanner_diagnostics="$(mktemp -d "${RUNNER_TEMP}/stage7-scanner-diagnostics.XXXXXX")"
+          chmod 0700 "$scanner_diagnostics"
+          case "$scanner_diagnostics" in
+            "$EVIDENCE_DIR"/*)
+              echo "SCANNER_DIAGNOSTIC_DIR=REJECTED reason=inside-evidence-directory" >&2
+              exit 2
+              ;;
+          esac
+          cleanup_scanner_diagnostics() {
+            rm -rf "$scanner_diagnostics"
+          }
+          trap cleanup_scanner_diagnostics EXIT
+
+          classify_scanner_failure() {
+            local tool="$1"
+            local log="$2"
+            local classification=unclassified
+            local hint="no allowlisted signature matched"
+            if grep -qiE 'no child with platform|no matching manifest for|does not match the specified platform|platform .*not found' "$log"; then
+              classification=platform_resolution_failed
+              hint="the published image index does not expose the requested platform"
+            elif grep -qiE 'unauthorized|authentication required|denied: requested access|status code 401|status code 403' "$log"; then
+              classification=registry_authentication_failed
+              hint="the registry rejected the supplied scanner credentials"
+            elif grep -qiE 'i/o timeout|connection reset|tls handshake timeout|no space left on device' "$log"; then
+              classification=transport_failed
+              hint="transient registry or runner transport failure"
+            fi
+            echo "SCANNER_DIAGNOSTIC=CLASSIFIED tool=${tool} classification=${classification} bytes=$(wc -c < "$log")" >&2
+            echo "SCANNER_DIAGNOSTIC_HINT=${hint}" >&2
+            echo "SCANNER_DIAGNOSTIC_RAW=withheld" >&2
+          }
+
+          run_scanner() {
+            local tool="$1"
+            local log="$2"
+            shift 2
+            if ! "$@" 2> "$log"; then
+              classify_scanner_failure "$tool" "$log"
+              return 1
+            fi
+            if [[ -s "$log" ]]; then
+              echo "SCANNER_STDERR=tool=${tool} bytes=$(wc -c < "$log") raw=withheld" >&2
+            fi
+            rm -f "$log"
+          }
+
+          run_scanner syft "$scanner_diagnostics/syft.stderr.log" \
+            syft "registry:$IMAGE_BY_DIGEST" --source-name "$IMAGE_BY_DIGEST" \
+              --platform linux/arm64 \
+              -o "spdx-json=$EVIDENCE_DIR/stage7.spdx.json" \
+              -o "cyclonedx-json=$EVIDENCE_DIR/stage7.cdx.json"
+          run_scanner grype "$scanner_diagnostics/grype.stderr.log" \
+            grype "registry:$IMAGE_BY_DIGEST" --platform linux/arm64 -o json \
+              --file "$EVIDENCE_DIR/stage7.grype.json"
+          test -s "$EVIDENCE_DIR/stage7.spdx.json"
+          test -s "$EVIDENCE_DIR/stage7.cdx.json"
+          test -s "$EVIDENCE_DIR/stage7.grype.json"
           test "$(jq '.ignoredMatches | length' "$EVIDENCE_DIR/stage7.grype.json")" = 0
           jq -e '.descriptor.db.status.valid == true' "$EVIDENCE_DIR/stage7.grype.json"
 
       - name: Collect transitive license, notices, and runtime linkage evidence
         shell: bash
+        env:
+          DOCKER_DEFAULT_PLATFORM: linux/arm64
         run: |
           set -euo pipefail
           IMAGE="$IMAGE_BY_DIGEST" OUT="$EVIDENCE_DIR" \
