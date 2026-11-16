@@ -177,7 +177,7 @@ jobs:
             echo "IMAGE_CONFIG_DIGEST=$config_digest"
           } >> "$GITHUB_ENV"
 
-      - name: Pull immutable ARM64 candidate by digest and verify architecture and ClamAV 1.5.4 (fail closed)
+      - name: Pull immutable ARM64 candidate by digest and verify architecture, ClamAV 1.5.4, and config hash (fail closed)
         shell: bash
         run: |
           set -euo pipefail
@@ -224,8 +224,15 @@ jobs:
             --arg imageClamdConfSha256 "$image_conf_sha" \
             --arg repoCandidateConfSha256 "$repo_conf_sha" \
             --arg dpkgTsv "$dpkg_out" \
-            '{imageRef:$imageRef,localConfigDigest:$localConfigDigest,platform:$platform,user:$user,clamdVersion:$clamdVersion,expectedPackageVersion:$expectedPackageVersion,dpkgVersions:($dpkgTsv | split("\n") | map(select(length>0) | split("\t") | {(.[0]): .[1]}) | add),imageClamdConfSha256:$imageClamdConfSha256,repoCandidateConfSha256:$repoCandidateConfSha256,candidateConfMatchesRepo:($imageClamdConfSha256 == $repoCandidateConfSha256)}' \
+            '{imageRef:$imageRef,localConfigDigest:$localConfigDigest,platform:$platform,user:$user,clamdVersion:$clamdVersion,expectedPackageVersion:$expectedPackageVersion,dpkgVersions:($dpkgTsv | split("\n") | map(select(length>0) | split("\t") | {(.[0]): .[1]}) | add),imageClamdConfSha256:$imageClamdConfSha256,repoCandidateConfSha256:$repoCandidateConfSha256,candidateConfMatchesRepo:(($imageClamdConfSha256 | test("^[a-f0-9]{64}$")) and ($repoCandidateConfSha256 | test("^[a-f0-9]{64}$")) and ($imageClamdConfSha256 == $repoCandidateConfSha256))}' \
             > "$EVIDENCE_DIR/image-verification.json"
+
+          # BEGIN PHASE0A_CANDIDATE_CONF_HASH_GUARD
+          if [[ ! "$image_conf_sha" =~ ^[a-f0-9]{64}$ ]] || [[ ! "$repo_conf_sha" =~ ^[a-f0-9]{64}$ ]] || [[ "$image_conf_sha" != "$repo_conf_sha" ]]; then
+            echo "FAIL-CLOSED: candidate /etc/clamav/clamd.conf SHA-256 (${image_conf_sha:-missing}) does not match repository approved candidate config SHA-256 (${repo_conf_sha:-missing})" >&2
+            exit 4
+          fi
+          # END PHASE0A_CANDIDATE_CONF_HASH_GUARD
 
       - name: Download fresh ClamAV signatures and enforce freshness gate (fail closed)
         shell: bash

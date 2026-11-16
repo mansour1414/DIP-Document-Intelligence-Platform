@@ -16,6 +16,7 @@ import resource
 import socket
 import socketserver
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -39,6 +40,11 @@ MAX_SOCKET_TIMEOUT_SECONDS = 60.0
 REPLY_SETTLE_SECONDS = 0.05                 # Drain trailing bytes after NUL
 PROCESS_FSIZE_LIMIT_BYTES = 16 * 1024 * 1024  # 16 MiB max file write ceiling
 PROCESS_CPU_LIMIT_SECONDS = 120
+
+# Approved candidate configuration limits (docs/operations/experimental/clamav-arm64-stage4-candidate.conf)
+CANDIDATE_STREAM_MAX_LENGTH_BYTES = 110 * 1024 * 1024  # 110M = 115343360
+CANDIDATE_MAX_FILE_SIZE_BYTES = 110 * 1024 * 1024      # 110M = 115343360
+CANDIDATE_MAX_SCAN_SIZE_BYTES = 400 * 1024 * 1024      # 400M = 419430400
 
 # Reduced isolated test limits for Experiment E (small ZIP32 MaxFileSize)
 REDUCED_MAX_FILE_SIZE_BYTES = 16 * 1024     # 16K
@@ -106,10 +112,82 @@ EFFECTIVE_LIMIT_KEYS = (
     "MaxThreads",
     "MaxRecursion",
     "MaxFiles",
+    "MaxEmbeddedPE",
+    "MaxHTMLNormalize",
+    "MaxHTMLNoTags",
+    "MaxScriptNormalize",
+    "MaxZipTypeRcg",
+    "MaxIconsPE",
+    "MaxRecHWP3",
+    "MaxPartitions",
+    "PCREMatchLimit",
+    "PCRERecMatchLimit",
+    "PCREMaxFileSize",
     "AlertExceedsMax",
     "AlertEncrypted",
     "ConcurrentDatabaseReload",
 )
+
+# Approved security/resource limits shared across candidate and isolated reduced profiles
+COMMON_EFFECTIVE_LIMIT_SPECS: dict[str, tuple[str, int | str]] = {
+    "MaxScanTime": ("number", 25000),
+    "ReadTimeout": ("number", 120),
+    "MaxRecursion": ("number", 16),
+    "MaxFiles": ("number", 10000),
+    "MaxEmbeddedPE": ("size", 40 * 1024 * 1024),
+    "MaxHTMLNormalize": ("size", 40 * 1024 * 1024),
+    "MaxHTMLNoTags": ("size", 8 * 1024 * 1024),
+    "MaxScriptNormalize": ("size", 20 * 1024 * 1024),
+    "MaxZipTypeRcg": ("size", 1 * 1024 * 1024),
+    "MaxIconsPE": ("number", 100),
+    "MaxRecHWP3": ("number", 16),
+    "MaxPartitions": ("number", 50),
+    "PCREMatchLimit": ("number", 100000),
+    "PCRERecMatchLimit": ("number", 2000),
+    "PCREMaxFileSize": ("size", 100 * 1024 * 1024),
+    "AlertEncrypted": ("bool", "no"),
+    "ConcurrentDatabaseReload": ("bool", "no"),
+}
+
+PROFILE_EXPECTED_LIMIT_SPECS: dict[str, dict[str, tuple[str, int | str]]] = {
+    "candidate": {
+        "StreamMaxLength": ("size", CANDIDATE_STREAM_MAX_LENGTH_BYTES),
+        "MaxFileSize": ("size", CANDIDATE_MAX_FILE_SIZE_BYTES),
+        "MaxScanSize": ("size", CANDIDATE_MAX_SCAN_SIZE_BYTES),
+        "MaxThreads": ("number", 12),
+        "AlertExceedsMax": ("bool", "yes"),
+        **COMMON_EFFECTIVE_LIMIT_SPECS,
+    },
+    "reduced_alert_yes": {
+        "StreamMaxLength": ("size", REDUCED_STREAM_MAX_LENGTH_BYTES),
+        "MaxFileSize": ("size", REDUCED_MAX_FILE_SIZE_BYTES),
+        "MaxScanSize": ("size", REDUCED_MAX_SCAN_SIZE_BYTES),
+        "MaxThreads": ("number", 4),
+        "AlertExceedsMax": ("bool", "yes"),
+        **COMMON_EFFECTIVE_LIMIT_SPECS,
+    },
+    "reduced_alert_no": {
+        "StreamMaxLength": ("size", REDUCED_STREAM_MAX_LENGTH_BYTES),
+        "MaxFileSize": ("size", REDUCED_MAX_FILE_SIZE_BYTES),
+        "MaxScanSize": ("size", REDUCED_MAX_SCAN_SIZE_BYTES),
+        "MaxThreads": ("number", 4),
+        "AlertExceedsMax": ("bool", "no"),
+        **COMMON_EFFECTIVE_LIMIT_SPECS,
+    },
+}
+
+SHA256_HEX_RE = re.compile(r"^[a-f0-9]{64}$")
+CLAMCONF_SIZE_RE = re.compile(r"^([0-9]+)([KMGkmg])?$")
+CLAMCONF_NUMBER_RE = re.compile(r"^[0-9]+$")
+CLAMCONF_SECTION_END_RE = re.compile(
+    r"^(?:.+\.conf\s+not\s+found|Software settings|Database information|Platform information|Build information)$"
+)
+CLAMCONF_SIZE_MULTIPLIERS = {
+    "": 1,
+    "k": 1024,
+    "m": 1024 * 1024,
+    "g": 1024 * 1024 * 1024,
+}
 
 
 def utc_now_iso() -> str:
@@ -1046,53 +1124,186 @@ def parse_zversion(text: str | None) -> dict[str, str] | None:
 
 
 # ---------------------------------------------------------------------------
-# clamconf effective configuration parser (ClamAV 1.5.4 clamconf.c syntax)
+# clamconf effective configuration parser & validator (ClamAV 1.5.4 syntax)
 # ---------------------------------------------------------------------------
+def parse_clamconf_size_bytes(raw: str) -> int:
+    """Parse ClamAV size output (`115343360` or ClamAV `MATCH_SIZE` e.g. `110M`)."""
+    match = CLAMCONF_SIZE_RE.match(raw)
+    if not match:
+        raise ValueError(f"malformed size value: {raw!r}")
+    amount = int(match.group(1))
+    unit = (match.group(2) or "").lower()
+    return amount * CLAMCONF_SIZE_MULTIPLIERS[unit]
+
+
+def parse_clamconf_number(raw: str) -> int:
+    """Parse ClamAV non-negative integer directive output strictly."""
+    if not CLAMCONF_NUMBER_RE.match(raw):
+        raise ValueError(f"malformed numeric value: {raw!r}")
+    return int(raw)
+
+
+def parse_clamconf_bool(raw: str) -> str:
+    """Parse ClamAV boolean directive output (`yes` vs `disabled`/`no`)."""
+    lowered = raw.lower()
+    if lowered in ("yes", "true", "1"):
+        return "yes"
+    if lowered in ("no", "false", "0", "disabled"):
+        return "no"
+    raise ValueError(f"malformed boolean value: {raw!r}")
+
+
 def parse_clamconf_clamd_section(clamconf_text: str) -> dict[str, Any]:
     """Parse effective clamd.conf directives from `clamconf --config-dir=...`."""
     in_clamd_section = False
     found_clamd_section = False
     settings: dict[str, str] = {}
+    duplicate_directives: dict[str, list[str]] = {}
+    malformed_directives: dict[str, str] = {}
+    tracked_keys = frozenset(EFFECTIVE_LIMIT_KEYS)
 
     for raw_line in clamconf_text.splitlines():
         line = raw_line.strip()
         section_match = re.match(r"^Config file:\s+(.+)$", line)
         if section_match:
             section_name = section_match.group(1).strip()
-            in_clamd_section = section_name == "clamd.conf"
-            if in_clamd_section:
+            if section_name == "clamd.conf":
+                if found_clamd_section:
+                    raise ValueError("clamconf output contained duplicate 'Config file: clamd.conf' sections")
+                in_clamd_section = True
                 found_clamd_section = True
+            else:
+                in_clamd_section = False
             continue
-        if not in_clamd_section or not line or line.startswith("-"):
+        if in_clamd_section and CLAMCONF_SECTION_END_RE.match(line):
+            in_clamd_section = False
             continue
+        if not in_clamd_section or not line or line.startswith("-") or line.startswith("***"):
+            continue
+
         kv_match = re.match(r'^([A-Za-z0-9]+)\s*=\s*"([^"]*)"$', line)
         if kv_match:
-            settings[kv_match.group(1)] = kv_match.group(2)
+            key, val = kv_match.group(1), kv_match.group(2)
+            if key in settings:
+                duplicate_directives.setdefault(key, [settings[key]]).append(val)
+            else:
+                settings[key] = val
             continue
+
         disabled_match = re.match(r"^([A-Za-z0-9]+)\s+disabled$", line)
         if disabled_match:
-            settings[disabled_match.group(1)] = "disabled"
+            key = disabled_match.group(1)
+            if key in settings:
+                duplicate_directives.setdefault(key, [settings[key]]).append("disabled")
+            else:
+                settings[key] = "disabled"
+            continue
+
+        any_assign_match = re.match(r"^([A-Za-z0-9]+)\s*=\s*(.*)$", line)
+        if any_assign_match:
+            key, rest = any_assign_match.group(1), any_assign_match.group(2)
+            if key in tracked_keys:
+                malformed_directives[key] = rest
+            continue
+
+        token_match = re.match(r"^([A-Za-z0-9]+)\b", line)
+        if token_match and token_match.group(1) in tracked_keys:
+            malformed_directives[token_match.group(1)] = line
 
     if not found_clamd_section:
         raise ValueError("clamconf output did not contain a 'Config file: clamd.conf' section")
 
     effective_subset = {key: settings.get(key) for key in EFFECTIVE_LIMIT_KEYS}
     raw_alert = settings.get("AlertExceedsMax")
-    if raw_alert is None:
+    if "AlertExceedsMax" in malformed_directives:
+        alert_normalized = f"malformed:{malformed_directives['AlertExceedsMax']}"
+    elif raw_alert is None:
         alert_normalized = "unknown"
-    elif raw_alert.lower() in ("yes", "true", "1"):
-        alert_normalized = "yes"
-    elif raw_alert.lower() in ("no", "false", "0", "disabled"):
-        alert_normalized = "no"
     else:
-        alert_normalized = f"unexpected:{raw_alert}"
+        try:
+            alert_normalized = parse_clamconf_bool(raw_alert)
+        except ValueError:
+            alert_normalized = f"unexpected:{raw_alert}"
 
     return {
         "clamd_section_found": True,
         "alert_exceeds_max_raw": raw_alert,
         "alert_exceeds_max_effective": alert_normalized,
         "effective_limits": effective_subset,
+        "duplicate_directives": duplicate_directives,
+        "malformed_directives": malformed_directives,
         "total_parsed_keys": len(settings),
+    }
+
+
+def validate_effective_limits(
+    profile: str,
+    parsed_conf: dict[str, Any],
+    expected_alert_exceeds_max: str,
+) -> dict[str, Any]:
+    """Fail-closed validation of all effective security limits for a scanner profile."""
+    if profile not in PROFILE_EXPECTED_LIMIT_SPECS:
+        raise ValueError(f"Unsupported profile for limit validation: {profile}")
+
+    specs = PROFILE_EXPECTED_LIMIT_SPECS[profile]
+    expected_profile_alert = specs["AlertExceedsMax"][1]
+    if expected_alert_exceeds_max != expected_profile_alert:
+        raise RuntimeError(
+            f"Profile {profile}: caller expected AlertExceedsMax={expected_alert_exceeds_max!r} "
+            f"contradicts profile specification {expected_profile_alert!r}"
+        )
+
+    eff = parsed_conf.get("effective_limits") or {}
+    duplicates = parsed_conf.get("duplicate_directives") or {}
+    malformed = parsed_conf.get("malformed_directives") or {}
+    violations: list[str] = []
+    normalized_limits: dict[str, int | str] = {}
+
+    for key, (kind, expected_value) in specs.items():
+        if key in duplicates:
+            violations.append(f"{key}: duplicate directive values={duplicates[key]!r}")
+            continue
+        if key in malformed:
+            violations.append(f"{key}: malformed clamconf syntax={malformed[key]!r}")
+            continue
+
+        raw_val = eff.get(key)
+        if raw_val is None:
+            violations.append(f"{key}: missing (expected {expected_value!r})")
+            continue
+
+        try:
+            if kind == "size":
+                actual: int | str = parse_clamconf_size_bytes(raw_val)
+            elif kind == "number":
+                actual = parse_clamconf_number(raw_val)
+            elif kind == "bool":
+                actual = parse_clamconf_bool(raw_val)
+            else:
+                raise ValueError(f"unsupported spec kind {kind!r}")
+        except ValueError as exc:
+            violations.append(f"{key}: malformed ({exc}; expected {expected_value!r})")
+            continue
+
+        if actual != expected_value:
+            violations.append(
+                f"{key}: mismatch (actual={actual!r} raw={raw_val!r} != expected={expected_value!r})"
+            )
+            continue
+
+        normalized_limits[key] = actual
+
+    if violations:
+        raise RuntimeError(
+            f"Profile {profile}: fail-closed clamconf effective-limit validation failed "
+            f"({len(violations)} violation(s)): " + "; ".join(violations)
+        )
+
+    return {
+        "status": STATUS_PASS,
+        "profile": profile,
+        "checked_keys": list(specs.keys()),
+        "normalized_limits": normalized_limits,
     }
 
 
@@ -1218,25 +1429,11 @@ def run_scan_profile(
     if profile not in PROFILE_PLANS:
         raise ValueError(f"Unsupported profile: {profile}")
 
-    # 1. Fail-closed effective config verification via clamconf
+    # 1. Fail-closed effective config verification via clamconf (all profile limits)
     parsed_conf = parse_clamconf_clamd_section(clamconf_text)
-    if parsed_conf["alert_exceeds_max_effective"] != expected_alert_exceeds_max:
-        raise RuntimeError(
-            f"Profile {profile}: effective AlertExceedsMax={parsed_conf['alert_exceeds_max_effective']} "
-            f"(raw={parsed_conf['alert_exceeds_max_raw']}) != expected {expected_alert_exceeds_max}"
-        )
-    if profile in ("reduced_alert_yes", "reduced_alert_no"):
-        eff = parsed_conf["effective_limits"]
-        expected_numeric = {
-            "MaxFileSize": str(REDUCED_MAX_FILE_SIZE_BYTES),
-            "MaxScanSize": str(REDUCED_MAX_SCAN_SIZE_BYTES),
-            "StreamMaxLength": str(REDUCED_STREAM_MAX_LENGTH_BYTES),
-        }
-        for key, expected_val in expected_numeric.items():
-            if eff.get(key) != expected_val:
-                raise RuntimeError(
-                    f"Profile {profile}: effective {key}={eff.get(key)!r} != expected {expected_val!r}"
-                )
+    parsed_conf["limit_validation"] = validate_effective_limits(
+        profile, parsed_conf, expected_alert_exceeds_max
+    )
 
     # 2. Fail-closed scanner readiness & ClamAV version verification (zPING + zVERSION)
     ping = clamd_simple_command(host, port, "zPING", timeout_seconds=min(timeout_seconds, 15.0))
@@ -1401,9 +1598,31 @@ def assemble_report(
     not_verified_cases = [c["case_id"] for c in all_cases if c["status"] == STATUS_NOT_VERIFIED]
     passed_cases = [c["case_id"] for c in all_cases if c["status"] == STATUS_PASS]
 
+    config_integrity_failures: list[str] = []
+    if image_verification is not None:
+        img_sha = image_verification.get("imageClamdConfSha256")
+        repo_sha = image_verification.get("repoCandidateConfSha256")
+        matches_flag = image_verification.get("candidateConfMatchesRepo")
+        hashes_valid = (
+            isinstance(img_sha, str)
+            and isinstance(repo_sha, str)
+            and bool(SHA256_HEX_RE.match(img_sha))
+            and bool(SHA256_HEX_RE.match(repo_sha))
+            and img_sha == repo_sha
+        )
+        if matches_flag is not True or not hashes_valid:
+            config_integrity_failures.append(
+                f"candidate_config_hash_mismatch(image={img_sha!r},repo={repo_sha!r},flag={matches_flag!r})"
+            )
+
     overall_status = (
         STATUS_PASS
-        if (not failed_cases and not not_verified_cases and not security_failures)
+        if (
+            not failed_cases
+            and not not_verified_cases
+            and not security_failures
+            and not config_integrity_failures
+        )
         else STATUS_FAIL
     )
 
@@ -1461,12 +1680,14 @@ def assemble_report(
             "failed": failed_cases,
             "not_verified": not_verified_cases,
             "security_failures": security_failures,
+            "config_integrity_failures": config_integrity_failures,
             "counts": {
                 "total": len(all_cases),
                 "pass": len(passed_cases),
                 "fail": len(failed_cases),
                 "not_verified": len(not_verified_cases),
                 "security_failures": len(security_failures),
+                "config_integrity_failures": len(config_integrity_failures),
             },
         },
         "cases": all_cases,
@@ -1494,6 +1715,7 @@ def render_markdown_summary(report: dict[str, Any]) -> str:
     wf = report["workflow"]
     cls = report["classifications"]
     cmp_e = report["alert_exceeds_max_comparison"]
+    runtime_ver = report["candidate_image"].get("runtime_verification")
     lines = [
         "# DIP — ClamAV 1.5.4 Phase 0A Isolated Evidence Summary",
         "",
@@ -1503,6 +1725,17 @@ def render_markdown_summary(report: dict[str, Any]) -> str:
         f"- **Workflow Run**: `{wf['run_id']}` (attempt `{wf['run_attempt']}`)",
         f"- **Repository / Ref / Commit**: `{wf['repository']}` / `{wf['ref']}` / `{wf['commit_sha']}`",
         f"- **Pinned Candidate Image**: `{report['candidate_image']['pinned_reference']}`",
+    ]
+    if runtime_ver is not None:
+        lines.append(
+            f"- **Candidate Config SHA-256 Match**: `{runtime_ver.get('candidateConfMatchesRepo')}` "
+            f"(image=`{runtime_ver.get('imageClamdConfSha256')}`, repo=`{runtime_ver.get('repoCandidateConfSha256')}`)"
+        )
+    if cls.get("config_integrity_failures"):
+        lines.append(
+            f"- **Config Integrity Failures**: `{'; '.join(cls['config_integrity_failures'])}`"
+        )
+    lines.extend([
         f"- **Python Version**: `{report['python']['version']}` ({report['python']['implementation']})",
         "- **Gates**: Security Gate `OPEN`, Licensing Gate `OPEN`, ClamAV Stage 7 `NOT ACCEPTED`",
         "",
@@ -1510,7 +1743,7 @@ def render_markdown_summary(report: dict[str, Any]) -> str:
         "",
         "| Case | Profile | Status | Security Failure | Verdict | Raw Reply | NUL | Elapsed (ms) |",
         "| --- | --- | --- | --- | --- | --- | --- | ---: |",
-    ]
+    ])
     for case in report["cases"]:
         scan = case.get("scan") or {}
         verdict = scan.get("verdict", "N/A")
@@ -1759,32 +1992,211 @@ def run_self_test() -> int:
         ctrl_no_eval["diagnosis"],
     )
 
-    # 4. clamconf parser (both AlertExceedsMax = "yes" and AlertExceedsMax disabled)
-    sample_conf_yes = (
-        "Checking configuration files in /etc/clamav-phase0a\n\n"
-        "Config file: clamd.conf\n"
-        "-----------------------\n"
-        'StreamMaxLength = "1048576"\n'
-        'MaxFileSize = "16384"\n'
-        'MaxScanSize = "524288"\n'
-        'AlertExceedsMax = "yes"\n\n'
-        "Config file: freshclam.conf\n"
-        "---------------------------\n"
+    # 4. clamconf parser & fail-closed effective-limit validator (Finding 2)
+    def _build_clamconf_sample(
+        profile_name: str,
+        *,
+        overrides: dict[str, str] | None = None,
+        raw_lines_override: dict[str, str] | None = None,
+        omit: set[str] | None = None,
+        extra_lines: list[str] | None = None,
+        trailing_section: str = "freshclam.conf not found\n\nSoftware settings\n-----------------\nVersion: 1.5.4\n",
+    ) -> str:
+        specs = PROFILE_EXPECTED_LIMIT_SPECS[profile_name]
+        ov = overrides or {}
+        raw_ov = raw_lines_override or {}
+        omitted = omit or set()
+        body = [
+            "Checking configuration files in /etc/clamav",
+            "",
+            "Config file: clamd.conf",
+            "-----------------------",
+        ]
+        for key in EFFECTIVE_LIMIT_KEYS:
+            if key in omitted:
+                continue
+            if key in raw_ov:
+                body.append(raw_ov[key])
+                continue
+            kind, expected_val = specs[key]
+            if key in ov:
+                val = ov[key]
+                body.append(f"{key} disabled" if val == "disabled" else f'{key} = "{val}"')
+            elif kind == "bool":
+                body.append(f'{key} = "yes"' if expected_val == "yes" else f"{key} disabled")
+            else:
+                body.append(f'{key} = "{expected_val}"')
+        if extra_lines:
+            body.extend(extra_lines)
+        body.append("")
+        body.append(trailing_section)
+        return "\n".join(body)
+
+    sample_conf_candidate = _build_clamconf_sample("candidate")
+    sample_conf_yes = _build_clamconf_sample("reduced_alert_yes")
+    sample_conf_no = _build_clamconf_sample("reduced_alert_no")
+
+    parsed_cand = parse_clamconf_clamd_section(sample_conf_candidate)
+    val_cand = validate_effective_limits("candidate", parsed_cand, "yes")
+    check(
+        "clamconf validates full approved candidate effective limits (normalized bytes)",
+        val_cand["status"] == STATUS_PASS
+        and val_cand["normalized_limits"]["StreamMaxLength"] == CANDIDATE_STREAM_MAX_LENGTH_BYTES
+        and val_cand["normalized_limits"]["MaxFileSize"] == CANDIDATE_MAX_FILE_SIZE_BYTES
+        and val_cand["normalized_limits"]["MaxScanSize"] == CANDIDATE_MAX_SCAN_SIZE_BYTES
+        and val_cand["normalized_limits"]["MaxScanTime"] == 25000
+        and val_cand["normalized_limits"]["MaxRecursion"] == 16
+        and val_cand["normalized_limits"]["MaxFiles"] == 10000
+        and val_cand["normalized_limits"]["AlertExceedsMax"] == "yes"
+        and len(val_cand["checked_keys"]) == len(PROFILE_EXPECTED_LIMIT_SPECS["candidate"]),
+        f"checked={len(val_cand['checked_keys'])} StreamMaxLength={val_cand['normalized_limits']['StreamMaxLength']} MaxScanSize={val_cand['normalized_limits']['MaxScanSize']}",
     )
+
+    sample_conf_candidate_units = _build_clamconf_sample(
+        "candidate",
+        overrides={
+            "StreamMaxLength": "110M",
+            "MaxFileSize": "110M",
+            "MaxScanSize": "400M",
+            "MaxEmbeddedPE": "40M",
+            "MaxHTMLNormalize": "40M",
+            "MaxHTMLNoTags": "8M",
+            "MaxScriptNormalize": "20M",
+            "MaxZipTypeRcg": "1M",
+            "PCREMaxFileSize": "100M",
+        },
+    )
+    val_cand_units = validate_effective_limits(
+        "candidate", parse_clamconf_clamd_section(sample_conf_candidate_units), "yes"
+    )
+    check(
+        "clamconf normalizes ClamAV binary unit suffixes (110M/400M) to exact bytes",
+        val_cand_units["status"] == STATUS_PASS
+        and val_cand_units["normalized_limits"]["MaxFileSize"] == 115343360
+        and val_cand_units["normalized_limits"]["MaxScanSize"] == 419430400,
+        f"MaxFileSize={val_cand_units['normalized_limits']['MaxFileSize']}",
+    )
+
     parsed_yes = parse_clamconf_clamd_section(sample_conf_yes)
+    val_yes = validate_effective_limits("reduced_alert_yes", parsed_yes, "yes")
     check(
-        "clamconf parses AlertExceedsMax=yes and reduced limits",
-        parsed_yes["alert_exceeds_max_effective"] == "yes"
-        and parsed_yes["effective_limits"]["MaxFileSize"] == "16384"
-        and parsed_yes["effective_limits"]["MaxScanSize"] == "524288",
-        str(parsed_yes["effective_limits"]),
+        "clamconf validates full reduced_alert_yes effective limits",
+        val_yes["status"] == STATUS_PASS
+        and parsed_yes["alert_exceeds_max_effective"] == "yes"
+        and val_yes["normalized_limits"]["MaxFileSize"] == REDUCED_MAX_FILE_SIZE_BYTES
+        and val_yes["normalized_limits"]["MaxScanSize"] == REDUCED_MAX_SCAN_SIZE_BYTES,
+        f"checked={len(val_yes['checked_keys'])} MaxFileSize={val_yes['normalized_limits']['MaxFileSize']}",
     )
-    sample_conf_no = sample_conf_yes.replace('AlertExceedsMax = "yes"', "AlertExceedsMax disabled")
+
     parsed_no = parse_clamconf_clamd_section(sample_conf_no)
+    val_no = validate_effective_limits("reduced_alert_no", parsed_no, "no")
     check(
-        "clamconf parses AlertExceedsMax disabled as effective no",
-        parsed_no["alert_exceeds_max_effective"] == "no" and parsed_no["alert_exceeds_max_raw"] == "disabled",
+        "clamconf validates full reduced_alert_no effective limits (AlertExceedsMax disabled)",
+        val_no["status"] == STATUS_PASS
+        and parsed_no["alert_exceeds_max_effective"] == "no"
+        and parsed_no["alert_exceeds_max_raw"] == "disabled",
         f"raw={parsed_no['alert_exceeds_max_raw']} effective={parsed_no['alert_exceeds_max_effective']}",
+    )
+
+    # 4a. Missing candidate limit values MUST fail closed
+    for missing_key in (
+        "StreamMaxLength",
+        "MaxFileSize",
+        "MaxScanSize",
+        "MaxScanTime",
+        "MaxRecursion",
+        "MaxFiles",
+        "AlertExceedsMax",
+        "PCREMaxFileSize",
+    ):
+        err_msg = ""
+        try:
+            validate_effective_limits(
+                "candidate",
+                parse_clamconf_clamd_section(_build_clamconf_sample("candidate", omit={missing_key})),
+                "yes",
+            )
+        except RuntimeError as exc:
+            err_msg = str(exc)
+        check(
+            f"clamconf missing {missing_key} fails closed",
+            f"{missing_key}: missing" in err_msg,
+            err_msg or "unexpectedly passed",
+        )
+
+    # 4b. Malformed candidate limit values & syntax MUST fail closed
+    malformed_cases: list[tuple[str, dict[str, Any]]] = [
+        ("empty MaxFileSize", {"overrides": {"MaxFileSize": ""}}),
+        ("invalid unit MaxFileSize=110MB", {"overrides": {"MaxFileSize": "110MB"}}),
+        ("disabled MaxFileSize", {"overrides": {"MaxFileSize": "disabled"}}),
+        ("non-numeric MaxScanTime=25000ms", {"overrides": {"MaxScanTime": "25000ms"}}),
+        ("negative MaxRecursion=-1", {"overrides": {"MaxRecursion": "-1"}}),
+        ("non-numeric MaxFiles=abc", {"overrides": {"MaxFiles": "abc"}}),
+        ("invalid bool AlertExceedsMax=maybe", {"overrides": {"AlertExceedsMax": "maybe"}}),
+        ("unquoted syntax MaxFileSize", {"raw_lines_override": {"MaxFileSize": "MaxFileSize = 115343360"}}),
+        ("multi-value syntax MaxFileSize", {"raw_lines_override": {"MaxFileSize": 'MaxFileSize = "115343360", "16384"'}}),
+        ("duplicate MaxFiles directive", {"extra_lines": ['MaxFiles = "10000"']}),
+    ]
+    for label, kwargs in malformed_cases:
+        err_msg = ""
+        try:
+            validate_effective_limits(
+                "candidate",
+                parse_clamconf_clamd_section(_build_clamconf_sample("candidate", **kwargs)),
+                "yes",
+            )
+        except RuntimeError as exc:
+            err_msg = str(exc)
+        check(
+            f"clamconf malformed ({label}) fails closed",
+            bool(err_msg) and ("malformed" in err_msg or "duplicate" in err_msg),
+            err_msg or "unexpectedly passed",
+        )
+
+    # 4c. Mismatched / weakened candidate limit values MUST fail closed
+    mismatch_cases: list[tuple[str, dict[str, str]]] = [
+        ("StreamMaxLength 100MiB vs 110MiB", {"StreamMaxLength": "104857600"}),
+        ("MaxFileSize 25MiB vs 110MiB", {"MaxFileSize": "26214400"}),
+        ("MaxScanSize 100MiB vs 400MiB", {"MaxScanSize": "104857600"}),
+        ("MaxScanTime 0 (disabled) vs 25000", {"MaxScanTime": "0"}),
+        ("MaxRecursion 17 vs 16", {"MaxRecursion": "17"}),
+        ("MaxFiles 20000 vs 10000", {"MaxFiles": "20000"}),
+        ("AlertExceedsMax disabled on candidate", {"AlertExceedsMax": "disabled"}),
+        ("MaxThreads 4 vs 12 on candidate", {"MaxThreads": "4"}),
+        ("MaxPartitions 128 vs 50", {"MaxPartitions": "128"}),
+        ("ConcurrentDatabaseReload yes vs disabled", {"ConcurrentDatabaseReload": "yes"}),
+    ]
+    for label, ov in mismatch_cases:
+        err_msg = ""
+        try:
+            validate_effective_limits(
+                "candidate",
+                parse_clamconf_clamd_section(_build_clamconf_sample("candidate", overrides=ov)),
+                "yes",
+            )
+        except RuntimeError as exc:
+            err_msg = str(exc)
+        check(
+            f"clamconf mismatch ({label}) fails closed",
+            "mismatch" in err_msg,
+            err_msg or "unexpectedly passed",
+        )
+
+    # 4d. Directive placed after Software settings section boundary MUST NOT leak into clamd.conf
+    leaked_conf = _build_clamconf_sample(
+        "candidate",
+        omit={"MaxFileSize"},
+        trailing_section='freshclam.conf not found\n\nSoftware settings\n-----------------\nMaxFileSize = "115343360"\n',
+    )
+    leaked_err = ""
+    try:
+        validate_effective_limits("candidate", parse_clamconf_clamd_section(leaked_conf), "yes")
+    except RuntimeError as exc:
+        leaked_err = str(exc)
+    check(
+        "clamconf ignores directives after section boundary (fails closed as missing)",
+        "MaxFileSize: missing" in leaked_err,
+        leaked_err or "unexpectedly passed",
     )
 
     # 5. Binary ZIP32 & ZIP64 inspection tests
@@ -1935,12 +2347,15 @@ def run_self_test() -> int:
                     if raw_payload == b"SLEEP_TIMEOUT":
                         time.sleep(0.4)
                         return
+                    mock_scan_calls[0] += 1
                     if raw_payload == CLEAN_PAYLOAD:
                         self.request.sendall(b"stream: OK\x00")
-                    elif EICAR_PAYLOAD in raw_payload:
-                        self.request.sendall(b"stream: Win.Test.EICAR_HDB-1 FOUND\x00")
-                    else:
+                    elif raw_payload == maxfs_bytes:
                         self.request.sendall(b"stream: Heuristics.Limits.Exceeded.MaxFileSize FOUND\x00")
+                    else:
+                        self.request.sendall(b"stream: Win.Test.EICAR_HDB-1 FOUND\x00")
+
+        mock_scan_calls = [0]
 
         class ReusableTCPServer(socketserver.ThreadingTCPServer):
             allow_reuse_address = True
@@ -1968,6 +2383,63 @@ def run_self_test() -> int:
                 check("mock TCP zINSTREAM LIMIT ALERT", r_limit["verdict"] == VERDICT_LIMIT_ALERT and r_limit["signature"] == EXPECTED_MAX_FILE_SIZE_ALERT, r_limit["raw_response_repr"])
                 r_timeout = clamd_instream_scan(host, port, b"SLEEP_TIMEOUT", timeout_seconds=0.1)
                 check("mock TCP zINSTREAM TIMEOUT", r_timeout["verdict"] == VERDICT_TIMEOUT, r_timeout["detail"])
+
+                # 6b. End-to-end run_scan_profile() fail-closed limit enforcement before scanning
+                mock_fix_dir = tmp_path / "mock-profile-fixtures"
+                mock_fix_dir.mkdir(parents=True, exist_ok=True)
+                (mock_fix_dir / "clean-control.txt").write_bytes(CLEAN_PAYLOAD)
+                (mock_fix_dir / "eicar.txt").write_bytes(EICAR_PAYLOAD)
+                (mock_fix_dir / "eicar-zip32.zip").write_bytes(zip32_path.read_bytes())
+                (mock_fix_dir / "eicar-zip64.zip").write_bytes(py312_ref_bytes)
+                mock_manifest = {
+                    "fixtures": {
+                        "clean": {"filename": "clean-control.txt", "sha256": sha256_bytes(CLEAN_PAYLOAD)},
+                        "eicar_direct": {"filename": "eicar.txt", "sha256": sha256_bytes(EICAR_PAYLOAD)},
+                        "eicar_zip32": {"filename": "eicar-zip32.zip", "sha256": sha256_file(zip32_path)},
+                        "eicar_zip64": {"filename": "eicar-zip64.zip", "sha256": sha256_bytes(py312_ref_bytes)},
+                    }
+                }
+                calls_before = mock_scan_calls[0]
+                bad_cand_err = ""
+                try:
+                    run_scan_profile(
+                        profile="candidate",
+                        host=host,
+                        port=port,
+                        fixtures_dir=mock_fix_dir,
+                        manifest=mock_manifest,
+                        expected_engine="1.5.4",
+                        clamconf_text=_build_clamconf_sample("candidate", overrides={"MaxScanSize": "104857600"}),
+                        expected_alert_exceeds_max="yes",
+                        timeout_seconds=5.0,
+                    )
+                except RuntimeError as exc:
+                    bad_cand_err = str(exc)
+                check(
+                    "run_scan_profile(candidate) fails closed before any scan on mismatched MaxScanSize",
+                    "MaxScanSize: mismatch" in bad_cand_err and mock_scan_calls[0] == calls_before,
+                    f"scans_added={mock_scan_calls[0] - calls_before} err={bad_cand_err}",
+                )
+
+                good_cand_res = run_scan_profile(
+                    profile="candidate",
+                    host=host,
+                    port=port,
+                    fixtures_dir=mock_fix_dir,
+                    manifest=mock_manifest,
+                    expected_engine="1.5.4",
+                    clamconf_text=sample_conf_candidate,
+                    expected_alert_exceeds_max="yes",
+                    timeout_seconds=5.0,
+                )
+                lv = good_cand_res["scanner"]["effective_config"]["limit_validation"]
+                check(
+                    "run_scan_profile(candidate) passes and records validated effective limits",
+                    lv["status"] == STATUS_PASS
+                    and len(good_cand_res["cases"]) == 4
+                    and all(c["status"] == STATUS_PASS for c in good_cand_res["cases"]),
+                    f"limit_validation={lv['status']} checked={len(lv['checked_keys'])}",
+                )
             finally:
                 server.shutdown()
 
@@ -2001,7 +2473,7 @@ def run_self_test() -> int:
             f"overall={partial_report['overall_status']} not_verified={partial_report['classifications']['counts']['not_verified']}",
         )
 
-        # 8. End-to-end synthetic profile + report assembly comparison (PASS vs E1 silent truncation vs D ZIP64 bypass)
+        # 8. End-to-end synthetic profile + report assembly comparison (PASS vs E1 silent truncation vs D ZIP64 bypass vs config hash mismatch)
         def _synthetic_profile(profile_name: str, responses: dict[str, bytes], conf_text: str) -> dict[str, Any]:
             cases = []
             for case_id, fid, expectation, desc in PROFILE_PLANS[profile_name]:
@@ -2009,6 +2481,9 @@ def run_self_test() -> int:
                 ev["description"] = desc
                 ev["fixture_id"] = fid
                 cases.append(ev)
+            eff_conf = parse_clamconf_clamd_section(conf_text)
+            exp_alert = str(PROFILE_EXPECTED_LIMIT_SPECS[profile_name]["AlertExceedsMax"][1])
+            eff_conf["limit_validation"] = validate_effective_limits(profile_name, eff_conf, exp_alert)
             return {
                 "profile": profile_name,
                 "collected_at_utc": utc_now_iso(),
@@ -2023,19 +2498,22 @@ def run_self_test() -> int:
                         "elapsed_ms": 0.2,
                         "parsed": parse_zversion("ClamAV 1.5.4/27890/Mon Nov 16 09:00:00 2026"),
                     },
-                    "effective_config": parse_clamconf_clamd_section(conf_text),
+                    "effective_config": eff_conf,
                     "container_stats": None,
                 },
                 "cases": cases,
             }
 
-        cand_conf = sample_conf_yes.replace('"16384"', '"115343360"').replace('"524288"', '"419430400"').replace('"1048576"', '"115343360"')
-        for scenario_name, e1_raw, d_raw, exp_overall, exp_sec_fail, exp_changed, exp_silent in (
+        matching_sha = "a" * 64
+        mismatched_sha = "b" * 64
+        for scenario_name, e1_raw, d_raw, conf_match, exp_overall, exp_sec_fail, exp_cfg_fail, exp_changed, exp_silent in (
             (
                 "all-pass",
                 b"stream: Heuristics.Limits.Exceeded.MaxFileSize FOUND\x00",
                 b"stream: Win.Test.EICAR_HDB-1 FOUND\x00",
+                True,
                 STATUS_PASS,
+                0,
                 0,
                 True,
                 False,
@@ -2044,8 +2522,10 @@ def run_self_test() -> int:
                 "e1-silent-truncation",
                 b"stream: OK\x00",
                 b"stream: Win.Test.EICAR_HDB-1 FOUND\x00",
+                True,
                 STATUS_FAIL,
                 1,
+                0,
                 False,
                 True,
             ),
@@ -2053,7 +2533,20 @@ def run_self_test() -> int:
                 "d-zip64-silent-clean",
                 b"stream: Heuristics.Limits.Exceeded.MaxFileSize FOUND\x00",
                 b"stream: OK\x00",
+                True,
                 STATUS_FAIL,
+                1,
+                0,
+                True,
+                False,
+            ),
+            (
+                "candidate-config-hash-mismatch",
+                b"stream: Heuristics.Limits.Exceeded.MaxFileSize FOUND\x00",
+                b"stream: Win.Test.EICAR_HDB-1 FOUND\x00",
+                False,
+                STATUS_FAIL,
+                0,
                 1,
                 True,
                 False,
@@ -2061,6 +2554,11 @@ def run_self_test() -> int:
         ):
             s_dir = tmp_path / f"ev-{scenario_name}"
             s_dir.mkdir(parents=True, exist_ok=True)
+            (s_dir / "image-verification.json").write_text(json.dumps({
+                "imageClamdConfSha256": matching_sha if conf_match else mismatched_sha,
+                "repoCandidateConfSha256": matching_sha,
+                "candidateConfMatchesRepo": conf_match,
+            }), encoding="utf-8")
             (s_dir / "profile-candidate.json").write_text(json.dumps(_synthetic_profile(
                 "candidate",
                 {
@@ -2069,7 +2567,7 @@ def run_self_test() -> int:
                     "C_eicar_zip32": b"stream: Win.Test.EICAR_HDB-1 FOUND\x00",
                     "D_eicar_zip64": d_raw,
                 },
-                cand_conf,
+                sample_conf_candidate,
             )), encoding="utf-8")
             (s_dir / "profile-reduced-alert-yes.json").write_text(json.dumps(_synthetic_profile(
                 "reduced_alert_yes",
@@ -2103,10 +2601,50 @@ def run_self_test() -> int:
                 f"report scenario:{scenario_name}",
                 rep["overall_status"] == exp_overall
                 and rep["classifications"]["counts"]["security_failures"] == exp_sec_fail
+                and rep["classifications"]["counts"]["config_integrity_failures"] == exp_cfg_fail
                 and cmp_r["alert_exceeds_max_changed_verdict"] is exp_changed
                 and cmp_r["silent_truncation_observed_with_alert_yes"] is exp_silent,
-                f"overall={rep['overall_status']} sec_fail={rep['classifications']['counts']['security_failures']} changed={cmp_r['alert_exceeds_max_changed_verdict']} silent={cmp_r['silent_truncation_observed_with_alert_yes']}",
+                f"overall={rep['overall_status']} sec_fail={rep['classifications']['counts']['security_failures']} cfg_fail={rep['classifications']['counts']['config_integrity_failures']} changed={cmp_r['alert_exceeds_max_changed_verdict']} silent={cmp_r['silent_truncation_observed_with_alert_yes']}",
             )
+
+        # 9. Finding 1 negative & positive test of verbatim workflow config-hash fail-closed guard
+        workflow_path = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "clamav-phase0a-evidence.yml"
+        if workflow_path.is_file():
+            wf_text = workflow_path.read_text(encoding="utf-8")
+            ev_write_pos = wf_text.find('> "$EVIDENCE_DIR/image-verification.json"')
+            guard_match = re.search(
+                r"# BEGIN PHASE0A_CANDIDATE_CONF_HASH_GUARD\n([\s\S]*?)# END PHASE0A_CANDIDATE_CONF_HASH_GUARD",
+                wf_text,
+            )
+            guard_present = guard_match is not None and ev_write_pos != -1 and guard_match.start() > ev_write_pos
+            check(
+                "workflow candidate config-hash guard placed immediately after image-verification.json write",
+                guard_present,
+                f"ev_write_pos={ev_write_pos} guard_found={guard_match is not None}",
+            )
+            if guard_present and guard_match is not None:
+                guard_script = "\n".join(line.lstrip() for line in guard_match.group(1).splitlines())
+                for label, img_h, repo_h, expect_rc in (
+                    ("matching 64-hex hashes pass", "1" * 64, "1" * 64, 0),
+                    ("mismatched 64-hex hashes fail closed", "1" * 64, "2" * 64, 4),
+                    ("empty hashes fail closed", "", "", 4),
+                    ("malformed non-hex hash fails closed", "not-a-sha256", "not-a-sha256", 4),
+                ):
+                    proc = subprocess.run(
+                        ["bash", "-euo", "pipefail", "-c", guard_script],
+                        env={"PATH": "/usr/bin:/bin", "image_conf_sha": img_h, "repo_conf_sha": repo_h},
+                        text=True,
+                        capture_output=True,
+                        timeout=10,
+                    )
+                    ok = proc.returncode == expect_rc and (expect_rc == 0 or "FAIL-CLOSED:" in proc.stderr)
+                    check(
+                        f"workflow config-hash guard ({label})",
+                        ok,
+                        f"rc={proc.returncode} stderr={proc.stderr.strip()!r}",
+                    )
+        else:
+            not_verified.append(f"workflow_config_hash_guard_test (workflow not found at {workflow_path})")
 
     print(f"### SELFTEST_PASS={passed} SELFTEST_FAIL={failed} SELFTEST_NOT_VERIFIED={len(not_verified)}")
     for item in not_verified:
