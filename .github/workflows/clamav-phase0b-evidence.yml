@@ -1,0 +1,357 @@
+name: ClamAV Phase 0B Isolated Remediation Evidence
+
+# Isolated experimental workflow for Phase 0B ClamAV remediation PoC:
+#   - Part A: Local ARM64 rebuild of Ubuntu DFSG clamav 1.5.4 + upstream CLAM-3102
+#             (PR #1832 / commit 9f84fb3404b9a66c782e33f3e2b0da5e3d32af76).
+#             Intentionally EXCLUDES unreviewed ZIP64 PR #1845.
+#   - Part B: Isolated bounded TypeScript ZIP/OOXML structural preflight prototype
+#             (zero decompression; NOT integrated into production upload validation).
+#
+# STRICT BOUNDARIES:
+#   - Manual workflow_dispatch on default branch (refs/heads/main) ONLY.
+#   - Explicit confirmation string required.
+#   - ZERO GHCR login, ZERO GHCR push, ZERO image publication, ZERO deployment.
+#   - Read-only repository permissions (contents: read).
+#   - Fail-closed verdict enforcement.
+#   - Security Gate: OPEN | Licensing Gate: OPEN | Stage 7: NOT ACCEPTED.
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: >-
+          Type run-phase0b-clamav-remediation-poc to authorize this isolated local-only Phase 0B evidence run
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: clamav-phase0b-evidence
+  cancel-in-progress: false
+
+jobs:
+  phase0b-evidence:
+    name: Build & evaluate isolated Phase 0B ClamAV PoC (no GHCR push)
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.repository == 'mansour1414/DIP-Document-Intelligence-Platform' &&
+      github.ref == 'refs/heads/main' &&
+      github.ref_name == 'main' &&
+      github.event.inputs.confirmation == 'run-phase0b-clamav-remediation-poc'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      EXPECTED_REPOSITORY: mansour1414/DIP-Document-Intelligence-Platform
+      EXPECTED_DEFAULT_BRANCH: main
+      EXPECTED_CONFIRMATION: run-phase0b-clamav-remediation-poc
+      LOCAL_CANDIDATE_IMAGE: dip-clamav-phase0b-poc:local
+      EXPECTED_PATCHED_PKG_VERSION: 1.5.4+dfsg-0ubuntu0.22.04.1+dipphase0b1
+      EXPECTED_CLAM3102_PATCH_SHA256: 503040ebfc3a950ca3f5303c1591bb637e5d42ccb46cb3ca63fa94dab98cf013
+      EXPECTED_BASE_CONF_SHA256: 75e2fc17058971c143580579d1d6027b5385c1724a3109e79390a272d95909a6
+      EXPECTED_FRESHNESS_GATE_SHA256: b1bff15489ece75f5baa20d6f244761492265ce52c072afdfde110461d9aade6
+      PHASE0B_NETWORK: dip-phase0b-private
+      PYTHONDONTWRITEBYTECODE: "1"
+
+    steps:
+      - name: Check out exact dispatched commit (read-only)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Enforce repository, default-branch, runner-arch, and confirmation boundary
+        id: boundary
+        env:
+          CONFIRMATION_INPUT: ${{ github.event.inputs.confirmation }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = "workflow_dispatch"
+          test "$GITHUB_REPOSITORY" = "$EXPECTED_REPOSITORY"
+          test "$GITHUB_REF" = "refs/heads/${EXPECTED_DEFAULT_BRANCH}"
+          test "$GITHUB_REF_NAME" = "$EXPECTED_DEFAULT_BRANCH"
+          test "$CONFIRMATION_INPUT" = "$EXPECTED_CONFIRMATION"
+          test "$(uname -m)" = "aarch64"
+
+          # Verify pinned baseline and patch integrity before building anything
+          printf '%s  %s\n' \
+            "$EXPECTED_CLAM3102_PATCH_SHA256" "docs/operations/experimental/patches/clamav-1.5.4-clam-3102.patch" \
+            "$EXPECTED_BASE_CONF_SHA256" "docs/operations/experimental/clamav-arm64-stage4-candidate.conf" \
+            "$EXPECTED_FRESHNESS_GATE_SHA256" "docs/operations/experimental/clamd-freshness-gate.sh" \
+            | sha256sum --check --strict
+
+          test -n "${RUNNER_TEMP:-}"
+          EVIDENCE_DIR="${RUNNER_TEMP%/}/clamav-phase0b-evidence"
+          WORK_DIR="${RUNNER_TEMP%/}/clamav-phase0b-work"
+          {
+            echo "EVIDENCE_DIR=$EVIDENCE_DIR"
+            echo "WORK_DIR=$WORK_DIR"
+          } >> "$GITHUB_ENV"
+          rm -rf "$EVIDENCE_DIR" "$WORK_DIR"
+          mkdir -p "$EVIDENCE_DIR" "$WORK_DIR/fixtures" "$WORK_DIR/db" "$WORK_DIR/cfg-yes" "$WORK_DIR/cfg-no"
+          chmod 0755 "$WORK_DIR" "$WORK_DIR/db" "$WORK_DIR/cfg-yes" "$WORK_DIR/cfg-no"
+
+          sha256sum \
+            .github/workflows/clamav-phase0b-evidence.yml \
+            docs/operations/experimental/patches/clamav-1.5.4-clam-3102.patch \
+            docs/operations/experimental/clamav-arm64-phase0b-candidate.Dockerfile \
+            docs/operations/experimental/clamav-arm64-phase0b-candidate.Dockerfile.dockerignore \
+            docs/operations/experimental/clamav-phase0b-zip-preflight.mts \
+            docs/operations/experimental/clamav-arm64-stage4-candidate.conf \
+            docs/operations/experimental/clamd-freshness-gate.sh \
+            scripts/experiments/clamav-phase0b-evidence.py \
+            > "$EVIDENCE_DIR/source-files.sha256"
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js 22 (native .mts execution, zero npm install)
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: "22"
+
+      - name: Run offline preflight and harness self-tests (fail closed)
+        shell: bash
+        run: |
+          set -euo pipefail
+          node docs/operations/experimental/clamav-phase0b-zip-preflight.mts --self-test \
+            > "$EVIDENCE_DIR/preflight-selftest.json"
+          python3 scripts/experiments/clamav-phase0b-evidence.py --self-test \
+            > "$EVIDENCE_DIR/python-selftest.json"
+
+      - name: Set up Docker Buildx (local-only, no registry credentials)
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - name: Build isolated Phase 0B ARM64 ClamAV + CLAM-3102 candidate locally (NO GHCR push)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --platform linux/arm64 \
+            --file docs/operations/experimental/clamav-arm64-phase0b-candidate.Dockerfile \
+            --target runtime \
+            --tag "$LOCAL_CANDIDATE_IMAGE" \
+            --load \
+            .
+          image_id="$(docker image inspect "$LOCAL_CANDIDATE_IMAGE" --format '{{.Id}}')"
+          echo "LOCAL_IMAGE_ID=$image_id" >> "$GITHUB_ENV"
+
+          # Verify built image provenance, non-root user, patched version, and UnRAR exclusion
+          docker run --rm --entrypoint /bin/bash "$LOCAL_CANDIDATE_IMAGE" -euo pipefail -c '
+            test "$(id -u)" = "101"
+            test "$(id -g)" = "102"
+            for pkg in libclamav12 clamav-base clamav-daemon clamav-freshclam; do
+              v="$(dpkg-query -W -f="\${Version}" "$pkg")"
+              test "$v" = "'"$EXPECTED_PATCHED_PKG_VERSION"'"
+            done
+            ! dpkg-query -W "*unrar*" >/dev/null 2>&1
+            ! ldd /usr/sbin/clamd | grep -qi unrar
+            cat /usr/share/doc/dip-phase0b/tool-versions.txt
+          ' | tee "$EVIDENCE_DIR/candidate-image-verification.txt"
+
+          # Extract auditable dpkg manifest and provenance from the built image
+          cid="$(docker create "$LOCAL_CANDIDATE_IMAGE")"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          docker cp "$cid:/usr/share/doc/dip-phase0b/dpkg-manifest.txt" "$EVIDENCE_DIR/dpkg-manifest.txt"
+          docker cp "$cid:/usr/share/doc/dip-phase0b/ubuntu-source.sha256" "$EVIDENCE_DIR/ubuntu-source.sha256"
+          docker cp "$cid:/usr/share/doc/dip-phase0b/built-debs.sha256" "$EVIDENCE_DIR/built-debs.sha256"
+          docker cp "$cid:/usr/share/doc/dip-phase0b/debian-patches-series.txt" "$EVIDENCE_DIR/debian-patches-series.txt"
+
+      - name: Generate deterministic Phase 0B fixtures and execute Part B preflight suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/experiments/clamav-phase0b-evidence.py generate \
+            --out-dir "$WORK_DIR/fixtures" \
+            --max-file-size 16384
+          cp "$WORK_DIR/fixtures/fixtures-manifest.json" "$EVIDENCE_DIR/fixtures-manifest.json"
+
+          python3 scripts/experiments/clamav-phase0b-evidence.py run-preflight \
+            --manifest "$WORK_DIR/fixtures/fixtures-manifest.json" \
+            --preflight-script docs/operations/experimental/clamav-phase0b-zip-preflight.mts \
+            --out "$EVIDENCE_DIR/preflight-results.json"
+
+      - name: Bootstrap fresh ClamAV signature database for isolated live testing
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Prepare writable DB directory owned by clamav uid/gid (101:102)
+          docker run --rm --user 0:0 \
+            -v "$WORK_DIR/db:/var/lib/clamav" \
+            --entrypoint /bin/bash \
+            "$LOCAL_CANDIDATE_IMAGE" -c 'chown -R 101:102 /var/lib/clamav'
+
+          docker run --rm \
+            --platform linux/arm64 \
+            --user 101:102 \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            -v "$WORK_DIR/db:/var/lib/clamav" \
+            --entrypoint /usr/bin/freshclam \
+            "$LOCAL_CANDIDATE_IMAGE" --stdout --datadir=/var/lib/clamav \
+            | tee "$EVIDENCE_DIR/freshclam-bootstrap.log"
+
+          # Verify freshness gate passes on bootstrapped DB
+          docker run --rm \
+            --platform linux/arm64 \
+            --user 101:102 \
+            --read-only \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            -v "$WORK_DIR/db:/var/lib/clamav:ro" \
+            --entrypoint /usr/local/bin/clamd-freshness-gate \
+            "$LOCAL_CANDIDATE_IMAGE" --check \
+            | tee "$EVIDENCE_DIR/freshness-gate-check.log"
+
+      - name: Run isolated live scans against patched clamd (AlertExceedsMax=yes and =no controls)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker network create --internal "$PHASE0B_NETWORK"
+
+          # Derive temporary isolated experiment configs from unmodified Stage 4 clamd.conf
+          # (MaxFileSize 16K, MaxScanSize 64K to exercise CLAM-3102 deterministically).
+          sed -E \
+            -e 's/^MaxFileSize .*/MaxFileSize 16K/' \
+            -e 's/^MaxScanSize .*/MaxScanSize 64K/' \
+            -e 's/^AlertExceedsMax .*/AlertExceedsMax yes/' \
+            docs/operations/experimental/clamav-arm64-stage4-candidate.conf \
+            > "$WORK_DIR/cfg-yes/clamd.conf"
+          sed -E \
+            -e 's/^MaxFileSize .*/MaxFileSize 16K/' \
+            -e 's/^MaxScanSize .*/MaxScanSize 64K/' \
+            -e 's/^AlertExceedsMax .*/AlertExceedsMax no/' \
+            docs/operations/experimental/clamav-arm64-stage4-candidate.conf \
+            > "$WORK_DIR/cfg-no/clamd.conf"
+          chmod 0644 "$WORK_DIR/cfg-yes/clamd.conf" "$WORK_DIR/cfg-no/clamd.conf"
+
+          start_and_verify() {
+            local name="$1"
+            local cfg_dir="$2"
+            local conf_out="$3"
+
+            docker run -d --name "$name" \
+              --platform linux/arm64 \
+              --network "$PHASE0B_NETWORK" \
+              --read-only \
+              --cap-drop ALL \
+              --security-opt no-new-privileges:true \
+              --memory 3g --memory-swap 3g --cpus 2 --pids-limit 256 \
+              --tmpfs /tmp:rw,noexec,nosuid,size=256m,uid=101,gid=102 \
+              --tmpfs /run/clamav:rw,noexec,nosuid,size=32m,uid=101,gid=102 \
+              --tmpfs /var/log/clamav:rw,noexec,nosuid,size=32m,uid=101,gid=102 \
+              -v "$WORK_DIR/db:/var/lib/clamav:ro" \
+              -v "$cfg_dir:/etc/clamav-phase0b:ro" \
+              --entrypoint /usr/local/bin/clamd-freshness-gate \
+              "$LOCAL_CANDIDATE_IMAGE" \
+              --exec /usr/sbin/clamd --config-file=/etc/clamav-phase0b/clamd.conf --foreground
+
+            for _ in $(seq 1 80); do
+              if docker exec "$name" bash -c 'exec 3<>/dev/tcp/127.0.0.1/3310 && printf "zPING\0" >&3 && head -c 4 <&3 | grep -q PONG' >/dev/null 2>&1; then
+                break
+              fi
+              sleep 3
+            done
+            docker exec "$name" bash -c 'exec 3<>/dev/tcp/127.0.0.1/3310 && printf "zPING\0" >&3 && head -c 4 <&3 | grep -q PONG'
+            test "$(docker exec "$name" id -u)" = "101"
+            test "$(docker exec "$name" id -g)" = "102"
+            test "$(docker inspect "$name" --format '{{.HostConfig.ReadonlyRootfs}}')" = "true"
+            test "$(docker inspect "$name" --format '{{len .HostConfig.PortBindings}}')" = "0"
+            test "$(docker inspect "$name" --format '{{.HostConfig.NetworkMode}}')" = "$PHASE0B_NETWORK"
+            docker exec "$name" /usr/bin/clamconf --config-dir=/etc/clamav-phase0b > "$conf_out"
+          }
+
+          start_and_verify "clamav-phase0b-yes" "$WORK_DIR/cfg-yes" "$EVIDENCE_DIR/clamconf-yes.txt"
+          start_and_verify "clamav-phase0b-no" "$WORK_DIR/cfg-no" "$EVIDENCE_DIR/clamconf-no.txt"
+
+          ip_yes="$(docker inspect clamav-phase0b-yes --format "{{with index .NetworkSettings.Networks \"$PHASE0B_NETWORK\"}}{{.IPAddress}}{{end}}")"
+          ip_no="$(docker inspect clamav-phase0b-no --format "{{with index .NetworkSettings.Networks \"$PHASE0B_NETWORK\"}}{{.IPAddress}}{{end}}")"
+          test -n "$ip_yes"
+          test -n "$ip_no"
+
+          python3 scripts/experiments/clamav-phase0b-evidence.py scan-live \
+            --manifest "$WORK_DIR/fixtures/fixtures-manifest.json" \
+            --host-yes "$ip_yes" \
+            --port-yes 3310 \
+            --host-no "$ip_no" \
+            --port-no 3310 \
+            --out "$EVIDENCE_DIR/live-scan-results.json"
+
+      - name: Assemble Phase 0B evidence report and enforce fail-closed verdict
+        if: always() && steps.boundary.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain)"
+          jq -n \
+            --arg runId "$GITHUB_RUN_ID" \
+            --arg runAttempt "$GITHUB_RUN_ATTEMPT" \
+            --arg commitSha "$GITHUB_SHA" \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg ref "$GITHUB_REF" \
+            --arg runnerArch "$(uname -m)" \
+            --arg localImage "$LOCAL_CANDIDATE_IMAGE" \
+            --arg localImageId "${LOCAL_IMAGE_ID:-unknown}" \
+            --arg patchedPkgVersion "$EXPECTED_PATCHED_PKG_VERSION" \
+            --arg clam3102PatchSha256 "$EXPECTED_CLAM3102_PATCH_SHA256" \
+            --arg baseConfSha256 "$EXPECTED_BASE_CONF_SHA256" \
+            '{
+              runId: $runId,
+              runAttempt: $runAttempt,
+              commitSha: $commitSha,
+              repository: $repository,
+              ref: $ref,
+              runnerArch: $runnerArch,
+              localImage: $localImage,
+              localImageId: $localImageId,
+              patchedPackageVersion: $patchedPkgVersion,
+              clam3102PatchSha256: $clam3102PatchSha256,
+              baseConfSha256: $baseConfSha256,
+              upstreamPr1832Commit: "9f84fb3404b9a66c782e33f3e2b0da5e3d32af76",
+              unreviewedZip64Pr1845Included: false,
+              unrarIncluded: false,
+              ghcrPublished: false
+            }' > "$EVIDENCE_DIR/provenance.json"
+
+          if [[ ! -f "$EVIDENCE_DIR/fixtures-manifest.json" || ! -f "$EVIDENCE_DIR/preflight-results.json" || ! -f "$EVIDENCE_DIR/live-scan-results.json" ]]; then
+            echo "Incomplete Phase 0B evidence artifacts; failing closed." | tee "$EVIDENCE_DIR/phase0b-evidence-summary.md"
+            exit 1
+          fi
+
+          rc=0
+          python3 scripts/experiments/clamav-phase0b-evidence.py assemble-report \
+            --manifest "$EVIDENCE_DIR/fixtures-manifest.json" \
+            --preflight-results "$EVIDENCE_DIR/preflight-results.json" \
+            --live-results "$EVIDENCE_DIR/live-scan-results.json" \
+            --provenance "$EVIDENCE_DIR/provenance.json" \
+            --out-md "$EVIDENCE_DIR/phase0b-evidence-summary.md" \
+            --out-json "$EVIDENCE_DIR/phase0b-evidence.json" || rc=$?
+
+          evidence_bytes="$(du -sb "$EVIDENCE_DIR" | awk '{print $1}')"
+          test "$evidence_bytes" -lt 5242880
+          cat "$EVIDENCE_DIR/phase0b-evidence-summary.md"
+          exit "$rc"
+
+      - name: Upload bounded non-sensitive Phase 0B evidence artifact
+        if: always() && steps.boundary.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: clamav-phase0b-evidence-${{ github.run_id }}-${{ github.sha }}
+          path: ${{ runner.temp }}/clamav-phase0b-evidence
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Clean up local containers, image, private network, and scratch directories
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker rm -f clamav-phase0b-yes clamav-phase0b-no 2>/dev/null || true
+          docker rmi -f "$LOCAL_CANDIDATE_IMAGE" 2>/dev/null || true
+          docker network rm "$PHASE0B_NETWORK" 2>/dev/null || true
+          if [[ -n "${WORK_DIR:-}" ]]; then
+            rm -rf "$WORK_DIR"
+          fi
