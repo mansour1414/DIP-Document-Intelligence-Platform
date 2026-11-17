@@ -98,12 +98,38 @@ simultaneous promise of 400 MiB materialised extraction and a 256 MiB disk ceili
 number is a cumulative scan-size reference, and streaming + reclamation are proven by construction
 and by the budget accounting in the report.
 
+**Accounting scope (PoC-level vs OS-enforced):** every ceiling above is enforced **in-process by
+the PoC budget only** (`ResourceBudget`). This is application-level accounting and is explicitly
+labelled as such in the report (`accounting_scope.level = APPLICATION_LEVEL_POC_ACCOUNTING`). It is
+**not** an operating-system security boundary. A production deployment must additionally enforce
+OS-level limits — cgroup memory/CPU caps, a bounded `tmpfs` mount (`size=`, `nosuid,nodev,noexec`),
+a read-only root filesystem, and a non-root user — as the repo's CI worker image already does
+(`--read-only --tmpfs /tmp/dip:rw,nosuid,nodev,noexec,size=256m,uid=10001`). The PoC proves the
+budget arithmetic and fail-closed behaviour; it does not prove kernel enforcement.
+
 ### 4.3 Streaming bounded ZIP reads
 
 - Central directory parsed byte-exactly (ZIP32 + ZIP64 EOCD/locator/sentinels/`0x0001` extra fields).
+  The ZIP64 EOCD locator is validated **positionally** (it must sit immediately before the classic
+  EOCD, and the ZIP64 EOCD record immediately before the locator); a ZIP64 magic byte pattern inside
+  member content can no longer masquerade as one, and a sentinel EOCD without a positional locator is
+  rejected (`ZIP64_SENTINEL_WITHOUT_LOCATOR`).
 - Members are **inflated to EOF and ACTUAL bytes counted** — the declared uncompressed size is
   never trusted (forged-size case `R2-10` proves rejection on mismatch). CRC is verified against
   actual inflated bytes (`R2-06`).
+- **DEFLATE terminal strictness (Revision 1):** a DEFLATE member is accepted only if the proper
+  end-of-stream marker is reached (`decompressor.eof`) after all declared compressed bytes are
+  consumed. A truncated stream that reproduces every decompressed byte (so CRC and size still match)
+  is rejected as `TRUNCATED_DEFLATE_STREAM`. Every decompression output chunk is strictly bounded by
+  the read-chunk size (via `decompress(..., max_length)`); no unbounded `flush()` is performed.
+- **Trailing-data validation (Revision 1):** compressed bytes following the end marker within the
+  declared size window are rejected as `UNEXPECTED_TRAILING_COMPRESSED_DATA` unless they form a
+  verified ZIP data descriptor (flag bit 3 set; 16- or 24-byte record; correct signature; and
+  CRC / compressed size / uncompressed size — plus the local-header offset for the 24-byte form —
+  all matching the ACTUAL read values). A set descriptor flag with no descriptor, or a descriptor
+  whose fields disagree, is rejected (`MALFORMED_DATA_DESCRIPTOR` / `INVALID_DATA_DESCRIPTOR`).
+  STORED members read exactly `usize` payload bytes; the remainder of the window is treated as
+  trailing data under the same rule.
 - Encrypted members (flag bit 0 / strong-encryption bits / method 99) and unsupported methods
   (only 0 STORED and 8 DEFLATE supported) fail closed (`R2-07`, `R2-08`).
 - Member names pass `safe_member_path` (virtual ledger labels only; the PoC has **no filesystem
@@ -140,7 +166,26 @@ Per object: path, depth, detected content type, structural verdict, extracted by
 completeness (end-to-end is **always INCOMPLETE offline** because ClamAV is unverified), plus
 `derive_conclusion` blockers. `COMPLETE_SAFE_SCAN` is unreachable offline by construction.
 
-## 5. Case matrix (28 cases; all expected == observed in the offline run)
+### 4.7 Focused security corrections (this revision cycle)
+
+Three implementation defects identified by the focused security correctness review of PR #16 were
+corrected in this cycle. All corrections are confined to the experimental files; no production code
+or dependency changed.
+
+| # | Defect | Correction | Regression coverage |
+| --- | --- | --- | --- |
+| 1 | Incomplete DEFLATE stream acceptance: `_inflate_bounded()` did not require `decompressor.eof`, and called an unbounded `flush()`. A truncated DEFLATE stream can reproduce the original decompressed bytes (CRC and declared size still match) while `eof` stays false, so it was accepted; trailing compressed data after the end marker was silently ignored. | Require the DEFLATE end-of-stream marker after all declared compressed bytes; reject truncated streams (`TRUNCATED_DEFLATE_STREAM`); reject unexpected trailing bytes unless they form a verified 16/24-byte ZIP data descriptor (signature + CRC + sizes + offset checked against ACTUAL read values); every output chunk strictly bounded via `decompress(..., max_length)`; unbounded `flush()` removed; actual-byte accounting, CRC verification, and declared-size comparison preserved. | Shipped cases R2-13..R2-16 + `TruncatedDeflateRegressionTests` (7 tests, incl. a truncated stream whose declared CRC and size DO match). |
+| 2 | Double counting in per-member limit enforcement: `actual` was incremented before being passed as `member_bytes`, and `charge_expanded()` added the current chunk again (`member_bytes + count`), so a member exactly at the ceiling was rejected and smaller members could be rejected early. | Corrected the accounting contract: `member_bytes` is the member's running total INCLUDING the current chunk; the per-member ceiling is evaluated against `member_bytes` alone (exactly-at-ceiling allowed, one byte over rejected); the cumulative expanded-byte ceiling is evaluated independently and shared by nested members. No hard limit was weakened. | Shipped cases R2-17..R2-18, R2-21, R2-22 + `MemberAccountingTests` (5 tests, incl. multi-chunk boundary crossing and direct `charge_expanded` contract tests). |
+| 3 | Generic exception handler referenced `error.code`, which an arbitrary exception (e.g. `RuntimeError`, `KeyError`) is not guaranteed to have — the handler itself could raise, escaping `run_case` with no report; fixture generation also ran outside the fail-closed boundary. | The generic handler now emits the explicit bounded code `UNEXPECTED_PARSER_ERROR` with a length-capped structured message; fixture generation moved inside the boundary (unexpected builder failure produces a structured REJECTED case, never a crash). Unexpected exceptions can never yield `INSPECTED` or `COMPLETE_SAFE_SCAN`. | `UnexpectedExceptionTests` (5 tests): scanner `feed` raising, scanner `finish` raising, parser raising an exception without a `.code` attribute (via mock), failing builder, and message length capping. |
+
+Also in this cycle (focused validation, no parser rewrite): ZIP64 EOCD locator validation moved to
+positional checks (prevents member content containing ZIP64 magics from masquerading as a locator);
+central-directory parse failures now record a container-level `REJECTED` ledger entry before
+re-raising; malformed CDH extra-field TLV overflow, LFH/CDH mismatches, truncated containers, and
+multi-disk flags are covered by `ZipStructureRegressionTests` and can never be classified as fully
+`INSPECTED`.
+
+## 5. Case matrix (38 cases: original 28-case matrix preserved + 10 targeted regression cases R2-13..R2-22; all expected == observed in the offline run)
 
 | Case | Description | Expected | Observed |
 | --- | --- | --- | --- |
@@ -169,6 +214,16 @@ completeness (end-to-end is **always INCOMPLETE offline** because ClamAV is unve
 | R2-10 | Forged declared uncompressed size | REJECTED | REJECTED |
 | R2-11 | Cumulative expanded-byte ceiling | REJECTED | REJECTED |
 | R2-12 | Entry-count ceiling | REJECTED | REJECTED |
+| R2-13 | Truncated DEFLATE stream with matching CRC/size (Revision 1) | REJECTED | REJECTED |
+| R2-14 | Trailing compressed bytes after DEFLATE end marker (Revision 1) | REJECTED | REJECTED |
+| R2-15 | Valid 16-byte ZIP data descriptor (positive descriptor control) | INSPECTED | INSPECTED |
+| R2-16 | Descriptor flag set, no descriptor present (Revision 1) | REJECTED | REJECTED |
+| R2-17 | Member exactly at per-member ceiling, multi-chunk (Revision 2) | INSPECTED | INSPECTED |
+| R2-18 | Member one byte over per-member ceiling, multi-chunk (Revision 2) | REJECTED | REJECTED |
+| R2-19 | LFH/CDH method mismatch | REJECTED | REJECTED |
+| R2-20 | Truncated ZIP container (EOCD cut) | REJECTED | REJECTED |
+| R2-21 | Cumulative expanded ceiling across several small members (Revision 2) | REJECTED | REJECTED |
+| R2-22 | Nested members share the cumulative budget (Revision 2) | REJECTED | REJECTED |
 | CTRL-POS-01 | Independent positive control: direct EICAR | INSPECTED | INSPECTED |
 | CTRL-NEG-01 | Independent negative control: benign bytes | INSPECTED | INSPECTED |
 | CTRL-NEG-02 | Clean nested ZIP32 — still NOT `COMPLETE_SAFE_SCAN` | INSPECTED | INSPECTED |
@@ -176,10 +231,10 @@ completeness (end-to-end is **always INCOMPLETE offline** because ClamAV is unve
 The R1 synthetic marker cases (R1-07) are labelled as **SYNTHETIC PARSER PROBES**, not genuine
 encrypted PDFs. No real malware is used anywhere; EICAR is the only detection signature.
 
-## 6. Resource-limit evidence (measured offline run, 28 cases)
+## 6. Resource-limit evidence (measured offline run, 38 cases)
 
-- Totals: input 22,412 B; expanded 8,721 B; scanner-fed 15,035 B; peak traced process memory
-  ≈1.16 MiB (against 32 MiB ceiling); wall-clock per case ≤ 6 ms.
+- Totals: input 25,547 B; expanded 10,548 B; scanner-fed 20,387 B; peak traced process memory
+  ≈1.57 MiB (against 32 MiB ceiling); wall-clock per case ≤ 6 ms.
 - `temp_disk_bytes_used = 0` and `filesystem_writes = 0` in **every** case; no extraction
   filesystem primitive exists in the module.
 - Limit-hit cases: `RECURSION_DEPTH_LIMIT` (R2-05), `EXPANDED_BYTE_LIMIT` (R2-11),
@@ -204,9 +259,14 @@ encrypted PDFs and post-unlock output scanning; incremental-revision object enum
 ## 8. R2 coverage achieved vs not verified
 
 **Achieved (offline):** ZIP32⊃ZIP32; ZIP32⊃ZIP64 (byte-exact EOCD/locator/sentinels, bounded
-stdlib parse that inspects what ClamAV 1.5.4 silently bypassed); DEFLATE nesting with streaming
-reads; spoofed-extension content sniff; depth limit; corrupt member; encrypted member; unsupported
-method; path traversal; forged declared size; cumulative byte/entry ceilings; zero-disk
+stdlib parse that inspects what ClamAV 1.5.4 silently bypassed; locator now validated
+positionally); DEFLATE nesting with streaming reads **and strict end-of-stream enforcement**
+(truncated streams rejected even when CRC/size match — R2-13); trailing compressed data rejected
+unless a verified ZIP data descriptor (R2-14/R2-15/R2-16); spoofed-extension content sniff; depth
+limit; corrupt member; encrypted member; unsupported method; path traversal; forged declared size;
+cumulative byte/entry ceilings with the per-member boundary corrected (exactly-at-ceiling allowed,
+one byte over rejected — R2-17/R2-18/R2-21); nested members sharing the cumulative budget
+(R2-22); LFH/CDH consistency rejection (R2-19); truncated-container fail-closed (R2-20); zero-disk
 materialization.
 
 **NOT VERIFIED / not covered:** live ClamAV verdicts on nested content (forbidden in this step);

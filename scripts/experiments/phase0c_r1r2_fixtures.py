@@ -59,13 +59,16 @@ class Member:
     name: str
     payload: bytes
     method: int = 0                     # 0 = STORED, 8 = DEFLATE, other = unsupported
-    flags: int = 0                      # bit 0 = encrypted, 0x40 / 0x2000 = strong encryption
+    flags: int = 0                      # bit 0 = encrypted, bit 3 = data descriptor, 0x40 / 0x2000 = strong
     crc: int | None = None              # None => zlib.crc32(payload)
     usize_lie: int | None = None        # forged declared uncompressed size in CDH
     lfh_zip64: bool = False             # 0xFFFFFFFF LFH sizes + 0x0001 extra field
     cdh_zip64: bool = False             # 0xFFFFFFFF CDH sizes + 0x0001 extra field
     version_needed: int = 20
     external_attrs: int = 0
+    raw_compressed: bytes | None = None # verbatim on-disk member bytes (method 0/8)
+    lfh_method_override: int | None = None  # write a DIFFERENT method in the LFH (mismatch probe)
+    cdh_extra_raw: bytes | None = None      # verbatim CDH extra field bytes (malformed-structure probe)
 
 
 def _zip64_extra(uncompressed: int, compressed: int, local_offset: int = 0,
@@ -91,14 +94,24 @@ def build_zip(members: Iterable[Member], *, zip64_eocd: bool = False) -> bytes:
     for member in members:
         name_b = member.name.encode("utf-8")
         raw = member.payload
-        compressed = deflate_raw(raw) if member.method == 8 else raw
+        if member.raw_compressed is not None:
+            if member.method not in (0, 8):
+                raise ValueError("raw_compressed requires method 0 or 8")
+            compressed = member.raw_compressed
+        else:
+            compressed = deflate_raw(raw) if member.method == 8 else raw
         crc = member.crc if member.crc is not None else (zlib.crc32(raw) & 0xFFFFFFFF)
         csize, usize = len(compressed), len(raw)
         flags = member.flags
         version = member.version_needed
+        lfh_method = (member.lfh_method_override
+                      if member.lfh_method_override is not None else member.method)
 
         lfh_extra = _zip64_extra(usize, csize) if member.lfh_zip64 else b""
-        cdh_extra = _zip64_extra(usize, csize) if member.cdh_zip64 else b""
+        if member.cdh_extra_raw is not None:
+            cdh_extra = member.cdh_extra_raw
+        else:
+            cdh_extra = _zip64_extra(usize, csize) if member.cdh_zip64 else b""
         lfh_csize = 0xFFFFFFFF if member.lfh_zip64 else csize
         lfh_usize = 0xFFFFFFFF if member.lfh_zip64 else usize
         cdh_csize = 0xFFFFFFFF if member.cdh_zip64 else csize
@@ -107,7 +120,7 @@ def build_zip(members: Iterable[Member], *, zip64_eocd: bool = False) -> bytes:
         )
 
         lfh = struct.pack(
-            "<IHHHHHIIIHH", 0x04034B50, version, flags, member.method, 0, 0,
+            "<IHHHHHIIIHH", 0x04034B50, version, flags, lfh_method, 0, 0,
             crc, lfh_csize, lfh_usize, len(name_b), len(lfh_extra),
         )
         lfh_offset = offset
@@ -329,3 +342,41 @@ def build_pdf(spec: PdfSpec) -> bytes:
 def pdf_attachment(payload: bytes, *, mode: str = "names_tree", **kwargs: object) -> bytes:
     return build_pdf(PdfSpec(attachment=payload, mode=mode, **kwargs))  # type: ignore[arg-type]
 
+
+# ---------------------------------------------------------------------------
+# Finding-1 regression helpers: raw DEFLATE stored blocks + ZIP data descriptors
+# ---------------------------------------------------------------------------
+def deflate_stored_block(data: bytes, *, final: bool) -> bytes:
+    """One raw-DEFLATE STORED (uncompressed) block.
+
+    `final=False` yields a VALID prefix of a stream (BFINAL=0) that produces all
+    of `data` yet leaves the stream unfinished: a truncated stream whose CRC and
+    uncompressed size still match the member's declared values.
+    """
+    if len(data) > 0xFFFF:
+        raise ValueError("stored block exceeds 64 KiB")
+    header = b"\x01" if final else b"\x00"
+    return header + struct.pack("<H", len(data)) + struct.pack("<H", len(data) ^ 0xFFFF) + data
+
+
+def deflate_two_block(data: bytes) -> bytes:
+    """Complete raw-DEFLATE stream: data in a non-final block + an empty final block."""
+    return deflate_stored_block(data, final=False) + deflate_stored_block(b"", final=True)
+
+
+def deflate_truncated(data: bytes) -> bytes:
+    """Truncated raw-DEFLATE stream (all data present, end-of-stream marker absent)."""
+    return deflate_stored_block(data, final=False)
+
+
+DATA_DESCRIPTOR_SIG = b"PK\x07\x08"
+
+
+def zip_data_descriptor_16(crc: int, csize: int, usize: int) -> bytes:
+    """16-byte ZIP data descriptor (signature + CRC-32 + compressed + uncompressed sizes)."""
+    return DATA_DESCRIPTOR_SIG + struct.pack("<III", crc, csize, usize)
+
+
+def zip_data_descriptor_24(crc: int, csize: int, usize: int, local_offset: int) -> bytes:
+    """24-byte ZIP data descriptor (16-byte form + 8-byte local-header offset)."""
+    return DATA_DESCRIPTOR_SIG + struct.pack("<III", crc, csize, usize) + struct.pack("<Q", local_offset)

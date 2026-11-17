@@ -91,7 +91,10 @@ test("Phase 0C report: verdict taxonomy and coverage invariants", async (t) => {
   assert.equal(report.filesystem_extraction_writes, 0);
 
   // Verdicts: all expected verdicts match; COMPLETE_SAFE_SCAN is never claimed.
-  assert.equal(report.summary.cases_total, 28);
+  // 38 cases: original 28-case matrix preserved + 10 targeted regression cases
+  // (R2-13..R2-22) for the Finding-1/2/3 corrections.
+  assert.equal(report.summary.cases_total, 38);
+  assert.equal(report.summary.r2_cases, 22);
   assert.equal(report.summary.all_verdicts_match, true);
   assert.equal(report.summary.complete_safe_scan_claimed, false);
   assert.deepEqual(report.summary.conclusions_observed, ["NOT_COMPLETE_SAFE_SCAN"]);
@@ -153,6 +156,35 @@ test("Phase 0C report: governance preserved verbatim", async (t) => {
   // R1/R2 must not claim complete remediation from partial coverage.
   assert.equal(report.r1.complete_r1_remediation_claimed, false);
   assert.equal(report.r2.complete_r2_remediation_claimed, false);
+
+  // The three focused corrections are recorded verbatim in the report.
+  assert.equal(report.revisions.length, 3);
+  assert.match(report.revisions[0], /TRUNCATED_DEFLATE_STREAM/u);
+  assert.match(report.revisions[1], /per-member/u);
+  assert.match(report.revisions[2], /UNEXPECTED_PARSER_ERROR/u);
+
+  // PoC accounting is explicitly distinguished from OS-enforced limits.
+  assert.equal(report.resource_budget.accounting_scope.level, "APPLICATION_LEVEL_POC_ACCOUNTING");
+  assert.equal(report.resource_budget.accounting_scope.os_enforcement_required_in_production, true);
+
+  // Finding-1 regression cases: truncated/trailing streams are never INSPECTED.
+  const byId2 = Object.fromEntries(report.cases.map((c) => [c.case_id, c]));
+  for (const [id, code] of [
+    ["R2-13", "TRUNCATED_DEFLATE_STREAM"],
+    ["R2-14", "UNEXPECTED_TRAILING_COMPRESSED_DATA"],
+    ["R2-16", "MALFORMED_DATA_DESCRIPTOR"],
+  ]) {
+    assert.equal(byId2[id].error_code, code, id);
+    assert.notEqual(byId2[id].observed_verdict, "INSPECTED", id);
+  }
+  assert.equal(byId2["R2-15"].observed_verdict, "INSPECTED"); // valid descriptor accepted
+  // Finding-2 boundary: exactly-at-ceiling allowed, one over rejected.
+  assert.equal(byId2["R2-17"].observed_verdict, "INSPECTED");
+  assert.equal(byId2["R2-18"].error_code, "MEMBER_BYTE_LIMIT");
+  // Ambiguous/malformed structures never classified as fully inspected.
+  for (const id of ["R2-19", "R2-20", "R2-21", "R2-22"]) {
+    assert.notEqual(byId2[id].observed_verdict, "INSPECTED", id);
+  }
 
   // Single shared end-to-end budget, including the scanner feed.
   assert.equal(report.resource_budget.single_end_to_end_budget, true);

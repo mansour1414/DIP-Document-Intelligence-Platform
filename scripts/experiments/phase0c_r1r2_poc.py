@@ -33,6 +33,18 @@ No 400 MiB materialisation is claimed or performed.
 Verdict taxonomy (per case / per object): INSPECTED | REJECTED | UNSUPPORTED |
 NOT_VERIFIED. Fail closed on any unsupported, malformed, ambiguous or incomplete
 inspection. No content is executed; no archive path is used as a filesystem path.
+
+Revision (this cycle — focused security correctness review of PR #16):
+  * Finding 1: DEFLATE members require the proper end-of-stream marker;
+    truncated streams and unexpected trailing compressed bytes are rejected
+    (trailing bytes accepted only as a verified 16/24-byte ZIP data descriptor);
+    every decompression output chunk is strictly bounded (no unbounded flush).
+  * Finding 2: per-member limit accounting corrected — a member exactly at the
+    per-member ceiling is allowed, one byte over is rejected; the cumulative
+    expanded-byte ceiling is enforced independently and shared by nested reads.
+  * Finding 3: the generic exception handler emits a bounded structured code
+    (no reliance on a non-guaranteed error.code); fixture generation is inside
+    the fail-closed boundary.
 """
 
 from __future__ import annotations
@@ -150,9 +162,19 @@ class ResourceBudget:
         self.check_time()
 
     def charge_expanded(self, count: int, *, member_bytes: int = 0) -> None:
+        """Charge one decompressed chunk against BOTH ceilings.
+
+        Accounting contract (Finding-2 fix): `count` is the current chunk size;
+        `member_bytes` is this member's CUMULATIVE expanded bytes INCLUDING the
+        current chunk (the caller must pass its running total). The per-member
+        ceiling is evaluated against `member_bytes` ALONE — a member exactly at
+        the ceiling is allowed, one byte over is rejected, and the chunk is
+        never counted twice. The cumulative ceiling is evaluated independently
+        (`expanded_bytes + count`) and is shared across nested members.
+        """
         if self.expanded_bytes + count > self.limits.max_expanded_bytes:
             self._hit("EXPANDED_BYTE_LIMIT")
-        if member_bytes + count > self.limits.max_member_bytes:
+        if member_bytes > self.limits.max_member_bytes:
             self._hit("MEMBER_BYTE_LIMIT")
         self.expanded_bytes += count
         self.check_time()
@@ -541,19 +563,30 @@ def _parse_central_directory(data: bytes, budget: ResourceBudget) -> tuple[list[
     if eocd + 22 + comment_len > len(data):
         raise RejectionError("MALFORMED_ZIP_EOCD_COMMENT")
 
-    if ZIP64_EOCD_SIG in data or ZIP64_LOCATOR_SIG in data:
-        flags_detected.append("ZIP64_EOCD_LOCATOR_PRESENT")
     if entries_total == 0xFFFF or cd_size == 0xFFFFFFFF or cd_offset == 0xFFFFFFFF:
         flags_detected.append("ZIP64_EOCD_SENTINEL")
-        locator = data.find(ZIP64_LOCATOR_SIG)
-        if locator < 0 or locator + 20 > len(data):
-            raise RejectionError("ZIP64_LOCATOR_MISSING")
-        z64_offset = struct.unpack_from("<Q", data, locator + 8)[0]
-        if z64_offset + 56 > len(data) or data[z64_offset:z64_offset + 4] != ZIP64_EOCD_SIG:
+        # APPNOTE: the ZIP64 EOCD locator sits IMMEDIATELY before the classic
+        # EOCD, and the ZIP64 EOCD record immediately before the locator. The
+        # locator is therefore validated POSITIONALLY — a ZIP64 magic byte
+        # pattern inside member content can no longer masquerade as one.
+        if eocd < 20 or data[eocd - 20:eocd - 16] != ZIP64_LOCATOR_SIG:
+            raise RejectionError("ZIP64_SENTINEL_WITHOUT_LOCATOR")
+        locator_disk = struct.unpack_from("<H", data, eocd - 16)[0]
+        if locator_disk not in (0, 0xFFFF):
+            raise RejectionError("MULTI_DISK_ZIP_UNSUPPORTED")
+        # locator layout: sig(4) disk(4) offset(8) total_disks(4); the 8-byte
+        # offset field therefore starts at eocd-12.
+        z64_offset = struct.unpack_from("<Q", data, eocd - 12)[0]
+        if (z64_offset + 56 > len(data) or z64_offset >= eocd - 20
+                or data[z64_offset:z64_offset + 4] != ZIP64_EOCD_SIG):
             raise RejectionError("ZIP64_EOCD_MISSING")
+        z64_disk, z64_cd_disk = struct.unpack_from("<II", data, z64_offset + 16)
+        if z64_disk not in (0, 0xFFFF) or z64_cd_disk not in (0, 0xFFFF):
+            raise RejectionError("MULTI_DISK_ZIP_UNSUPPORTED")
         entries_total = struct.unpack_from("<Q", data, z64_offset + 32)[0]
         cd_size = struct.unpack_from("<Q", data, z64_offset + 40)[0]
         cd_offset = struct.unpack_from("<Q", data, z64_offset + 48)[0]
+        flags_detected.append("ZIP64_EOCD_LOCATOR_PRESENT")
     if entries_total > budget.limits.max_entries:
         budget._hit("ENTRY_COUNT_LIMIT")
     if cd_offset + cd_size > len(data):
@@ -592,41 +625,112 @@ def _parse_central_directory(data: bytes, budget: ResourceBudget) -> tuple[list[
     return entries, sorted(set(flags_detected))
 
 
-def _inflate_bounded(compressed: memoryview, chunk_bytes: int) -> Iterable[bytes]:
-    """Yield inflated output in bounded chunks. Never materialises the member."""
-    decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
-    position = 0
-    total = len(compressed)
-    while position < total and not decompressor.eof:
-        block = bytes(compressed[position:position + chunk_bytes])
-        position += len(block)
-        pending = block
-        while pending:
-            out = decompressor.decompress(pending, chunk_bytes)
-            pending = decompressor.unconsumed_tail
-            if out:
-                yield out
-            if decompressor.eof:
-                break
-            if not out and not pending:
-                break
+@dataclass
+class _InflateResult:
+    """Terminal state of a bounded raw-DEFLATE stream.
+
+    Finding-1 fix: a DEFLATE member is ACCEPTED ONLY IF the end-of-stream
+    marker was actually reached (`eof=True`) after ALL declared compressed
+    bytes were consumed. A truncated stream (eof stays False) is reported and
+    rejected by the caller. `trailing_bytes` reports compressed bytes that
+    follow the end-of-stream marker WITHIN the declared size window; those are
+    valid only as a ZIP data descriptor, which the caller validates separately.
+    No unbounded `flush()` is ever performed: every yielded chunk is strictly
+    bounded by the `max_length` argument of `decompress()`.
+    """
+    eof: bool = False
+    trailing_bytes: int = 0
+
+
+def _inflate_bounded(compressed: memoryview, chunk_bytes: int) -> tuple[Iterable[bytes], _InflateResult]:
+    """Stream decompressed output in strictly bounded chunks.
+
+    Returns `(chunks, result)`. Progress is guaranteed on every inner
+    iteration: `decompress(pending, chunk_bytes)` either consumes input
+    (`unconsumed_tail` shrinks) or yields bounded output; a call with
+    non-empty input never returns without one of the two.
+    """
+    result = _InflateResult()
+
+    def stream() -> Iterable[bytes]:
+        decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
+        total = len(compressed)
+        position = 0
+        pending = b""
+        while position < total and not decompressor.eof:
+            block = bytes(compressed[position:position + chunk_bytes])
+            position += len(block)
+            pending = block
+            while pending and not decompressor.eof:
+                out = decompressor.decompress(pending, chunk_bytes)
+                pending = decompressor.unconsumed_tail
+                if out:
+                    yield out  # strictly <= chunk_bytes (max_length bound)
+        # Terminal state — the stream is complete ONLY if the DEFLATE
+        # end-of-stream marker was reached (a truncated stream that reproduces
+        # every decompressed byte must still be rejected).
+        result.eof = decompressor.eof
         if decompressor.eof:
-            break
-    if not decompressor.eof:
-        # Drain any buffered output with the same bounded output ceiling.
-        for _ in range(chunk_bytes + 8):
-            out = decompressor.decompress(b"", chunk_bytes)
-            if not out:
-                break
-            yield out
-        tail = decompressor.flush()
-        if tail:
-            yield tail
+            # Trailing bytes after the end marker: the remainder of the last
+            # fed block (CPython exposes it via unused_data, and possibly via
+            # unconsumed_tail) plus any blocks never fed at all.
+            unused = decompressor.unused_data
+            result.trailing_bytes = max(len(pending), len(unused) if unused else 0) \
+                + (total - position)
+        else:
+            result.trailing_bytes = 0
+
+    return stream(), result
+
+
+_DATA_DESCRIPTOR_SIG = b"PK\x07\x08"
+
+
+def _validate_member_trailing(*, data: bytes, data_start: int, consumed: int,
+                              trailing: int, flags: int, local_offset: int,
+                              actual: int, crc: int) -> None:
+    """Validate bytes following the member data within the declared size window.
+
+    Finding-1 fix: unexpected trailing compressed bytes are REJECTED. They are
+    accepted only as a genuine ZIP data descriptor (flag bit 3 set, 16- or
+    24-byte record, correct signature, and CRC / compressed size / uncompressed
+    size — and local-header offset for the 24-byte form — all matching the
+    ACTUAL read values).
+    """
+    if trailing == 0:
+        if flags & 0x0008:
+            raise RejectionError("MALFORMED_DATA_DESCRIPTOR",
+                                 "data-descriptor flag set but no descriptor present")
+        return
+    if not (flags & 0x0008):
+        raise RejectionError("UNEXPECTED_TRAILING_COMPRESSED_DATA",
+                             f"{trailing} trailing compressed bytes without data-descriptor flag")
+    if trailing not in (16, 24):
+        raise RejectionError("INVALID_DATA_DESCRIPTOR", f"descriptor size {trailing}")
+    descriptor = data[data_start + consumed:data_start + consumed + trailing]
+    if len(descriptor) != trailing or descriptor[:4] != _DATA_DESCRIPTOR_SIG:
+        raise RejectionError("INVALID_DATA_DESCRIPTOR", "bad descriptor signature")
+    dd_crc, dd_csize, dd_usize = struct.unpack_from("<III", descriptor, 4)
+    if dd_crc != crc or dd_csize != consumed or dd_usize != actual:
+        raise RejectionError("INVALID_DATA_DESCRIPTOR", "descriptor fields mismatch actual read")
+    if trailing == 24:
+        dd_offset = struct.unpack_from("<Q", descriptor, 16)[0]
+        if dd_offset != local_offset:
+            raise RejectionError("INVALID_DATA_DESCRIPTOR", "descriptor offset mismatch")
 
 
 def _stream_member(budget: ResourceBudget, *, data: bytes, entry: _CentralEntry,
                    scanner: ScannerAdapter) -> tuple[int, int, bytes | None, str]:
-    """Stream ONE member in bounded chunks. Returns (actual_bytes, crc, nested_bytes, first_type)."""
+    """Stream ONE member in bounded chunks. Returns (actual_bytes, crc, nested_bytes, first_type).
+
+    Finding-1/2 fixes applied here:
+      * STORED members read exactly `usize` payload bytes; anything beyond that
+        within the declared window is treated as trailing data and validated
+        as a (or rejected as a fake) ZIP data descriptor.
+      * DEFLATE members require a proper end-of-stream marker; truncated
+        streams and unexpected trailing bytes are rejected.
+      * Per-member accounting passes the RUNNING TOTAL (Finding-2 contract).
+    """
     if entry.local_offset + 30 > len(data) or data[entry.local_offset:entry.local_offset + 4] != LFH_SIG:
         raise RejectionError("MALFORMED_ZIP_LOCAL_HEADER")
     lfh_name_len, lfh_extra_len = struct.unpack_from("<HH", data, entry.local_offset + 26)
@@ -637,17 +741,30 @@ def _stream_member(budget: ResourceBudget, *, data: bytes, entry: _CentralEntry,
     if lfh_flags != entry.flags or lfh_method != entry.method:
         raise RejectionError("MALFORMED_LFH_CDH_MISMATCH")
 
-    compressed = memoryview(data)[data_start:data_start + entry.csize]
     if entry.flags & 0x0001 or entry.flags & 0x0040 or entry.flags & 0x2000 or entry.method == 99:
         raise RejectionError("ENCRYPTED_MEMBER", "encrypted archive member: no key, fail closed")
     if entry.method not in SUPPORTED_METHODS:
         raise RejectionError("UNSUPPORTED_COMPRESSION_METHOD", f"method={entry.method}")
 
+    chunk_bytes = budget.limits.chunk_bytes
     if entry.method == 0:
-        chunks = (bytes(compressed[i:i + budget.limits.chunk_bytes])
-                  for i in range(0, len(compressed), budget.limits.chunk_bytes))
+        # STORED: the payload IS the on-disk data. The declared uncompressed
+        # size bounds the payload; the remainder of the declared window is
+        # trailing data (valid only as a data descriptor).
+        if entry.usize > entry.csize:
+            raise RejectionError("MALFORMED_ZIP_MEMBER_RANGE",
+                                 "declared usize exceeds declared csize")
+        payload_window = memoryview(data)[data_start:data_start + entry.usize]
+        trailing = entry.csize - entry.usize
+        consumed = entry.usize
+        chunks = (bytes(payload_window[i:i + chunk_bytes])
+                  for i in range(0, len(payload_window), chunk_bytes))
+        inflate_result = None
     else:
-        chunks = _inflate_bounded(compressed, budget.limits.chunk_bytes)
+        compressed = memoryview(data)[data_start:data_start + entry.csize]
+        chunks, inflate_result = _inflate_bounded(compressed, chunk_bytes)
+        trailing = 0
+        consumed = 0
 
     actual = 0
     crc = 0
@@ -674,6 +791,24 @@ def _stream_member(budget: ResourceBudget, *, data: bytes, entry: _CentralEntry,
             nested.extend(chunk)
             nested_size += len(chunk)
     crc &= 0xFFFFFFFF
+
+    # Finding-1 terminal validation (DEFLATE path).
+    if inflate_result is not None:
+        if not inflate_result.eof:
+            # A truncated stream can reproduce every decompressed byte (CRC and
+            # size would still match) while the end-of-stream marker is absent:
+            # reject it explicitly instead of trusting the produced bytes.
+            raise RejectionError("TRUNCATED_DEFLATE_STREAM",
+                                 "DEFLATE end-of-stream marker not reached")
+        trailing = inflate_result.trailing_bytes
+        consumed = entry.csize - trailing
+
+    # Finding-1 trailing-data validation (both paths).
+    _validate_member_trailing(
+        data=data, data_start=data_start, consumed=consumed, trailing=trailing,
+        flags=entry.flags, local_offset=entry.local_offset, actual=actual, crc=crc,
+    )
+
     nested_bytes: bytes | None = None
     if nested is not None:
         budget.reserve_memory(len(nested))
@@ -751,7 +886,12 @@ def inspect_zip_container(budget: ResourceBudget, ledger: CoverageLedger, *,
         raise RejectionError("MATERIALIZED_OBJECT_LIMIT")
     budget.reserve_memory(len(data))
     try:
-        entries, zip_flags = _parse_central_directory(data, budget)
+        try:
+            entries, zip_flags = _parse_central_directory(data, budget)
+        except RejectionError as error:
+            ledger.reject(object_path, depth, error.code, detected="application/zip",
+                          notes=[error.detail] if error.detail else [])
+            raise
         container_scanner = scanner_factory()
         container_scanner.feed(data[:min(len(data), budget.limits.chunk_bytes)], budget)
         container_scan = container_scanner.finish()
@@ -1106,13 +1246,29 @@ def _ensure_terminal(ledger: CoverageLedger, code: str, data: bytes,
     ledger.reject("input", 0, code, detected=sniff_content_type(data), notes=list(notes))
 
 
+def _bounded_message(error: BaseException, limit: int = 200) -> str:
+    """Bounded, structured description of an unexpected exception (Finding-3).
+
+    Never relies on attributes the exception is not guaranteed to have; the
+    result is length-capped so it can be embedded in a report verbatim.
+    """
+    message = str(error)
+    if len(message) > limit - 64:
+        message = message[: limit - 64] + "...<truncated>"
+    return f"{type(error).__name__}: {message}"
+
+
 def run_case(spec: CaseSpec) -> dict[str, object]:
     budget = ResourceBudget(spec.limits)
     ledger = CoverageLedger(spec.case_id, budget)
-    data = spec.builder()
+    data: bytes | None = None
     gaps: list[str] = []
     error_code: str | None = None
     try:
+        # Fixture generation is inside the fail-closed boundary: an unexpected
+        # builder failure must yield a structured REJECTED case, never a crash
+        # of the suite or an unreported case (Finding-3).
+        data = spec.builder()
         budget.charge_input(len(data))
         if spec.kind == "pdf":
             gaps = inspect_pdf(budget, ledger, object_path="input.pdf", data=data,
@@ -1122,13 +1278,16 @@ def run_case(spec: CaseSpec) -> dict[str, object]:
                                   depth=0, scanner_factory=spec.scanner_factory)
     except BudgetExceeded as error:
         error_code = error.code
-        _ensure_terminal(ledger, error.code, data)
+        _ensure_terminal(ledger, error.code, data or b"")
     except RejectionError as error:
         error_code = error.code
-        _ensure_terminal(ledger, error.code, data)
-    except Exception as error:  # fail closed on any unexpected parser condition
+        _ensure_terminal(ledger, error.code, data or b"",
+                         notes=[error.detail] if error.detail else [])
+    except Exception as error:  # fail closed on any unexpected condition
+        # Finding-3 fix: use an explicit bounded code; an arbitrary exception
+        # (e.g. RuntimeError/KeyError) is NOT guaranteed to carry `.code`.
         error_code = "UNEXPECTED_PARSER_ERROR"
-        _ensure_terminal(ledger, error.code, data, notes=[type(error).__name__])
+        _ensure_terminal(ledger, error_code, data or b"", notes=[_bounded_message(error)])
 
     coverage = ledger.coverage(stream_gaps=gaps)
     scanner_clean_flags = [record.scanner_verdict == "CLEAN" for record in ledger.objects
@@ -1138,6 +1297,7 @@ def run_case(spec: CaseSpec) -> dict[str, object]:
         scanner_all_clean=bool(scanner_clean_flags) and all(scanner_clean_flags),
         resource_limits_hit=budget.limits_hit,
     )
+    effective_data = data if data is not None else b""
     return {
         "case_id": spec.case_id,
         "track": spec.track,
@@ -1145,8 +1305,8 @@ def run_case(spec: CaseSpec) -> dict[str, object]:
         "expected_verdict": spec.expected_verdict,
         "observed_verdict": ledger.case_verdict(),
         "verdict_match": ledger.case_verdict() == spec.expected_verdict,
-        "input_bytes": len(data),
-        "input_sha256": hashlib.sha256(data).hexdigest(),
+        "input_bytes": len(effective_data),
+        "input_sha256": hashlib.sha256(effective_data).hexdigest(),
         "error_code": error_code,
         "notes": list(spec.notes),
         "coverage": coverage,
@@ -1327,6 +1487,83 @@ def build_case_suite() -> list[CaseSpec]:
         limits=replace(DEFAULT_RESOURCE_LIMITS, max_entries=2),
     ))
 
+    # --- Finding-1 regression cases (DEFLATE terminal strictness) ----------
+    cases.append(CaseSpec(
+        "R2-13", "R2", "Truncated DEFLATE stream: CRC and uncompressed size still match, end marker absent",
+        REJECTED, "zip",
+        lambda: fx.build_zip([fx.Member("trunc.bin", fx.EICAR_BYTES, method=8,
+                                        raw_compressed=fx.deflate_truncated(fx.EICAR_BYTES))]),
+        notes=["TRUNCATED_DEFLATE_STREAM: produced bytes alone are never proof of a complete stream"],
+    ))
+    cases.append(CaseSpec(
+        "R2-14", "R2", "Unexpected trailing compressed bytes after the DEFLATE end marker (within declared csize)",
+        REJECTED, "zip",
+        lambda: fx.build_zip([fx.Member("trail.bin", fx.EICAR_BYTES, method=8,
+                                        raw_compressed=fx.deflate_two_block(fx.EICAR_BYTES) + b"\x00\xffz")]),
+        notes=["UNEXPECTED_TRAILING_COMPRESSED_DATA: trailing data is rejected, not silently skipped"],
+    ))
+    cases.append(CaseSpec(
+        "R2-15", "R2", "Valid 16-byte ZIP data descriptor after STORED member (flag bit 3) is accepted",
+        INSPECTED, "zip",
+        lambda: fx.build_zip([fx.Member("dd.bin", fx.EICAR_BYTES, method=0, flags=0x0008,
+                                        raw_compressed=fx.EICAR_BYTES + fx.zip_data_descriptor_16(
+                                            zlib.crc32(fx.EICAR_BYTES) & 0xFFFFFFFF,
+                                            len(fx.EICAR_BYTES), len(fx.EICAR_BYTES)))]),
+        notes=["data descriptor validated field-by-field against ACTUAL read values"],
+    ))
+    cases.append(CaseSpec(
+        "R2-16", "R2", "Data-descriptor flag set but no descriptor present",
+        REJECTED, "zip",
+        lambda: fx.build_zip([fx.Member("nod.bin", fx.EICAR_BYTES, method=0, flags=0x0008)]),
+        notes=["MALFORMED_DATA_DESCRIPTOR: fail closed on the ambiguity"],
+    ))
+
+    # --- Finding-2 regression cases (per-member accounting boundary) -------
+    cases.append(CaseSpec(
+        "R2-17", "R2", "Member exactly at the per-member ceiling (multi-chunk read): allowed",
+        INSPECTED, "zip",
+        lambda: fx.build_zip([fx.Member("exact.bin", b"A" * 256)]),
+        limits=replace(DEFAULT_RESOURCE_LIMITS, max_member_bytes=256, chunk_bytes=64),
+        notes=["exactly-at-ceiling must be allowed (double counting removed)"],
+    ))
+    cases.append(CaseSpec(
+        "R2-18", "R2", "Member one byte over the per-member ceiling (multi-chunk read): rejected",
+        REJECTED, "zip",
+        lambda: fx.build_zip([fx.Member("over.bin", b"A" * 257)]),
+        limits=replace(DEFAULT_RESOURCE_LIMITS, max_member_bytes=256, chunk_bytes=64),
+        notes=["one byte above the ceiling is rejected (MEMBER_BYTE_LIMIT)"],
+    ))
+    cases.append(CaseSpec(
+        "R2-19", "R2", "LFH/CDH method mismatch: rejected, never classified inspected",
+        REJECTED, "zip",
+        lambda: fx.build_zip([fx.Member("mm.bin", fx.BENIGN_BYTES, lfh_method_override=8)]),
+        notes=["LFH method 8 vs CDH method 0 => MALFORMED_LFH_CDH_MISMATCH"],
+    ))
+    cases.append(CaseSpec(
+        "R2-20", "R2", "Truncated ZIP container (EOCD cut): fail closed",
+        REJECTED, "zip",
+        lambda: fx.zip32(fx.BENIGN_BYTES)[:-12],
+        notes=["truncated EOCD => MALFORMED_ZIP_NO_EOCD, no recovery attempted"],
+    ))
+    cases.append(CaseSpec(
+        "R2-21", "R2", "Cumulative expanded-byte ceiling hit across several small members",
+        REJECTED, "zip",
+        lambda: fx.build_zip([fx.Member(f"s{i}.bin", b"B" * 90) for i in range(3)]),
+        limits=replace(DEFAULT_RESOURCE_LIMITS, max_member_bytes=100, max_expanded_bytes=250),
+        notes=["per-member ceiling (100) never hit; cumulative ceiling (250) hit on the 3rd member"],
+    ))
+    _r2_22_payload = b"A" * 500
+    _r2_22_inner = fx.zip32(_r2_22_payload)
+    cases.append(CaseSpec(
+        "R2-22", "R2", "Nested members consume the SAME cumulative expanded budget",
+        REJECTED, "zip",
+        lambda: fx.build_zip([fx.Member("inner.zip", _r2_22_inner, method=0)]),
+        limits=replace(DEFAULT_RESOURCE_LIMITS,
+                       max_expanded_bytes=len(_r2_22_inner) + len(_r2_22_payload) - 1),
+        notes=["outer member read + inner member read share one cumulative ceiling; "
+               "the inner read trips EXPANDED_BYTE_LIMIT"],
+    ))
+
     # --------------------------- CONTROLS ----------------------------------
     cases.append(CaseSpec(
         "CTRL-POS-01", "CONTROL", "Independent POSITIVE control: direct EICAR test signature",
@@ -1400,11 +1637,24 @@ def run_offline_suite(*, start_tracemalloc: bool = True) -> dict[str, object]:
             "note": "A worker scan after storage.put does NOT satisfy the approved pre-storage boundary.",
         },
         "security_requirements": SECURITY_REQUIREMENTS,
+        "revisions": [
+            "REVISION-1: strict DEFLATE end-of-stream required (decompressor.eof); truncated streams rejected as TRUNCATED_DEFLATE_STREAM even when CRC/size match; unexpected trailing compressed bytes rejected unless a verified 16/24-byte ZIP data descriptor (CRC/csize/usize/offset checked against ACTUAL read values); all decompression output strictly bounded per chunk; unbounded flush removed",
+            "REVISION-2: per-member accounting contract corrected (member_bytes = running total INCLUDING current chunk; exactly-at-ceiling allowed, one byte over rejected); cumulative expanded-byte ceiling enforced independently and shared by nested members",
+            "REVISION-3: generic exception handler no longer relies on error.code (explicit bounded code UNEXPECTED_PARSER_ERROR + length-capped message); fixture generation moved inside the fail-closed boundary (unexpected builder failure => structured REJECTED case, never a crash); ZIP64 EOCD locator now validated positionally instead of by whole-file magic search",
+        ],
         "tool_capabilities": tool_capabilities(),
         "resource_budget": {
             "limits": DEFAULT_RESOURCE_LIMITS.as_dict(),
             "single_end_to_end_budget": True,
             "shared_by": ["pdf_parse", "attachment_extraction", "nested_archive_traversal", "scanner_feed"],
+            "accounting_scope": {
+                "level": "APPLICATION_LEVEL_POC_ACCOUNTING",
+                "os_enforcement_required_in_production": True,
+                "note": ("These ceilings are enforced in-process by the PoC budget only. "
+                         "A production deployment must ADDITIONALLY enforce OS-level limits "
+                         "(cgroup memory/CPU, bounded tmpfs size= with nosuid/nodev/noexec, "
+                         "read-only rootfs, non-root user). PoC accounting is NOT an OS security boundary."),
+            },
             "streaming_proof": {
                 "member_read_mode": "BOUNDED_STREAMING_CHUNKS",
                 "chunk_bytes": DEFAULT_RESOURCE_LIMITS.chunk_bytes,

@@ -153,9 +153,14 @@ class ResourceBudgetTests(unittest.TestCase):
         with self.assertRaises(P.BudgetExceeded) as ctx:
             budget.charge_expanded(200)
         self.assertEqual(ctx.exception.code, "EXPANDED_BYTE_LIMIT")
+        # New Finding-2 contract: member_bytes is the RUNNING TOTAL including
+        # the current chunk. Exactly at the ceiling is allowed; one over is not.
         budget2 = make_budget(max_expanded_bytes=100, max_member_bytes=50)
+        budget2.charge_expanded(30, member_bytes=30)
+        budget2.charge_expanded(20, member_bytes=50)  # exactly at ceiling: allowed
+        self.assertEqual(budget2.limits_hit, [])
         with self.assertRaises(P.BudgetExceeded) as ctx:
-            budget2.charge_expanded(40, member_bytes=20)
+            budget2.charge_expanded(1, member_bytes=51)  # one byte over: rejected
         self.assertEqual(ctx.exception.code, "MEMBER_BYTE_LIMIT")
 
     def test_entry_count_and_depth_limits(self) -> None:
@@ -380,7 +385,8 @@ class OfflineSuiteTests(unittest.TestCase):
 
     def test_all_verdicts_match(self) -> None:
         summary = self.report["summary"]
-        self.assertEqual(summary["cases_total"], 28)
+        self.assertEqual(summary["cases_total"], 38)
+        self.assertEqual(summary["r2_cases"], 22)
         self.assertTrue(summary["all_verdicts_match"])
         for case in self.report["cases"]:
             self.assertEqual(case["observed_verdict"], case["expected_verdict"],
@@ -507,6 +513,340 @@ class OfflineSuiteTests(unittest.TestCase):
     def test_report_is_json_serializable(self) -> None:
         # Guards against non-serializable objects in the coverage ledger.
         json.dumps(self.report, ensure_ascii=False)
+
+
+class TruncatedDeflateRegressionTests(unittest.TestCase):
+    """Finding 1: DEFLATE terminal strictness, trailing data, data descriptors."""
+
+    def _run_zip(self, data: bytes, **limits: object) -> dict[str, object]:
+        spec = P.CaseSpec("t", "R2", "probe", P.REJECTED, "zip",
+                          lambda: data, limits=P.replace(P.DEFAULT_RESOURCE_LIMITS, **limits))  # type: ignore[arg-type]
+        return P.run_case(spec)
+
+    def test_inflate_bounded_requires_eof_and_bounded_chunks(self) -> None:
+        truncated = F.deflate_truncated(BENIGN)
+        chunks, result = P._inflate_bounded(memoryview(truncated), 64)
+        total = sum(len(chunk) for chunk in chunks)
+        for chunk in chunks:
+            self.assertLessEqual(len(chunk), 64)
+        self.assertEqual(total, len(BENIGN))
+        self.assertFalse(result.eof, "truncated stream must NOT report eof")
+        self.assertEqual(result.trailing_bytes, 0)
+
+        full = F.deflate_two_block(BENIGN)
+        chunks, result = P._inflate_bounded(memoryview(full), 64)
+        self.assertEqual(b"".join(chunks), BENIGN)
+        self.assertTrue(result.eof)
+        self.assertEqual(result.trailing_bytes, 0)
+
+        with_trailing = full + b"\x01\x02\x03"
+        chunks, result = P._inflate_bounded(memoryview(with_trailing), 64)
+        self.assertEqual(b"".join(chunks), BENIGN)
+        self.assertTrue(result.eof)
+        self.assertEqual(result.trailing_bytes, 3)
+
+    def test_truncated_stream_with_matching_crc_and_size_is_rejected(self) -> None:
+        payload = EICAR
+        member = F.Member("trunc.bin", payload, method=8,
+                          raw_compressed=F.deflate_truncated(payload))
+        data = F.build_zip([member])
+        # Prove the "otherwise matching" property: declared CRC and usize in the
+        # central directory DO match the actual decompressed bytes.
+        import zlib as _zlib
+
+        budget = P.ResourceBudget()
+        entries, _flags = P._parse_central_directory(data, budget)
+        self.assertEqual(entries[0].crc, _zlib.crc32(payload) & 0xFFFFFFFF)
+        self.assertEqual(entries[0].usize, len(payload))
+        result = self._run_zip(data)
+        self.assertEqual(result["observed_verdict"], P.REJECTED)
+        self.assertEqual(result["error_code"], "TRUNCATED_DEFLATE_STREAM")
+
+    def test_trailing_garbage_after_end_marker_is_rejected(self) -> None:
+        payload = EICAR
+        member = F.Member("trail.bin", payload, method=8,
+                          raw_compressed=F.deflate_two_block(payload) + b"\x00\xffz")
+        result = self._run_zip(F.build_zip([member]))
+        self.assertEqual(result["observed_verdict"], P.REJECTED)
+        self.assertEqual(result["error_code"], "UNEXPECTED_TRAILING_COMPRESSED_DATA")
+
+    def test_valid_16_byte_data_descriptor_is_accepted(self) -> None:
+        import zlib as _zlib
+
+        payload = EICAR
+        dd = F.zip_data_descriptor_16(_zlib.crc32(payload) & 0xFFFFFFFF,
+                                      len(payload), len(payload))
+        member = F.Member("dd.bin", payload, method=0, flags=0x0008,
+                          raw_compressed=payload + dd)
+        result = self._run_zip(F.build_zip([member]))
+        self.assertEqual(result["observed_verdict"], P.INSPECTED)
+        self.assertIsNone(result["error_code"])
+
+    def test_valid_24_byte_data_descriptor_is_accepted(self) -> None:
+        import zlib as _zlib
+
+        payload = EICAR
+        zip_bytes = F.build_zip(
+            [F.Member("dd24.bin", payload, method=0, flags=0x0008,
+                      raw_compressed=payload + F.zip_data_descriptor_24(
+                          _zlib.crc32(payload) & 0xFFFFFFFF, len(payload), len(payload),
+                          local_offset=0))])
+        result = self._run_zip(zip_bytes)
+        self.assertEqual(result["observed_verdict"], P.INSPECTED)
+
+    def test_corrupt_data_descriptor_fields_are_rejected(self) -> None:
+        import zlib as _zlib
+
+        payload = EICAR
+        good_crc = _zlib.crc32(payload) & 0xFFFFFFFF
+        bad_dd = F.DATA_DESCRIPTOR_SIG + (good_crc - 1).to_bytes(4, "little") \
+            + len(payload).to_bytes(4, "little") + len(payload).to_bytes(4, "little")
+        member = F.Member("badd.bin", payload, method=0, flags=0x0008,
+                          raw_compressed=payload + bad_dd)
+        result = self._run_zip(F.build_zip([member]))
+        self.assertEqual(result["observed_verdict"], P.REJECTED)
+        self.assertEqual(result["error_code"], "INVALID_DATA_DESCRIPTOR")
+
+    def test_descriptor_flag_without_descriptor_is_rejected(self) -> None:
+        result = self._run_zip(F.build_zip(
+            [F.Member("nod.bin", EICAR, method=0, flags=0x0008)]))
+        self.assertEqual(result["observed_verdict"], P.REJECTED)
+        self.assertEqual(result["error_code"], "MALFORMED_DATA_DESCRIPTOR")
+
+
+class MemberAccountingTests(unittest.TestCase):
+    """Finding 2: per-member boundary is exact; cumulative ceiling independent."""
+
+    def test_charge_expanded_contract(self) -> None:
+        limits = P.replace(P.DEFAULT_RESOURCE_LIMITS, max_member_bytes=100,
+                           max_expanded_bytes=1000)
+        budget = P.ResourceBudget(limits)
+        # Exactly at the per-member ceiling (running total including chunk): allowed.
+        budget.charge_expanded(60, member_bytes=60)
+        budget.charge_expanded(40, member_bytes=100)
+        self.assertEqual(budget.expanded_bytes, 100)
+        self.assertEqual(budget.limits_hit, [])
+        # One byte over: rejected.
+        with self.assertRaises(P.BudgetExceeded) as ctx:
+            budget.charge_expanded(1, member_bytes=101)
+        self.assertEqual(ctx.exception.code, "MEMBER_BYTE_LIMIT")
+
+    def test_cumulative_ceiling_is_independent_of_member_ceiling(self) -> None:
+        limits = P.replace(P.DEFAULT_RESOURCE_LIMITS, max_member_bytes=100,
+                           max_expanded_bytes=250)
+        budget = P.ResourceBudget(limits)
+        # Three members of 90 bytes: each under the member ceiling...
+        for _ in range(2):
+            budget.charge_expanded(90, member_bytes=90)
+        # ...but the third crosses the cumulative ceiling.
+        with self.assertRaises(P.BudgetExceeded) as ctx:
+            budget.charge_expanded(90, member_bytes=90)
+        self.assertEqual(ctx.exception.code, "EXPANDED_BYTE_LIMIT")
+
+    def test_member_exactly_at_ceiling_multi_chunk_inspected(self) -> None:
+        limits = P.replace(P.DEFAULT_RESOURCE_LIMITS, max_member_bytes=256,
+                           chunk_bytes=64)
+        data = F.build_zip([F.Member("exact.bin", b"A" * 256)])
+        spec = P.CaseSpec("a", "R2", "exact", P.INSPECTED, "zip",
+                          lambda: data, limits=limits)
+        result = P.run_case(spec)
+        self.assertEqual(result["observed_verdict"], P.INSPECTED)
+        self.assertEqual(result["budget"]["expanded_bytes"], 256)
+
+    def test_member_one_byte_over_multi_chunk_rejected(self) -> None:
+        limits = P.replace(P.DEFAULT_RESOURCE_LIMITS, max_member_bytes=256,
+                           chunk_bytes=64)
+        data = F.build_zip([F.Member("over.bin", b"A" * 257)])
+        spec = P.CaseSpec("b", "R2", "over", P.REJECTED, "zip",
+                          lambda: data, limits=limits)
+        result = P.run_case(spec)
+        self.assertEqual(result["observed_verdict"], P.REJECTED)
+        self.assertEqual(result["error_code"], "MEMBER_BYTE_LIMIT")
+
+    def test_nested_members_share_the_cumulative_budget(self) -> None:
+        payload = b"A" * 500
+        inner = F.zip32(payload)
+        outer = F.build_zip([F.Member("inner.zip", inner, method=0)])
+        limits = P.replace(P.DEFAULT_RESOURCE_LIMITS,
+                           max_expanded_bytes=len(inner) + len(payload) - 1)
+        budget = P.ResourceBudget(limits)
+        ledger = P.CoverageLedger("nested", budget)
+        with self.assertRaises(P.BudgetExceeded) as ctx:
+            P.inspect_zip_container(budget, ledger, object_path="root", data=outer,
+                                    depth=0, scanner_factory=P.OfflineEicarControlProbe)
+        self.assertEqual(ctx.exception.code, "EXPANDED_BYTE_LIMIT")
+        # The failing charge is NOT recorded: the budget stays at the outer
+        # member's contribution (fail before adding keeps the ceiling intact).
+        self.assertEqual(budget.expanded_bytes, len(inner))
+
+
+class UnexpectedExceptionTests(unittest.TestCase):
+    """Finding 3: unexpected exceptions yield bounded structured fail-closed reports."""
+
+    def test_scanner_feed_raising_is_fail_closed(self) -> None:
+        class BrokenFeed:
+            name = "BROKEN"
+
+            def feed(self, chunk: bytes, budget: P.ResourceBudget) -> None:
+                raise RuntimeError("scanner blew up")
+
+            def finish(self) -> dict[str, object]:
+                return {"scanner_verdict": "NOT_SCANNED"}
+
+        data = F.zip32(EICAR)
+        spec = P.CaseSpec("x1", "R2", "broken scanner", P.REJECTED, "zip",
+                          lambda: data, scanner_factory=BrokenFeed)
+        result = P.run_case(spec)  # must not raise
+        self.assertNotEqual(result["observed_verdict"], P.INSPECTED)
+        self.assertEqual(result["error_code"], "UNEXPECTED_PARSER_ERROR")
+        self.assertEqual(result["conclusion"]["overall_conclusion"], P.NOT_COMPLETE_SAFE_SCAN)
+        notes = [note for obj in result["objects"] for note in obj["notes"]]
+        self.assertTrue(any("RuntimeError" in note for note in notes))
+
+    def test_scanner_finish_raising_is_fail_closed(self) -> None:
+        class BrokenFinish:
+            name = "BROKEN"
+
+            def feed(self, chunk: bytes, budget: P.ResourceBudget) -> None:
+                budget.charge_scanned(len(chunk))
+
+            def finish(self) -> dict[str, object]:
+                raise KeyError("no verdict key")
+
+        data = F.zip32(EICAR)
+        spec = P.CaseSpec("x2", "R2", "broken finish", P.REJECTED, "zip",
+                          lambda: data, scanner_factory=BrokenFinish)
+        result = P.run_case(spec)
+        self.assertNotEqual(result["observed_verdict"], P.INSPECTED)
+        self.assertEqual(result["error_code"], "UNEXPECTED_PARSER_ERROR")
+        self.assertEqual(result["conclusion"]["overall_conclusion"], P.NOT_COMPLETE_SAFE_SCAN)
+
+    def test_parser_raising_exception_without_code_attribute(self) -> None:
+        import unittest.mock as mock
+
+        data = F.zip32(EICAR)
+        spec = P.CaseSpec("x3", "R2", "broken parser", P.REJECTED, "zip",
+                          lambda: data)
+        with mock.patch.object(P, "inspect_zip_container", side_effect=KeyError("boom")):
+            result = P.run_case(spec)  # KeyError has no .code: must not crash
+        self.assertNotEqual(result["observed_verdict"], P.INSPECTED)
+        self.assertEqual(result["error_code"], "UNEXPECTED_PARSER_ERROR")
+        self.assertEqual(result["conclusion"]["overall_conclusion"], P.NOT_COMPLETE_SAFE_SCAN)
+
+    def test_builder_failing_produces_structured_case_not_crash(self) -> None:
+        def bad_builder() -> bytes:
+            raise ValueError("fixture build boom")
+
+        spec = P.CaseSpec("x4", "R2", "broken builder", P.REJECTED, "zip", bad_builder)
+        result = P.run_case(spec)  # must not raise
+        self.assertNotEqual(result["observed_verdict"], P.INSPECTED)
+        self.assertTrue(isinstance(result["error_code"], str) and result["error_code"])
+        self.assertEqual(result["conclusion"]["overall_conclusion"], P.NOT_COMPLETE_SAFE_SCAN)
+        self.assertEqual(result["input_bytes"], 0)
+        self.assertTrue(any("ValueError" in note
+                            for obj in result["objects"] for note in obj["notes"]))
+
+    def test_bounded_message_is_length_capped(self) -> None:
+        class Loud(Exception):
+            pass
+
+        message = P._bounded_message(Loud("x" * 10000), limit=200)
+        self.assertLessEqual(len(message), 200)
+        self.assertTrue(message.startswith("Loud:"))
+
+
+class ZipStructureRegressionTests(unittest.TestCase):
+    """Focused validation: LFH/CDH, ZIP64 extra fields, truncation, ambiguity.
+
+    Malformed / ambiguous structures must never be classified as fully INSPECTED.
+    """
+
+    def test_lfh_cdh_method_mismatch_rejected(self) -> None:
+        data = F.build_zip([F.Member("mm.bin", BENIGN, lfh_method_override=8)])
+        budget = P.ResourceBudget()
+        ledger = P.CoverageLedger("mm", budget)
+        with self.assertRaises(P.RejectionError) as ctx:
+            P.inspect_zip_container(budget, ledger, object_path="root", data=data,
+                                    depth=0, scanner_factory=P.OfflineEicarControlProbe)
+        self.assertEqual(ctx.exception.code, "MALFORMED_LFH_CDH_MISMATCH")
+        self.assertEqual(ledger.case_verdict(), P.REJECTED)
+
+    def test_malformed_cdh_extra_field_rejected(self) -> None:
+        # 0x0001 tag claiming 100 bytes of body but only 4 present: TLV overflow.
+        bad_extra = b"\x01\x00" + (100).to_bytes(2, "little") + b"\x00" * 4
+        data = F.build_zip([F.Member("bad.bin", BENIGN, cdh_extra_raw=bad_extra)])
+        budget = P.ResourceBudget()
+        ledger = P.CoverageLedger("bad", budget)
+        with self.assertRaises(P.RejectionError) as ctx:
+            P.inspect_zip_container(budget, ledger, object_path="root", data=data,
+                                    depth=0, scanner_factory=P.OfflineEicarControlProbe)
+        self.assertEqual(ctx.exception.code, "MALFORMED_ZIP_EXTRA_FIELD")
+        self.assertEqual(ledger.case_verdict(), P.REJECTED)
+
+    def test_truncated_container_never_inspected(self) -> None:
+        for cut in (1, 12, 21):
+            data = F.zip32(BENIGN)[:-cut]
+            budget = P.ResourceBudget()
+            ledger = P.CoverageLedger("trunc", budget)
+            with self.assertRaises(P.RejectionError):
+                P.inspect_zip_container(budget, ledger, object_path="root", data=data,
+                                        depth=0, scanner_factory=P.OfflineEicarControlProbe)
+            self.assertNotEqual(ledger.case_verdict(), P.INSPECTED)
+
+    def test_multi_disk_flag_rejected(self) -> None:
+        data = bytearray(F.zip32(BENIGN))
+        # "number of this disk" is at EOCD offset +4 => absolute len-18.
+        data[-18:-16] = (1).to_bytes(2, "little")
+        budget = P.ResourceBudget()
+        ledger = P.CoverageLedger("md", budget)
+        with self.assertRaises(P.RejectionError) as ctx:
+            P.inspect_zip_container(budget, ledger, object_path="root",
+                                    data=bytes(data), depth=0,
+                                    scanner_factory=P.OfflineEicarControlProbe)
+        self.assertEqual(ctx.exception.code, "MULTI_DISK_ZIP_UNSUPPORTED")
+
+    def test_zip64_positional_locator_rejects_magic_in_content(self) -> None:
+        # A classic-EOCD zip whose member CONTENT contains ZIP64 magic bytes
+        # must still parse as a plain ZIP32 (no false ZIP64 flag), and a
+        # sentinel EOCD WITHOUT a positional locator must be rejected.
+        inner = F.zip64(EICAR)
+        outer = F.build_zip([F.Member("content.bin", inner)])
+        budget = P.ResourceBudget()
+        ledger = P.CoverageLedger("z64c", budget)
+        structural = P.inspect_zip_container(budget, ledger, object_path="root",
+                                             data=outer, depth=0,
+                                             scanner_factory=P.OfflineEicarControlProbe)
+        self.assertEqual(structural, "WELL_FORMED_ZIP32")
+        # Sentinel EOCD without the locator directly before it: reject.
+        no_locator = F.zip64(EICAR)
+        eocd = no_locator.rfind(b"PK\x05\x06")
+        corrupted = no_locator[:eocd - 20] + b"\x00" * 20 + no_locator[eocd:]
+        budget2 = P.ResourceBudget()
+        ledger2 = P.CoverageLedger("z64n", budget2)
+        with self.assertRaises(P.RejectionError) as ctx:
+            P.inspect_zip_container(budget2, ledger2, object_path="root",
+                                    data=corrupted, depth=0,
+                                    scanner_factory=P.OfflineEicarControlProbe)
+        self.assertEqual(ctx.exception.code, "ZIP64_SENTINEL_WITHOUT_LOCATOR")
+
+
+class ReportRevisionTests(unittest.TestCase):
+    def test_report_records_revisions_and_accounting_scope(self) -> None:
+        report = P.run_offline_suite()
+        self.assertEqual(len(report["revisions"]), 3)
+        scope = report["resource_budget"]["accounting_scope"]
+        self.assertEqual(scope["level"], "APPLICATION_LEVEL_POC_ACCOUNTING")
+        self.assertTrue(scope["os_enforcement_required_in_production"])
+        # The new regression cases are part of the shipped matrix.
+        ids = {case["case_id"] for case in report["cases"]}
+        for expected in ("R2-13", "R2-14", "R2-15", "R2-16", "R2-17", "R2-18",
+                         "R2-19", "R2-20", "R2-21", "R2-22"):
+            self.assertIn(expected, ids)
+        # All malformed/ambiguous structures rejected or unsupported, never INSPECTED.
+        by_id = {case["case_id"]: case for case in report["cases"]}
+        for case_id in ("R2-13", "R2-14", "R2-16", "R2-19", "R2-20"):
+            self.assertIn(by_id[case_id]["observed_verdict"],
+                          (P.REJECTED, P.UNSUPPORTED, P.NOT_VERIFIED))
 
 
 if __name__ == "__main__":
