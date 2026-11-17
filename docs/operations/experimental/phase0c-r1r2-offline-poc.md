@@ -122,14 +122,32 @@ budget arithmetic and fail-closed behaviour; it does not prove kernel enforcemen
   consumed. A truncated stream that reproduces every decompressed byte (so CRC and size still match)
   is rejected as `TRUNCATED_DEFLATE_STREAM`. Every decompression output chunk is strictly bounded by
   the read-chunk size (via `decompress(..., max_length)`); no unbounded `flush()` is performed.
-- **Trailing-data validation (Revision 1):** compressed bytes following the end marker within the
-  declared size window are rejected as `UNEXPECTED_TRAILING_COMPRESSED_DATA` unless they form a
-  verified ZIP data descriptor (flag bit 3 set; 16- or 24-byte record; correct signature; and
-  CRC / compressed size / uncompressed size — plus the local-header offset for the 24-byte form —
-  all matching the ACTUAL read values). A set descriptor flag with no descriptor, or a descriptor
-  whose fields disagree, is rejected (`MALFORMED_DATA_DESCRIPTOR` / `INVALID_DATA_DESCRIPTOR`).
-  STORED members read exactly `usize` payload bytes; the remainder of the window is treated as
-  trailing data under the same rule.
+- **Data descriptor validation (Revision 4, superseding the Revision-1 in-window rule):** the
+  member's compressed data occupies `data_start .. data_start + csize` **exactly** — the Central
+  Directory compressed-size field describes the compressed file data and does **NOT** include the
+  descriptor. The optional data descriptor is read and validated **after** the compressed data, at
+  `data_start + csize`:
+  - presence is required exactly when general-purpose **bit 3** is set; bit 3 set with no valid
+    descriptor ⇒ `INVALID_DATA_DESCRIPTOR`; a descriptor signature present with bit 3 **not** set
+    ⇒ `UNDECLARED_DATA_DESCRIPTOR` (contradictory structure);
+  - **width selection uses verified format metadata, never descriptor sniffing**: a ZIP64 member
+    (CDH `0xFFFFFFFF` sentinels resolved from the `0x0001` extra) requires the signed 24-byte
+    ZIP64 form — `Signature(4) + CRC32(4) + CompressedSize64(8) + UncompressedSize64(8)` — which
+    carries **no local-header-offset field** (PKWARE APPNOTE 4.3.9; Go `archive/zip`; CPython
+    `zipfile` packs `<LLQQ`); every other member requires the signed 16-byte form
+    `Signature(4) + CRC32(4) + CompressedSize32(4) + UncompressedSize32(4)` (CPython `<LLLL`);
+    incompatible 32/64 width combinations are rejected, never sniffed;
+  - the descriptor's CRC/sizes are cross-checked against the Central Directory AND the ACTUAL read;
+    the record following the descriptor must be a valid LFH/CDH record, and a following LFH must sit
+    exactly at the next CDH local offset (overlapping/contradictory/truncated layouts ⇒
+    `INVALID_DATA_DESCRIPTOR` / `TRUNCATED_DATA_DESCRIPTOR`);
+  - the legacy **unsigned** descriptor form (no signature) is out of scope and classified
+    `UNSUPPORTED` (`UNSIGNED_DATA_DESCRIPTOR_UNSUPPORTED`) — it is never silently accepted and
+    never reported as corrupt;
+  - compressed bytes following the DEFLATE end marker **within** the compressed window are
+    rejected as `UNEXPECTED_TRAILING_COMPRESSED_DATA` (a descriptor falsely embedded inside the
+    declared window is rejected, not reclassified);
+  - STORED members require `csize == usize` exactly (the descriptor sits outside the window).
 - Encrypted members (flag bit 0 / strong-encryption bits / method 99) and unsupported methods
   (only 0 STORED and 8 DEFLATE supported) fail closed (`R2-07`, `R2-08`).
 - Member names pass `safe_member_path` (virtual ledger labels only; the PoC has **no filesystem
@@ -174,7 +192,7 @@ or dependency changed.
 
 | # | Defect | Correction | Regression coverage |
 | --- | --- | --- | --- |
-| 1 | Incomplete DEFLATE stream acceptance: `_inflate_bounded()` did not require `decompressor.eof`, and called an unbounded `flush()`. A truncated DEFLATE stream can reproduce the original decompressed bytes (CRC and declared size still match) while `eof` stays false, so it was accepted; trailing compressed data after the end marker was silently ignored. | Require the DEFLATE end-of-stream marker after all declared compressed bytes; reject truncated streams (`TRUNCATED_DEFLATE_STREAM`); reject unexpected trailing bytes unless they form a verified 16/24-byte ZIP data descriptor (signature + CRC + sizes + offset checked against ACTUAL read values); every output chunk strictly bounded via `decompress(..., max_length)`; unbounded `flush()` removed; actual-byte accounting, CRC verification, and declared-size comparison preserved. | Shipped cases R2-13..R2-16 + `TruncatedDeflateRegressionTests` (7 tests, incl. a truncated stream whose declared CRC and size DO match). |
+| 1 | Incomplete DEFLATE stream acceptance: `_inflate_bounded()` did not require `decompressor.eof`, and called an unbounded `flush()`. A truncated DEFLATE stream can reproduce the original decompressed bytes (CRC and declared size still match) while `eof` stays false, so it was accepted; trailing compressed data after the end marker was silently ignored. | Require the DEFLATE end-of-stream marker after all declared compressed bytes; reject truncated streams (`TRUNCATED_DEFLATE_STREAM`); reject bytes after the end marker inside the compressed window (`UNEXPECTED_TRAILING_COMPRESSED_DATA`); the data descriptor itself is validated at its standards position (see §4.3, corrected in REVISION-4); every output chunk strictly bounded via `decompress(..., max_length)`; unbounded `flush()` removed; actual-byte accounting, CRC verification, and declared-size comparison preserved. | Shipped cases R2-13..R2-16 + `TruncatedDeflateRegressionTests` (7 tests, incl. a truncated stream whose declared CRC and size DO match). |
 | 2 | Double counting in per-member limit enforcement: `actual` was incremented before being passed as `member_bytes`, and `charge_expanded()` added the current chunk again (`member_bytes + count`), so a member exactly at the ceiling was rejected and smaller members could be rejected early. | Corrected the accounting contract: `member_bytes` is the member's running total INCLUDING the current chunk; the per-member ceiling is evaluated against `member_bytes` alone (exactly-at-ceiling allowed, one byte over rejected); the cumulative expanded-byte ceiling is evaluated independently and shared by nested members. No hard limit was weakened. | Shipped cases R2-17..R2-18, R2-21, R2-22 + `MemberAccountingTests` (5 tests, incl. multi-chunk boundary crossing and direct `charge_expanded` contract tests). |
 | 3 | Generic exception handler referenced `error.code`, which an arbitrary exception (e.g. `RuntimeError`, `KeyError`) is not guaranteed to have — the handler itself could raise, escaping `run_case` with no report; fixture generation also ran outside the fail-closed boundary. | The generic handler now emits the explicit bounded code `UNEXPECTED_PARSER_ERROR` with a length-capped structured message; fixture generation moved inside the boundary (unexpected builder failure produces a structured REJECTED case, never a crash). Unexpected exceptions can never yield `INSPECTED` or `COMPLETE_SAFE_SCAN`. | `UnexpectedExceptionTests` (5 tests): scanner `feed` raising, scanner `finish` raising, parser raising an exception without a `.code` attribute (via mock), failing builder, and message length capping. |
 
@@ -185,7 +203,60 @@ re-raising; malformed CDH extra-field TLV overflow, LFH/CDH mismatches, truncate
 multi-disk flags are covered by `ZipStructureRegressionTests` and can never be classified as fully
 `INSPECTED`.
 
-## 5. Case matrix (38 cases: original 28-case matrix preserved + 10 targeted regression cases R2-13..R2-22; all expected == observed in the offline run)
+
+### 4.8 Data descriptor standards compliance (REVISION-4)
+
+Two data-descriptor defects from the focused standards review were corrected, plus one narrow
+structural check. All changes are confined to the experimental files; no production code or
+dependency changed.
+
+| # | Defect | Correction | Regression coverage |
+| --- | --- | --- | --- |
+| 1 | **Incorrect descriptor location.** The validator expected the data descriptor *inside* the declared compressed-size window (i.e. it assumed `csize` covered the descriptor). Standards-compliant streaming writers (e.g. CPython `zipfile` non-seekable mode) set the CDH/LFH compressed-size to the compressed data **only** and write the descriptor **after** it, so genuine streaming ZIPs were rejected and the window check contradicted the CDH. | Descriptor is now read/validated at `data_start + csize` (after the compressed data); presence is required exactly when bit 3 is set; the following record must be a valid LFH/CDH and a following LFH must match the next CDH local offset; malformed / overlapping / contradictory / truncated / ambiguous structures are rejected; DEFLATE EOF, actual-byte counts, CRC, and cumulative limits remain strict. | Shipped cases R2-15, R2-23..R2-33 + `DataDescriptorComplianceTests` (20 tests). |
+| 2 | **Incorrect 24-byte ZIP64 descriptor layout.** The fixture/validator used `sig(4)+CRC(4)+CSize(4)+USize(4)+LocalOffset(8)` — that layout is not the standard ZIP64 data descriptor and does not match any independent writer. | The 24-byte form is now `sig(4)+CRC32(4)+CompressedSize64(8)+UncompressedSize64(8)` — **no local-header-offset field** (PKWARE APPNOTE 4.3.9; Go `archive/zip` `struct.go`/`writer.go`; CPython `zipfile` `struct.pack('<LLQQ', ...)`). Width is selected from verified CDH sentinel metadata; ambiguous/incompatible widths are rejected; genuine signed 16-byte and 24-byte controls shipped; the legacy unsigned form is classified `UNSUPPORTED` with documented compatibility impact (legacy streaming writers that omit the signature are not inspected — never silently accepted, never reported corrupt). | Shipped cases R2-24, R2-29, R2-30, R2-36 + `DataDescriptorComplianceTests` (24-byte acceptance, both wrong-width directions, unsigned classification). |
+| 3 | **Narrow ZIP64 EOCD-locator check.** The locator's disk fields were parsed as 16-bit. | Both locator disk fields are validated as 32-bit (`disk_number` and `total_disk_count`): the full locator structure `sig(4)+disk(4)+zip64_eocd_offset(8)+total_disks(4)` is checked positionally, and multi-disk archives remain fail-closed (`MULTI_DISK_ZIP_UNSUPPORTED`). Deliberately NOT a general ZIP parser rewrite. | Shipped cases R2-34, R2-35 + `ZipStructureRegressionTests`-style unit tests (disk field, total field, and a genuine-locator acceptance control). |
+
+**Sample provenance (independent writer interop evidence).** Case R2-25 is built by CPython
+3.11.2 `zipfile.ZipFile(stream, "w")` writing to a **non-seekable** in-memory stream
+(`NonSeekableBytesIO`; `seek()` raises). Observed byte layout for
+`[("stored.bin", 68 B, STORED), ("deflated.txt", 24 B, DEFLATE)]` (deterministic):
+
+- LFH `stored.bin` @0: bit 3 set, `crc/csize/usize` all zeroed; data `40..108`.
+- Descriptor @108 (16 B, signed): `50 4b 07 08 | 3c cf 51 68 (CRC32) | 44 00 00 00 (csize=68) | 44 00 00 00 (usize=68)`; next record is the next LFH.
+- LFH `deflated.txt` @124: bit 3 set, sizes zeroed; data `166..192` (26 compressed bytes).
+- Descriptor @192 (16 B, signed): CRC `0x6159c593`, `csize=26`, `usize=24`; next record is the central directory @208.
+- CDH `stored.bin`: `csize=68 usize=68` (compressed data only — descriptor excluded); CDH `deflated.txt`: `csize=26 usize=24`.
+- EOCD @322; total 344 bytes.
+
+The CPython writer source (`Lib/zipfile.py`) writes `struct.pack('<LLLL', _DD_SIGNATURE, crc,
+compress_size, file_size)` in non-zip64 mode and `struct.pack('<LLQQ', ...)` in zip64 mode — both
+signed, both **after** the member data, confirming the corrected layout. The PoC reader accepts
+exactly this archive (R2-25 `INSPECTED`), which proves reader/writer agreement on the fixture's
+validity. No byte was fabricated: the archive is produced at run time by the stdlib writer inside
+the case builder.
+
+**Bidirectional cross-validation (independent reader):** CPython's own `zipfile` reader accepts
+every descriptor-bearing fixture this PoC ships — the non-seekable writer output (round-trip with
+`testzip() == None` and exact content equality on both members), the PoC-builder ZIP32 STORED +
+16-byte-descriptor archive, the ZIP32 DEFLATE + 16-byte-descriptor archive, and the ZIP64 +
+signed 24-byte-descriptor (no offset field) archive. Independent writer → independent reader,
+independent writer → PoC reader, and PoC builder → independent reader all agree on validity.
+
+**Remaining unsupported structures (fail-closed, documented):**
+- Legacy **unsigned** data descriptors (no `PK\x07\x08` signature): `UNSUPPORTED`
+  (`UNSIGNED_DATA_DESCRIPTOR_UNSUPPORTED`) — compatibility impact: archives from legacy streaming
+  writers that omit the signature are not inspected.
+- **Multi-disk** ZIP/ZIP64 archives (any non-zero disk number in the EOCD, the ZIP64 EOCD, or the
+  locator's 32-bit disk fields): `MULTI_DISK_ZIP_UNSUPPORTED`.
+- Non-standard descriptor variants (e.g. the non-standard 24-byte form with an embedded
+  local-header offset, or any width not equal to the verified 16/24-byte signed forms): rejected
+  (`INVALID_DATA_DESCRIPTOR`); only signed 16-byte and signed 24-byte forms are supported.
+- Encryption (bit 0 / strong-encryption bits / method 99): `ENCRYPTED_MEMBER`.
+- Compression methods other than 0 (STORED) and 8 (DEFLATE): `UNSUPPORTED_COMPRESSION_METHOD`.
+- ZIP descriptors with CRC/size fields that do not simultaneously match the Central Directory and
+  the ACTUAL read: rejected (never trusted in isolation).
+
+## 5. Case matrix (53 cases: original 28-case matrix preserved + 10 targeted regression cases R2-13..R2-22 + 15 data-descriptor standards-compliance cases R2-23..R2-37; all expected == observed in the offline run)
 
 | Case | Description | Expected | Observed |
 | --- | --- | --- | --- |
@@ -224,6 +295,21 @@ multi-disk flags are covered by `ZipStructureRegressionTests` and can never be c
 | R2-20 | Truncated ZIP container (EOCD cut) | REJECTED | REJECTED |
 | R2-21 | Cumulative expanded ceiling across several small members (Revision 2) | REJECTED | REJECTED |
 | R2-22 | Nested members share the cumulative budget (Revision 2) | REJECTED | REJECTED |
+| R2-23 | Valid 16-byte descriptor AFTER a DEFLATE member (Revision 4) | INSPECTED | INSPECTED |
+| R2-24 | Valid ZIP64 member + signed 24-byte descriptor, no offset field (Revision 4) | INSPECTED | INSPECTED |
+| R2-25 | CPython 3.11.2 `zipfile` non-seekable streaming output (independent writer) | INSPECTED | INSPECTED |
+| R2-26 | Descriptor CRC contradicts the Central Directory (Revision 4) | REJECTED | REJECTED |
+| R2-27 | Descriptor compressed size contradicts the Central Directory (Revision 4) | REJECTED | REJECTED |
+| R2-28 | Descriptor uncompressed size contradicts the Central Directory (Revision 4) | REJECTED | REJECTED |
+| R2-29 | Wrong width: ZIP32 member + 24-byte ZIP64 descriptor (Revision 4) | REJECTED | REJECTED |
+| R2-30 | Wrong width: ZIP64 member + 16-byte descriptor (Revision 4) | REJECTED | REJECTED |
+| R2-31 | Descriptor falsely embedded inside the compressed window (Revision 4) | REJECTED | REJECTED |
+| R2-32 | Multi-entry ZIP with per-member descriptors + correct LFH/CDH boundaries (Revision 4) | INSPECTED | INSPECTED |
+| R2-33 | Garbage record after the data descriptor (Revision 4) | REJECTED | REJECTED |
+| R2-34 | ZIP64 EOCD locator 32-bit disk number non-zero (Revision 4) | REJECTED | REJECTED |
+| R2-35 | ZIP64 EOCD locator 32-bit total disk count ≠ 1 (Revision 4) | REJECTED | REJECTED |
+| R2-36 | Legacy unsigned 12-byte descriptor — classified UNSUPPORTED (Revision 4) | UNSUPPORTED | UNSUPPORTED |
+| R2-37 | Undeclared descriptor signature (bit 3 not set) (Revision 4) | REJECTED | REJECTED |
 | CTRL-POS-01 | Independent positive control: direct EICAR | INSPECTED | INSPECTED |
 | CTRL-NEG-01 | Independent negative control: benign bytes | INSPECTED | INSPECTED |
 | CTRL-NEG-02 | Clean nested ZIP32 — still NOT `COMPLETE_SAFE_SCAN` | INSPECTED | INSPECTED |
@@ -231,15 +317,15 @@ multi-disk flags are covered by `ZipStructureRegressionTests` and can never be c
 The R1 synthetic marker cases (R1-07) are labelled as **SYNTHETIC PARSER PROBES**, not genuine
 encrypted PDFs. No real malware is used anywhere; EICAR is the only detection signature.
 
-## 6. Resource-limit evidence (measured offline run, 38 cases)
+## 6. Resource-limit evidence (measured offline run, 53 cases)
 
-- Totals: input 25,547 B; expanded 10,548 B; scanner-fed 20,387 B; peak traced process memory
-  ≈1.57 MiB (against 32 MiB ceiling); wall-clock per case ≤ 6 ms.
+- Totals: input 29,391 B; expanded 11,554 B; scanner-fed 24,625 B; peak traced process memory
+  ≈1.72 MiB (against 32 MiB ceiling); wall-clock per case ≤ 6 ms.
 - `temp_disk_bytes_used = 0` and `filesystem_writes = 0` in **every** case; no extraction
   filesystem primitive exists in the module.
-- Limit-hit cases: `RECURSION_DEPTH_LIMIT` (R2-05), `EXPANDED_BYTE_LIMIT` (R2-11),
-  `ENTRY_COUNT_LIMIT` (R2-12), `MATERIALIZED_OBJECT_LIMIT` (R1-13) — all fail closed with the hit
-  recorded in the case budget snapshot.
+- Limit-hit cases: `RECURSION_DEPTH_LIMIT` (R2-05), `EXPANDED_BYTE_LIMIT` (R2-11, R2-21, R2-22),
+  `ENTRY_COUNT_LIMIT` (R2-12), `MEMBER_BYTE_LIMIT` (R2-18), `MATERIALIZED_OBJECT_LIMIT` (R1-13)
+  — all fail closed with the hit recorded in the case budget snapshot.
 - `full_extraction_materialized` is `false` in every case (streaming, bounded re-parse only).
 - `live_clamav_executed: false`, `network_calls: 0`, `subprocess_calls: 0` in every report.
 
@@ -261,8 +347,13 @@ encrypted PDFs and post-unlock output scanning; incremental-revision object enum
 **Achieved (offline):** ZIP32⊃ZIP32; ZIP32⊃ZIP64 (byte-exact EOCD/locator/sentinels, bounded
 stdlib parse that inspects what ClamAV 1.5.4 silently bypassed; locator now validated
 positionally); DEFLATE nesting with streaming reads **and strict end-of-stream enforcement**
-(truncated streams rejected even when CRC/size match — R2-13); trailing compressed data rejected
-unless a verified ZIP data descriptor (R2-14/R2-15/R2-16); spoofed-extension content sniff; depth
+(truncated streams rejected even when CRC/size match — R2-13); bytes after the DEFLATE end marker
+inside the compressed window rejected (R2-14); data descriptors validated at their standards
+position `data_start + csize` with verified-metadata width selection — signed 16-byte ZIP32 form
+and signed 24-byte ZIP64 form (no local-header-offset field) both accepted from genuine writers
+(including CPython `zipfile` non-seekable streaming output, R2-25), contradictory fields and
+wrong-width combinations rejected (R2-16, R2-26..R2-31, R2-33, R2-37), legacy unsigned form
+classified UNSUPPORTED (R2-36); spoofed-extension content sniff; depth
 limit; corrupt member; encrypted member; unsupported method; path traversal; forged declared size;
 cumulative byte/entry ceilings with the per-member boundary corrected (exactly-at-ceiling allowed,
 one byte over rejected — R2-17/R2-18/R2-21); nested members sharing the cumulative budget
@@ -270,9 +361,11 @@ one byte over rejected — R2-17/R2-18/R2-21); nested members sharing the cumula
 materialization.
 
 **NOT VERIFIED / not covered:** live ClamAV verdicts on nested content (forbidden in this step);
-multi-disk archives; BZIP2/LZMA/PPMd/Zstd members; ZIP64 data-descriptor variants; encrypted
-members with a key (post-decryption scanning); production-scale expansion under a real tmpfs.
-R2 remains OPEN.
+multi-disk archives (fail-closed `MULTI_DISK_ZIP_UNSUPPORTED`, including the ZIP64 locator's
+32-bit disk fields — R2-34/R2-35); BZIP2/LZMA/PPMd/Zstd members; legacy unsigned data
+descriptors (no signature — classified UNSUPPORTED, `UNSIGNED_DATA_DESCRIPTOR_UNSUPPORTED`);
+encrypted members with a key (post-decryption scanning); production-scale expansion under a real
+tmpfs. R2 remains OPEN.
 
 ## 9. Production placement question (UNRESOLVED — no architecture approved)
 

@@ -385,8 +385,8 @@ class OfflineSuiteTests(unittest.TestCase):
 
     def test_all_verdicts_match(self) -> None:
         summary = self.report["summary"]
-        self.assertEqual(summary["cases_total"], 38)
-        self.assertEqual(summary["r2_cases"], 22)
+        self.assertEqual(summary["cases_total"], 53)
+        self.assertEqual(summary["r2_cases"], 37)
         self.assertTrue(summary["all_verdicts_match"])
         for case in self.report["cases"]:
             self.assertEqual(case["observed_verdict"], case["expected_verdict"],
@@ -571,28 +571,23 @@ class TruncatedDeflateRegressionTests(unittest.TestCase):
         self.assertEqual(result["error_code"], "UNEXPECTED_TRAILING_COMPRESSED_DATA")
 
     def test_valid_16_byte_data_descriptor_is_accepted(self) -> None:
+        """Standards placement: descriptor AFTER the data, CDH csize excludes it."""
         import zlib as _zlib
 
         payload = EICAR
         dd = F.zip_data_descriptor_16(_zlib.crc32(payload) & 0xFFFFFFFF,
                                       len(payload), len(payload))
         member = F.Member("dd.bin", payload, method=0, flags=0x0008,
-                          raw_compressed=payload + dd)
+                          raw_compressed=payload, raw_data_descriptor=dd)
         result = self._run_zip(F.build_zip([member]))
         self.assertEqual(result["observed_verdict"], P.INSPECTED)
         self.assertIsNone(result["error_code"])
 
-    def test_valid_24_byte_data_descriptor_is_accepted(self) -> None:
-        import zlib as _zlib
-
-        payload = EICAR
-        zip_bytes = F.build_zip(
-            [F.Member("dd24.bin", payload, method=0, flags=0x0008,
-                      raw_compressed=payload + F.zip_data_descriptor_24(
-                          _zlib.crc32(payload) & 0xFFFFFFFF, len(payload), len(payload),
-                          local_offset=0))])
-        result = self._run_zip(zip_bytes)
+    def test_valid_24_byte_zip64_data_descriptor_is_accepted(self) -> None:
+        """Signed ZIP64 descriptor: sig+crc+csize64+usize64, NO offset field."""
+        result = self._run_zip(F.zip64_with_descriptor(EICAR, method=0))
         self.assertEqual(result["observed_verdict"], P.INSPECTED)
+        self.assertIsNone(result["error_code"])
 
     def test_corrupt_data_descriptor_fields_are_rejected(self) -> None:
         import zlib as _zlib
@@ -602,7 +597,7 @@ class TruncatedDeflateRegressionTests(unittest.TestCase):
         bad_dd = F.DATA_DESCRIPTOR_SIG + (good_crc - 1).to_bytes(4, "little") \
             + len(payload).to_bytes(4, "little") + len(payload).to_bytes(4, "little")
         member = F.Member("badd.bin", payload, method=0, flags=0x0008,
-                          raw_compressed=payload + bad_dd)
+                          raw_compressed=payload, raw_data_descriptor=bad_dd)
         result = self._run_zip(F.build_zip([member]))
         self.assertEqual(result["observed_verdict"], P.REJECTED)
         self.assertEqual(result["error_code"], "INVALID_DATA_DESCRIPTOR")
@@ -611,7 +606,7 @@ class TruncatedDeflateRegressionTests(unittest.TestCase):
         result = self._run_zip(F.build_zip(
             [F.Member("nod.bin", EICAR, method=0, flags=0x0008)]))
         self.assertEqual(result["observed_verdict"], P.REJECTED)
-        self.assertEqual(result["error_code"], "MALFORMED_DATA_DESCRIPTOR")
+        self.assertEqual(result["error_code"], "INVALID_DATA_DESCRIPTOR")
 
 
 class MemberAccountingTests(unittest.TestCase):
@@ -830,23 +825,306 @@ class ZipStructureRegressionTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "ZIP64_SENTINEL_WITHOUT_LOCATOR")
 
 
+class DataDescriptorComplianceTests(unittest.TestCase):
+    """Data descriptor STANDARDS-COMPLIANCE regression matrix (REVISION-4).
+
+    Placement: descriptor AFTER the compressed data at data_start + csize; the
+    CDH compressed-size field excludes the descriptor. Width selection from
+    verified metadata; unsigned legacy form UNSUPPORTED; narrow ZIP64 EOCD
+    locator 32-bit disk-field validation. Every negative case fails closed.
+    """
+
+    def _run_zip(self, data: bytes) -> dict[str, object]:
+        spec = P.CaseSpec("t", "R2", "probe", P.REJECTED, "zip",
+                          lambda: data, limits=P.DEFAULT_RESOURCE_LIMITS)  # type: ignore[arg-type]
+        return P.run_case(spec)
+
+    # --- mandatory positive controls (independent + own builder) -------------
+    def test_valid_zip32_stored_with_16_byte_descriptor(self) -> None:
+        import zlib as _zlib
+
+        crc = _zlib.crc32(EICAR) & 0xFFFFFFFF
+        data = F.build_zip([F.Member("a.bin", EICAR, method=0, flags=0x0008,
+                                     raw_compressed=EICAR,
+                                     raw_data_descriptor=F.zip_data_descriptor_16(crc, len(EICAR), len(EICAR)))])
+        result = self._run_zip(data)
+        self.assertEqual(result["observed_verdict"], P.INSPECTED)
+        self.assertIsNone(result["error_code"])
+
+    def test_valid_zip32_deflate_with_16_byte_descriptor(self) -> None:
+        import zlib as _zlib
+
+        compressed = F.deflate_two_block(EICAR)
+        crc = _zlib.crc32(EICAR) & 0xFFFFFFFF
+        data = F.build_zip([F.Member("b.bin", EICAR, method=8, flags=0x0008,
+                                     raw_compressed=compressed,
+                                     raw_data_descriptor=F.zip_data_descriptor_16(
+                                         crc, len(compressed), len(EICAR)))])
+        result = self._run_zip(data)
+        self.assertEqual(result["observed_verdict"], P.INSPECTED)
+        self.assertIsNone(result["error_code"])
+
+    def test_valid_zip64_with_24_byte_descriptor(self) -> None:
+        data = F.zip64_with_descriptor(EICAR, method=0)
+        # Sanity: the on-disk descriptor is 24 bytes and has NO offset field.
+        cdh = data.rfind(b"PK\x01\x02")
+        self.assertLess(data.index(F.DATA_DESCRIPTOR_SIG), cdh,
+                        "descriptor must sit between the member data and the CD")
+        result = self._run_zip(data)
+        self.assertEqual(result["observed_verdict"], P.INSPECTED)
+        self.assertIsNone(result["error_code"])
+
+    def test_cpython_zipfile_nonseekable_streaming_output(self) -> None:
+        """Independent writer: CPython zipfile over a non-seekable stream.
+
+        The archive is produced by stdlib zipfile streaming mode (bit 3 set,
+        zeroed LFH sizes, signed 16-byte descriptors after the data); the PoC
+        reader must accept EXACTLY what the independent writer emitted.
+        """
+        data = F.zipfile_nonseekable_archive(
+            [("stored.bin", EICAR, 0), ("deflated.txt", F.BENIGN_BYTES, 8)])
+        self.assertTrue(data.startswith(b"PK\x03\x04"))
+        # LFH CRC/size fields must be zeroed (streaming mode marker).
+        self.assertEqual(data[14:26], b"\x00" * 12)
+        result = self._run_zip(data)
+        self.assertEqual(result["observed_verdict"], P.INSPECTED)
+        self.assertIsNone(result["error_code"])
+        verdicts = [o["verdict"] for o in result["objects"] if not o["skipped"]]
+        self.assertEqual(verdicts.count(P.INSPECTED), 3)  # container + 2 members
+
+    def test_multi_entry_zip_with_descriptors_and_correct_boundaries(self) -> None:
+        import zlib as _zlib
+
+        crc_a = _zlib.crc32(EICAR) & 0xFFFFFFFF
+        crc_b = _zlib.crc32(F.BENIGN_BYTES) & 0xFFFFFFFF
+        compressed_b = F.deflate_two_block(F.BENIGN_BYTES)
+        data = F.build_zip([
+            F.Member("a.bin", EICAR, method=0, flags=0x0008, raw_compressed=EICAR,
+                     raw_data_descriptor=F.zip_data_descriptor_16(crc_a, len(EICAR), len(EICAR))),
+            F.Member("b.txt", F.BENIGN_BYTES, method=8, flags=0x0008,
+                     raw_compressed=compressed_b,
+                     raw_data_descriptor=F.zip_data_descriptor_16(
+                         crc_b, len(compressed_b), len(F.BENIGN_BYTES))),
+        ])
+        result = self._run_zip(data)
+        self.assertEqual(result["observed_verdict"], P.INSPECTED)
+        self.assertIsNone(result["error_code"])
+
+    # --- mandatory negative cases (all fail closed) --------------------------
+    def test_bit3_set_without_descriptor_is_rejected(self) -> None:
+        data = F.build_zip([F.Member("nod.bin", EICAR, method=0, flags=0x0008)])
+        result = self._run_zip(data)
+        self.assertEqual(result["observed_verdict"], P.REJECTED)
+        self.assertEqual(result["error_code"], "INVALID_DATA_DESCRIPTOR")
+
+    def test_truncated_descriptor_is_rejected(self) -> None:
+        """Unit: the 16-byte descriptor extends past the end of the buffer."""
+        import zlib as _zlib
+
+        crc = _zlib.crc32(EICAR) & 0xFFFFFFFF
+        dd = F.zip_data_descriptor_16(crc, 64, 64)
+        buffer = b"\x00" * 64 + dd[:8]  # only 8 of the 16 descriptor bytes exist
+        with self.assertRaises(P.RejectionError) as ctx:
+            P._validate_data_descriptor(data=buffer, data_start=0, compressed_size=64,
+                                        flags=0x0008, zip64_sizes=False,
+                                        actual=64, crc=crc)
+        self.assertEqual(ctx.exception.code, "TRUNCATED_DATA_DESCRIPTOR")
+
+    def test_descriptor_crc_mismatch_is_rejected(self) -> None:
+        import zlib as _zlib
+
+        crc = _zlib.crc32(EICAR) & 0xFFFFFFFF
+        data = F.build_zip([F.Member("c.bin", EICAR, method=0, flags=0x0008,
+                                     raw_compressed=EICAR,
+                                     raw_data_descriptor=F.zip_data_descriptor_16(
+                                         crc ^ 1, len(EICAR), len(EICAR)))])
+        result = self._run_zip(data)
+        self.assertEqual(result["observed_verdict"], P.REJECTED)
+        self.assertEqual(result["error_code"], "INVALID_DATA_DESCRIPTOR")
+
+    def test_descriptor_compressed_size_mismatch_is_rejected(self) -> None:
+        import zlib as _zlib
+
+        crc = _zlib.crc32(EICAR) & 0xFFFFFFFF
+        data = F.build_zip([F.Member("c.bin", EICAR, method=0, flags=0x0008,
+                                     raw_compressed=EICAR,
+                                     raw_data_descriptor=F.zip_data_descriptor_16(
+                                         crc, len(EICAR) + 1, len(EICAR)))])
+        result = self._run_zip(data)
+        self.assertEqual(result["observed_verdict"], P.REJECTED)
+        self.assertEqual(result["error_code"], "INVALID_DATA_DESCRIPTOR")
+
+    def test_descriptor_uncompressed_size_mismatch_is_rejected(self) -> None:
+        import zlib as _zlib
+
+        crc = _zlib.crc32(EICAR) & 0xFFFFFFFF
+        data = F.build_zip([F.Member("c.bin", EICAR, method=0, flags=0x0008,
+                                     raw_compressed=EICAR,
+                                     raw_data_descriptor=F.zip_data_descriptor_16(
+                                         crc, len(EICAR), len(EICAR) + 1))])
+        result = self._run_zip(data)
+        self.assertEqual(result["observed_verdict"], P.REJECTED)
+        self.assertEqual(result["error_code"], "INVALID_DATA_DESCRIPTOR")
+
+    def test_wrong_width_zip32_member_with_zip64_descriptor(self) -> None:
+        import zlib as _zlib
+
+        crc = _zlib.crc32(EICAR) & 0xFFFFFFFF
+        data = F.build_zip([F.Member("w.bin", EICAR, method=0, flags=0x0008,
+                                     raw_compressed=EICAR,
+                                     raw_data_descriptor=F.zip_data_descriptor_24(
+                                         crc, len(EICAR), len(EICAR)))])
+        result = self._run_zip(data)
+        self.assertEqual(result["observed_verdict"], P.REJECTED)
+        self.assertEqual(result["error_code"], "INVALID_DATA_DESCRIPTOR")
+
+    def test_wrong_width_zip64_member_with_zip32_descriptor(self) -> None:
+        import zlib as _zlib
+
+        crc = _zlib.crc32(EICAR) & 0xFFFFFFFF
+        data = F.build_zip(
+            [F.Member("w64.bin", EICAR, method=0, version_needed=45, flags=0x0008,
+                      lfh_zip64=True, cdh_zip64=True, raw_compressed=EICAR,
+                      raw_data_descriptor=F.zip_data_descriptor_16(crc, len(EICAR), len(EICAR)))],
+            zip64_eocd=True)
+        result = self._run_zip(data)
+        self.assertEqual(result["observed_verdict"], P.REJECTED)
+        self.assertEqual(result["error_code"], "INVALID_DATA_DESCRIPTOR")
+
+    def test_descriptor_falsely_embedded_in_compressed_window(self) -> None:
+        """Legacy in-window layout (descriptor bytes inside the declared csize)."""
+        import zlib as _zlib
+
+        compressed = F.deflate_two_block(EICAR)
+        crc = _zlib.crc32(EICAR) & 0xFFFFFFFF
+        dd = F.zip_data_descriptor_16(crc, len(compressed), len(EICAR))
+        data = F.build_zip([F.Member("e.bin", EICAR, method=8, flags=0x0008,
+                                     raw_compressed=compressed + dd)])
+        result = self._run_zip(data)
+        self.assertEqual(result["observed_verdict"], P.REJECTED)
+        self.assertEqual(result["error_code"], "UNEXPECTED_TRAILING_COMPRESSED_DATA")
+
+    def test_unexpected_trailing_compressed_bytes(self) -> None:
+        data = F.build_zip([F.Member("t.bin", EICAR, method=8,
+                                     raw_compressed=F.deflate_two_block(EICAR) + b"\x00\xffz")])
+        result = self._run_zip(data)
+        self.assertEqual(result["observed_verdict"], P.REJECTED)
+        self.assertEqual(result["error_code"], "UNEXPECTED_TRAILING_COMPRESSED_DATA")
+
+    def test_no_record_after_descriptor_is_rejected(self) -> None:
+        """Unit: garbage instead of the following LFH/CDH record."""
+        import zlib as _zlib
+
+        crc = _zlib.crc32(EICAR) & 0xFFFFFFFF
+        dd = F.zip_data_descriptor_16(crc, 64, 64)
+        buffer = b"\x00" * 64 + dd + b"\xde\xad\xbe\xef"
+        with self.assertRaises(P.RejectionError) as ctx:
+            P._validate_data_descriptor(data=buffer, data_start=0, compressed_size=64,
+                                        flags=0x0008, zip64_sizes=False,
+                                        actual=64, crc=crc)
+        self.assertEqual(ctx.exception.code, "INVALID_DATA_DESCRIPTOR")
+
+    def test_undeclared_descriptor_signature_rejected(self) -> None:
+        """Bit 3 NOT set but a descriptor signature follows the data."""
+        import zlib as _zlib
+
+        crc = _zlib.crc32(EICAR) & 0xFFFFFFFF
+        data = F.build_zip([F.Member("u.bin", EICAR, method=0, flags=0,
+                                     raw_compressed=EICAR,
+                                     raw_data_descriptor=F.zip_data_descriptor_16(crc, len(EICAR), len(EICAR)))])
+        result = self._run_zip(data)
+        self.assertEqual(result["observed_verdict"], P.REJECTED)
+        self.assertEqual(result["error_code"], "UNDECLARED_DATA_DESCRIPTOR")
+
+    def test_unsigned_legacy_descriptor_classified_unsupported(self) -> None:
+        import zlib as _zlib
+
+        crc = _zlib.crc32(EICAR) & 0xFFFFFFFF
+        data = F.build_zip([F.Member("s.bin", EICAR, method=0, flags=0x0008,
+                                     raw_compressed=EICAR,
+                                     raw_data_descriptor=F.zip_data_descriptor_unsigned_12(
+                                         crc, len(EICAR), len(EICAR)))])
+        result = self._run_zip(data)
+        self.assertEqual(result["observed_verdict"], P.UNSUPPORTED)
+        self.assertEqual(result["error_code"], "UNSIGNED_DATA_DESCRIPTOR_UNSUPPORTED")
+        # Fail closed: never INSPECTED, never COMPLETE_SAFE_SCAN.
+        self.assertEqual(result["conclusion"]["overall_conclusion"], P.NOT_COMPLETE_SAFE_SCAN)
+
+    # --- narrow ZIP64 EOCD-locator 32-bit disk-field checks ------------------
+    def test_zip64_locator_disk_number_field_is_32_bit(self) -> None:
+        data = bytearray(F.zip64(EICAR))
+        eocd = bytes(data).rfind(b"PK\x05\x06")
+        data[eocd - 16] = 1  # 32-bit disk number (first byte)
+        budget = P.ResourceBudget()
+        ledger = P.CoverageLedger("z64d", budget)
+        with self.assertRaises(P.RejectionError) as ctx:
+            P.inspect_zip_container(budget, ledger, object_path="root",
+                                    data=bytes(data), depth=0,
+                                    scanner_factory=P.OfflineEicarControlProbe)
+        self.assertEqual(ctx.exception.code, "MULTI_DISK_ZIP_UNSUPPORTED")
+
+    def test_zip64_locator_total_disk_count_field_is_32_bit(self) -> None:
+        data = bytearray(F.zip64(EICAR))
+        eocd = bytes(data).rfind(b"PK\x05\x06")
+        data[eocd - 4] = 2  # 32-bit total disk count (first byte; was 1)
+        budget = P.ResourceBudget()
+        ledger = P.CoverageLedger("z64t", budget)
+        with self.assertRaises(P.RejectionError) as ctx:
+            P.inspect_zip_container(budget, ledger, object_path="root",
+                                    data=bytes(data), depth=0,
+                                    scanner_factory=P.OfflineEicarControlProbe)
+        self.assertEqual(ctx.exception.code, "MULTI_DISK_ZIP_UNSUPPORTED")
+
+    def test_genuine_zip64_locator_still_accepted(self) -> None:
+        # The unmodified genuine ZIP64 fixture must remain INSPECTED: the
+        # 32-bit validation must not produce false positives.
+        result = self._run_zip(F.zip64(EICAR))
+        self.assertEqual(result["observed_verdict"], P.INSPECTED)
+        self.assertIsNone(result["error_code"])
+
+
 class ReportRevisionTests(unittest.TestCase):
     def test_report_records_revisions_and_accounting_scope(self) -> None:
         report = P.run_offline_suite()
-        self.assertEqual(len(report["revisions"]), 3)
+        self.assertEqual(len(report["revisions"]), 4)
+        self.assertIn("REVISION-4", report["revisions"][3])
+        self.assertIn("data descriptor", report["revisions"][3])
         scope = report["resource_budget"]["accounting_scope"]
         self.assertEqual(scope["level"], "APPLICATION_LEVEL_POC_ACCOUNTING")
         self.assertTrue(scope["os_enforcement_required_in_production"])
         # The new regression cases are part of the shipped matrix.
         ids = {case["case_id"] for case in report["cases"]}
-        for expected in ("R2-13", "R2-14", "R2-15", "R2-16", "R2-17", "R2-18",
-                         "R2-19", "R2-20", "R2-21", "R2-22"):
+        for expected in (
+            "R2-13", "R2-14", "R2-15", "R2-16", "R2-17", "R2-18",
+            "R2-19", "R2-20", "R2-21", "R2-22", "R2-23", "R2-24", "R2-25",
+            "R2-26", "R2-27", "R2-28", "R2-29", "R2-30", "R2-31", "R2-32",
+            "R2-33", "R2-34", "R2-35", "R2-36", "R2-37",
+        ):
             self.assertIn(expected, ids)
         # All malformed/ambiguous structures rejected or unsupported, never INSPECTED.
         by_id = {case["case_id"]: case for case in report["cases"]}
-        for case_id in ("R2-13", "R2-14", "R2-16", "R2-19", "R2-20"):
+        for case_id in ("R2-13", "R2-14", "R2-16", "R2-19", "R2-20",
+                        "R2-26", "R2-27", "R2-28", "R2-29", "R2-30", "R2-31",
+                        "R2-33", "R2-34", "R2-35", "R2-37"):
             self.assertIn(by_id[case_id]["observed_verdict"],
                           (P.REJECTED, P.UNSUPPORTED, P.NOT_VERIFIED))
+        # Descriptor standards-compliance matrix codes (REVISION-4).
+        for case_id, code in (
+            ("R2-24", None), ("R2-25", None), ("R2-32", None),
+            ("R2-26", "INVALID_DATA_DESCRIPTOR"),
+            ("R2-29", "INVALID_DATA_DESCRIPTOR"),
+            ("R2-30", "INVALID_DATA_DESCRIPTOR"),
+            ("R2-31", "UNEXPECTED_TRAILING_COMPRESSED_DATA"),
+            ("R2-34", "MULTI_DISK_ZIP_UNSUPPORTED"),
+            ("R2-35", "MULTI_DISK_ZIP_UNSUPPORTED"),
+            ("R2-36", "UNSIGNED_DATA_DESCRIPTOR_UNSUPPORTED"),
+            ("R2-37", "UNDECLARED_DATA_DESCRIPTOR"),
+        ):
+            self.assertEqual(by_id[case_id]["error_code"], code, case_id)
+        self.assertEqual(by_id["R2-24"]["observed_verdict"], P.INSPECTED)
+        self.assertEqual(by_id["R2-25"]["observed_verdict"], P.INSPECTED)
+        self.assertEqual(by_id["R2-32"]["observed_verdict"], P.INSPECTED)
+        self.assertEqual(by_id["R2-36"]["observed_verdict"], P.UNSUPPORTED)
 
 
 if __name__ == "__main__":

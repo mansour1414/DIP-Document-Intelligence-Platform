@@ -90,6 +90,16 @@ class RejectionError(Exception):
         self.detail = detail
 
 
+class UnsupportedError(Exception):
+    """Structurally valid-but-out-of-scope construct: classified UNSUPPORTED
+    (never accepted, never reported as corrupt)."""
+
+    def __init__(self, code: str, detail: str = "") -> None:
+        super().__init__(code)
+        self.code = code
+        self.detail = detail
+
+
 # ---------------------------------------------------------------------------
 # ONE cumulative end-to-end resource budget (extraction + scanning + timeouts)
 # ---------------------------------------------------------------------------
@@ -511,6 +521,7 @@ class _CentralEntry:
     usize: int
     local_offset: int
     zip64_extra: bool
+    zip64_sizes: bool = False  # CDH used 0xFFFFFFFF sentinels (resolved via extra)
 
 
 def _resolve_zip64_extra(extra: bytes, *, csize: int, usize: int,
@@ -565,14 +576,18 @@ def _parse_central_directory(data: bytes, budget: ResourceBudget) -> tuple[list[
 
     if entries_total == 0xFFFF or cd_size == 0xFFFFFFFF or cd_offset == 0xFFFFFFFF:
         flags_detected.append("ZIP64_EOCD_SENTINEL")
-        # APPNOTE: the ZIP64 EOCD locator sits IMMEDIATELY before the classic
-        # EOCD, and the ZIP64 EOCD record immediately before the locator. The
-        # locator is therefore validated POSITIONALLY — a ZIP64 magic byte
-        # pattern inside member content can no longer masquerade as one.
+        # APPNOTE 4.4.4: the ZIP64 EOCD locator sits IMMEDIATELY before the
+        # classic EOCD, and the ZIP64 EOCD record immediately before the
+        # locator. The locator is therefore validated POSITIONALLY — a ZIP64
+        # magic byte pattern inside member content can no longer masquerade as
+        # one. Locator layout: sig(4) disk_number(4) zip64_eocd_offset(8)
+        # total_disk_count(4). Both disk fields are 32-bit; multi-disk
+        # archives are unsupported and fail closed.
         if eocd < 20 or data[eocd - 20:eocd - 16] != ZIP64_LOCATOR_SIG:
             raise RejectionError("ZIP64_SENTINEL_WITHOUT_LOCATOR")
-        locator_disk = struct.unpack_from("<H", data, eocd - 16)[0]
-        if locator_disk not in (0, 0xFFFF):
+        locator_disk = struct.unpack_from("<I", data, eocd - 16)[0]
+        locator_total_disks = struct.unpack_from("<I", data, eocd - 4)[0]
+        if locator_disk != 0 or locator_total_disks != 1:
             raise RejectionError("MULTI_DISK_ZIP_UNSUPPORTED")
         # locator layout: sig(4) disk(4) offset(8) total_disks(4); the 8-byte
         # offset field therefore starts at eocd-12.
@@ -618,7 +633,9 @@ def _parse_central_directory(data: bytes, budget: ResourceBudget) -> tuple[list[
             raise RejectionError("MULTI_DISK_ZIP_UNSUPPORTED")
         if csize_raw == 0xFFFFFFFF or usize_raw == 0xFFFFFFFF:
             flags_detected.append("ZIP64_CDH_SENTINEL")
-        entries.append(_CentralEntry(name, gp_flags, method, crc, csize, usize, local_offset, had_extra))
+        zip64_sizes = csize_raw == 0xFFFFFFFF or usize_raw == 0xFFFFFFFF
+        entries.append(_CentralEntry(name, gp_flags, method, crc, csize, usize,
+                                     local_offset, had_extra, zip64_sizes))
         budget.count_entry()
         budget.check_time()
         pos = end
@@ -684,52 +701,104 @@ def _inflate_bounded(compressed: memoryview, chunk_bytes: int) -> tuple[Iterable
 
 
 _DATA_DESCRIPTOR_SIG = b"PK\x07\x08"
+_KNOWN_RECORD_SIGS = (LFH_SIG, CDH_SIG, EOCD_SIG, ZIP64_EOCD_SIG, ZIP64_LOCATOR_SIG)
 
 
-def _validate_member_trailing(*, data: bytes, data_start: int, consumed: int,
-                              trailing: int, flags: int, local_offset: int,
-                              actual: int, crc: int) -> None:
-    """Validate bytes following the member data within the declared size window.
+def _validate_data_descriptor(*, data: bytes, data_start: int, compressed_size: int,
+                              flags: int, zip64_sizes: bool,
+                              actual: int, crc: int,
+                              next_local_offset: int | None = None) -> None:
+    """Validate the optional data descriptor that FOLLOWS the member data.
 
-    Finding-1 fix: unexpected trailing compressed bytes are REJECTED. They are
-    accepted only as a genuine ZIP data descriptor (flag bit 3 set, 16- or
-    24-byte record, correct signature, and CRC / compressed size / uncompressed
-    size — and local-header offset for the 24-byte form — all matching the
-    ACTUAL read values).
+    Standards placement (Finding 1 correction): the descriptor occurs
+    immediately AFTER the compressed member data, at
+    `data_start + compressed_size`. The Central Directory compressed-size
+    field describes the compressed file data and does NOT include the
+    descriptor.
+
+    Width selection uses VERIFIED format metadata, never descriptor sniffing:
+    a ZIP64 member (0xFFFFFFFF sentinels resolved from the 0x0001 extra)
+    requires the signed 24-byte ZIP64 form — Signature(4) + CRC32(4) +
+    CompressedSize64(8) + UncompressedSize64(8) (APPNOTE 4.3.9; Go
+    archive/zip; CPython zipfile ``<LLQQ``). All other members require the
+    signed 16-byte form — Signature(4) + CRC32(4) + CompressedSize32(4) +
+    UncompressedSize32(4) (CPython zipfile ``<LLLL``).
+
+    The legacy UNSIGNED form (no signature) is out of scope: it raises
+    UnsupportedError (classified UNSUPPORTED, documented compatibility
+    impact) and is never silently accepted.
+
+    Field validation ties the descriptor to the Central Directory and the
+    ACTUAL read; the record following the descriptor must be a valid local
+    header / central directory record, and a following local header must be
+    exactly where the next Central Directory entry's local offset says.
     """
-    if trailing == 0:
-        if flags & 0x0008:
-            raise RejectionError("MALFORMED_DATA_DESCRIPTOR",
-                                 "data-descriptor flag set but no descriptor present")
-        return
+    descriptor_start = data_start + compressed_size
     if not (flags & 0x0008):
-        raise RejectionError("UNEXPECTED_TRAILING_COMPRESSED_DATA",
-                             f"{trailing} trailing compressed bytes without data-descriptor flag")
-    if trailing not in (16, 24):
-        raise RejectionError("INVALID_DATA_DESCRIPTOR", f"descriptor size {trailing}")
-    descriptor = data[data_start + consumed:data_start + consumed + trailing]
-    if len(descriptor) != trailing or descriptor[:4] != _DATA_DESCRIPTOR_SIG:
-        raise RejectionError("INVALID_DATA_DESCRIPTOR", "bad descriptor signature")
-    dd_crc, dd_csize, dd_usize = struct.unpack_from("<III", descriptor, 4)
-    if dd_crc != crc or dd_csize != consumed or dd_usize != actual:
-        raise RejectionError("INVALID_DATA_DESCRIPTOR", "descriptor fields mismatch actual read")
-    if trailing == 24:
-        dd_offset = struct.unpack_from("<Q", descriptor, 16)[0]
-        if dd_offset != local_offset:
-            raise RejectionError("INVALID_DATA_DESCRIPTOR", "descriptor offset mismatch")
+        # No descriptor expected. A descriptor signature immediately after the
+        # data is a contradictory structure (undeclared descriptor).
+        if (descriptor_start + 4 <= len(data)
+                and data[descriptor_start:descriptor_start + 4] == _DATA_DESCRIPTOR_SIG):
+            raise RejectionError("UNDECLARED_DATA_DESCRIPTOR",
+                                 "data descriptor present but general-purpose bit 3 not set")
+        return
+    # Bit 3 set: the descriptor is REQUIRED.
+    width = 24 if zip64_sizes else 16
+    if descriptor_start + width > len(data):
+        raise RejectionError("TRUNCATED_DATA_DESCRIPTOR",
+                             f"{width}-byte descriptor extends past end of data")
+    descriptor = data[descriptor_start:descriptor_start + width]
+    if descriptor[:4] != _DATA_DESCRIPTOR_SIG:
+        if width == 16 and descriptor_start + 12 <= len(data):
+            u_crc, u_csize, u_usize = struct.unpack_from("<LLL", descriptor, 0)
+            if u_crc == crc and u_csize == compressed_size and u_usize == actual:
+                raise UnsupportedError(
+                    "UNSIGNED_DATA_DESCRIPTOR_UNSUPPORTED",
+                    "legacy unsigned data descriptor (no signature): out of scope; "
+                    "compatibility impact: archives from legacy streaming writers that "
+                    "omit the descriptor signature are not inspected (fail-closed)")
+        raise RejectionError("INVALID_DATA_DESCRIPTOR",
+                             "missing data descriptor signature (bit 3 set)")
+    if width == 16:
+        d_crc, d_csize, d_usize = struct.unpack_from("<LLL", descriptor, 4)
+    else:
+        d_crc = struct.unpack_from("<I", descriptor, 4)[0]
+        d_csize = struct.unpack_from("<Q", descriptor, 8)[0]
+        d_usize = struct.unpack_from("<Q", descriptor, 16)[0]
+    if d_crc != crc or d_csize != compressed_size or d_usize != actual:
+        raise RejectionError(
+            "INVALID_DATA_DESCRIPTOR",
+            f"descriptor fields contradict central directory / actual read "
+            f"(crc {d_crc:#x}!={crc:#x}, csize {d_csize}!={compressed_size}, usize {d_usize}!={actual})")
+    following = descriptor_start + width
+    if following + 4 > len(data):
+        raise RejectionError("TRUNCATED_DATA_DESCRIPTOR",
+                             "no record follows the data descriptor")
+    following_sig = data[following:following + 4]
+    if following_sig not in _KNOWN_RECORD_SIGS:
+        raise RejectionError("INVALID_DATA_DESCRIPTOR",
+                             "no valid local header / central directory record follows the "
+                             "descriptor (incompatible or ambiguous width/layout)")
+    if following_sig == LFH_SIG:
+        if next_local_offset is None:
+            raise RejectionError("INVALID_DATA_DESCRIPTOR",
+                                 "untracked local header follows the descriptor")
+        if next_local_offset != following:
+            raise RejectionError("INVALID_DATA_DESCRIPTOR",
+                                 "following local header offset contradicts the descriptor boundary")
 
 
 def _stream_member(budget: ResourceBudget, *, data: bytes, entry: _CentralEntry,
-                   scanner: ScannerAdapter) -> tuple[int, int, bytes | None, str]:
+                   scanner: ScannerAdapter,
+                   next_local_offset: int | None = None) -> tuple[int, int, bytes | None, str]:
     """Stream ONE member in bounded chunks. Returns (actual_bytes, crc, nested_bytes, first_type).
 
-    Finding-1/2 fixes applied here:
-      * STORED members read exactly `usize` payload bytes; anything beyond that
-        within the declared window is treated as trailing data and validated
-        as a (or rejected as a fake) ZIP data descriptor.
-      * DEFLATE members require a proper end-of-stream marker; truncated
-        streams and unexpected trailing bytes are rejected.
-      * Per-member accounting passes the RUNNING TOTAL (Finding-2 contract).
+    Standards data-descriptor placement (Finding-1 correction): the member's
+    compressed data occupies `data_start .. data_start + csize` EXACTLY — the
+    CDH compressed-size field never includes the descriptor. The optional
+    data descriptor is validated at `data_start + csize` by
+    `_validate_data_descriptor`. DEFLATE streams must reach the end-of-stream
+    marker; any bytes after it WITHIN the compressed window are rejected.
     """
     if entry.local_offset + 30 > len(data) or data[entry.local_offset:entry.local_offset + 4] != LFH_SIG:
         raise RejectionError("MALFORMED_ZIP_LOCAL_HEADER")
@@ -748,23 +817,21 @@ def _stream_member(budget: ResourceBudget, *, data: bytes, entry: _CentralEntry,
 
     chunk_bytes = budget.limits.chunk_bytes
     if entry.method == 0:
-        # STORED: the payload IS the on-disk data. The declared uncompressed
-        # size bounds the payload; the remainder of the declared window is
-        # trailing data (valid only as a data descriptor).
-        if entry.usize > entry.csize:
-            raise RejectionError("MALFORMED_ZIP_MEMBER_RANGE",
-                                 "declared usize exceeds declared csize")
+        # STORED: the payload IS the on-disk data, so csize == usize must hold
+        # EXACTLY — for a stored member the compressed data and the file data
+        # are the same bytes, and the descriptor sits OUTSIDE that window.
+        if entry.usize != entry.csize:
+            raise RejectionError(
+                "MALFORMED_ZIP_MEMBER_RANGE",
+                "STORED member: csize must equal usize (data descriptors never "
+                "occupy the compressed-size window)")
         payload_window = memoryview(data)[data_start:data_start + entry.usize]
-        trailing = entry.csize - entry.usize
-        consumed = entry.usize
         chunks = (bytes(payload_window[i:i + chunk_bytes])
                   for i in range(0, len(payload_window), chunk_bytes))
         inflate_result = None
     else:
         compressed = memoryview(data)[data_start:data_start + entry.csize]
         chunks, inflate_result = _inflate_bounded(compressed, chunk_bytes)
-        trailing = 0
-        consumed = 0
 
     actual = 0
     crc = 0
@@ -792,21 +859,21 @@ def _stream_member(budget: ResourceBudget, *, data: bytes, entry: _CentralEntry,
             nested_size += len(chunk)
     crc &= 0xFFFFFFFF
 
-    # Finding-1 terminal validation (DEFLATE path).
-    if inflate_result is not None:
-        if not inflate_result.eof:
-            # A truncated stream can reproduce every decompressed byte (CRC and
-            # size would still match) while the end-of-stream marker is absent:
-            # reject it explicitly instead of trusting the produced bytes.
-            raise RejectionError("TRUNCATED_DEFLATE_STREAM",
-                                 "DEFLATE end-of-stream marker not reached")
-        trailing = inflate_result.trailing_bytes
-        consumed = entry.csize - trailing
+    # DEFLATE terminal validation: the end-of-stream marker is mandatory;
+    # bytes after it WITHIN the compressed window are unexpected trailing
+    # compressed data (never silently reclassified as a descriptor).
+    if inflate_result is not None and not inflate_result.eof:
+        raise RejectionError("TRUNCATED_DEFLATE_STREAM",
+                             "DEFLATE end-of-stream marker not reached")
+    if inflate_result is not None and inflate_result.trailing_bytes:
+        raise RejectionError("UNEXPECTED_TRAILING_COMPRESSED_DATA",
+                             "bytes after the DEFLATE end marker inside the compressed window")
 
-    # Finding-1 trailing-data validation (both paths).
-    _validate_member_trailing(
-        data=data, data_start=data_start, consumed=consumed, trailing=trailing,
-        flags=entry.flags, local_offset=entry.local_offset, actual=actual, crc=crc,
+    # Data descriptor: AFTER the compressed data at data_start + csize.
+    _validate_data_descriptor(
+        data=data, data_start=data_start, compressed_size=entry.csize,
+        flags=entry.flags, zip64_sizes=entry.zip64_sizes, actual=actual, crc=crc,
+        next_local_offset=next_local_offset,
     )
 
     nested_bytes: bytes | None = None
@@ -819,13 +886,21 @@ def _stream_member(budget: ResourceBudget, *, data: bytes, entry: _CentralEntry,
 def _inspect_one_member(budget: ResourceBudget, ledger: CoverageLedger, *,
                         object_path: str, member_path: str, data: bytes,
                         entry: _CentralEntry, depth: int,
-                        scanner_factory: Callable[[], ScannerAdapter]) -> None:
+                        scanner_factory: Callable[[], ScannerAdapter],
+                        next_local_offset: int | None = None) -> None:
     budget.check_depth(depth)  # member depth also counts against the recursion budget
     scanner = scanner_factory()
     try:
         actual, crc, nested_bytes, detected = _stream_member(
-            budget, data=data, entry=entry, scanner=scanner
+            budget, data=data, entry=entry, scanner=scanner,
+            next_local_offset=next_local_offset
         )
+    except UnsupportedError as error:
+        # Structurally out of scope (e.g. legacy unsigned data descriptor):
+        # classified UNSUPPORTED, never accepted, never reported as corrupt.
+        ledger.unsupported(member_path, depth, error.code,
+                           notes=[error.detail] if error.detail else [])
+        raise
     except RejectionError as error:
         if error.code == "UNSUPPORTED_COMPRESSION_METHOD":
             # Fail closed, but classify with the correct taxonomy: the member is
@@ -917,10 +992,14 @@ def inspect_zip_container(budget: ResourceBudget, ledger: CoverageLedger, *,
                 ledger.reject(f"{object_path}::/{entry.name!r}", depth + 1, error.code,
                               detected="application/zip")
                 raise
+            later_offsets = [e.local_offset for e in entries
+                             if e.local_offset > entry.local_offset]
             _inspect_one_member(budget, ledger, object_path=object_path,
                                 member_path=f"{object_path}::/{label}", data=data,
                                 entry=entry, depth=depth + 1,
-                                scanner_factory=scanner_factory)
+                                scanner_factory=scanner_factory,
+                                next_local_offset=min(later_offsets)
+                                if later_offsets else None)
         return structural
     finally:
         budget.release_memory(len(data))
@@ -1279,6 +1358,10 @@ def run_case(spec: CaseSpec) -> dict[str, object]:
     except BudgetExceeded as error:
         error_code = error.code
         _ensure_terminal(ledger, error.code, data or b"")
+    except UnsupportedError as error:
+        error_code = error.code
+        _ensure_terminal(ledger, error.code, data or b"",
+                         notes=[error.detail] if error.detail else [])
     except RejectionError as error:
         error_code = error.code
         _ensure_terminal(ledger, error.code, data or b"",
@@ -1331,6 +1414,34 @@ def _load_fixture_module():
     sys.modules[spec.name] = module  # required for dataclass on Python 3.11
     spec.loader.exec_module(module)
     return module
+
+
+def _zip64_with_16byte_descriptor(payload: bytes) -> bytes:
+    """ZIP64 member (sentinels resolved) followed by a WRONG 16-byte descriptor."""
+    module = _load_fixture_module()
+    crc = zlib.crc32(payload) & 0xFFFFFFFF
+    return module.build_zip(
+        [module.Member(name="p16.bin", payload=payload, method=0, version_needed=45,
+                       flags=0x0008, lfh_zip64=True, cdh_zip64=True,
+                       raw_compressed=payload,
+                       raw_data_descriptor=module.zip_data_descriptor_16(
+                           crc, len(payload), len(payload)))],
+        zip64_eocd=True,
+    )
+
+
+def _member_with_descriptor_garbage(payload: bytes) -> bytes:
+    """Member + valid 16-byte descriptor + 4 garbage bytes before the next record."""
+    module = _load_fixture_module()
+    crc = zlib.crc32(payload) & 0xFFFFFFFF
+    dd = module.zip_data_descriptor_16(crc, len(payload), len(payload))
+    # splice the garbage directly after the descriptor: rebuild then locate.
+    base = module.build_zip(
+        [module.Member(name="g.bin", payload=payload, method=0, flags=0x0008,
+                       raw_compressed=payload, raw_data_descriptor=dd)])
+    marker = dd + b"PK\x01\x02"
+    idx = base.find(marker)
+    return base[:idx + 4] + b"\x00\xff\x13\x37" + base[idx + 4 + 4:]
 
 
 def build_case_suite() -> list[CaseSpec]:
@@ -1502,20 +1613,22 @@ def build_case_suite() -> list[CaseSpec]:
                                         raw_compressed=fx.deflate_two_block(fx.EICAR_BYTES) + b"\x00\xffz")]),
         notes=["UNEXPECTED_TRAILING_COMPRESSED_DATA: trailing data is rejected, not silently skipped"],
     ))
+    _dd16_eicar = fx.zip_data_descriptor_16(
+        zlib.crc32(fx.EICAR_BYTES) & 0xFFFFFFFF, len(fx.EICAR_BYTES), len(fx.EICAR_BYTES))
     cases.append(CaseSpec(
-        "R2-15", "R2", "Valid 16-byte ZIP data descriptor after STORED member (flag bit 3) is accepted",
+        "R2-15", "R2", "Valid signed 16-byte data descriptor AFTER a STORED member (bit 3) is accepted",
         INSPECTED, "zip",
         lambda: fx.build_zip([fx.Member("dd.bin", fx.EICAR_BYTES, method=0, flags=0x0008,
-                                        raw_compressed=fx.EICAR_BYTES + fx.zip_data_descriptor_16(
-                                            zlib.crc32(fx.EICAR_BYTES) & 0xFFFFFFFF,
-                                            len(fx.EICAR_BYTES), len(fx.EICAR_BYTES)))]),
-        notes=["data descriptor validated field-by-field against ACTUAL read values"],
+                                        raw_compressed=fx.EICAR_BYTES,
+                                        raw_data_descriptor=_dd16_eicar)]),
+        notes=["descriptor read at data_start + csize (CDH csize excludes the descriptor); "
+               "validated field-by-field against the ACTUAL read"],
     ))
     cases.append(CaseSpec(
         "R2-16", "R2", "Data-descriptor flag set but no descriptor present",
         REJECTED, "zip",
         lambda: fx.build_zip([fx.Member("nod.bin", fx.EICAR_BYTES, method=0, flags=0x0008)]),
-        notes=["MALFORMED_DATA_DESCRIPTOR: fail closed on the ambiguity"],
+        notes=["INVALID_DATA_DESCRIPTOR: bit 3 set => descriptor required; fail closed on the gap"],
     ))
 
     # --- Finding-2 regression cases (per-member accounting boundary) -------
@@ -1564,6 +1677,154 @@ def build_case_suite() -> list[CaseSpec]:
                "the inner read trips EXPANDED_BYTE_LIMIT"],
     ))
 
+    # --- Data-descriptor standards-compliance regression cases --------------
+    _defl_eicar = fx.deflate_two_block(fx.EICAR_BYTES)
+    _dd16_defl = fx.zip_data_descriptor_16(
+        zlib.crc32(fx.EICAR_BYTES) & 0xFFFFFFFF, len(_defl_eicar), len(fx.EICAR_BYTES))
+    cases.append(CaseSpec(
+        "R2-23", "R2", "Valid signed 16-byte data descriptor AFTER a DEFLATE member (bit 3) is accepted",
+        INSPECTED, "zip",
+        lambda: fx.build_zip([fx.Member("dd_defl.bin", fx.EICAR_BYTES, method=8, flags=0x0008,
+                                        raw_compressed=_defl_eicar,
+                                        raw_data_descriptor=_dd16_defl)]),
+        notes=["DEFLATE EOS reached, no in-window trailing, descriptor after the data: INSPECTED"],
+    ))
+    cases.append(CaseSpec(
+        "R2-24", "R2", "Valid ZIP64 member with the signed 24-byte descriptor (sig+crc+csize64+usize64) after the data",
+        INSPECTED, "zip",
+        lambda: fx.zip64_with_descriptor(fx.EICAR_BYTES, method=0),
+        notes=["width selected from VERIFIED metadata (0xFFFFFFFF sentinels resolved); "
+               "the 24-byte form carries NO local-header offset field"],
+    ))
+    cases.append(CaseSpec(
+        "R2-25", "R2", "Independent writer: CPython zipfile over a non-seekable stream (bit 3 + 16-byte descriptors)",
+        INSPECTED, "zip",
+        lambda: fx.zipfile_nonseekable_archive(
+            [("stored.bin", fx.EICAR_BYTES, 0), ("deflated.txt", fx.BENIGN_BYTES, 8)]),
+        notes=["provenance: CPython 3.11.2 zipfile streaming mode (LFH sizes zeroed, "
+               "descriptor after the data, CDH sizes = compressed data only); the independent "
+               "reader (this PoC) must accept exactly what the independent writer produced"],
+    ))
+    cases.append(CaseSpec(
+        "R2-26", "R2", "Descriptor CRC contradicts the Central Directory CRC",
+        REJECTED, "zip",
+        lambda: fx.build_zip([fx.Member("dd_crc.bin", fx.EICAR_BYTES, method=0, flags=0x0008,
+                                        raw_compressed=fx.EICAR_BYTES,
+                                        raw_data_descriptor=fx.zip_data_descriptor_16(
+                                            (zlib.crc32(fx.EICAR_BYTES) + 1) & 0xFFFFFFFF,
+                                            len(fx.EICAR_BYTES), len(fx.EICAR_BYTES)))]),
+        notes=["INVALID_DATA_DESCRIPTOR: descriptor fields are tied to the CD and the ACTUAL read"],
+    ))
+    cases.append(CaseSpec(
+        "R2-27", "R2", "Descriptor compressed size contradicts the Central Directory compressed size",
+        REJECTED, "zip",
+        lambda: fx.build_zip([fx.Member("dd_csize.bin", fx.EICAR_BYTES, method=0, flags=0x0008,
+                                        raw_compressed=fx.EICAR_BYTES,
+                                        raw_data_descriptor=fx.zip_data_descriptor_16(
+                                            zlib.crc32(fx.EICAR_BYTES) & 0xFFFFFFFF,
+                                            len(fx.EICAR_BYTES) + 1, len(fx.EICAR_BYTES)))]),
+        notes=["INVALID_DATA_DESCRIPTOR: the CDH compressed-size window is the compressed data ONLY"],
+    ))
+    cases.append(CaseSpec(
+        "R2-28", "R2", "Descriptor uncompressed size contradicts the Central Directory / ACTUAL read",
+        REJECTED, "zip",
+        lambda: fx.build_zip([fx.Member("dd_usize.bin", fx.EICAR_BYTES, method=0, flags=0x0008,
+                                        raw_compressed=fx.EICAR_BYTES,
+                                        raw_data_descriptor=fx.zip_data_descriptor_16(
+                                            zlib.crc32(fx.EICAR_BYTES) & 0xFFFFFFFF,
+                                            len(fx.EICAR_BYTES), len(fx.EICAR_BYTES) + 1))]),
+        notes=["INVALID_DATA_DESCRIPTOR: declared sizes are never trusted over ACTUAL bytes"],
+    ))
+    cases.append(CaseSpec(
+        "R2-29", "R2", "Wrong descriptor width: ZIP32 member followed by a 24-byte ZIP64 descriptor",
+        REJECTED, "zip",
+        lambda: fx.build_zip([fx.Member("dd_w64.bin", fx.EICAR_BYTES, method=0, flags=0x0008,
+                                        raw_compressed=fx.EICAR_BYTES,
+                                        raw_data_descriptor=fx.zip_data_descriptor_24(
+                                            zlib.crc32(fx.EICAR_BYTES) & 0xFFFFFFFF,
+                                            len(fx.EICAR_BYTES), len(fx.EICAR_BYTES)))]),
+        notes=["INVALID_DATA_DESCRIPTOR: non-ZIP64 member requires the 16-byte signed form; "
+               "ambiguous width combinations are rejected, never sniffed"],
+    ))
+    cases.append(CaseSpec(
+        "R2-30", "R2", "Wrong descriptor width: ZIP64 member followed by a 16-byte descriptor",
+        REJECTED, "zip",
+        lambda: _zip64_with_16byte_descriptor(fx.EICAR_BYTES),
+        notes=["INVALID_DATA_DESCRIPTOR: ZIP64 member (sentinels resolved) requires the "
+               "24-byte ZIP64 form; the 16-byte form cannot express the verified metadata"],
+    ))
+    cases.append(CaseSpec(
+        "R2-31", "R2", "Descriptor falsely embedded INSIDE the compressed window (legacy in-window layout)",
+        REJECTED, "zip",
+        lambda: fx.build_zip([fx.Member("dd_inwin.bin", fx.EICAR_BYTES, method=8, flags=0x0008,
+                                        raw_compressed=_defl_eicar + _dd16_defl)]),
+        notes=["UNEXPECTED_TRAILING_COMPRESSED_DATA: bytes after the DEFLATE end marker inside the "
+               "declared csize window are rejected; the descriptor belongs OUTSIDE the window"],
+    ))
+    cases.append(CaseSpec(
+        "R2-32", "R2", "Multi-entry ZIP with per-member descriptors and correct LFH/CDH boundaries",
+        INSPECTED, "zip",
+        lambda: fx.build_zip([
+            fx.Member("a.bin", fx.EICAR_BYTES, method=0, flags=0x0008,
+                      raw_compressed=fx.EICAR_BYTES, raw_data_descriptor=_dd16_eicar),
+            fx.Member("b.txt", fx.BENIGN_BYTES, method=8, flags=0x0008,
+                      raw_compressed=fx.deflate_two_block(fx.BENIGN_BYTES),
+                      raw_data_descriptor=fx.zip_data_descriptor_16(
+                          zlib.crc32(fx.BENIGN_BYTES) & 0xFFFFFFFF,
+                          len(fx.deflate_two_block(fx.BENIGN_BYTES)), len(fx.BENIGN_BYTES))),
+        ]),
+        notes=["the record following each descriptor must be the next LFH exactly at the "
+               "next CDH local offset (or the central directory for the last member)"],
+    ))
+    cases.append(CaseSpec(
+        "R2-33", "R2", "Garbage record immediately after the data descriptor",
+        REJECTED, "zip",
+        lambda: _member_with_descriptor_garbage(fx.EICAR_BYTES),
+        notes=["INVALID_DATA_DESCRIPTOR: no valid LFH/CDH record follows the descriptor "
+               "(unexpected trailing bytes after the descriptor)"],
+    ))
+    def _patch_zip64_locator(data: bytes, field: str) -> bytes:
+        out = bytearray(data)
+        eocd = bytes(out).rfind(b"PK\x05\x06")
+        if field == "disk":
+            out[eocd - 16] = 1  # 32-bit disk number, first byte (was 0)
+        else:
+            out[eocd - 4] = 2   # 32-bit total disk count, first byte (was 1)
+        return bytes(out)
+    cases.append(CaseSpec(
+        "R2-34", "R2", "Invalid ZIP64 EOCD locator: 32-bit disk number field non-zero",
+        REJECTED, "zip",
+        lambda: _patch_zip64_locator(fx.zip64(fx.EICAR_BYTES), "disk"),
+        notes=["MULTI_DISK_ZIP_UNSUPPORTED: the locator disk field is 32 bits (not 16); "
+               "non-zero disk numbers are multi-disk archives: fail closed"],
+    ))
+    cases.append(CaseSpec(
+        "R2-35", "R2", "Invalid ZIP64 EOCD locator: 32-bit total disk count not exactly 1",
+        REJECTED, "zip",
+        lambda: _patch_zip64_locator(fx.zip64(fx.EICAR_BYTES), "total"),
+        notes=["MULTI_DISK_ZIP_UNSUPPORTED: full locator structure validated "
+               "(disk number + total disk count); multi-disk archives are out of scope"],
+    ))
+    cases.append(CaseSpec(
+        "R2-36", "R2", "Legacy UNSIGNED 12-byte data descriptor (no signature): classified UNSUPPORTED",
+        UNSUPPORTED, "zip",
+        lambda: fx.build_zip([fx.Member("dd_uns.bin", fx.EICAR_BYTES, method=0, flags=0x0008,
+                                        raw_compressed=fx.EICAR_BYTES,
+                                        raw_data_descriptor=fx.zip_data_descriptor_unsigned_12(
+                                            zlib.crc32(fx.EICAR_BYTES) & 0xFFFFFFFF,
+                                            len(fx.EICAR_BYTES), len(fx.EICAR_BYTES)))]),
+        notes=["UNSIGNED_DATA_DESCRIPTOR_UNSUPPORTED: documented compatibility impact - archives "
+               "from legacy streaming writers that omit the descriptor signature are NOT inspected "
+               "(never silently accepted, never reported as corrupt)"],
+    ))
+    cases.append(CaseSpec(
+        "R2-37", "R2", "Undeclared descriptor: bit 3 not set but a descriptor signature follows the data",
+        REJECTED, "zip",
+        lambda: fx.build_zip([fx.Member("dd_nobit.bin", fx.EICAR_BYTES, method=0, flags=0,
+                                        raw_compressed=fx.EICAR_BYTES,
+                                        raw_data_descriptor=_dd16_eicar)]),
+        notes=["UNDECLARED_DATA_DESCRIPTOR: contradictory structure rejected"],
+    ))
     # --------------------------- CONTROLS ----------------------------------
     cases.append(CaseSpec(
         "CTRL-POS-01", "CONTROL", "Independent POSITIVE control: direct EICAR test signature",
@@ -1641,6 +1902,7 @@ def run_offline_suite(*, start_tracemalloc: bool = True) -> dict[str, object]:
             "REVISION-1: strict DEFLATE end-of-stream required (decompressor.eof); truncated streams rejected as TRUNCATED_DEFLATE_STREAM even when CRC/size match; unexpected trailing compressed bytes rejected unless a verified 16/24-byte ZIP data descriptor (CRC/csize/usize/offset checked against ACTUAL read values); all decompression output strictly bounded per chunk; unbounded flush removed",
             "REVISION-2: per-member accounting contract corrected (member_bytes = running total INCLUDING current chunk; exactly-at-ceiling allowed, one byte over rejected); cumulative expanded-byte ceiling enforced independently and shared by nested members",
             "REVISION-3: generic exception handler no longer relies on error.code (explicit bounded code UNEXPECTED_PARSER_ERROR + length-capped message); fixture generation moved inside the fail-closed boundary (unexpected builder failure => structured REJECTED case, never a crash); ZIP64 EOCD locator now validated positionally instead of by whole-file magic search",
+            "REVISION-4: ZIP data descriptor STANDARDS-COMPLIANCE correction — (a) descriptors are now read/validated at data_start + csize, i.e. AFTER the compressed member data (the CDH compressed-size field excludes the descriptor); presence is required exactly when general-purpose bit 3 is set; the record following the descriptor must be a valid LFH/CDH and a following LFH must sit exactly at the next CDH local offset; malformed/overlapping/contradictory/truncated/ambiguous structures are rejected (INVALID_DATA_DESCRIPTOR / TRUNCATED_DATA_DESCRIPTOR / UNDECLARED_DATA_DESCRIPTOR / UNEXPECTED_TRAILING_COMPRESSED_DATA); (b) the 24-byte form is the signed ZIP64 descriptor Signature(4)+CRC32(4)+CompressedSize64(8)+UncompressedSize64(8) with NO local-header-offset field (APPNOTE 4.3.9; Go archive/zip; CPython zipfile <LLQQ>); width is selected from verified metadata (CDH 0xFFFFFFFF sentinels) and incompatible widths are rejected; the legacy unsigned form is classified UNSUPPORTED (UNSIGNED_DATA_DESCRIPTOR_UNSUPPORTED); (c) ZIP64 EOCD locator disk-number and total-disk-count fields validated as 32-bit with multi-disk archives fail-closed; (d) interop evidence: CPython 3.11.2 zipfile writing to a non-seekable stream (case R2-25) is accepted by this reader",
         ],
         "tool_capabilities": tool_capabilities(),
         "resource_budget": {

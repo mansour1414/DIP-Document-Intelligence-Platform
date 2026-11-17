@@ -91,10 +91,11 @@ test("Phase 0C report: verdict taxonomy and coverage invariants", async (t) => {
   assert.equal(report.filesystem_extraction_writes, 0);
 
   // Verdicts: all expected verdicts match; COMPLETE_SAFE_SCAN is never claimed.
-  // 38 cases: original 28-case matrix preserved + 10 targeted regression cases
-  // (R2-13..R2-22) for the Finding-1/2/3 corrections.
-  assert.equal(report.summary.cases_total, 38);
-  assert.equal(report.summary.r2_cases, 22);
+  // 53 cases: original 28-case matrix preserved + 10 Finding-1/2/3 regression
+  // cases (R2-13..R2-22) + 15 data-descriptor standards-compliance cases
+  // (R2-23..R2-37) for REVISION-4.
+  assert.equal(report.summary.cases_total, 53);
+  assert.equal(report.summary.r2_cases, 37);
   assert.equal(report.summary.all_verdicts_match, true);
   assert.equal(report.summary.complete_safe_scan_claimed, false);
   assert.deepEqual(report.summary.conclusions_observed, ["NOT_COMPLETE_SAFE_SCAN"]);
@@ -157,11 +158,13 @@ test("Phase 0C report: governance preserved verbatim", async (t) => {
   assert.equal(report.r1.complete_r1_remediation_claimed, false);
   assert.equal(report.r2.complete_r2_remediation_claimed, false);
 
-  // The three focused corrections are recorded verbatim in the report.
-  assert.equal(report.revisions.length, 3);
+  // The four revision entries are recorded verbatim in the report.
+  assert.equal(report.revisions.length, 4);
   assert.match(report.revisions[0], /TRUNCATED_DEFLATE_STREAM/u);
   assert.match(report.revisions[1], /per-member/u);
   assert.match(report.revisions[2], /UNEXPECTED_PARSER_ERROR/u);
+  assert.match(report.revisions[3], /data descriptor/u);
+  assert.match(report.revisions[3], /data_start \+ csize/u);
 
   // PoC accounting is explicitly distinguished from OS-enforced limits.
   assert.equal(report.resource_budget.accounting_scope.level, "APPLICATION_LEVEL_POC_ACCOUNTING");
@@ -172,7 +175,7 @@ test("Phase 0C report: governance preserved verbatim", async (t) => {
   for (const [id, code] of [
     ["R2-13", "TRUNCATED_DEFLATE_STREAM"],
     ["R2-14", "UNEXPECTED_TRAILING_COMPRESSED_DATA"],
-    ["R2-16", "MALFORMED_DATA_DESCRIPTOR"],
+    ["R2-16", "INVALID_DATA_DESCRIPTOR"],
   ]) {
     assert.equal(byId2[id].error_code, code, id);
     assert.notEqual(byId2[id].observed_verdict, "INSPECTED", id);
@@ -185,6 +188,39 @@ test("Phase 0C report: governance preserved verbatim", async (t) => {
   for (const id of ["R2-19", "R2-20", "R2-21", "R2-22"]) {
     assert.notEqual(byId2[id].observed_verdict, "INSPECTED", id);
   }
+
+  // REVISION-4: data descriptor standards-compliance matrix.
+  // Valid controls: ZIP32 STORED/DEFLATE + 16-byte descriptor, ZIP64 + 24-byte
+  // descriptor (no offset field), CPython zipfile non-seekable streaming output,
+  // multi-entry archive with correct per-member boundaries.
+  for (const id of ["R2-23", "R2-24", "R2-25", "R2-32"]) {
+    assert.equal(byId2[id].observed_verdict, "INSPECTED", id);
+    assert.equal(byId2[id].error_code, null, id);
+  }
+  // Descriptor field contradictions and wrong widths fail closed.
+  for (const [id, code] of [
+    ["R2-26", "INVALID_DATA_DESCRIPTOR"],
+    ["R2-27", "INVALID_DATA_DESCRIPTOR"],
+    ["R2-28", "INVALID_DATA_DESCRIPTOR"],
+    ["R2-29", "INVALID_DATA_DESCRIPTOR"],
+    ["R2-30", "INVALID_DATA_DESCRIPTOR"],
+    ["R2-31", "UNEXPECTED_TRAILING_COMPRESSED_DATA"],
+    ["R2-33", "INVALID_DATA_DESCRIPTOR"],
+  ]) {
+    assert.equal(byId2[id].error_code, code, id);
+    assert.equal(byId2[id].observed_verdict, "REJECTED", id);
+  }
+  // Narrow ZIP64 EOCD-locator 32-bit disk-field validation (multi-disk closed).
+  for (const id of ["R2-34", "R2-35"]) {
+    assert.equal(byId2[id].error_code, "MULTI_DISK_ZIP_UNSUPPORTED", id);
+    assert.equal(byId2[id].observed_verdict, "REJECTED", id);
+  }
+  // Legacy unsigned descriptor: classified UNSUPPORTED, never INSPECTED.
+  assert.equal(byId2["R2-36"].error_code, "UNSIGNED_DATA_DESCRIPTOR_UNSUPPORTED");
+  assert.equal(byId2["R2-36"].observed_verdict, "UNSUPPORTED");
+  // Undeclared descriptor signature: contradictory structure, rejected.
+  assert.equal(byId2["R2-37"].error_code, "UNDECLARED_DATA_DESCRIPTOR");
+  assert.equal(byId2["R2-37"].observed_verdict, "REJECTED");
 
   // Single shared end-to-end budget, including the scanner feed.
   assert.equal(report.resource_budget.single_end_to_end_budget, true);

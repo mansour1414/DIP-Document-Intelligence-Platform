@@ -69,6 +69,7 @@ class Member:
     raw_compressed: bytes | None = None # verbatim on-disk member bytes (method 0/8)
     lfh_method_override: int | None = None  # write a DIFFERENT method in the LFH (mismatch probe)
     cdh_extra_raw: bytes | None = None      # verbatim CDH extra field bytes (malformed-structure probe)
+    raw_data_descriptor: bytes | None = None  # appended AFTER the member data (CDH csize excludes it)
 
 
 def _zip64_extra(uncompressed: int, compressed: int, local_offset: int = 0,
@@ -126,6 +127,12 @@ def build_zip(members: Iterable[Member], *, zip64_eocd: bool = False) -> bytes:
         lfh_offset = offset
         local_parts.extend([lfh, name_b, lfh_extra, compressed])
         offset += len(lfh) + len(name_b) + len(lfh_extra) + len(compressed)
+        if member.raw_data_descriptor is not None:
+            # Standards placement: the data descriptor immediately follows the
+            # compressed data. The CDH/LFH compressed-size fields describe the
+            # compressed file data ONLY and never include the descriptor.
+            local_parts.append(member.raw_data_descriptor)
+            offset += len(member.raw_data_descriptor)
 
         cdh = struct.pack(
             "<IHHHHHHIIIHHHHHII", 0x02014B50, version, version, flags,
@@ -166,6 +173,24 @@ def zip64(payload: bytes, name: str = "payload.bin") -> bytes:
     return build_zip(
         [Member(name=name, payload=payload, method=8, version_needed=45,
                 lfh_zip64=True, cdh_zip64=True)],
+        zip64_eocd=True,
+    )
+
+
+def zip64_with_descriptor(payload: bytes, name: str = "payload.bin",
+                          method: int = 0, raw_compressed: bytes | None = None) -> bytes:
+    """Genuine ZIP64 archive (sentinels + 0x0001 extra + EOCD64 + locator)
+    whose member carries bit 3 and the signed 24-byte ZIP64 data descriptor
+    AFTER the compressed data (no local-header offset field in the descriptor)."""
+    crc = zlib.crc32(payload) & 0xFFFFFFFF
+    compressed = raw_compressed if raw_compressed is not None else (
+        deflate_raw(payload) if method == 8 else payload)
+    return build_zip(
+        [Member(name=name, payload=payload, method=method, version_needed=45,
+                flags=0x0008, lfh_zip64=True, cdh_zip64=True,
+                raw_compressed=raw_compressed,
+                raw_data_descriptor=zip_data_descriptor_24(
+                    crc, len(compressed), len(payload)))],
         zip64_eocd=True,
     )
 
@@ -377,6 +402,84 @@ def zip_data_descriptor_16(crc: int, csize: int, usize: int) -> bytes:
     return DATA_DESCRIPTOR_SIG + struct.pack("<III", crc, csize, usize)
 
 
-def zip_data_descriptor_24(crc: int, csize: int, usize: int, local_offset: int) -> bytes:
-    """24-byte ZIP data descriptor (16-byte form + 8-byte local-header offset)."""
-    return DATA_DESCRIPTOR_SIG + struct.pack("<III", crc, csize, usize) + struct.pack("<Q", local_offset)
+def zip_data_descriptor_24(crc: int, csize: int, usize: int) -> bytes:
+    """Signed 24-byte ZIP64 data descriptor (APPNOTE 4.3.9 / Go archive/zip).
+
+    Layout: Signature(4) + CRC32(4) + CompressedSize64(8) + UncompressedSize64(8).
+    There is NO local-header offset field in this descriptor. This matches the
+    CPython zipfile non-seekable writer, which packs
+    ``struct.pack('<LLQQ', 0x08074b50, crc, compress_size, file_size)``.
+    """
+    return DATA_DESCRIPTOR_SIG + struct.pack("<IQQ", crc, csize, usize)
+
+
+def zip_data_descriptor_unsigned_12(crc: int, csize: int, usize: int) -> bytes:
+    """Legacy UNSIGNED data descriptor (no signature): CRC32 + csize32 + usize32.
+
+    Some legacy streaming writers omit the 0x08074B50 signature. The PoC
+    classifies this form UNSUPPORTED (documented compatibility impact); the
+    builder exists so regression cases can exercise the classifier.
+    """
+    return struct.pack("<LLL", crc, csize, usize)
+
+
+# ---------------------------------------------------------------------------
+# Independent standards-compliant writer (NOT the PoC's own builder)
+# ---------------------------------------------------------------------------
+class NonSeekableBytesIO:
+    """Minimal non-seekable writable in-memory stream.
+
+    Feeding this to ``zipfile.ZipFile(stream, "w")`` puts CPython into
+    streaming mode: general-purpose bit 3 is set, the local-header
+    CRC/size fields are zeroed, and a signed 16-byte data descriptor
+    (``<LLLL``: signature + CRC32 + csize32 + usize32) is written AFTER the
+    member data. The central directory (written at close) carries the true
+    sizes, which describe the compressed data only.
+    """
+
+    def __init__(self) -> None:
+        self._buf = bytearray()
+
+    def write(self, data: bytes) -> int:
+        self._buf.extend(data)
+        return len(data)
+
+    def read(self, size: int = -1) -> bytes:
+        data = bytes(self._buf)
+        return data if size is None or size < 0 else data[:size]
+
+    def seek(self, *args: object) -> int:
+        raise OSError("non-seekable stream")
+
+    def tell(self) -> int:
+        return len(self._buf)
+
+    def flush(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+    @property
+    def bytes(self) -> bytes:
+        return bytes(self._buf)
+
+
+def zipfile_nonseekable_archive(members: list[tuple[str, bytes, int]]) -> bytes:
+    """Build an archive with CPython ``zipfile`` writing to a non-seekable stream.
+
+    `members` is a list of (name, payload, method) with method 0 = STORED or
+    8 = DEFLATE. The result is a valid, standards-compliant single-disk ZIP32
+    archive whose members carry bit 3 + signed 16-byte data descriptors.
+    Deterministic: fixed name/order/payloads, no timestamps (ZipInfo default
+    date_time is 1980-01-01) and zlib deflate is deterministic for a fixed
+    level.
+    """
+    import zipfile as _zipfile
+
+    stream = NonSeekableBytesIO()
+    with _zipfile.ZipFile(stream, "w") as zf:
+        for name, payload, method in members:
+            compress_type = _zipfile.ZIP_STORED if method == 0 else _zipfile.ZIP_DEFLATED
+            zf.writestr(name, payload, compress_type=compress_type)
+    return stream.bytes
