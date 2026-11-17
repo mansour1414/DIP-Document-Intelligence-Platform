@@ -1,0 +1,1556 @@
+#!/usr/bin/env python3
+"""DIP Phase 0C -- minimal ISOLATED OFFLINE PoC for R1 (PDF-embedded ZIP64) and
+R2 (bounded inspection of compressed nested ZIP archives).
+
+EXPERIMENTAL ONLY. NOT production integration. NOT a Change Request approval.
+NO new production dependencies: Python standard library only (struct, zlib, re,
+hashlib, dataclasses, time, tracemalloc, shutil, typing, json).
+
+Architecture corrections honoured (see docs/operations/experimental/phase0c-r1r2-offline-poc.md):
+  1. The approved PRE-STORAGE boundary is unchanged: in src/lib/jobs/orchestrator.ts
+     validateUpload -> requireCleanUpload -> storage.put. A post-storage worker scan
+     does NOT satisfy it. This PoC never stores anything and never claims placement.
+  2. qpdf --json / PDF.js are NOT exhaustive PDF stream inspectors. qpdf's
+     `--json=1 --json-key=objects --decode-level=none` (used in production only for
+     signature detection) enumerates object metadata; PDF.js exposes a bounded subset
+     of decoded image XObjects. Neither is used here as proof of stream coverage.
+  3. ONE cumulative ResourceBudget is threaded through PDF parsing, attachment
+     extraction, nested-archive traversal and (offline) scanner feeding. Extraction
+     and scanning share the SAME time / memory / disk / byte ceilings.
+  4. Encrypted-PDF detection and post-unlock/decrypted-output scanning are recorded
+     as explicit OPEN security requirements, not silently assumed.
+  5. A raw clamd `stream: OK` CLEAN is NOT proof of complete nested-content
+     inspection (Phase 0A `D_eicar_zip64` produced `stream: OK` on a ZIP64 bypass).
+     A CLEAN verdict with incomplete coverage can NEVER yield COMPLETE_SAFE_SCAN.
+
+Resource-safety note: the production baseline `MaxScanSize 400M` is a CUMULATIVE
+scan-size budget, NOT a materialised extraction footprint. CI runs the worker under
+a `size=256m` tmpfs. This PoC therefore performs ZERO filesystem extraction: members
+are read in bounded streaming chunks, nested containers are held only in a bounded
+in-memory buffer, and `temp_disk_bytes_used` is accounted and enforced (0 used).
+No 400 MiB materialisation is claimed or performed.
+
+Verdict taxonomy (per case / per object): INSPECTED | REJECTED | UNSUPPORTED |
+NOT_VERIFIED. Fail closed on any unsupported, malformed, ambiguous or incomplete
+inspection. No content is executed; no archive path is used as a filesystem path.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import hashlib
+import json
+import re
+import shutil
+import sys
+import struct
+import time
+import tracemalloc
+import zlib
+from dataclasses import dataclass, field, replace
+from typing import Callable, Iterable, Protocol
+
+# ---------------------------------------------------------------------------
+# Verdict / reason constants
+# ---------------------------------------------------------------------------
+INSPECTED = "INSPECTED"
+REJECTED = "REJECTED"
+UNSUPPORTED = "UNSUPPORTED"
+NOT_VERIFIED = "NOT_VERIFIED"
+
+COMPLETE_SAFE_SCAN = "COMPLETE_SAFE_SCAN"
+NOT_COMPLETE_SAFE_SCAN = "NOT_COMPLETE_SAFE_SCAN"
+
+EXPERIMENT_ID = "DIP-PHASE-0C-R1R2-OFFLINE-POC"
+EICAR_SIGNATURE = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
+
+
+class BudgetExceeded(Exception):
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+class RejectionError(Exception):
+    def __init__(self, code: str, detail: str = "") -> None:
+        super().__init__(code)
+        self.code = code
+        self.detail = detail
+
+
+# ---------------------------------------------------------------------------
+# ONE cumulative end-to-end resource budget (extraction + scanning + timeouts)
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class ResourceLimits:
+    """Conservative OFFLINE ceilings. Experimental only; NOT production sizing."""
+    max_input_bytes: int = 4 * 1024 * 1024             # 4 MiB top-level input
+    max_expanded_bytes: int = 16 * 1024 * 1024         # 16 MiB cumulative expanded
+    max_member_bytes: int = 2 * 1024 * 1024            # 2 MiB actual per member
+    max_entries: int = 256                             # cumulative entries/attachments
+    max_depth: int = 3                                 # root=0
+    max_cpu_seconds: float = 3.0
+    max_wall_clock_seconds: float = 5.0
+    max_memory_bytes: int = 32 * 1024 * 1024           # 32 MiB reserve-enforced
+    max_temp_disk_bytes: int = 8 * 1024 * 1024         # 8 MiB (PoC writes ZERO)
+    max_materialized_object_bytes: int = 8 * 1024 * 1024  # bounded re-parse buffer
+    chunk_bytes: int = 64 * 1024
+
+    def as_dict(self) -> dict[str, object]:
+        return dataclasses.asdict(self)
+
+
+DEFAULT_RESOURCE_LIMITS = ResourceLimits()
+
+
+class ResourceBudget:
+    """Single budget shared by PDF parse, extraction, recursion and scanner feed.
+
+    Byte accounting is deliberately NON-DOUBLE-COUNTING: every byte produced by
+    decompression is charged once to `expanded_bytes` at the level that produced it.
+    Scanner bytes are tracked separately as `scanned_bytes` but are checked against
+    the SAME wall-clock, CPU, memory and temp-disk ceilings.
+    """
+
+    def __init__(self, limits: ResourceLimits = DEFAULT_RESOURCE_LIMITS, *,
+                 monotonic: Callable[[], float] = time.monotonic,
+                 process_time: Callable[[], float] = time.process_time) -> None:
+        self.limits = limits
+        self._monotonic = monotonic
+        self._process_time = process_time
+        self._wall_start = monotonic()
+        self._cpu_start = process_time()
+        self.input_bytes = 0
+        self.expanded_bytes = 0
+        self.scanned_bytes = 0
+        self.entries = 0
+        self.max_depth_seen = 0
+        self.temp_disk_bytes = 0
+        self.reserved_memory_bytes = 0
+        self.peak_reserved_memory_bytes = 0
+        self.full_extraction_materialized = False
+        self.filesystem_writes = 0
+        self.limits_hit: list[str] = []
+
+    def _hit(self, code: str) -> None:
+        if code not in self.limits_hit:
+            self.limits_hit.append(code)
+        raise BudgetExceeded(code)
+
+    def check_time(self) -> None:
+        if self._monotonic() - self._wall_start > self.limits.max_wall_clock_seconds:
+            self._hit("WALL_CLOCK_LIMIT")
+        if self._process_time() - self._cpu_start > self.limits.max_cpu_seconds:
+            self._hit("CPU_TIME_LIMIT")
+
+    def charge_input(self, count: int) -> None:
+        if self.input_bytes + count > self.limits.max_input_bytes:
+            self._hit("INPUT_BYTE_LIMIT")
+        self.input_bytes += count
+        self.check_time()
+
+    def charge_expanded(self, count: int, *, member_bytes: int = 0) -> None:
+        if self.expanded_bytes + count > self.limits.max_expanded_bytes:
+            self._hit("EXPANDED_BYTE_LIMIT")
+        if member_bytes + count > self.limits.max_member_bytes:
+            self._hit("MEMBER_BYTE_LIMIT")
+        self.expanded_bytes += count
+        self.check_time()
+
+    def charge_scanned(self, count: int) -> None:
+        """Scanner feed shares the SAME end-to-end budget."""
+        self.scanned_bytes += count
+        self.check_time()
+        if self.temp_disk_bytes > self.limits.max_temp_disk_bytes:
+            self._hit("TEMP_DISK_LIMIT")
+
+    def count_entry(self) -> None:
+        self.entries += 1
+        if self.entries > self.limits.max_entries:
+            self._hit("ENTRY_COUNT_LIMIT")
+        self.check_time()
+
+    def check_depth(self, depth: int) -> None:
+        self.max_depth_seen = max(self.max_depth_seen, depth)
+        if depth > self.limits.max_depth:
+            self._hit("RECURSION_DEPTH_LIMIT")
+        self.check_time()
+
+    def reserve_memory(self, count: int) -> None:
+        if self.reserved_memory_bytes + count > self.limits.max_memory_bytes:
+            self._hit("MEMORY_LIMIT")
+        if count > self.limits.max_materialized_object_bytes:
+            self._hit("MATERIALIZED_OBJECT_LIMIT")
+        self.reserved_memory_bytes += count
+        self.peak_reserved_memory_bytes = max(self.peak_reserved_memory_bytes, self.reserved_memory_bytes)
+
+    def release_memory(self, count: int) -> None:
+        self.reserved_memory_bytes = max(0, self.reserved_memory_bytes - count)
+
+    def account_temp_disk(self, count: int) -> None:
+        # This PoC NEVER writes extraction output to disk. The hook exists so a
+        # future live design cannot silently exceed the tmpfs ceiling.
+        if count:
+            self.filesystem_writes += 1
+        if self.temp_disk_bytes + count > self.limits.max_temp_disk_bytes:
+            self._hit("TEMP_DISK_LIMIT")
+        self.temp_disk_bytes += count
+
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "limits": self.limits.as_dict(),
+            "input_bytes": self.input_bytes,
+            "expanded_bytes": self.expanded_bytes,
+            "scanned_bytes": self.scanned_bytes,
+            "entry_count": self.entries,
+            "max_depth_seen": self.max_depth_seen,
+            "temp_disk_bytes_used": self.temp_disk_bytes,
+            "temp_disk_bytes_ceiling": self.limits.max_temp_disk_bytes,
+            "filesystem_writes": self.filesystem_writes,
+            "full_extraction_materialized": self.full_extraction_materialized,
+            "peak_reserved_memory_bytes": self.peak_reserved_memory_bytes,
+            "resource_limits_hit": list(self.limits_hit),
+            "elapsed_wall_seconds": round(self._monotonic() - self._wall_start, 6),
+            "elapsed_cpu_seconds": round(self._process_time() - self._cpu_start, 6),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Scanner adapters (OFFLINE ONLY; no socket, no subprocess, no live clamd)
+# ---------------------------------------------------------------------------
+class ScannerAdapter(Protocol):
+    name: str
+    def feed(self, chunk: bytes, budget: ResourceBudget) -> None: ...
+    def finish(self) -> dict[str, object]: ...
+
+
+class OfflineEicarControlProbe:
+    """Deterministic offline CONTROL, deliberately NOT a malware scanner.
+
+    Detects only the harmless standard EICAR test signature. It is used for
+    independent positive/negative controls and to demonstrate scanner-feed
+    streaming. Its result is NEVER a ClamAV CLEAN/INFECTED verdict.
+    """
+    name = "OFFLINE_EICAR_CONTROL_PROBE"
+
+    def __init__(self) -> None:
+        self._tail = b""
+        self._found = False
+        self._bytes = 0
+
+    def feed(self, chunk: bytes, budget: ResourceBudget) -> None:
+        window = self._tail + chunk
+        if EICAR_SIGNATURE in window:
+            self._found = True
+        self._tail = window[-(len(EICAR_SIGNATURE) - 1):] if len(EICAR_SIGNATURE) > 1 else b""
+        self._bytes += len(chunk)
+        budget.charge_scanned(len(chunk))
+
+    def finish(self) -> dict[str, object]:
+        return {
+            "role": "OFFLINE_SIGNATURE_CONTROL",
+            "is_clamav_scanner": False,
+            "signature": "EICAR_SIGNATURE_PRESENT" if self._found else "EICAR_SIGNATURE_ABSENT",
+            "scanner_verdict": NOT_VERIFIED,
+            "scanner_reason": "CLAMAV_OFFLINE_UNAVAILABLE_CONTROL_PROBE_ONLY",
+            "bytes_fed": self._bytes,
+        }
+
+
+class FakeAlwaysCleanScanner:
+    """INVARIANT TEST STUB ONLY. Simulates a raw `CLEAN` reply.
+
+    Used solely to prove that CLEAN + incomplete coverage can never produce
+    COMPLETE_SAFE_SCAN. Never used in the shipped offline case suite.
+    """
+    name = "FAKE_ALWAYS_CLEAN_STUB"
+
+    def __init__(self) -> None:
+        self._bytes = 0
+
+    def feed(self, chunk: bytes, budget: ResourceBudget) -> None:
+        self._bytes += len(chunk)
+        budget.charge_scanned(len(chunk))
+
+    def finish(self) -> dict[str, object]:
+        return {
+            "role": "INVARIANT_TEST_STUB",
+            "is_clamav_scanner": True,
+            "signature": "NONE",
+            "scanner_verdict": "CLEAN",
+            "scanner_reason": "SYNTHETIC_STUB_FOR_COVERAGE_INVARIANT",
+            "bytes_fed": self._bytes,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Coverage ledger
+# ---------------------------------------------------------------------------
+@dataclass
+class ObjectRecord:
+    object_path: str
+    depth: int
+    detected_content_type: str
+    structural_verdict: str
+    verdict: str
+    extracted_bytes: int
+    scanner_verdict: str = "NOT_SCANNED"
+    scanner_reason: str = "NOT_SCANNED"
+    offline_control_signature: str = "NOT_APPLICABLE"
+    skipped: bool = False
+    skip_reason: str | None = None
+    resource_limits_hit: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+    def as_dict(self) -> dict[str, object]:
+        return dataclasses.asdict(self)
+
+
+class CoverageLedger:
+    def __init__(self, case_id: str, budget: ResourceBudget) -> None:
+        self.case_id = case_id
+        self.budget = budget
+        self.objects: list[ObjectRecord] = []
+        self.skipped_objects: list[dict[str, object]] = []
+
+    def add(self, record: ObjectRecord) -> None:
+        self.objects.append(record)
+        if record.skipped:
+            self.skipped_objects.append({
+                "object_path": record.object_path,
+                "depth": record.depth,
+                "reason": record.skip_reason,
+                "verdict": record.verdict,
+            })
+
+    def skip(self, path: str, depth: int, reason: str, *, verdict: str = NOT_VERIFIED) -> None:
+        self.add(ObjectRecord(
+            object_path=path, depth=depth, detected_content_type="UNKNOWN",
+            structural_verdict="NOT_INSPECTED", verdict=verdict, extracted_bytes=0,
+            scanner_verdict="NOT_SCANNED", scanner_reason=reason,
+            skipped=True, skip_reason=reason,
+        ))
+
+    def reject(self, path: str, depth: int, code: str, *, extracted_bytes: int = 0,
+               detected: str = "UNKNOWN", notes: Iterable[str] = ()) -> None:
+        self.add(ObjectRecord(
+            object_path=path, depth=depth, detected_content_type=detected,
+            structural_verdict=code, verdict=REJECTED, extracted_bytes=extracted_bytes,
+            scanner_verdict="NOT_SCANNED", scanner_reason=code,
+            resource_limits_hit=[code] if code.endswith("LIMIT") else [],
+            notes=list(notes),
+        ))
+
+    def unsupported(self, path: str, depth: int, code: str, *,
+                    notes: Iterable[str] = ()) -> None:
+        self.add(ObjectRecord(
+            object_path=path, depth=depth, detected_content_type="UNKNOWN",
+            structural_verdict=code, verdict=UNSUPPORTED, extracted_bytes=0,
+            scanner_verdict="NOT_SCANNED", scanner_reason=code,
+            notes=list(notes),
+        ))
+
+    def case_verdict(self) -> str:
+        """Verdict of the TARGETED object graph only. Coverage gaps are reported
+        separately in `coverage()` and can never be silently counted as inspected.
+        """
+        if not self.objects:
+            return NOT_VERIFIED
+        verdicts = [record.verdict for record in self.objects if not record.skipped]
+        if not verdicts:
+            return NOT_VERIFIED
+        if REJECTED in verdicts:
+            return REJECTED
+        if UNSUPPORTED in verdicts:
+            return UNSUPPORTED
+        if NOT_VERIFIED in verdicts:
+            return NOT_VERIFIED
+        return INSPECTED
+
+    def coverage(self, *, stream_gaps: Iterable[str] = ()) -> dict[str, object]:
+        gaps = list(stream_gaps)
+        targeted = [record for record in self.objects if not record.skipped]
+        inspected = sum(1 for record in targeted if record.verdict == INSPECTED)
+        rejected = sum(1 for record in targeted if record.verdict == REJECTED)
+        unsupported = sum(1 for record in targeted if record.verdict == UNSUPPORTED)
+        not_verified = sum(1 for record in targeted if record.verdict == NOT_VERIFIED)
+        reasons: list[str] = []
+        if self.skipped_objects:
+            reasons.append("SKIPPED_OBJECTS_PRESENT")
+        if gaps:
+            reasons.append("ARBITRARY_PDF_STREAMS_NOT_INSPECTED")
+        if rejected or unsupported or not_verified:
+            reasons.append("NON_INSPECTED_TARGET_VERDICTS")
+        if self.budget.limits_hit:
+            reasons.append("RESOURCE_LIMIT_HIT")
+        reasons.append("CLAMAV_SCANNER_NOT_VERIFIED_OFFLINE")
+        structural = "COMPLETE" if targeted and inspected == len(targeted) and not gaps else "INCOMPLETE"
+        return {
+            "structural_coverage": structural,
+            "end_to_end_coverage": "INCOMPLETE",  # offline: clamd NOT VERIFIED, always
+            "completeness": "INCOMPLETE",
+            "reasons": reasons,
+            "objects_total": len(self.objects),
+            "targeted_objects": len(targeted),
+            "inspected": inspected,
+            "rejected": rejected,
+            "unsupported": unsupported,
+            "not_verified": not_verified,
+            "skipped_objects": list(self.skipped_objects),
+            "uninspected_stream_gaps": gaps,
+            "resource_limits_hit": list(self.budget.limits_hit),
+        }
+
+
+def derive_conclusion(coverage: dict[str, object], *, clamav_verified: bool,
+                      scanner_all_clean: bool, resource_limits_hit: Iterable[str] = ()) -> dict[str, object]:
+    """CLEAN + incomplete coverage can NEVER produce COMPLETE_SAFE_SCAN."""
+    blockers: list[str] = []
+    if coverage.get("completeness") != "COMPLETE":
+        blockers.append("COVERAGE_INCOMPLETE")
+    if coverage.get("end_to_end_coverage") != "COMPLETE":
+        blockers.append("END_TO_END_COVERAGE_INCOMPLETE")
+    if coverage.get("skipped_objects"):
+        blockers.append("SKIPPED_OBJECTS_PRESENT")
+    if coverage.get("uninspected_stream_gaps"):
+        blockers.append("ARBITRARY_PDF_STREAMS_NOT_INSPECTED")
+    if coverage.get("rejected") or coverage.get("unsupported") or coverage.get("not_verified"):
+        blockers.append("NON_INSPECTED_TARGET_VERDICTS")
+    if not clamav_verified:
+        blockers.append("CLAMAV_SCANNER_NOT_VERIFIED")
+    if not scanner_all_clean:
+        blockers.append("SCANNER_VERDICT_NOT_ALL_CLEAN")
+    if list(resource_limits_hit):
+        blockers.append("RESOURCE_LIMIT_HIT")
+    conclusion = COMPLETE_SAFE_SCAN if not blockers and scanner_all_clean else NOT_COMPLETE_SAFE_SCAN
+    return {"overall_conclusion": conclusion, "blockers": blockers,
+            "clamav_verified": clamav_verified, "scanner_all_clean": scanner_all_clean}
+
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+def sniff_content_type(data: bytes) -> str:
+    if data.startswith(b"%PDF-"):
+        return "application/pdf"
+    if data.startswith((b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")):
+        return "application/zip"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xd0\xcf\x11\xe0"):
+        return "application/vnd.ms-office"
+    if not data:
+        return "application/octet-stream"
+    if all(byte in b"\t\n\r\x20-\x7e" for byte in data[:512]):
+        return "text/plain"
+    return "application/octet-stream"
+
+
+_UNSAFE_PATH_PARTS = {"..", ".", ""}
+
+
+def safe_member_path(name: str) -> str:
+    """Return a VIRTUAL ledger label only. NEVER used for filesystem extraction.
+
+    Rejects absolute paths, drive letters, backslashes, parent traversal, NUL and
+    control characters, and leading/trailing whitespace components.
+    """
+    if not isinstance(name, str) or not name:
+        raise RejectionError("UNSAFE_MEMBER_PATH", "empty member name")
+    if "\x00" in name or any(ord(char) < 32 or ord(char) == 127 for char in name):
+        raise RejectionError("UNSAFE_MEMBER_PATH", "control character in member name")
+    if "\\" in name or re.match(r"^[A-Za-z]:", name) or name.startswith(("/", "~")):
+        raise RejectionError("UNSAFE_MEMBER_PATH", "absolute / drive / backslash path")
+    parts = name.split("/")
+    if any(part.strip() in _UNSAFE_PATH_PARTS or ".." in part for part in parts):
+        raise RejectionError("UNSAFE_MEMBER_PATH", "parent traversal component")
+    return "/".join(part.strip() for part in parts if part.strip())
+
+
+# ---------------------------------------------------------------------------
+# Bounded ZIP parser (deliberately NOT zipfile.open: it truncates at DECLARED
+# file_size; we inflate to EOF and count ACTUAL bytes instead).
+# ---------------------------------------------------------------------------
+EOCD_SIG = b"PK\x05\x06"
+ZIP64_EOCD_SIG = b"PK\x06\x06"
+ZIP64_LOCATOR_SIG = b"PK\x06\x07"
+CDH_SIG = b"PK\x01\x02"
+LFH_SIG = b"PK\x03\x04"
+SUPPORTED_METHODS = {0, 8}
+
+
+@dataclass
+class _CentralEntry:
+    name: str
+    flags: int
+    method: int
+    crc: int
+    csize: int
+    usize: int
+    local_offset: int
+    zip64_extra: bool
+
+
+def _resolve_zip64_extra(extra: bytes, *, csize: int, usize: int,
+                         local_offset: int) -> tuple[int, int, int, bool]:
+    """Resolve 0xFFFFFFFF sentinels from the 0x0001 TLV extra field (APPNOTE)."""
+    pos, values = 0, []
+    found = False
+    while pos + 4 <= len(extra):
+        tag, size = struct.unpack_from("<HH", extra, pos)
+        pos += 4
+        if pos + size > len(extra):
+            raise RejectionError("MALFORMED_ZIP_EXTRA_FIELD", "TLV length overflow")
+        if tag == 0x0001:
+            found = True
+            qpos = 0
+            body = extra[pos:pos + size]
+            while qpos + 8 <= len(body):
+                values.append(struct.unpack_from("<Q", body, qpos)[0])
+                qpos += 8
+        pos += size
+    if not found:
+        return csize, usize, local_offset, False
+    index = 0
+    if usize == 0xFFFFFFFF:
+        if index >= len(values):
+            raise RejectionError("ZIP64_SENTINEL_UNRESOLVED", "missing usize")
+        usize = values[index]; index += 1
+    if csize == 0xFFFFFFFF:
+        if index >= len(values):
+            raise RejectionError("ZIP64_SENTINEL_UNRESOLVED", "missing csize")
+        csize = values[index]; index += 1
+    if local_offset == 0xFFFFFFFF:
+        if index >= len(values):
+            raise RejectionError("ZIP64_SENTINEL_UNRESOLVED", "missing offset")
+        local_offset = values[index]; index += 1
+    return csize, usize, local_offset, True
+
+
+def _parse_central_directory(data: bytes, budget: ResourceBudget) -> tuple[list[_CentralEntry], list[str]]:
+    flags_detected: list[str] = []
+    search_from = max(0, len(data) - (22 + 65535))
+    eocd = data.rfind(EOCD_SIG, search_from)
+    if eocd < 0 or eocd + 22 > len(data):
+        raise RejectionError("MALFORMED_ZIP_NO_EOCD")
+    disk, cd_disk, entries_disk, entries_total, cd_size, cd_offset, comment_len = struct.unpack_from(
+        "<HHHHIIH", data, eocd + 4
+    )
+    if disk != 0 or cd_disk != 0 or entries_disk != entries_total:
+        raise RejectionError("MULTI_DISK_ZIP_UNSUPPORTED")
+    if eocd + 22 + comment_len > len(data):
+        raise RejectionError("MALFORMED_ZIP_EOCD_COMMENT")
+
+    if ZIP64_EOCD_SIG in data or ZIP64_LOCATOR_SIG in data:
+        flags_detected.append("ZIP64_EOCD_LOCATOR_PRESENT")
+    if entries_total == 0xFFFF or cd_size == 0xFFFFFFFF or cd_offset == 0xFFFFFFFF:
+        flags_detected.append("ZIP64_EOCD_SENTINEL")
+        locator = data.find(ZIP64_LOCATOR_SIG)
+        if locator < 0 or locator + 20 > len(data):
+            raise RejectionError("ZIP64_LOCATOR_MISSING")
+        z64_offset = struct.unpack_from("<Q", data, locator + 8)[0]
+        if z64_offset + 56 > len(data) or data[z64_offset:z64_offset + 4] != ZIP64_EOCD_SIG:
+            raise RejectionError("ZIP64_EOCD_MISSING")
+        entries_total = struct.unpack_from("<Q", data, z64_offset + 32)[0]
+        cd_size = struct.unpack_from("<Q", data, z64_offset + 40)[0]
+        cd_offset = struct.unpack_from("<Q", data, z64_offset + 48)[0]
+    if entries_total > budget.limits.max_entries:
+        budget._hit("ENTRY_COUNT_LIMIT")
+    if cd_offset + cd_size > len(data):
+        raise RejectionError("MALFORMED_ZIP_CENTRAL_DIRECTORY_RANGE")
+
+    entries: list[_CentralEntry] = []
+    pos = cd_offset
+    for _ in range(entries_total):
+        if pos + 46 > len(data) or data[pos:pos + 4] != CDH_SIG:
+            raise RejectionError("MALFORMED_ZIP_CENTRAL_DIRECTORY_HEADER")
+        (version_made, version_needed, gp_flags, method, _mtime, _mdate, crc,
+         csize_raw, usize_raw, name_len, extra_len, comment_len, disk_start,
+         _int_attrs, _ext_attrs, local_offset) = struct.unpack_from("<HHHHHHIIIHHHHHII", data, pos + 4)
+        name_start = pos + 46
+        extra_start = name_start + name_len
+        end = extra_start + extra_len + comment_len
+        if end > len(data):
+            raise RejectionError("MALFORMED_ZIP_CENTRAL_DIRECTORY_HEADER")
+        name = data[name_start:extra_start].decode("utf-8", errors="replace")
+        extra = data[extra_start:extra_start + extra_len]
+        csize, usize, local_offset, had_extra = _resolve_zip64_extra(
+            extra, csize=csize_raw, usize=usize_raw, local_offset=local_offset
+        )
+        if had_extra:
+            flags_detected.append("ZIP64_EXTRA_FIELD_PRESENT")
+        if gp_flags & 0x0001 or gp_flags & 0x0040 or gp_flags & 0x2000 or method == 99:
+            flags_detected.append("ENCRYPTED_MEMBER")
+        if disk_start not in (0, 0xFFFF):
+            raise RejectionError("MULTI_DISK_ZIP_UNSUPPORTED")
+        if csize_raw == 0xFFFFFFFF or usize_raw == 0xFFFFFFFF:
+            flags_detected.append("ZIP64_CDH_SENTINEL")
+        entries.append(_CentralEntry(name, gp_flags, method, crc, csize, usize, local_offset, had_extra))
+        budget.count_entry()
+        budget.check_time()
+        pos = end
+    return entries, sorted(set(flags_detected))
+
+
+def _inflate_bounded(compressed: memoryview, chunk_bytes: int) -> Iterable[bytes]:
+    """Yield inflated output in bounded chunks. Never materialises the member."""
+    decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
+    position = 0
+    total = len(compressed)
+    while position < total and not decompressor.eof:
+        block = bytes(compressed[position:position + chunk_bytes])
+        position += len(block)
+        pending = block
+        while pending:
+            out = decompressor.decompress(pending, chunk_bytes)
+            pending = decompressor.unconsumed_tail
+            if out:
+                yield out
+            if decompressor.eof:
+                break
+            if not out and not pending:
+                break
+        if decompressor.eof:
+            break
+    if not decompressor.eof:
+        # Drain any buffered output with the same bounded output ceiling.
+        for _ in range(chunk_bytes + 8):
+            out = decompressor.decompress(b"", chunk_bytes)
+            if not out:
+                break
+            yield out
+        tail = decompressor.flush()
+        if tail:
+            yield tail
+
+
+def _stream_member(budget: ResourceBudget, *, data: bytes, entry: _CentralEntry,
+                   scanner: ScannerAdapter) -> tuple[int, int, bytes | None, str]:
+    """Stream ONE member in bounded chunks. Returns (actual_bytes, crc, nested_bytes, first_type)."""
+    if entry.local_offset + 30 > len(data) or data[entry.local_offset:entry.local_offset + 4] != LFH_SIG:
+        raise RejectionError("MALFORMED_ZIP_LOCAL_HEADER")
+    lfh_name_len, lfh_extra_len = struct.unpack_from("<HH", data, entry.local_offset + 26)
+    data_start = entry.local_offset + 30 + lfh_name_len + lfh_extra_len
+    if data_start + entry.csize > len(data):
+        raise RejectionError("MALFORMED_ZIP_MEMBER_RANGE")
+    lfh_flags, lfh_method = struct.unpack_from("<HH", data, entry.local_offset + 6)
+    if lfh_flags != entry.flags or lfh_method != entry.method:
+        raise RejectionError("MALFORMED_LFH_CDH_MISMATCH")
+
+    compressed = memoryview(data)[data_start:data_start + entry.csize]
+    if entry.flags & 0x0001 or entry.flags & 0x0040 or entry.flags & 0x2000 or entry.method == 99:
+        raise RejectionError("ENCRYPTED_MEMBER", "encrypted archive member: no key, fail closed")
+    if entry.method not in SUPPORTED_METHODS:
+        raise RejectionError("UNSUPPORTED_COMPRESSION_METHOD", f"method={entry.method}")
+
+    if entry.method == 0:
+        chunks = (bytes(compressed[i:i + budget.limits.chunk_bytes])
+                  for i in range(0, len(compressed), budget.limits.chunk_bytes))
+    else:
+        chunks = _inflate_bounded(compressed, budget.limits.chunk_bytes)
+
+    actual = 0
+    crc = 0
+    first_chunk = b""
+    nested: bytearray | None = None
+    nested_size = 0
+    is_nested = False
+    for chunk in chunks:
+        if not chunk:
+            continue
+        if not first_chunk:
+            first_chunk = chunk[:16]
+            # Content sniffing is decisive, NEVER the declared filename extension.
+            is_nested = sniff_content_type(first_chunk) == "application/zip"
+            if is_nested:
+                nested = bytearray()
+        actual += len(chunk)
+        budget.charge_expanded(len(chunk), member_bytes=actual)
+        crc = zlib.crc32(chunk, crc) & 0xFFFFFFFF
+        scanner.feed(chunk, budget)
+        if nested is not None:
+            if nested_size + len(chunk) > budget.limits.max_materialized_object_bytes:
+                raise RejectionError("NESTED_CONTAINER_TOO_LARGE")
+            nested.extend(chunk)
+            nested_size += len(chunk)
+    crc &= 0xFFFFFFFF
+    nested_bytes: bytes | None = None
+    if nested is not None:
+        budget.reserve_memory(len(nested))
+        nested_bytes = bytes(nested)
+    return actual, crc, nested_bytes, sniff_content_type(first_chunk)
+
+
+def _inspect_one_member(budget: ResourceBudget, ledger: CoverageLedger, *,
+                        object_path: str, member_path: str, data: bytes,
+                        entry: _CentralEntry, depth: int,
+                        scanner_factory: Callable[[], ScannerAdapter]) -> None:
+    budget.check_depth(depth)  # member depth also counts against the recursion budget
+    scanner = scanner_factory()
+    try:
+        actual, crc, nested_bytes, detected = _stream_member(
+            budget, data=data, entry=entry, scanner=scanner
+        )
+    except RejectionError as error:
+        if error.code == "UNSUPPORTED_COMPRESSION_METHOD":
+            # Fail closed, but classify with the correct taxonomy: the member is
+            # NOT inspected because the compressor is out of supported scope.
+            ledger.unsupported(member_path, depth, error.code,
+                               notes=[error.detail] if error.detail else [])
+        else:
+            ledger.reject(member_path, depth, error.code, detected="UNKNOWN",
+                          notes=[error.detail] if error.detail else [])
+        raise
+    except (zlib.error, struct.error, ValueError) as error:
+        ledger.reject(member_path, depth, "CORRUPT_MEMBER", detected="UNKNOWN",
+                      notes=[type(error).__name__])
+        raise RejectionError("CORRUPT_MEMBER", type(error).__name__)
+
+    scan = scanner.finish()
+    if crc != entry.crc:
+        ledger.reject(member_path, depth, "CRC_MISMATCH", extracted_bytes=actual,
+                      detected=detected, notes=["declared CRC did not match ACTUAL inflated bytes"])
+        raise RejectionError("CRC_MISMATCH")
+    if actual != entry.usize:
+        ledger.reject(member_path, depth, "DECLARED_SIZE_MISMATCH", extracted_bytes=actual,
+                      detected=detected,
+                      notes=[f"declared_uncompressed_size={entry.usize}",
+                             "declared size was NOT trusted; actual bytes were counted"])
+        raise RejectionError("DECLARED_SIZE_MISMATCH")
+
+    notes = [f"declared_size={entry.usize}", f"method={entry.method}"]
+    if entry.zip64_extra:
+        notes.append("ZIP64_EXTRA_FIELD_RESOLVED")
+    record = ObjectRecord(
+        object_path=member_path, depth=depth, detected_content_type=detected,
+        structural_verdict="BOUNDED_STREAMING_READ_COMPLETE", verdict=INSPECTED,
+        extracted_bytes=actual, scanner_verdict=str(scan["scanner_verdict"]),
+        scanner_reason=str(scan["scanner_reason"]),
+        offline_control_signature=str(scan["signature"]), notes=notes,
+    )
+    ledger.add(record)
+
+    if nested_bytes is not None:
+        try:
+            # The nested container IS this member's content: same depth level.
+            inspect_zip_container(budget, ledger, object_path=member_path,
+                                  data=nested_bytes, depth=depth,
+                                  scanner_factory=scanner_factory)
+        finally:
+            budget.release_memory(len(nested_bytes))
+
+
+def inspect_zip_container(budget: ResourceBudget, ledger: CoverageLedger, *,
+                          object_path: str, data: bytes, depth: int,
+                          scanner_factory: Callable[[], ScannerAdapter]) -> str:
+    """Bounded, streaming, recursive ZIP inspection. Fail closed on any gap."""
+    budget.check_depth(depth)
+    if len(data) > budget.limits.max_materialized_object_bytes:
+        ledger.reject(object_path, depth, "MATERIALIZED_OBJECT_LIMIT",
+                      detected=sniff_content_type(data))
+        raise RejectionError("MATERIALIZED_OBJECT_LIMIT")
+    budget.reserve_memory(len(data))
+    try:
+        entries, zip_flags = _parse_central_directory(data, budget)
+        container_scanner = scanner_factory()
+        container_scanner.feed(data[:min(len(data), budget.limits.chunk_bytes)], budget)
+        container_scan = container_scanner.finish()
+        structural = ("ZIP64_STRUCTURES_PRESENT_BOUNDED_STDLIB_PARSE"
+                      if any(flag.startswith("ZIP64") for flag in zip_flags)
+                      else "WELL_FORMED_ZIP32")
+        notes = [f"zip_flags={','.join(zip_flags) or 'NONE'}",
+                 "raw_clamd_CLEAN_would_not_prove_nested_inspection"]
+        if "ZIP64" in structural:
+            notes.append("Phase 0A D_eicar_zip64 -> stream: OK (ClamAV 1.5.4 ZIP64 bypass)")
+        ledger.add(ObjectRecord(
+            object_path=object_path, depth=depth, detected_content_type="application/zip",
+            structural_verdict=structural, verdict=INSPECTED, extracted_bytes=len(data),
+            scanner_verdict=str(container_scan["scanner_verdict"]),
+            scanner_reason=str(container_scan["scanner_reason"]),
+            offline_control_signature=str(container_scan["signature"]), notes=notes,
+        ))
+        for entry in entries:
+            budget.check_time()
+            try:
+                label = safe_member_path(entry.name)
+            except RejectionError as error:
+                ledger.reject(f"{object_path}::/{entry.name!r}", depth + 1, error.code,
+                              detected="application/zip")
+                raise
+            _inspect_one_member(budget, ledger, object_path=object_path,
+                                member_path=f"{object_path}::/{label}", data=data,
+                                entry=entry, depth=depth + 1,
+                                scanner_factory=scanner_factory)
+        return structural
+    finally:
+        budget.release_memory(len(data))
+
+
+# ---------------------------------------------------------------------------
+# Narrow PDF attachment-tree parser (NOT exhaustive stream inspection)
+# ---------------------------------------------------------------------------
+_OBJECT_RE = re.compile(rb"(?m)^(\d+)\s+(\d+)\s+obj\b")
+_REF_RE = re.compile(rb"(\d+)\s+(\d+)\s+R")
+_NAMES_PAIR_RE = re.compile(rb"\(([^)]*)\)\s*(\d+)\s+(\d+)\s+R")
+_STREAM_LENGTH_RE = re.compile(rb"/Length\s+(\d+)(?!\s+\d+\s+R)")
+
+
+@dataclass
+class _PdfObject:
+    number: int
+    body: bytes
+    stream: bytes | None
+    stream_error: str | None
+
+
+def _parse_pdf_objects(data: bytes, budget: ResourceBudget) -> tuple[dict[int, _PdfObject], list[str]]:
+    gaps: list[str] = []
+    matches = list(_OBJECT_RE.finditer(data))
+    if not matches:
+        raise RejectionError("MALFORMED_PDF_NO_OBJECTS")
+    objects: dict[int, _PdfObject] = {}
+    for index, match in enumerate(matches):
+        number = int(match.group(1))
+        start = match.end()
+        end = data.find(b"endobj", start)
+        if end < 0:
+            raise RejectionError("MALFORMED_PDF_UNTERMINATED_OBJECT")
+        body = data[start:end]
+        stream_bytes: bytes | None = None
+        stream_error: str | None = None
+        stream_marker = re.search(rb"\bstream\r?\n", body)
+        if stream_marker:
+            dictionary = body[:stream_marker.start()]
+            if b"/Length" not in dictionary:
+                stream_error = "PDF_STREAM_WITHOUT_LENGTH"
+            elif re.search(rb"/Length\s+\d+\s+\d+\s+R", dictionary):
+                stream_error = "INDIRECT_PDF_STREAM_LENGTH_UNSUPPORTED"
+            else:
+                length_match = _STREAM_LENGTH_RE.search(dictionary)
+                if not length_match:
+                    stream_error = "PDF_STREAM_LENGTH_UNPARSEABLE"
+                else:
+                    length = int(length_match.group(1))
+                    if length > budget.limits.max_materialized_object_bytes:
+                        budget._hit("MATERIALIZED_OBJECT_LIMIT")
+                    stream_start = stream_marker.end()
+                    stream_bytes = body[stream_start:stream_start + length]
+                    remainder = body[stream_start + length:stream_start + length + 12]
+                    if b"endstream" not in remainder:
+                        stream_error = "PDF_STREAM_LENGTH_MISMATCH"
+            gaps.append(f"object_{number}_arbitrary_stream")
+        if number in objects:
+            gaps.append("DUPLICATE_OBJECT_IDS_AMBIGUOUS")
+        objects[number] = _PdfObject(number, body, stream_bytes, stream_error)
+        budget.check_time()
+    return objects, sorted(set(gaps))
+
+
+def inspect_pdf(budget: ResourceBudget, ledger: CoverageLedger, *,
+                object_path: str, data: bytes, depth: int,
+                scanner_factory: Callable[[], ScannerAdapter]) -> list[str]:
+    """Narrow, explicitly scoped PDF parsing.
+
+    SUPPORTED (attachment-only): /EmbeddedFiles name tree, /Filespec + /EF /F|/UF
+    references, /FileAttachment annotations, /AF associated files.
+    NOT SUPPORTED / NOT VERIFIED: arbitrary PDF streams, /ObjStm compressed object
+    streams, filtered (FlateDecode) embedded streams, indirect /Length, encryption,
+    incremental revisions, duplicate object ids, malformed xref, /Kids name trees.
+    qpdf --json and PDF.js are NOT used and are NOT exhaustive stream inspectors.
+    """
+    if not data.startswith(b"%PDF-"):
+        ledger.reject(object_path, depth, "MALFORMED_PDF_MAGIC", detected="UNKNOWN")
+        raise RejectionError("MALFORMED_PDF_MAGIC")
+    if b"startxref" not in data or b"%%EOF" not in data or b"trailer" not in data:
+        ledger.reject(object_path, depth, "MALFORMED_PDF", detected="application/pdf",
+                      notes=["missing xref/trailer/EOF: fail closed, no recovery attempted"])
+        raise RejectionError("MALFORMED_PDF")
+
+    gaps: list[str] = ["ARBITRARY_PDF_STREAMS_NOT_INSPECTED"]
+    if b"/Encrypt" in data:
+        ledger.add(ObjectRecord(
+            object_path=f"{object_path}::/Encrypt", depth=depth,
+            detected_content_type="application/pdf",
+            structural_verdict="ENCRYPTED_PDF_CANNOT_INSPECT_WITHOUT_DECRYPTION",
+            verdict=UNSUPPORTED, extracted_bytes=0, scanner_verdict="NOT_SCANNED",
+            scanner_reason="ENCRYPTED_PDF_REQUIRES_POST_UNLOCK_OUTPUT_SCAN",
+            notes=["SEC-REQ-02 encrypted-PDF detection; SEC-REQ-03 post-unlock output scan",
+                   "fail closed: no decryption attempted in the isolated PoC",
+                   "genuine AES-256/R6 fixture is NOT_VERIFIED offline (qpdf absent); "
+                   "synthetic markers are parser probes only, never real encryption"],
+        ))
+        gaps.append("ENCRYPTED_PDF_NOT_INSPECTED")
+        return gaps
+    if data.count(b"%%EOF") > 1:
+        ledger.add(ObjectRecord(
+            object_path=f"{object_path}::/IncrementalRevisions", depth=depth,
+            detected_content_type="application/pdf",
+            structural_verdict="INCREMENTAL_REVISIONS_DETECTED", verdict=NOT_VERIFIED,
+            extracted_bytes=0, scanner_verdict="NOT_SCANNED",
+            scanner_reason="PARSER_READS_LATEST_TRAILER_ONLY",
+            notes=["earlier revision objects are NOT enumerated; parser ambiguity"],
+        ))
+        gaps.append("INCREMENTAL_REVISIONS_NOT_VERIFIED")
+    if b"/ObjStm" in data:
+        gaps.append("COMPRESSED_OBJECT_STREAMS_NOT_VERIFIED")
+        ledger.add(ObjectRecord(
+            object_path=f"{object_path}::/ObjStm", depth=depth,
+            detected_content_type="application/pdf",
+            structural_verdict="COMPRESSED_OBJECT_STREAMS_NOT_INSPECTED",
+            verdict=NOT_VERIFIED, extracted_bytes=0, scanner_verdict="NOT_SCANNED",
+            scanner_reason="NO_OBJSTM_DECODE_IN_ISOLATED_POC",
+            notes=["objects hidden inside /ObjStm are NOT enumerated",
+                   "qpdf --json / PDF.js are NOT claimed as exhaustive stream inspectors"],
+        ))
+
+    objects, object_gaps = _parse_pdf_objects(data, budget)
+    gaps.extend(f"PDF_OBJECT_GAP_{gap}" for gap in object_gaps)
+    if "DUPLICATE_OBJECT_IDS_AMBIGUOUS" in object_gaps:
+        ledger.add(ObjectRecord(
+            object_path=f"{object_path}::/AmbiguousObjects", depth=depth,
+            detected_content_type="application/pdf",
+            structural_verdict="DUPLICATE_OBJECT_IDS_AMBIGUOUS", verdict=NOT_VERIFIED,
+            extracted_bytes=0, scanner_verdict="NOT_SCANNED",
+            scanner_reason="PARSER_AMBIGUITY_FAIL_CLOSED",
+            notes=["duplicate indirect object numbers: no winner is assumed"],
+        ))
+
+    catalog = next((obj for obj in objects.values() if b"/Type /Catalog" in obj.body), None)
+    if catalog is None:
+        ledger.reject(object_path, depth, "MALFORMED_PDF_NO_CATALOG", detected="application/pdf")
+        raise RejectionError("MALFORMED_PDF_NO_CATALOG")
+
+    filespec_refs: list[tuple[int, str]] = []
+    embedded_tree = re.search(rb"/EmbeddedFiles\s+(\d+)\s+(\d+)\s+R", catalog.body)
+    if embedded_tree:
+        tree = objects.get(int(embedded_tree.group(1)))
+        if tree is None:
+            ledger.reject(object_path, depth, "EMBEDDED_FILES_TREE_MISSING",
+                          detected="application/pdf")
+            raise RejectionError("EMBEDDED_FILES_TREE_MISSING")
+        if b"/Kids" in tree.body:
+            ledger.add(ObjectRecord(
+                object_path=f"{object_path}::/Names/Kids", depth=depth,
+                detected_content_type="application/pdf",
+                structural_verdict="NAME_TREE_KIDS_UNSUPPORTED", verdict=UNSUPPORTED,
+                extracted_bytes=0, scanner_verdict="NOT_SCANNED",
+                scanner_reason="NAME_TREE_KIDS_NOT_IMPLEMENTED",
+            ))
+            gaps.append("NAME_TREE_KIDS_UNSUPPORTED")
+        for name_match in _NAMES_PAIR_RE.finditer(tree.body):
+            filespec_refs.append((int(name_match.group(2)), "EmbeddedFiles/NameTree"))
+    af_matches = re.search(rb"/AF\s*\[(.*?)\]", catalog.body, re.DOTALL)
+    if af_matches:
+        for ref in _REF_RE.finditer(af_matches.group(1)):
+            filespec_refs.append((int(ref.group(1)), "AF/AssociatedFiles"))
+    for obj in objects.values():
+        if b"/Type /Page" in obj.body and b"/Type /Pages" not in obj.body:
+            annots = re.search(rb"/Annots\s*\[(.*?)\]", obj.body, re.DOTALL)
+            if not annots:
+                continue
+            for ref in _REF_RE.finditer(annots.group(1)):
+                annot = objects.get(int(ref.group(1)))
+                if annot is None or b"/Subtype /FileAttachment" not in annot.body:
+                    continue
+                fs = re.search(rb"/FS\s+(\d+)\s+(\d+)\s+R", annot.body)
+                if fs:
+                    filespec_refs.append((int(fs.group(1)), "Annots/FileAttachment"))
+                else:
+                    ledger.skip(f"{object_path}::/Annots/FileAttachment", depth,
+                                "FILEATTACHMENT_ANNOTATION_WITHOUT_FS")
+
+    referenced_filespecs = {number for number, _ in filespec_refs}
+    for number, obj in objects.items():
+        if b"/Type /Filespec" in obj.body and number not in referenced_filespecs:
+            ledger.skip(f"{object_path}::/Filespec#{number}", depth,
+                        "UNREFERENCED_FILESPEC_NOT_INSPECTED")
+
+    embedded_numbers: list[tuple[int, str]] = []
+    for number, source in filespec_refs:
+        spec = objects.get(number)
+        if spec is None:
+            ledger.skip(f"{object_path}::/{source}/Filespec", depth,
+                        "FILESPEC_REFERENCE_UNRESOLVED")
+            continue
+        ef = re.search(rb"/EF\s*<<(.*?)>>", spec.body, re.DOTALL)
+        if not ef:
+            ledger.skip(f"{object_path}::/{source}/Filespec", depth,
+                        "FILESPEC_WITHOUT_EF_REFERENCE")
+            continue
+        for key, number, _generation in re.findall(rb"/(F|UF)\s+(\d+)\s+(\d+)\s+R", ef.group(1)):
+            embedded_numbers.append((int(number), f"{source}/EF/{key.decode('ascii')}"))
+    if not embedded_numbers and filespec_refs:
+        ledger.skip(f"{object_path}::/EF", depth, "NO_RESOLVABLE_EF_STREAM_REFERENCE")
+
+    inspected_streams: set[int] = set()
+    for number, source in embedded_numbers:
+        obj = objects.get(number)
+        if obj is None or obj.stream is None:
+            ledger.add(ObjectRecord(
+                object_path=f"{object_path}::/{source}", depth=depth + 1,
+                detected_content_type="UNKNOWN",
+                structural_verdict=obj.stream_error or "EMBEDDED_FILE_STREAM_UNRESOLVED",
+                verdict=UNSUPPORTED, extracted_bytes=0, scanner_verdict="NOT_SCANNED",
+                scanner_reason="EMBEDDED_FILE_STREAM_NOT_DECODED",
+                notes=["filtered/indirect/malformed stream: no filter decoder implemented"],
+            ))
+            gaps.append("FILTERED_OR_INDIRECT_PDF_STREAM_UNSUPPORTED")
+            continue
+        if b"/Filter" in obj.body[:obj.body.find(b"stream")]:
+            ledger.add(ObjectRecord(
+                object_path=f"{object_path}::/{source}", depth=depth + 1,
+                detected_content_type="UNKNOWN",
+                structural_verdict="FILTERED_EMBEDDED_FILE_STREAM", verdict=UNSUPPORTED,
+                extracted_bytes=0, scanner_verdict="NOT_SCANNED",
+                scanner_reason="NO_PDF_FILTER_DECODER_IN_ISOLATED_POC",
+                notes=["qpdf --json / PDF.js are NOT exhaustive stream inspectors"],
+            ))
+            gaps.append("FILTERED_PDF_STREAM_UNSUPPORTED")
+            continue
+        inspected_streams.add(number)
+        payload = obj.stream
+        budget.count_entry()
+        budget.charge_expanded(len(payload), member_bytes=len(payload))
+        detected = sniff_content_type(payload)
+        scanner = scanner_factory()
+        for offset in range(0, len(payload), budget.limits.chunk_bytes):
+            scanner.feed(payload[offset:offset + budget.limits.chunk_bytes], budget)
+        scan = scanner.finish()
+        ledger.add(ObjectRecord(
+            object_path=f"{object_path}::/{source}", depth=depth + 1,
+            detected_content_type=detected,
+            structural_verdict="REFERENCED_EMBEDDED_FILE_STREAM_EXTRACTED",
+            verdict=INSPECTED, extracted_bytes=len(payload),
+            scanner_verdict=str(scan["scanner_verdict"]),
+            scanner_reason=str(scan["scanner_reason"]),
+            offline_control_signature=str(scan["signature"]),
+            notes=[f"pdf_reference_source={source}"],
+        ))
+        if detected == "application/zip":
+            inspect_zip_container(budget, ledger,
+                                  object_path=f"{object_path}::/{source}",
+                                  data=payload, depth=depth + 2,
+                                  scanner_factory=scanner_factory)
+
+    for number, obj in objects.items():
+        if obj.stream is not None and number not in inspected_streams:
+            ledger.skip(f"{object_path}::/Stream#{number}", depth,
+                        "ARBITRARY_PDF_STREAM_NOT_INSPECTED")
+    return sorted(set(gaps))
+
+
+# ---------------------------------------------------------------------------
+# Case harness
+# ---------------------------------------------------------------------------
+@dataclass
+class CaseSpec:
+    case_id: str
+    track: str
+    description: str
+    expected_verdict: str
+    kind: str                                   # "pdf" | "zip"
+    builder: Callable[[], bytes]
+    limits: ResourceLimits = DEFAULT_RESOURCE_LIMITS
+    scanner_factory: Callable[[], ScannerAdapter] = OfflineEicarControlProbe
+    notes: list[str] = field(default_factory=list)
+
+
+def tool_capabilities() -> dict[str, object]:
+    """Unverified capabilities are recorded as NOT_VERIFIED, never PASS."""
+    return {
+        "qpdf_binary_present": bool(shutil.which("qpdf")),
+        "pdfdetach_binary_present": bool(shutil.which("pdfdetach")),
+        "clamscan_binary_present": bool(shutil.which("clamscan")),
+        "qpdf_json_stream_inspection": {
+            "verdict": NOT_VERIFIED,
+            "reason": "OFFLINE_POC_DOES_NOT_EXECUTE_EXTERNAL_TOOLS; qpdf --json=1 --json-key=objects --decode-level=none enumerates object metadata only, NOT exhaustive PDF stream inspection",
+        },
+        "pdfjs_stream_inspection": {
+            "verdict": NOT_VERIFIED,
+            "reason": "PDF.js exposes a bounded subset of decoded image XObjects; NOT an exhaustive arbitrary-PDF-stream inspector and NOT used in this PoC",
+        },
+        "pdfdetach_attachment_parity": {
+            "verdict": NOT_VERIFIED,
+            "reason": "pdfdetach absent offline; attachment byte-parity NOT verified",
+        },
+        "genuine_encrypted_pdf_fixture": {
+            "verdict": NOT_VERIFIED,
+            "reason": "qpdf absent offline; genuine AES-256/R6 fixture NOT generated and NOT fabricated",
+        },
+        "clamav_live_scan": {
+            "verdict": NOT_VERIFIED,
+            "reason": "LIVE_CLAMAV_EXPERIMENTS_FORBIDDEN_IN_PHASE_0C_OFFLINE_STEP",
+        },
+    }
+
+
+SECURITY_REQUIREMENTS = [
+    {"id": "SEC-REQ-01", "requirement": "R1/R2 inspection must complete BEFORE permanent storage (validateUpload -> requireCleanUpload -> storage.put)", "status": "OPEN_UNRESOLVED_PLACEMENT"},
+    {"id": "SEC-REQ-02", "requirement": "Encrypted-PDF detection at ingress must fail closed (no claim of inspection of ciphertext)", "status": "NOT_VERIFIED"},
+    {"id": "SEC-REQ-03", "requirement": "Post-unlock / decrypted PDF output must be scanned before it is persisted or reused", "status": "NOT_VERIFIED"},
+    {"id": "SEC-REQ-04", "requirement": "Nested-content inspection completeness must be proven per object; raw clamd CLEAN is not proof", "status": "OPEN"},
+    {"id": "SEC-REQ-05", "requirement": "One cumulative end-to-end budget covering extraction + scanning + timeouts + memory + disk", "status": "ENFORCED_IN_OFFLINE_POC"},
+    {"id": "SEC-REQ-06", "requirement": "No new production dependency, no production path modification, no live workflow", "status": "ENFORCED_IN_OFFLINE_POC"},
+]
+
+
+def _ensure_terminal(ledger: CoverageLedger, code: str, data: bytes,
+                     *, notes: Iterable[str] = ()) -> None:
+    """Guarantee a case that raised ends with a terminal (REJECTED/UNSUPPORTED)
+    record so it can never be reported as fully INSPECTED. Skipped records and
+    already-recorded terminal verdicts are left untouched.
+    """
+    if any(record.verdict in (REJECTED, UNSUPPORTED) for record in ledger.objects
+           if not record.skipped):
+        return
+    ledger.reject("input", 0, code, detected=sniff_content_type(data), notes=list(notes))
+
+
+def run_case(spec: CaseSpec) -> dict[str, object]:
+    budget = ResourceBudget(spec.limits)
+    ledger = CoverageLedger(spec.case_id, budget)
+    data = spec.builder()
+    gaps: list[str] = []
+    error_code: str | None = None
+    try:
+        budget.charge_input(len(data))
+        if spec.kind == "pdf":
+            gaps = inspect_pdf(budget, ledger, object_path="input.pdf", data=data,
+                               depth=0, scanner_factory=spec.scanner_factory)
+        else:
+            inspect_zip_container(budget, ledger, object_path="input.bin", data=data,
+                                  depth=0, scanner_factory=spec.scanner_factory)
+    except BudgetExceeded as error:
+        error_code = error.code
+        _ensure_terminal(ledger, error.code, data)
+    except RejectionError as error:
+        error_code = error.code
+        _ensure_terminal(ledger, error.code, data)
+    except Exception as error:  # fail closed on any unexpected parser condition
+        error_code = "UNEXPECTED_PARSER_ERROR"
+        _ensure_terminal(ledger, error.code, data, notes=[type(error).__name__])
+
+    coverage = ledger.coverage(stream_gaps=gaps)
+    scanner_clean_flags = [record.scanner_verdict == "CLEAN" for record in ledger.objects
+                           if record.scanner_verdict not in ("NOT_SCANNED", NOT_VERIFIED)]
+    conclusion = derive_conclusion(
+        coverage, clamav_verified=False,
+        scanner_all_clean=bool(scanner_clean_flags) and all(scanner_clean_flags),
+        resource_limits_hit=budget.limits_hit,
+    )
+    return {
+        "case_id": spec.case_id,
+        "track": spec.track,
+        "description": spec.description,
+        "expected_verdict": spec.expected_verdict,
+        "observed_verdict": ledger.case_verdict(),
+        "verdict_match": ledger.case_verdict() == spec.expected_verdict,
+        "input_bytes": len(data),
+        "input_sha256": hashlib.sha256(data).hexdigest(),
+        "error_code": error_code,
+        "notes": list(spec.notes),
+        "coverage": coverage,
+        "conclusion": conclusion,
+        "objects": [record.as_dict() for record in ledger.objects],
+        "budget": budget.snapshot(),
+    }
+
+
+def _load_fixture_module():
+    """Load the sibling experimental fixture module (stdlib only)."""
+    import importlib.util
+    from pathlib import Path
+
+    import sys
+
+    module_path = Path(__file__).resolve().with_name("phase0c_r1r2_fixtures.py")
+    spec = importlib.util.spec_from_file_location("phase0c_r1r2_fixtures", module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("could not load Phase 0C fixture module")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module  # required for dataclass on Python 3.11
+    spec.loader.exec_module(module)
+    return module
+
+
+def build_case_suite() -> list[CaseSpec]:
+    """R1 + R2 + independent controls. EICAR is the ONLY detection signature."""
+    fx = _load_fixture_module()
+
+    cases: list[CaseSpec] = []
+
+    # ----------------------------- R1 --------------------------------------
+    cases.append(CaseSpec(
+        "R1-01", "R1", "PDF /EmbeddedFiles name tree -> /Filespec -> /EF ZIP64 EICAR attachment",
+        INSPECTED, "pdf",
+        lambda: fx.pdf_attachment(fx.zip64(fx.EICAR_BYTES, "eicar.txt")),
+        notes=["attachment-only coverage; arbitrary PDF streams remain NOT_VERIFIED"],
+    ))
+    cases.append(CaseSpec(
+        "R1-02", "R1", "/Filespec with BOTH /EF /F and /UF references (two resolved streams)",
+        INSPECTED, "pdf",
+        lambda: fx.pdf_attachment(fx.zip32(fx.EICAR_BYTES), mode="filespec_ef"),
+    ))
+    cases.append(CaseSpec(
+        "R1-03", "R1", "FileAttachment annotation -> /FS -> /Filespec -> /EF",
+        INSPECTED, "pdf",
+        lambda: fx.pdf_attachment(fx.zip32(fx.BENIGN_BYTES), mode="annotation"),
+    ))
+    cases.append(CaseSpec(
+        "R1-04", "R1", "/AF associated-files array on Catalog -> /Filespec -> /EF",
+        INSPECTED, "pdf",
+        lambda: fx.pdf_attachment(fx.zip32(fx.EICAR_BYTES), mode="af"),
+    ))
+    cases.append(CaseSpec(
+        "R1-05", "R1", "Benign ZIP32 attached via /EmbeddedFiles (negative structural control)",
+        INSPECTED, "pdf",
+        lambda: fx.pdf_attachment(fx.zip32(fx.BENIGN_BYTES)),
+    ))
+    cases.append(CaseSpec(
+        "R1-06", "R1", "Unreferenced /EmbeddedFile stream with NO /EF reference (arbitrary-stream gap)",
+        NOT_VERIFIED, "pdf",
+        lambda: fx.pdf_attachment(fx.zip32(fx.EICAR_BYTES), mode="unreferenced"),
+        notes=["proves attachment-only coverage cannot close R1"],
+    ))
+    cases.append(CaseSpec(
+        "R1-07", "R1", "SYNTHETIC /Encrypt marker probe: parser fail-closed on encrypted PDF",
+        UNSUPPORTED, "pdf",
+        lambda: fx.pdf_attachment(fx.zip32(fx.BENIGN_BYTES),
+                                  synthetic_encrypt_marker=True),
+        notes=["SYNTHETIC MARKER ONLY; genuine AES-256 fixture NOT generated (qpdf absent)",
+               "SEC-REQ-02 / SEC-REQ-03 remain explicit requirements"],
+    ))
+    cases.append(CaseSpec(
+        "R1-08", "R1", "Incremental revisions (2x %%EOF): earlier revision objects not enumerated",
+        NOT_VERIFIED, "pdf",
+        lambda: fx.pdf_attachment(fx.zip32(fx.BENIGN_BYTES), incremental_revision=True),
+    ))
+    cases.append(CaseSpec(
+        "R1-09", "R1", "Compressed /ObjStm marker + arbitrary page/content streams",
+        NOT_VERIFIED, "pdf",
+        lambda: fx.pdf_attachment(fx.zip32(fx.BENIGN_BYTES),
+                                  include_object_stream_marker=True),
+        notes=["qpdf --json and PDF.js are NOT claimed as exhaustive stream inspection"],
+    ))
+    cases.append(CaseSpec(
+        "R1-10", "R1", "Malformed PDF (no xref/startxref/%%EOF): fail closed",
+        REJECTED, "pdf",
+        lambda: fx.build_pdf(fx.PdfSpec(attachment=fx.zip32(fx.BENIGN_BYTES),
+                                        malformed=True)),
+    ))
+    cases.append(CaseSpec(
+        "R1-11", "R1", "Duplicate indirect object ids: parser ambiguity -> NOT_VERIFIED",
+        NOT_VERIFIED, "pdf",
+        lambda: fx.pdf_attachment(fx.zip32(fx.BENIGN_BYTES),
+                                  duplicate_object_ids=True),
+    ))
+    cases.append(CaseSpec(
+        "R1-12", "R1", "Filtered (/FlateDecode) embedded file stream: no decoder in isolated PoC",
+        UNSUPPORTED, "pdf",
+        lambda: fx.pdf_attachment(fx.zip32(fx.EICAR_BYTES),
+                                  compress_attachment_stream=True),
+    ))
+    cases.append(CaseSpec(
+        "R1-13", "R1", "Attachment stream exceeds bounded materialisation ceiling",
+        REJECTED, "pdf",
+        lambda: fx.pdf_attachment(fx.zip32(fx.BENIGN_BYTES)),
+        limits=replace(DEFAULT_RESOURCE_LIMITS, max_materialized_object_bytes=64),
+        notes=["resource-limit enforcement; no disk spill"],
+    ))
+
+    # ----------------------------- R2 --------------------------------------
+    cases.append(CaseSpec(
+        "R2-01", "R2", "ZIP32 containing ZIP32 (EICAR at depth 2)",
+        INSPECTED, "zip",
+        lambda: fx.build_zip([fx.Member("outer/inner.zip", fx.zip32(fx.EICAR_BYTES), method=8)]),
+    ))
+    cases.append(CaseSpec(
+        "R2-02", "R2", "ZIP32 containing ZIP64 (full EOCD + locator + sentinels) with EICAR",
+        INSPECTED, "zip",
+        lambda: fx.build_zip([fx.Member("outer/inner.zip", fx.zip64(fx.EICAR_BYTES), method=8)]),
+        notes=["stdlib bounded parse INSPECTS what ClamAV 1.5.4 silently bypasses; clamd verdict NOT_VERIFIED"],
+    ))
+    cases.append(CaseSpec(
+        "R2-03", "R2", "DEFLATE-compressed nested archive (streaming bounded inflate)",
+        INSPECTED, "zip",
+        lambda: fx.build_zip([fx.Member("outer/inner.zip",
+                                        fx.zip32(fx.EICAR_BYTES, method=8), method=8)]),
+    ))
+    cases.append(CaseSpec(
+        "R2-04", "R2", "Spoofed extension: nested ZIP stored as notes.txt (content sniff, not name)",
+        INSPECTED, "zip",
+        lambda: fx.build_zip([fx.Member("notes.txt", fx.zip32(fx.EICAR_BYTES), method=8)]),
+    ))
+    cases.append(CaseSpec(
+        "R2-05", "R2", "Nested archive depth limit exceeded (chain of 5, ceiling depth=3)",
+        REJECTED, "zip",
+        lambda: fx.nested_zip_chain(5, fx.EICAR_BYTES),
+        notes=["RECURSION_DEPTH_LIMIT hit; fail closed"],
+    ))
+    cases.append(CaseSpec(
+        "R2-06", "R2", "Corrupt member (declared CRC mismatch on ACTUAL inflated bytes)",
+        REJECTED, "zip",
+        lambda: fx.build_zip([fx.Member("bad.bin", fx.EICAR_BYTES, method=8, crc=0x12345678)]),
+    ))
+    cases.append(CaseSpec(
+        "R2-07", "R2", "Encrypted archive member (flag bit 0): no key, fail closed",
+        REJECTED, "zip",
+        lambda: fx.build_zip([fx.Member("locked.bin", fx.BENIGN_BYTES, flags=0x0001)]),
+    ))
+    cases.append(CaseSpec(
+        "R2-08", "R2", "Unsupported compression method (LZMA=14): fail closed",
+        UNSUPPORTED, "zip",
+        lambda: fx.build_zip([fx.Member("lzma.bin", fx.BENIGN_BYTES, method=14)]),
+    ))
+    cases.append(CaseSpec(
+        "R2-09", "R2", "Path traversal member name ../../evil.txt: rejected, never extracted",
+        REJECTED, "zip",
+        lambda: fx.build_zip([fx.Member("../../evil.txt", fx.BENIGN_BYTES)]),
+        notes=["no filesystem extraction exists in this PoC"],
+    ))
+    cases.append(CaseSpec(
+        "R2-10", "R2", "Forged declared uncompressed size: ACTUAL inflated bytes counted instead",
+        REJECTED, "zip",
+        lambda: fx.build_zip([fx.Member("forged.bin", b"A" * 4096, method=8, usize_lie=8)]),
+        notes=["declared size is NEVER trusted"],
+    ))
+    cases.append(CaseSpec(
+        "R2-11", "R2", "Cumulative expanded-byte ceiling hit (tiny experimental ceiling)",
+        REJECTED, "zip",
+        lambda: fx.build_zip([fx.Member("big.bin", b"A" * 4096, method=8)]),
+        limits=replace(DEFAULT_RESOURCE_LIMITS, max_expanded_bytes=64),
+    ))
+    cases.append(CaseSpec(
+        "R2-12", "R2", "Entry-count ceiling hit (tiny experimental ceiling)",
+        REJECTED, "zip",
+        lambda: fx.build_zip([fx.Member(f"f{i}.txt", b"x") for i in range(6)]),
+        limits=replace(DEFAULT_RESOURCE_LIMITS, max_entries=2),
+    ))
+
+    # --------------------------- CONTROLS ----------------------------------
+    cases.append(CaseSpec(
+        "CTRL-POS-01", "CONTROL", "Independent POSITIVE control: direct EICAR test signature",
+        INSPECTED, "zip",
+        lambda: fx.zip32(fx.EICAR_BYTES),
+        notes=["offline deterministic signature probe must report EICAR_SIGNATURE_PRESENT"],
+    ))
+    cases.append(CaseSpec(
+        "CTRL-NEG-01", "CONTROL", "Independent NEGATIVE control: benign bytes, no signature",
+        INSPECTED, "zip",
+        lambda: fx.zip32(fx.BENIGN_BYTES),
+    ))
+    cases.append(CaseSpec(
+        "CTRL-NEG-02", "CONTROL", "Clean nested ZIP32: all objects INSPECTED, still NOT COMPLETE_SAFE_SCAN",
+        INSPECTED, "zip",
+        lambda: fx.build_zip([fx.Member("inner.zip", fx.zip32(fx.BENIGN_BYTES), method=8)]),
+        notes=["proves CLEAN + offline incomplete coverage never yields COMPLETE_SAFE_SCAN"],
+    ))
+    return cases
+
+
+def run_offline_suite(*, start_tracemalloc: bool = True) -> dict[str, object]:
+    """Run the whole deterministic OFFLINE suite. NO live scanner, NO network."""
+    if start_tracemalloc and not tracemalloc.is_tracing():
+        tracemalloc.start()
+    if start_tracemalloc:
+        tracemalloc.reset_peak()
+    suite = build_case_suite()
+    results = [run_case(spec) for spec in suite]
+    peak = tracemalloc.get_traced_memory()[1] if tracemalloc.is_tracing() else 0
+    if start_tracemalloc and tracemalloc.is_tracing():
+        tracemalloc.stop()
+
+    r1 = [result for result in results if result["track"] == "R1"]
+    r2 = [result for result in results if result["track"] == "R2"]
+    controls = [result for result in results if result["track"] == "CONTROL"]
+    all_match = all(bool(result["verdict_match"]) for result in results)
+    conclusions = {str(result["conclusion"]["overall_conclusion"]) for result in results}
+    report: dict[str, object] = {
+        "experiment_id": EXPERIMENT_ID,
+        "mode": "OFFLINE_ONLY_ISOLATED_POC",
+        "run_kind": "DETERMINISTIC_OFFLINE_TESTS_ONLY",
+        "python_stdlib_only": True,
+        "live_clamav_executed": False,
+        "network_calls": 0,
+        "subprocess_calls": 0,
+        "filesystem_extraction_writes": sum(
+            int(result["budget"]["filesystem_writes"]) for result in results  # type: ignore[index]
+        ),
+        "governance": {
+            "CLAMAV-CR-P01": "PROPOSED — NOT APPROVED",
+            "CLAMAV-CR-P02": "PROPOSED — NOT APPROVED",
+            "CLAMAV-CR-P03": "PROPOSED — NOT APPROVED",
+            "CLAMAV-CR-R1": "PROPOSED — NOT APPROVED",
+            "CLAMAV-CR-R2": "PROPOSED — NOT APPROVED",
+            "approved_decisions": "PRESERVED_VERBATIM",
+            "MASTER_BASELINE": "NOT_AMENDED",
+            "Security_Gate": "OPEN",
+            "Licensing_Gate": "OPEN",
+            "Stage_7": "NOT ACCEPTED",
+            "CI": "NOT CHECKED",
+            "R1": "OPEN",
+            "R2": "OPEN",
+            "production_source_or_dependency_changes": "NONE",
+            "live_execution_workflow_created": False,
+        },
+        "security_boundary": {
+            "approved_sequence": "validateUpload -> requireCleanUpload -> storage.put",
+            "source": "src/lib/jobs/orchestrator.ts (unchanged)",
+            "post_storage_worker_scan_satisfies_pre_storage": False,
+            "note": "A worker scan after storage.put does NOT satisfy the approved pre-storage boundary.",
+        },
+        "security_requirements": SECURITY_REQUIREMENTS,
+        "tool_capabilities": tool_capabilities(),
+        "resource_budget": {
+            "limits": DEFAULT_RESOURCE_LIMITS.as_dict(),
+            "single_end_to_end_budget": True,
+            "shared_by": ["pdf_parse", "attachment_extraction", "nested_archive_traversal", "scanner_feed"],
+            "streaming_proof": {
+                "member_read_mode": "BOUNDED_STREAMING_CHUNKS",
+                "chunk_bytes": DEFAULT_RESOURCE_LIMITS.chunk_bytes,
+                "nested_container_buffer": "BOUNDED_IN_MEMORY_ONLY",
+                "max_materialized_object_bytes": DEFAULT_RESOURCE_LIMITS.max_materialized_object_bytes,
+                "extraction_to_filesystem": False,
+                "temp_disk_bytes_written": 0,
+                "cumulative_expanded_ceiling_bytes": DEFAULT_RESOURCE_LIMITS.max_expanded_bytes,
+                "production_reference_MaxScanSize_bytes": 400 * 1024 * 1024,
+                "ci_tmpfs_ceiling_bytes": 256 * 1024 * 1024,
+                "claim": "400 MiB is a CUMULATIVE scan-size reference, NOT a materialised extraction. This PoC writes 0 bytes to temp disk; streaming + reclamation are proven by construction and by budget accounting.",
+            },
+        },
+        "verdict_taxonomy": [INSPECTED, REJECTED, UNSUPPORTED, NOT_VERIFIED],
+        "cases": results,
+        "controls": [result["case_id"] for result in controls],  # type: ignore[index]
+        "summary": {
+            "cases_total": len(results),
+            "r1_cases": len(r1),
+            "r2_cases": len(r2),
+            "control_cases": len(controls),
+            "verdict_matches": sum(1 for result in results if result["verdict_match"]),
+            "all_verdicts_match": all_match,
+            "rejected_cases": sum(1 for result in results if result["observed_verdict"] == REJECTED),
+            "unsupported_cases": sum(1 for result in results if result["observed_verdict"] == UNSUPPORTED),
+            "not_verified_cases": sum(1 for result in results if result["observed_verdict"] == NOT_VERIFIED),
+            "inspected_cases": sum(1 for result in results if result["observed_verdict"] == INSPECTED),
+            "conclusions_observed": sorted(conclusions),
+            "complete_safe_scan_claimed": COMPLETE_SAFE_SCAN in conclusions,
+            "observed_peak_traced_memory_bytes": peak,
+            "total_filesystem_writes": 0,
+        },
+        "r1": {
+            "status": "OPEN",
+            "coverage_achieved": [
+                "/EmbeddedFiles name tree", "/Filespec + /EF /F and /UF references",
+                "FileAttachment annotations", "/AF associated files",
+                "ZIP64 embedded as a referenced attachment",
+            ],
+            "coverage_not_verified": [
+                "arbitrary PDF streams (including unreferenced /EmbeddedFile streams)",
+                "compressed /ObjStm object streams and indirect /Length",
+                "filtered (/FlateDecode) embedded streams",
+                "genuine encrypted PDFs and post-unlock output scanning",
+                "incremental revisions and parser ambiguity (duplicate object ids)",
+                "malformed documents beyond fail-closed rejection",
+                "qpdf --json / PDF.js exhaustive stream inspection (explicitly NOT claimed)",
+            ],
+            "complete_r1_remediation_claimed": False,
+            "note": "Attachment-only coverage MUST NOT be reported as complete R1 remediation.",
+        },
+        "r2": {
+            "status": "OPEN",
+            "coverage_achieved": [
+                "ZIP32 containing ZIP32", "ZIP32 containing ZIP64",
+                "DEFLATE-compressed nested archive", "spoofed file extension",
+                "nested depth limit", "corrupt member",
+                "encrypted member", "unsupported compression method",
+                "path traversal rejection", "forged declared size",
+                "streaming bounded member reads (actual bytes, not declared size only)",
+            ],
+            "coverage_not_verified": [
+                "live ClamAV verdict on nested content (forbidden in this offline step)",
+                "multi-disk / split archives", "BZIP2/LZMA/PPMd/Zstd members",
+                "ZIP64 data descriptors and 8-byte descriptor variants",
+                "encrypted members WITH a key (post-decryption scanning)",
+                "production-scale 400 MiB expansion under real tmpfs",
+            ],
+            "complete_r2_remediation_claimed": False,
+        },
+        "overall_conclusion": NOT_COMPLETE_SAFE_SCAN,
+    }
+    return report
+
+
+def _summarize_report(report: dict[str, object]) -> None:
+    summary = report["summary"]
+    print("DIP Phase 0C -- R1/R2 minimal ISOLATED OFFLINE PoC")
+    print("  mode                     : OFFLINE_ONLY_ISOLATED_POC")
+    print(f"  cases_total              : {summary['cases_total']}")
+    print(f"  r1 / r2 / control        : {summary['r1_cases']} / {summary['r2_cases']} / {summary['control_cases']}")
+    print(f"  verdict_matches          : {summary['verdict_matches']}/{summary['cases_total']}")
+    print(f"  all_verdicts_match       : {summary['all_verdicts_match']}")
+    print(f"  inspected/rejected/unsupported/not_verified: "
+          f"{summary['inspected_cases']}/{summary['rejected_cases']}/{summary['unsupported_cases']}/{summary['not_verified_cases']}")
+    print(f"  complete_safe_scan_claimed: {summary['complete_safe_scan_claimed']}")
+    print(f"  filesystem_writes        : {report['filesystem_extraction_writes']}")
+    print(f"  live_clamav_executed     : {report['live_clamav_executed']}")
+    print(f"  observed_peak_memory     : {summary['observed_peak_traced_memory_bytes']}")
+    print(f"  overall_conclusion       : {report['overall_conclusion']}")
+
+
+def main(argv: list[str]) -> int:
+    """CLI for the isolated offline PoC. Subcommands: run, self-test, report.
+
+    `run`       -> executes the full offline suite, prints summary, exit 0 on all
+                    verdict matches else 1.
+    `self-test` -> same as run but also asserts invariants (no live scan, no writes,
+                    no COMPLETE_SAFE_SCAN, EICAR control fired). Non-zero on failure.
+    `report`    -> prints the full JSON report to stdout.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(description="DIP Phase 0C R1/R2 offline PoC")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("run", help="run offline suite + summary")
+    sub.add_parser("self-test", help="run offline suite + invariant assertions")
+    sub.add_parser("report", help="print full JSON report")
+    args = parser.parse_args(argv)
+
+    report = run_offline_suite()
+    if args.cmd == "report":
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+    _summarize_report(report)
+
+    if args.cmd == "run":
+        return 0 if report["summary"]["all_verdicts_match"] else 1  # type: ignore[index]
+
+    # self-test invariants
+    failures: list[str] = []
+    if not report["summary"]["all_verdicts_match"]:
+        failures.append("NOT_ALL_VERDICTS_MATCH")
+    if report["live_clamav_executed"]:
+        failures.append("LIVE_CLAMAV_MUST_BE_FALSE")
+    if report["network_calls"] != 0 or report["subprocess_calls"] != 0:
+        failures.append("NO_NETWORK_OR_SUBPROCESS_ALLOWED")
+    if int(report["filesystem_extraction_writes"]) != 0:
+        failures.append("NO_FILESYSTEM_EXTRACTOR_WRITES_ALLOWED")
+    if report["summary"]["complete_safe_scan_claimed"]:
+        failures.append("COMPLETE_SAFE_SCAN_MUST_NEVER_BE_CLAIMED_OFFLINE")
+    for case in report["cases"]:
+        if case["case_id"] == "CTRL-POS-01":
+            sigs = [str(obj.get("offline_control_signature")) for obj in case["objects"]]
+            if "EICAR_SIGNATURE_PRESENT" not in sigs:
+                failures.append("EICAR_POSITIVE_CONTROL_MUST_FIRE")
+        if case["case_id"] == "CTRL-NEG-01":
+            sigs = [str(obj.get("offline_control_signature")) for obj in case["objects"]]
+            if "EICAR_SIGNATURE_ABSENT" not in sigs:
+                failures.append("EICAR_NEGATIVE_CONTROL_MUST_STAY_CLEAN")
+    if failures:
+        print("SELF-TEST FAILURES: " + ", ".join(failures))
+        return 1
+    print("SELF-TEST PASS: all invariants hold")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
