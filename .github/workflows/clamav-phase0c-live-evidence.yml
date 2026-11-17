@@ -1,0 +1,415 @@
+name: ClamAV Phase 0C Isolated Live Evidence (Experimental)
+
+# Experimental synthetic-fixture harness only. Manual dispatch after review and
+# separate authorization; not production integration or gate approval.
+# Security Gate: OPEN | Licensing Gate: OPEN | Stage 7: NOT ACCEPTED | R1/R2: OPEN.
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: >-
+          Type run-phase0c-r1r2-isolated-live-evidence to authorize this isolated experiment
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: clamav-phase0c-live-evidence
+  cancel-in-progress: false
+
+jobs:
+  phase0c-live-evidence:
+    name: Build and run isolated Phase 0C evidence client (no publication)
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.repository == 'mansour1414/DIP-Document-Intelligence-Platform' &&
+      github.ref == 'refs/heads/main' &&
+      github.ref_name == 'main' &&
+      github.event.inputs.confirmation == 'run-phase0c-r1r2-isolated-live-evidence'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      EXPECTED_REPOSITORY: mansour1414/DIP-Document-Intelligence-Platform
+      EXPECTED_DEFAULT_BRANCH: main
+      EXPECTED_CONFIRMATION: run-phase0c-r1r2-isolated-live-evidence
+      LOCAL_CANDIDATE_IMAGE: dip-clamav-phase0c-poc:local
+      LOCAL_CLIENT_IMAGE: dip-phase0c-live-client:local
+      PHASE0C_NETWORK: dip-phase0c-internal
+      CLAMD_CONTAINER: clamav-phase0c
+      CLIENT_CONTAINER: dip-phase0c-client
+      EXPECTED_PATCHED_PKG_VERSION: 1.5.4+dfsg-0ubuntu0.22.04.1+dipphase0b1
+      EXPECTED_CLAM3102_PATCH_SHA256: 503040ebfc3a950ca3f5303c1591bb637e5d42ccb46cb3ca63fa94dab98cf013
+      EXPECTED_BASE_CONF_SHA256: 75e2fc17058971c143580579d1d6027b5385c1724a3109e79390a272d95909a6
+      EXPECTED_FRESHNESS_GATE_SHA256: b1bff15489ece75f5baa20d6f244761492265ce52c072afdfde110461d9aade6
+      PYTHONDONTWRITEBYTECODE: "1"
+
+    steps:
+      - name: Check out dispatched source without persisted credentials
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Enforce manual, repository, branch, confirmation, and ARM64 boundary
+        id: boundary
+        env:
+          CONFIRMATION_INPUT: ${{ github.event.inputs.confirmation }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = "workflow_dispatch"
+          test "$GITHUB_REPOSITORY" = "$EXPECTED_REPOSITORY"
+          test "$GITHUB_REF" = "refs/heads/${EXPECTED_DEFAULT_BRANCH}"
+          test "$GITHUB_REF_NAME" = "$EXPECTED_DEFAULT_BRANCH"
+          test "$CONFIRMATION_INPUT" = "$EXPECTED_CONFIRMATION"
+          test "$(uname -m)" = "aarch64"
+          test -n "${RUNNER_TEMP:-}"
+          [[ "$RUNNER_TEMP" == /* && "$RUNNER_TEMP" != */ ]]
+          case "/$RUNNER_TEMP/" in *"/../"*|*"/./"*) exit 2 ;; esac
+          test "${RUNNER_TEMP##*/}" = "_temp"
+          test "${RUNNER_TEMP%/*}" = */work
+          test "$(realpath -e -- "$RUNNER_TEMP")" = "$RUNNER_TEMP"
+
+          EVIDENCE_DIR="${RUNNER_TEMP%/}/clamav-phase0c-evidence"
+          WORK_DIR="${RUNNER_TEMP%/}/clamav-phase0c-work"
+          {
+            echo "EVIDENCE_DIR=$EVIDENCE_DIR"
+            echo "WORK_DIR=$WORK_DIR"
+          } >> "$GITHUB_ENV"
+          mkdir -p "$EVIDENCE_DIR" "$WORK_DIR/fixtures" "$WORK_DIR/client-fixtures" \
+            "$WORK_DIR/db" "$WORK_DIR/cfg"
+          chmod 0755 "$EVIDENCE_DIR" "$WORK_DIR" "$WORK_DIR/fixtures" \
+            "$WORK_DIR/client-fixtures" "$WORK_DIR/db" "$WORK_DIR/cfg"
+
+          printf '%s  %s\n' \
+            "$EXPECTED_CLAM3102_PATCH_SHA256" "docs/operations/experimental/patches/clamav-1.5.4-clam-3102.patch" \
+            "$EXPECTED_BASE_CONF_SHA256" "docs/operations/experimental/clamav-arm64-stage4-candidate.conf" \
+            "$EXPECTED_FRESHNESS_GATE_SHA256" "docs/operations/experimental/clamd-freshness-gate.sh" \
+            | sha256sum --check --strict
+          sha256sum \
+            .github/workflows/clamav-phase0c-live-evidence.yml \
+            scripts/experiments/phase0c_r1r2_live_evidence.py \
+            scripts/experiments/phase0c_r1r2_poc.py \
+            scripts/experiments/phase0c_r1r2_fixtures.py \
+            scripts/experiments/clamav-phase0b-evidence.py \
+            docs/operations/experimental/clamav-phase0c-client.Dockerfile \
+            docs/operations/experimental/clamav-phase0c-client.Dockerfile.dockerignore \
+            docs/operations/experimental/clamav-arm64-phase0b-candidate.Dockerfile \
+            docs/operations/experimental/clamav-arm64-phase0b-candidate.Dockerfile.dockerignore \
+            docs/operations/experimental/clamav-arm64-stage4-candidate.conf \
+            docs/operations/experimental/clamd-freshness-gate.sh \
+            > "$EVIDENCE_DIR/source-files.sha256"
+
+      - name: Set up Python 3.12 for offline fixture verification
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Run Phase 0C and live-adapter offline tests (no network, no subprocess)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/experiments/phase0c_r1r2_poc.py self-test > "$EVIDENCE_DIR/phase0c-offline-selftest.log"
+          python3 test/phase0c-r1r2-live-artifacts.py
+
+      - name: Set up Docker Buildx for local-only ARM64 builds
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - name: Build existing Phase 0B ClamAV candidate locally (never publish)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx build --platform linux/arm64 \
+            --file docs/operations/experimental/clamav-arm64-phase0b-candidate.Dockerfile \
+            --target runtime --tag "$LOCAL_CANDIDATE_IMAGE" --load .
+          image_id="$(docker image inspect "$LOCAL_CANDIDATE_IMAGE" --format '{{.Id}}')"
+          echo "LOCAL_IMAGE_ID=$image_id" >> "$GITHUB_ENV"
+          docker run --rm --platform linux/arm64 --entrypoint /bin/bash "$LOCAL_CANDIDATE_IMAGE" \
+            -euo pipefail -c '
+              test "$(id -u)" = 101
+              test "$(id -g)" = 102
+              for pkg in libclamav12 clamav-base clamav-daemon clamav-freshclam; do
+                test "$(dpkg-query -W -f="\${Version}" "$pkg")" = "'"$EXPECTED_PATCHED_PKG_VERSION"'"
+              done
+              ! dpkg-query -W "*unrar*" >/dev/null 2>&1
+              ! ldd /usr/sbin/clamd | grep -qi unrar
+            '
+          cid="$(docker create "$LOCAL_CANDIDATE_IMAGE")"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          docker cp "$cid:/usr/share/doc/dip-phase0b/dpkg-manifest.txt" "$EVIDENCE_DIR/clamav-dpkg-manifest.txt"
+          docker cp "$cid:/usr/share/doc/dip-phase0b/ubuntu-source.sha256" "$EVIDENCE_DIR/clamav-ubuntu-source.sha256"
+          docker cp "$cid:/usr/share/doc/dip-phase0b/built-debs.sha256" "$EVIDENCE_DIR/clamav-built-debs.sha256"
+          printf '%s\n' "$image_id" > "$EVIDENCE_DIR/clamav-local-image-id.txt"
+
+      - name: Build pinned-base Python client image locally (no production dependency)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx build --platform linux/arm64 \
+            --file docs/operations/experimental/clamav-phase0c-client.Dockerfile \
+            --tag "$LOCAL_CLIENT_IMAGE" --load .
+          client_id="$(docker image inspect "$LOCAL_CLIENT_IMAGE" --format '{{.Id}}')"
+          echo "LOCAL_CLIENT_IMAGE_ID=$client_id" >> "$GITHUB_ENV"
+          cid="$(docker create "$LOCAL_CLIENT_IMAGE")"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          docker cp "$cid:/usr/share/doc/dip-phase0c-client/dpkg-manifest.txt" "$EVIDENCE_DIR/client-dpkg-manifest.txt"
+          docker cp "$cid:/usr/share/doc/dip-phase0c-client" "$EVIDENCE_DIR/client-license-notices"
+          printf '%s\n' "$client_id" > "$EVIDENCE_DIR/client-local-image-id.txt"
+
+      - name: Install runner-only independent PDF and Office verification tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            fonts-dejavu-core libreoffice-calc libreoffice-impress libreoffice-writer \
+            poppler-utils qpdf
+          {
+            echo "soffice=$(soffice --version)"
+            echo "qpdf=$(qpdf --version | head -n 1)"
+            echo "pdftotext=$(pdftotext -v 2>&1 | head -n 1)"
+            echo "pdfdetach=$(pdfdetach -v 2>&1 | head -n 1)"
+          } > "$EVIDENCE_DIR/verification-tool-versions.txt"
+
+      - name: Generate and independently verify Phase 0B fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/experiments/clamav-phase0b-evidence.py generate \
+            --out-dir "$WORK_DIR/fixtures" --max-file-size 16384 --require-qpdf
+          python3 scripts/experiments/clamav-phase0b-evidence.py verify-fixtures \
+            --manifest "$WORK_DIR/fixtures/fixtures-manifest.json" \
+            --out "$WORK_DIR/fixtures/fixture-verification.json" \
+            --require-tool-verification
+
+          # Independent ZIP reader verifies the real Phase 0B nested ZIP32/ZIP64 EICAR fixture.
+          python3 - "$WORK_DIR/fixtures" "$WORK_DIR/fixtures/fixtures-manifest.json" \
+            "$WORK_DIR/fixtures/fixture-verification.json" <<'PY'
+          import hashlib, json, pathlib, sys, zipfile, io
+          root = pathlib.Path(sys.argv[1])
+          manifest_path, verification_path = map(pathlib.Path, sys.argv[2:4])
+          manifest = json.loads(manifest_path.read_text())
+          verification = json.loads(verification_path.read_text())
+          fixtures = {item['id']: item for item in manifest['fixtures']}
+          target = fixtures['R2_compressed_nested_zip64_inside_zip32_residual_risk']
+          expected = '275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f'
+          outer = (root / target['filename']).read_bytes()
+          assert hashlib.sha256(outer).hexdigest() == target['sha256']
+          with zipfile.ZipFile(io.BytesIO(outer)) as zf:
+              assert zf.testzip() is None
+              inner = zf.read('nested/inner_zip64_eicar.zip')
+          with zipfile.ZipFile(io.BytesIO(inner)) as zf:
+              assert zf.testzip() is None
+              eicar = zf.read('eicar.txt')
+          assert hashlib.sha256(eicar).hexdigest() == expected
+          verification.setdefault('checks', []).append({
+              'id':'R2_compressed_nested_zip64_inside_zip32_residual_risk', 'kind':'nested_zip64',
+              'structural_check':'PASS', 'tool_verification_status':'PASS',
+              'tool_details':{'reader':'python.zipfile','outer_sha256':target['sha256'],
+                              'inner_eicar_sha256':hashlib.sha256(eicar).hexdigest()}})
+          verification_path.write_text(json.dumps(verification, indent=2) + '\n')
+          PY
+
+          cp "$WORK_DIR/fixtures/fixtures-manifest.json" "$EVIDENCE_DIR/fixtures-manifest.json"
+          cp "$WORK_DIR/fixtures/fixture-verification.json" "$EVIDENCE_DIR/fixture-verification.json"
+          for id in R1_pdf_embedded_zip64_residual_risk R2_compressed_nested_zip64_inside_zip32_residual_risk \
+                    B10_valid_docx_control B11_valid_xlsx_control B12_valid_pptx_control \
+                    B13_valid_pdf_control B14_encrypted_pdf_unlock_pdf_control; do
+            filename="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(next(x["filename"] for x in d["fixtures"] if x["id"]==sys.argv[2]) )' \
+              "$WORK_DIR/fixtures/fixtures-manifest.json" "$id")"
+            cp -- "$WORK_DIR/fixtures/$filename" "$WORK_DIR/client-fixtures/$filename"
+          done
+          cp "$WORK_DIR/fixtures/fixtures-manifest.json" "$WORK_DIR/client-fixtures/fixtures-manifest.json"
+          cp "$WORK_DIR/fixtures/fixture-verification.json" "$WORK_DIR/client-fixtures/fixture-verification.json"
+          chmod -R a+rX "$WORK_DIR/client-fixtures"
+
+      - name: Bootstrap and validate signature database before isolation
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --user 0:0 -v "$WORK_DIR/db:/var/lib/clamav" \
+            --entrypoint /bin/bash "$LOCAL_CANDIDATE_IMAGE" -c 'chown -R 101:102 /var/lib/clamav'
+          docker run --rm --platform linux/arm64 --user 101:102 \
+            --cap-drop ALL --security-opt no-new-privileges:true \
+            -v "$WORK_DIR/db:/var/lib/clamav" \
+            --entrypoint /usr/bin/freshclam "$LOCAL_CANDIDATE_IMAGE" \
+            --stdout --datadir=/var/lib/clamav > "$WORK_DIR/freshclam-bootstrap.log"
+          docker run --rm --platform linux/arm64 --user 101:102 --read-only \
+            --cap-drop ALL --security-opt no-new-privileges:true \
+            -v "$WORK_DIR/db:/var/lib/clamav:ro" \
+            --entrypoint /usr/local/bin/clamd-freshness-gate \
+            "$LOCAL_CANDIDATE_IMAGE" --check > "$EVIDENCE_DIR/signature-freshness-check.txt"
+
+      - name: Run two-container live experiment on an internal no-egress network
+        id: live
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp docs/operations/experimental/clamav-arm64-stage4-candidate.conf "$WORK_DIR/cfg/clamd.conf"
+          chmod 0644 "$WORK_DIR/cfg/clamd.conf"
+          jq -n \
+            --arg clamavImage "$LOCAL_IMAGE_ID" \
+            --arg clientImage "$LOCAL_CLIENT_IMAGE_ID" \
+            --arg configSha "$(sha256sum "$WORK_DIR/cfg/clamd.conf" | awk '{print $1}')" \
+            --arg expectedPackage "$EXPECTED_PATCHED_PKG_VERSION" \
+            '{architecture:"linux/arm64",clamav_local_image_id:$clamavImage,
+              client_local_image_id:$clientImage,clamav_config_sha256:$configSha,
+              clamav_package_version:$expectedPackage,network_mode:"internal_no_egress"}' \
+            > "$WORK_DIR/client-fixtures/runtime-provenance.json"
+          chmod 0644 "$WORK_DIR/client-fixtures/runtime-provenance.json"
+          docker network create --internal "$PHASE0C_NETWORK"
+
+          docker run -d --name "$CLAMD_CONTAINER" --platform linux/arm64 \
+            --network "$PHASE0C_NETWORK" --read-only --cap-drop ALL \
+            --security-opt no-new-privileges:true --memory 3g --memory-swap 3g \
+            --cpus 2 --pids-limit 128 --ulimit cpu=1800:1800 \
+            --tmpfs /tmp:rw,noexec,nosuid,nodev,size=256m,uid=101,gid=102 \
+            --tmpfs /run/clamav:rw,noexec,nosuid,nodev,size=32m,uid=101,gid=102 \
+            --tmpfs /var/log/clamav:rw,noexec,nosuid,nodev,size=32m,uid=101,gid=102 \
+            -v "$WORK_DIR/db:/var/lib/clamav:ro" \
+            -v "$WORK_DIR/cfg:/etc/clamav-phase0c:ro" \
+            --entrypoint /usr/bin/timeout "$LOCAL_CANDIDATE_IMAGE" \
+            --signal=TERM --kill-after=5s 1800s \
+            /usr/local/bin/clamd-freshness-gate --exec /usr/sbin/clamd \
+            --config-file=/etc/clamav-phase0c/clamd.conf --foreground
+
+          for _ in $(seq 1 80); do
+            if docker exec "$CLAMD_CONTAINER" bash -c \
+              'exec 3<>/dev/tcp/127.0.0.1/3310 && printf "zPING\0" >&3 && head -c 4 <&3 | grep -q PONG' \
+              >/dev/null 2>&1; then break; fi
+            sleep 3
+          done
+          docker exec "$CLAMD_CONTAINER" id -u | grep -Fx 101
+          docker exec "$CLAMD_CONTAINER" bash -c \
+            'exec 3<>/dev/tcp/127.0.0.1/3310 && printf "zPING\0" >&3 && head -c 4 <&3 | grep -q PONG'
+          test "$(docker inspect "$CLAMD_CONTAINER" --format '{{.HostConfig.ReadonlyRootfs}}')" = true
+          test "$(docker inspect "$CLAMD_CONTAINER" --format '{{.HostConfig.Memory}}')" = 3221225472
+          test "$(docker inspect "$CLAMD_CONTAINER" --format '{{.HostConfig.MemorySwap}}')" = 3221225472
+          test "$(docker inspect "$CLAMD_CONTAINER" --format '{{.HostConfig.NanoCpus}}')" = 2000000000
+          test "$(docker inspect "$CLAMD_CONTAINER" --format '{{.HostConfig.PidsLimit}}')" = 128
+          test "$(docker inspect "$CLAMD_CONTAINER" --format '{{len .HostConfig.PortBindings}}')" = 0
+          test "$(docker inspect "$CLAMD_CONTAINER" --format '{{.HostConfig.NetworkMode}}')" = "$PHASE0C_NETWORK"
+          docker inspect "$CLAMD_CONTAINER" | jq -e '.[0].HostConfig.CapDrop == ["ALL"]'
+          docker inspect "$CLAMD_CONTAINER" | jq -e '.[0].HostConfig.SecurityOpt | index("no-new-privileges:true") != null'
+          docker inspect "$CLAMD_CONTAINER" | jq -e '.[0].HostConfig.Tmpfs | has("/tmp") and has("/run/clamav") and has("/var/log/clamav")'
+          docker inspect "$CLAMD_CONTAINER" | jq -e '[.[0].Mounts[] | select((.Destination == "/var/lib/clamav" or .Destination == "/etc/clamav-phase0c") and .RW == false)] | length == 2'
+          docker exec "$CLAMD_CONTAINER" /usr/bin/clamconf --config-dir=/etc/clamav-phase0c \
+            > "$EVIDENCE_DIR/clamconf-effective.txt"
+
+          sudo chown 10001:10001 "$EVIDENCE_DIR"
+          chmod 0755 "$EVIDENCE_DIR"
+          docker run -d --name "$CLIENT_CONTAINER" \
+            --platform linux/arm64 --network "$PHASE0C_NETWORK" --read-only \
+            --cap-drop ALL --security-opt no-new-privileges:true \
+            --memory 512m --memory-swap 512m --cpus 1 --pids-limit 64 \
+            --ulimit cpu=120:120 \
+            --tmpfs /tmp:rw,noexec,nosuid,nodev,size=16m,uid=10001,gid=10001 \
+            -v "$WORK_DIR/client-fixtures:/fixtures:ro" \
+            -v "$EVIDENCE_DIR:/evidence:rw" \
+            --entrypoint /usr/bin/timeout "$LOCAL_CLIENT_IMAGE" \
+            --signal=TERM --kill-after=5s 1200s python3 \
+            /opt/dip/phase0c_r1r2_live_evidence.py --mode live \
+            --fixtures-dir /fixtures --output /evidence/phase0c-live-evidence.json \
+            --clamd-host "$CLAMD_CONTAINER" --clamd-port 3310 --expected-engine 1.5.4
+          test "$(docker inspect "$CLIENT_CONTAINER" --format '{{.Config.User}}')" = "10001:10001"
+          test "$(docker inspect "$CLIENT_CONTAINER" --format '{{.HostConfig.ReadonlyRootfs}}')" = true
+          test "$(docker inspect "$CLIENT_CONTAINER" --format '{{.HostConfig.Memory}}')" = 536870912
+          test "$(docker inspect "$CLIENT_CONTAINER" --format '{{.HostConfig.MemorySwap}}')" = 536870912
+          test "$(docker inspect "$CLIENT_CONTAINER" --format '{{.HostConfig.NanoCpus}}')" = 1000000000
+          test "$(docker inspect "$CLIENT_CONTAINER" --format '{{.HostConfig.PidsLimit}}')" = 64
+          test "$(docker inspect "$CLIENT_CONTAINER" --format '{{len .HostConfig.PortBindings}}')" = 0
+          test "$(docker inspect "$CLIENT_CONTAINER" --format '{{.HostConfig.NetworkMode}}')" = "$PHASE0C_NETWORK"
+          docker network inspect "$PHASE0C_NETWORK" | jq -e '.[0].Internal == true and (.[0].Containers | length == 2)'
+          docker inspect "$CLIENT_CONTAINER" | jq -e '.[0].HostConfig.CapDrop == ["ALL"]'
+          docker inspect "$CLIENT_CONTAINER" | jq -e '.[0].HostConfig.SecurityOpt | index("no-new-privileges:true") != null'
+          docker inspect "$CLIENT_CONTAINER" | jq -e '.[0].HostConfig.Tmpfs | has("/tmp")'
+          docker inspect "$CLIENT_CONTAINER" | jq -e '[.[0].Mounts[] | select(.Destination == "/fixtures" and .RW == false)] | length == 1'
+          docker inspect "$CLIENT_CONTAINER" | jq -e '[.[0].Mounts[] | select(.Destination == "/evidence" and .RW == true)] | length == 1'
+
+          set +e
+          wait_rc=0
+          client_rc="$(timeout --signal=TERM --kill-after=10s 1210s docker wait "$CLIENT_CONTAINER")" || wait_rc=$?
+          set -e
+          sudo chown -R "$(id -u):$(id -g)" "$EVIDENCE_DIR"
+          printf '{"docker_wait_exit_code":%s,"client_exit_code":"%s"}\n' \
+            "$wait_rc" "${client_rc:-unknown}" > "$EVIDENCE_DIR/live-exit-status.json"
+          test "$wait_rc" -eq 0
+          test "$client_rc" = 0
+
+      - name: Always clean containers, images, network, and scratch; record actual cleanup result
+        if: always() && steps.boundary.outcome == 'success'
+        id: cleanup
+        shell: bash
+        run: |
+          set +e
+          errors=0
+          clamd_absent=false; client_absent=false; network_absent=false
+          candidate_absent=false; client_image_absent=false; scratch_absent=false
+          if docker inspect "$CLIENT_CONTAINER" >/dev/null 2>&1; then docker rm -f "$CLIENT_CONTAINER" >/dev/null 2>&1 || errors=1; fi
+          if docker inspect "$CLAMD_CONTAINER" >/dev/null 2>&1; then docker rm -f "$CLAMD_CONTAINER" >/dev/null 2>&1 || errors=1; fi
+          if ! docker inspect "$CLIENT_CONTAINER" >/dev/null 2>&1; then client_absent=true; else errors=1; fi
+          if ! docker inspect "$CLAMD_CONTAINER" >/dev/null 2>&1; then clamd_absent=true; else errors=1; fi
+          sudo chown -R "$(id -u):$(id -g)" "$EVIDENCE_DIR" >/dev/null 2>&1 || errors=1
+          if docker network inspect "$PHASE0C_NETWORK" >/dev/null 2>&1; then docker network rm "$PHASE0C_NETWORK" >/dev/null 2>&1 || errors=1; fi
+          if ! docker network inspect "$PHASE0C_NETWORK" >/dev/null 2>&1; then network_absent=true; else errors=1; fi
+          if docker image inspect "$LOCAL_CANDIDATE_IMAGE" >/dev/null 2>&1; then docker rmi -f "$LOCAL_CANDIDATE_IMAGE" >/dev/null 2>&1 || errors=1; fi
+          if docker image inspect "$LOCAL_CLIENT_IMAGE" >/dev/null 2>&1; then docker rmi -f "$LOCAL_CLIENT_IMAGE" >/dev/null 2>&1 || errors=1; fi
+          if ! docker image inspect "$LOCAL_CANDIDATE_IMAGE" >/dev/null 2>&1; then candidate_absent=true; else errors=1; fi
+          if ! docker image inspect "$LOCAL_CLIENT_IMAGE" >/dev/null 2>&1; then client_image_absent=true; else errors=1; fi
+
+          runner_temp="${RUNNER_TEMP:-}"
+          if [[ -z "$runner_temp" || "$runner_temp" != /* || "$runner_temp" == */ ]] || \
+             [[ "${runner_temp##*/}" != _temp || "${runner_temp%/*}" != */work ]] || \
+             [[ "$(realpath -e -- "$runner_temp" 2>/dev/null)" != "$runner_temp" ]]; then
+            errors=1
+          else
+            scratch="${runner_temp%/}/clamav-phase0c-work"
+            if [[ -L "$scratch" || "$scratch" != "$runner_temp/clamav-phase0c-work" ]]; then
+              errors=1
+            else
+              rm -rf -- "$scratch" || errors=1
+              [[ ! -e "$scratch" && ! -L "$scratch" ]] && scratch_absent=true || errors=1
+            fi
+          fi
+          status=PASS; [[ "$errors" -eq 0 ]] || status=FAIL
+          jq -n --arg status "$status" --argjson clamd_absent "$clamd_absent" \
+            --argjson client_absent "$client_absent" --argjson network_absent "$network_absent" \
+            --argjson candidate_image_absent "$candidate_absent" \
+            --argjson client_image_absent "$client_image_absent" \
+            --argjson scratch_absent "$scratch_absent" \
+            '{status:$status,clamd_container_absent:$clamd_absent,client_container_absent:$client_absent,
+              internal_network_absent:$network_absent,candidate_image_absent:$candidate_image_absent,
+              client_image_absent:$client_image_absent,scratch_absent:$scratch_absent}' \
+            > "$EVIDENCE_DIR/cleanup-status.json"
+          [[ "$errors" -eq 0 ]]
+
+      - name: Finalize bounded evidence with verified cleanup status
+        if: always() && steps.boundary.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f "$EVIDENCE_DIR/phase0c-live-evidence.json" && -f "$EVIDENCE_DIR/cleanup-status.json" ]]; then
+            python3 scripts/experiments/phase0c_r1r2_live_evidence.py \
+              --mode finalize --output "$EVIDENCE_DIR/phase0c-live-evidence.json" \
+              --cleanup-status "$EVIDENCE_DIR/cleanup-status.json"
+          else
+            jq -n --slurpfile cleanup "$EVIDENCE_DIR/cleanup-status.json" \
+              '{schema_version:"phase0c-live-evidence-v1",TEST_CASE_RESULT:"NOT_VERIFIED",
+                error_code:"LIVE_EVIDENCE_OR_CLEANUP_RECORD_MISSING",cleanup:$cleanup[0],
+                governance:{Security_Gate:"OPEN",Licensing_Gate:"OPEN",R1:"OPEN",R2:"OPEN"}}' \
+              > "$EVIDENCE_DIR/phase0c-live-evidence.json"
+            exit 1
+          fi
+          bytes="$(du -sb "$EVIDENCE_DIR" | awk '{print $1}')"
+          test "$bytes" -le 5242880
+
+      - name: Upload bounded sanitized evidence (30-day retention)
+        if: always() && steps.boundary.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: clamav-phase0c-live-evidence-${{ github.run_id }}-${{ github.sha }}
+          path: ${{ runner.temp }}/clamav-phase0c-evidence
+          if-no-files-found: error
+          retention-days: 30

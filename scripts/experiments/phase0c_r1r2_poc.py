@@ -970,10 +970,18 @@ def _stream_member(budget: ResourceBudget, *, data: bytes, entry: _CentralEntry,
     return actual, crc, nested_bytes, sniff_content_type(first_chunk), lfh_zip64
 
 
+def _abort_scanner(scanner: ScannerAdapter) -> None:
+    """Cancel a partially fed optional live adapter; offline adapters are no-ops."""
+    abort = getattr(scanner, "abort", None)
+    if callable(abort):
+        abort()
+
+
 def _inspect_one_member(budget: ResourceBudget, ledger: CoverageLedger, *,
                         object_path: str, member_path: str, data: bytes,
                         entry: _CentralEntry, depth: int,
                         scanner_factory: Callable[[], ScannerAdapter],
+                        container_scanner_factory: Callable[[], ScannerAdapter] | None = None,
                         next_local_offset: int | None = None) -> None:
     budget.check_depth(depth)  # member depth also counts against the recursion budget
     scanner = scanner_factory()
@@ -983,12 +991,14 @@ def _inspect_one_member(budget: ResourceBudget, ledger: CoverageLedger, *,
             next_local_offset=next_local_offset
         )
     except UnsupportedError as error:
+        _abort_scanner(scanner)
         # Structurally out of scope (e.g. legacy unsigned data descriptor):
         # classified UNSUPPORTED, never accepted, never reported as corrupt.
         ledger.unsupported(member_path, depth, error.code,
                            notes=[error.detail] if error.detail else [])
         raise
     except RejectionError as error:
+        _abort_scanner(scanner)
         if error.code == "UNSUPPORTED_COMPRESSION_METHOD":
             # Fail closed, but classify with the correct taxonomy: the member is
             # NOT inspected because the compressor is out of supported scope.
@@ -999,9 +1009,13 @@ def _inspect_one_member(budget: ResourceBudget, ledger: CoverageLedger, *,
                           notes=[error.detail] if error.detail else [])
         raise
     except (zlib.error, struct.error, ValueError) as error:
+        _abort_scanner(scanner)
         ledger.reject(member_path, depth, "CORRUPT_MEMBER", detected="UNKNOWN",
                       notes=[type(error).__name__])
         raise RejectionError("CORRUPT_MEMBER", type(error).__name__)
+    except Exception:
+        _abort_scanner(scanner)
+        raise
 
     scan = scanner.finish()
     if crc != entry.crc:
@@ -1034,14 +1048,16 @@ def _inspect_one_member(budget: ResourceBudget, ledger: CoverageLedger, *,
             # The nested container IS this member's content: same depth level.
             inspect_zip_container(budget, ledger, object_path=member_path,
                                   data=nested_bytes, depth=depth,
-                                  scanner_factory=scanner_factory)
+                                  scanner_factory=scanner_factory,
+                                  container_scanner_factory=container_scanner_factory)
         finally:
             budget.release_memory(len(nested_bytes))
 
 
 def inspect_zip_container(budget: ResourceBudget, ledger: CoverageLedger, *,
                           object_path: str, data: bytes, depth: int,
-                          scanner_factory: Callable[[], ScannerAdapter]) -> str:
+                          scanner_factory: Callable[[], ScannerAdapter],
+                          container_scanner_factory: Callable[[], ScannerAdapter] | None = None) -> str:
     """Bounded, streaming, recursive ZIP inspection. Fail closed on any gap."""
     budget.check_depth(depth)
     if len(data) > budget.limits.max_materialized_object_bytes:
@@ -1056,7 +1072,11 @@ def inspect_zip_container(budget: ResourceBudget, ledger: CoverageLedger, *,
             ledger.reject(object_path, depth, error.code, detected="application/zip",
                           notes=[error.detail] if error.detail else [])
             raise
-        container_scanner = scanner_factory()
+        # The original container is not scanned here: this legacy bounded probe
+        # deliberately feeds only one offline-control chunk. A live caller must
+        # scan the complete original input separately and provide an explicit
+        # offline-only control factory for container ledger records.
+        container_scanner = (container_scanner_factory or scanner_factory)()
         container_scanner.feed(data[:min(len(data), budget.limits.chunk_bytes)], budget)
         container_scan = container_scanner.finish()
         structural = ("ZIP64_STRUCTURES_PRESENT_BOUNDED_STDLIB_PARSE"
@@ -1087,6 +1107,7 @@ def inspect_zip_container(budget: ResourceBudget, ledger: CoverageLedger, *,
                                 member_path=f"{object_path}::/{label}", data=data,
                                 entry=entry, depth=depth + 1,
                                 scanner_factory=scanner_factory,
+                                container_scanner_factory=container_scanner_factory,
                                 next_local_offset=min(later_offsets)
                                 if later_offsets else None)
         return structural
@@ -1156,7 +1177,8 @@ def _parse_pdf_objects(data: bytes, budget: ResourceBudget) -> tuple[dict[int, _
 
 def inspect_pdf(budget: ResourceBudget, ledger: CoverageLedger, *,
                 object_path: str, data: bytes, depth: int,
-                scanner_factory: Callable[[], ScannerAdapter]) -> list[str]:
+                scanner_factory: Callable[[], ScannerAdapter],
+                container_scanner_factory: Callable[[], ScannerAdapter] | None = None) -> list[str]:
     """Narrow, explicitly scoped PDF parsing.
 
     SUPPORTED (attachment-only): /EmbeddedFiles name tree, /Filespec + /EF /F|/UF
@@ -1321,9 +1343,13 @@ def inspect_pdf(budget: ResourceBudget, ledger: CoverageLedger, *,
         budget.charge_expanded(len(payload), member_bytes=len(payload))
         detected = sniff_content_type(payload)
         scanner = scanner_factory()
-        for offset in range(0, len(payload), budget.limits.chunk_bytes):
-            scanner.feed(payload[offset:offset + budget.limits.chunk_bytes], budget)
-        scan = scanner.finish()
+        try:
+            for offset in range(0, len(payload), budget.limits.chunk_bytes):
+                scanner.feed(payload[offset:offset + budget.limits.chunk_bytes], budget)
+            scan = scanner.finish()
+        except Exception:
+            _abort_scanner(scanner)
+            raise
         ledger.add(ObjectRecord(
             object_path=f"{object_path}::/{source}", depth=depth + 1,
             detected_content_type=detected,
@@ -1338,7 +1364,8 @@ def inspect_pdf(budget: ResourceBudget, ledger: CoverageLedger, *,
             inspect_zip_container(budget, ledger,
                                   object_path=f"{object_path}::/{source}",
                                   data=payload, depth=depth + 2,
-                                  scanner_factory=scanner_factory)
+                                  scanner_factory=scanner_factory,
+                                  container_scanner_factory=container_scanner_factory)
 
     for number, obj in objects.items():
         if obj.stream is not None and number not in inspected_streams:
@@ -1426,7 +1453,8 @@ def _bounded_message(error: BaseException, limit: int = 200) -> str:
     return f"{type(error).__name__}: {message}"
 
 
-def run_case(spec: CaseSpec) -> dict[str, object]:
+def run_case(spec: CaseSpec, *,
+             container_scanner_factory: Callable[[], ScannerAdapter] | None = None) -> dict[str, object]:
     budget = ResourceBudget(spec.limits)
     ledger = CoverageLedger(spec.case_id, budget)
     data: bytes | None = None
@@ -1440,10 +1468,12 @@ def run_case(spec: CaseSpec) -> dict[str, object]:
         budget.charge_input(len(data))
         if spec.kind == "pdf":
             gaps = inspect_pdf(budget, ledger, object_path="input.pdf", data=data,
-                               depth=0, scanner_factory=spec.scanner_factory)
+                               depth=0, scanner_factory=spec.scanner_factory,
+                               container_scanner_factory=container_scanner_factory)
         else:
             inspect_zip_container(budget, ledger, object_path="input.bin", data=data,
-                                  depth=0, scanner_factory=spec.scanner_factory)
+                                  depth=0, scanner_factory=spec.scanner_factory,
+                                  container_scanner_factory=container_scanner_factory)
     except BudgetExceeded as error:
         error_code = error.code
         _ensure_terminal(ledger, error.code, data or b"")
@@ -1456,9 +1486,15 @@ def run_case(spec: CaseSpec) -> dict[str, object]:
         _ensure_terminal(ledger, error.code, data or b"",
                          notes=[error.detail] if error.detail else [])
     except Exception as error:  # fail closed on any unexpected condition
-        # Finding-3 fix: use an explicit bounded code; an arbitrary exception
-        # (e.g. RuntimeError/KeyError) is NOT guaranteed to carry `.code`.
-        error_code = "UNEXPECTED_PARSER_ERROR"
+        # Finding-3 fix: use an explicit bounded code; arbitrary exceptions do
+        # not guarantee `.code`. The separately gated live adapter may provide
+        # a stable protocol code; offline behavior remains unchanged.
+        candidate_code = getattr(error, "code", None)
+        error_code = (str(candidate_code)[:100]
+                      if type(error).__name__ == "LiveScanError"
+                      and isinstance(candidate_code, str)
+                      and re.fullmatch(r"[A-Z0-9_]+", candidate_code)
+                      else "UNEXPECTED_PARSER_ERROR")
         _ensure_terminal(ledger, error_code, data or b"", notes=[_bounded_message(error)])
 
     coverage = ledger.coverage(stream_gaps=gaps)
