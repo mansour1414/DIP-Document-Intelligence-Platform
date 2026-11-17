@@ -1,0 +1,475 @@
+# DIP Phase 0C — R1/R2 Minimal Isolated Offline Proof of Concept
+
+**Status:** EXPERIMENTAL — ISOLATED — OFFLINE ONLY. Not production integration. Not a Change Request approval.
+**Date:** 2026-11-17
+**Base:** `main` @ `e9fc069189fd54534b065a87d10fd9352b75d993`
+**Statuses (verbatim):** `CI: NOT CHECKED. Security Gate: OPEN. Licensing Gate: OPEN. Stage 7: NOT ACCEPTED. R1/R2: OPEN.`
+
+## 1. Scope and non-goals
+
+This PoC evaluates, **offline only**:
+
+- **R1** — PDF-embedded ZIP64 detection and inspection (explicitly referenced attachments).
+- **R2** — Bounded, streaming inspection of compressed nested ZIP archives.
+
+Explicit non-goals: no production wiring, no modification of `src/`, `workers/`, `package.json`,
+dependencies, or workflows; no live ClamAV execution; no `workflow_dispatch`; no deployment; no GHCR
+publishing; no Change Request approval; no gate closure; no merge. A live isolated experiment is a
+**future, separately authorized** step (Section 10).
+
+Deliverables (all inside authorized paths):
+
+| Path | Role |
+| --- | --- |
+| `scripts/experiments/phase0c_r1r2_fixtures.py` | Deterministic offline fixture builders (EICAR halves, benign controls, byte-exact ZIP32/ZIP64, small PDFs with attachment trees). Stdlib only. |
+| `scripts/experiments/phase0c_r1r2_poc.py` | Bounded inspection prototype: single cumulative resource budget, streaming ZIP reader, narrow PDF attachment parser, coverage ledger, offline scanner adapters, case suite, JSON report. Stdlib only. |
+| `test/phase0c-r1r2-offline-artifacts.py` | Python `unittest` regression suite (run explicitly; not part of `npm test`). |
+| `test/phase0c-r1r2-offline.test.mjs` | Node `node:test` runner (picked up by `npm test`) that executes the PoC offline and asserts governance/safety invariants; skips honestly if `python3` is unavailable. |
+
+## 2. MASTER BASELINE review (pre-implementation)
+
+Reviewed before implementation:
+
+- **Approved pre-storage boundary** (`docs/production-readiness.md`): malware scanning happens
+  **after** validation and **before** durable storage/job creation. The actual ingest sequence in
+  `src/lib/jobs/orchestrator.ts` is `validateUpload` → `requireCleanUpload` → `storage.put`
+  (then DB job creation and enqueue). A **post-storage worker scan does NOT satisfy** this boundary
+  and is never used as evidence here.
+- **Tool limits** (`docs/phase-1-capability-audit.md`): qpdf does not interpret content-stream
+  semantics; its `--json=1 --json-key=objects --decode-level=none` usage (production: signature
+  detection only, `src/lib/pdf/qpdf.ts:38`) enumerates object metadata and is **not** exhaustive PDF
+  stream inspection. PDF.js exposes a bounded subset of decoded image XObjects and is **not** an
+  exhaustive arbitrary-stream inspector. Neither is invoked or relied upon in this PoC.
+- **Phase 0B residual risks** (`docs/operations/experimental/clamav-phase0b-remediation-design.md`):
+  R1 (PDF-embedded ZIP64) and R2 (compressed nested archives) are `RESIDUAL_RISK_OPEN`; raw clamd
+  CLEAN, observational controls, and residual-risk probes never count as security PASS.
+- **Phase 0A verified failures**: `D_eicar_zip64` — ZIP64 silent bypass returning `stream: OK` on
+  ClamAV 1.5.4; `E1_yes_small_zip32_maxfilesize` — silent truncation at max file size.
+- **Existing components reused conceptually (not imported into production):** Python stdlib
+  `zipfile`/`zlib` behaviour model (note: `zipfile`/`read()` truncate at *declared* size — this PoC
+  deliberately does NOT rely on that), the isolated ZIP/OOXML preflight
+  (`docs/operations/experimental/clamav-phase0b-zip-preflight.mts`, zero-decompression scope), and
+  the EICAR-based test corpus conventions of the Phase 0A/0B evidence scripts.
+- **Licensing** (`docs/license-registry.md`): no new dependencies introduced; ClamAV stays a
+  separate private GPL-2.0-only INSTREAM scanner; qpdf Apache-2.0 controlled subprocess; Ghostscript
+  prohibited. The OCR-specific licensing closure (2026-09-10) is not a global R1/R2 gate.
+
+## 3. Mandatory architecture corrections — implementation mapping
+
+| # | Correction | How this PoC honours it |
+| --- | --- | --- |
+| 1 | Preserve the approved pre-storage boundary | `security_boundary` block in every report restates `validateUpload -> requireCleanUpload -> storage.put`; `post_storage_worker_scan_satisfies_pre_storage: false`; no code touches the boundary. |
+| 2 | Post-storage worker scan ≠ pre-storage requirement | Stated verbatim in report and here; no worker path is used or implied. |
+| 3 | No claim that qpdf --json / PDF.js give exhaustive stream inspection | `tool_capabilities` records both as `NOT_VERIFIED` with explicit reasons; the PoC's PDF parser is declared narrow and gap-tagged; arbitrary streams are ledger-skipped with reasons. |
+| 4 | ONE end-to-end resource budget (extraction + scanning + timeouts + memory + disk) | `ResourceBudget` is a single shared object threaded through PDF parsing, attachment extraction, nested recursion, and scanner feed. Scanner `feed()` calls charge the **same** wall-clock/CPU/memory/temp-disk ceilings. |
+| 5 | Encrypted-PDF and post-unlock output scanning are explicit requirements | `SEC-REQ-02` / `SEC-REQ-03` recorded in every report; `/Encrypt`-bearing input fails closed as `UNSUPPORTED` with reason `ENCRYPTED_PDF_REQUIRES_POST_UNLOCK_OUTPUT_SCAN`; genuine encrypted fixtures are `NOT_VERIFIED` (qpdf absent offline — none fabricated). |
+| 6 | Raw clamd CLEAN ≠ complete nested-content inspection | Every `CLEAN`-style scanner result is paired with a coverage assessment; `derive_conclusion` can only emit `COMPLETE_SAFE_SCAN` when coverage is complete **and** the ClamAV scanner is verified; the offline suite can therefore never emit it. Phase 0A `D_eicar_zip64` is cited in ledger notes. |
+
+## 4. Design
+
+### 4.1 Verdict taxonomy
+
+Per object and per case: `INSPECTED` | `REJECTED` | `UNSUPPORTED` | `NOT_VERIFIED`.
+Rules: unsupported or incomplete inspection **fails closed**; a case with any `REJECTED` targeted
+object is `REJECTED`, else `UNSUPPORTED`/`NOT_VERIFIED` propagate; skipped objects are listed with
+explicit reasons and never counted as inspected. Absent tooling ⇒ `NOT_VERIFIED`, never PASS.
+
+### 4.2 Resource budget (single end-to-end, conservative offline ceilings)
+
+| Limit | Offline PoC ceiling | Production reference (unchanged) |
+| --- | --- | --- |
+| Input bytes | 4 MiB | `MAX_FIXTURE_ARCHIVE_BYTES` 16 MiB (0A), `MALWARE_SCAN_MAX_BYTES` 100 MiB |
+| Expanded bytes (cumulative) | 16 MiB | `MaxScanSize 400M` is a **cumulative scan-size** reference, not a materialised footprint |
+| Per-member actual bytes | 2 MiB | — |
+| Entry/attachment count | 256 | — |
+| Recursion depth | 3 (root = 0) | — |
+| CPU time | 3 s | — |
+| Wall-clock time | 5 s | — |
+| Memory (reserved-accounting) | 32 MiB | — |
+| Temp disk (accounted) | 8 MiB — **0 bytes written** | CI worker tmpfs `size=256m` |
+| Max materialized re-parse buffer | 8 MiB | — |
+| Read chunk | 64 KiB | `ClamdScanner` 64 KiB INSTREAM chunks |
+
+**400 MiB vs 256 MiB resolution:** the PoC performs **zero filesystem extraction**. Members are
+read in bounded 64 KiB streaming chunks; nested containers are held only in a bounded in-memory
+re-parse buffer (`max_materialized_object_bytes`) and released after recursion. Temp-disk usage is
+accounted and enforced (`temp_disk_bytes_used = 0` in every case). Therefore there is no
+simultaneous promise of 400 MiB materialised extraction and a 256 MiB disk ceiling: the 400 MiB
+number is a cumulative scan-size reference, and streaming + reclamation are proven by construction
+and by the budget accounting in the report.
+
+**Accounting scope (PoC-level vs OS-enforced):** every ceiling above is enforced **in-process by
+the PoC budget only** (`ResourceBudget`). This is application-level accounting and is explicitly
+labelled as such in the report (`accounting_scope.level = APPLICATION_LEVEL_POC_ACCOUNTING`). It is
+**not** an operating-system security boundary. A production deployment must additionally enforce
+OS-level limits — cgroup memory/CPU caps, a bounded `tmpfs` mount (`size=`, `nosuid,nodev,noexec`),
+a read-only root filesystem, and a non-root user — as the repo's CI worker image already does
+(`--read-only --tmpfs /tmp/dip:rw,nosuid,nodev,noexec,size=256m,uid=10001`). The PoC proves the
+budget arithmetic and fail-closed behaviour; it does not prove kernel enforcement.
+
+### 4.3 Streaming bounded ZIP reads
+
+- Central directory parsed byte-exactly (ZIP32 + ZIP64 EOCD/locator/sentinels/`0x0001` extra fields).
+  The ZIP64 EOCD locator is validated **positionally** (it must sit immediately before the classic
+  EOCD, and the ZIP64 EOCD record immediately before the locator); a ZIP64 magic byte pattern inside
+  member content can no longer masquerade as one, and a sentinel EOCD without a positional locator is
+  rejected (`ZIP64_SENTINEL_WITHOUT_LOCATOR`).
+- Members are **inflated to EOF and ACTUAL bytes counted** — the declared uncompressed size is
+  never trusted (forged-size case `R2-10` proves rejection on mismatch). CRC is verified against
+  actual inflated bytes (`R2-06`).
+- **DEFLATE terminal strictness (Revision 1):** a DEFLATE member is accepted only if the proper
+  end-of-stream marker is reached (`decompressor.eof`) after all declared compressed bytes are
+  consumed. A truncated stream that reproduces every decompressed byte (so CRC and size still match)
+  is rejected as `TRUNCATED_DEFLATE_STREAM`. Every decompression output chunk is strictly bounded by
+  the read-chunk size (via `decompress(..., max_length)`); no unbounded `flush()` is performed.
+- **Data descriptor validation (Revision 4, superseding the Revision-1 in-window rule):** the
+  member's compressed data occupies `data_start .. data_start + csize` **exactly** — the Central
+  Directory compressed-size field describes the compressed file data and does **NOT** include the
+  descriptor. The optional data descriptor is read and validated **after** the compressed data, at
+  `data_start + csize`:
+  - presence is required exactly when general-purpose **bit 3** is set; bit 3 set with no valid
+    descriptor ⇒ `INVALID_DATA_DESCRIPTOR`; a descriptor signature present with bit 3 **not** set
+    ⇒ `UNDECLARED_DATA_DESCRIPTOR` (contradictory structure);
+  - **width selection uses verified format metadata, never descriptor sniffing**: a ZIP64 member
+    (CDH `0xFFFFFFFF` sentinels resolved from the `0x0001` extra) requires the signed 24-byte
+    ZIP64 form — `Signature(4) + CRC32(4) + CompressedSize64(8) + UncompressedSize64(8)` — which
+    carries **no local-header-offset field** (PKWARE APPNOTE 4.3.9; Go `archive/zip`; CPython
+    `zipfile` packs `<LLQQ`); every other member requires the signed 16-byte form
+    `Signature(4) + CRC32(4) + CompressedSize32(4) + UncompressedSize32(4)` (CPython `<LLLL`);
+    incompatible 32/64 width combinations are rejected, never sniffed;
+  - the descriptor's CRC/sizes are cross-checked against the Central Directory AND the ACTUAL read;
+    the record following the descriptor must be a valid LFH/CDH record, and a following LFH must sit
+    exactly at the next CDH local offset (overlapping/contradictory/truncated layouts ⇒
+    `INVALID_DATA_DESCRIPTOR` / `TRUNCATED_DATA_DESCRIPTOR`);
+  - the legacy **unsigned** descriptor form (no signature) is out of scope and classified
+    `UNSUPPORTED` (`UNSIGNED_DATA_DESCRIPTOR_UNSUPPORTED`) — it is never silently accepted and
+    never reported as corrupt;
+  - compressed bytes following the DEFLATE end marker **within** the compressed window are
+    rejected as `UNEXPECTED_TRAILING_COMPRESSED_DATA` (a descriptor falsely embedded inside the
+    declared window is rejected, not reclassified);
+  - STORED members require `csize == usize` exactly (the descriptor sits outside the window).
+- Encrypted members (flag bit 0 / strong-encryption bits / method 99) and unsupported methods
+  (only 0 STORED and 8 DEFLATE supported) fail closed (`R2-07`, `R2-08`).
+- Member names pass `safe_member_path` (virtual ledger labels only; the PoC has **no filesystem
+  extraction primitive at all**). Traversal/absolute/drive/backslash/control names are rejected
+  (`R2-09`).
+- Nested containers are detected by **content sniff, not file extension** (spoofed-extension case
+  `R2-04`), bounded in size, and recursed under the same budget (`R2-05` depth-limit case).
+
+### 4.4 Narrow PDF attachment parser (R1)
+
+Supported (all explicitly referenced): `/EmbeddedFiles` name tree, `/Filespec` + `/EF /F|/UF`
+references, `/FileAttachment` annotations via `/FS`, `/AF` associated-files arrays. Embedded file
+streams are extracted by absolute `/Length` only; filtered (`/FlateDecode`) and indirect-`/Length`
+streams are `UNSUPPORTED` (no PDF filter decoder is implemented). `/Encrypt` ⇒ `UNSUPPORTED`
+fail-closed (genuine encrypted fixtures `NOT_VERIFIED` offline). Incremental revisions
+(two `%%EOF`) and duplicate object ids ⇒ `NOT_VERIFIED`. Malformed input (no xref/trailer/EOF) ⇒
+`REJECTED` with no recovery attempted. Unreferenced streams and `/ObjStm`-hidden objects are
+ledger-skipped with explicit reasons — **attachment-only coverage is not reported as complete R1**.
+
+### 4.5 Scanner adapters (offline)
+
+- `OfflineEicarControlProbe` — deterministic streaming detection of the standard EICAR test
+  signature only (independent positive/negative controls). It is explicitly **not** a ClamAV
+  scanner; its verdict is always `NOT_VERIFIED` with reason `CLAMAV_OFFLINE_UNAVAILABLE_CONTROL_PROBE_ONLY`.
+- `FakeAlwaysCleanScanner` — stub used **only** to prove the invariant: `CLEAN` + incomplete
+  coverage ⇒ `NOT_COMPLETE_SAFE_SCAN` (asserted in the unittest suite, never shipped in the suite's
+  case verdicts).
+- Live ClamAV: **NOT VERIFIED** in this step (`LIVE_CLAMAV_EXPERIMENTS_FORBIDDEN_IN_PHASE_0C_OFFLINE_STEP`).
+
+### 4.6 Coverage ledger and conclusion
+
+Per object: path, depth, detected content type, structural verdict, extracted bytes, scanner verdict
+(when scanned), skip reasons, resource limits hit. Per case: structural completeness vs end-to-end
+completeness (end-to-end is **always INCOMPLETE offline** because ClamAV is unverified), plus
+`derive_conclusion` blockers. `COMPLETE_SAFE_SCAN` is unreachable offline by construction.
+
+### 4.7 Focused security corrections (this revision cycle)
+
+Three implementation defects identified by the focused security correctness review of PR #16 were
+corrected in this cycle. All corrections are confined to the experimental files; no production code
+or dependency changed.
+
+| # | Defect | Correction | Regression coverage |
+| --- | --- | --- | --- |
+| 1 | Incomplete DEFLATE stream acceptance: `_inflate_bounded()` did not require `decompressor.eof`, and called an unbounded `flush()`. A truncated DEFLATE stream can reproduce the original decompressed bytes (CRC and declared size still match) while `eof` stays false, so it was accepted; trailing compressed data after the end marker was silently ignored. | Require the DEFLATE end-of-stream marker after all declared compressed bytes; reject truncated streams (`TRUNCATED_DEFLATE_STREAM`); reject bytes after the end marker inside the compressed window (`UNEXPECTED_TRAILING_COMPRESSED_DATA`); the data descriptor itself is validated at its standards position (see §4.3, corrected in REVISION-4); every output chunk strictly bounded via `decompress(..., max_length)`; unbounded `flush()` removed; actual-byte accounting, CRC verification, and declared-size comparison preserved. | Shipped cases R2-13..R2-16 + `TruncatedDeflateRegressionTests` (7 tests, incl. a truncated stream whose declared CRC and size DO match). |
+| 2 | Double counting in per-member limit enforcement: `actual` was incremented before being passed as `member_bytes`, and `charge_expanded()` added the current chunk again (`member_bytes + count`), so a member exactly at the ceiling was rejected and smaller members could be rejected early. | Corrected the accounting contract: `member_bytes` is the member's running total INCLUDING the current chunk; the per-member ceiling is evaluated against `member_bytes` alone (exactly-at-ceiling allowed, one byte over rejected); the cumulative expanded-byte ceiling is evaluated independently and shared by nested members. No hard limit was weakened. | Shipped cases R2-17..R2-18, R2-21, R2-22 + `MemberAccountingTests` (5 tests, incl. multi-chunk boundary crossing and direct `charge_expanded` contract tests). |
+| 3 | Generic exception handler referenced `error.code`, which an arbitrary exception (e.g. `RuntimeError`, `KeyError`) is not guaranteed to have — the handler itself could raise, escaping `run_case` with no report; fixture generation also ran outside the fail-closed boundary. | The generic handler now emits the explicit bounded code `UNEXPECTED_PARSER_ERROR` with a length-capped structured message; fixture generation moved inside the boundary (unexpected builder failure produces a structured REJECTED case, never a crash). Unexpected exceptions can never yield `INSPECTED` or `COMPLETE_SAFE_SCAN`. | `UnexpectedExceptionTests` (5 tests): scanner `feed` raising, scanner `finish` raising, parser raising an exception without a `.code` attribute (via mock), failing builder, and message length capping. |
+
+Also in this cycle (focused validation, no parser rewrite): ZIP64 EOCD locator validation moved to
+positional checks (prevents member content containing ZIP64 magics from masquerading as a locator);
+central-directory parse failures now record a container-level `REJECTED` ledger entry before
+re-raising; malformed CDH extra-field TLV overflow, LFH/CDH mismatches, truncated containers, and
+multi-disk flags are covered by `ZipStructureRegressionTests` and can never be classified as fully
+`INSPECTED`.
+
+
+### 4.8 Data descriptor standards compliance (REVISION-4)
+
+Two data-descriptor defects from the focused standards review were corrected, plus one narrow
+structural check. All changes are confined to the experimental files; no production code or
+dependency changed.
+
+| # | Defect | Correction | Regression coverage |
+| --- | --- | --- | --- |
+| 1 | **Incorrect descriptor location.** The validator expected the data descriptor *inside* the declared compressed-size window (i.e. it assumed `csize` covered the descriptor). Standards-compliant streaming writers (e.g. CPython `zipfile` non-seekable mode) set the CDH/LFH compressed-size to the compressed data **only** and write the descriptor **after** it, so genuine streaming ZIPs were rejected and the window check contradicted the CDH. | Descriptor is now read/validated at `data_start + csize` (after the compressed data); presence is required exactly when bit 3 is set; the following record must be a valid LFH/CDH and a following LFH must match the next CDH local offset; malformed / overlapping / contradictory / truncated / ambiguous structures are rejected; DEFLATE EOF, actual-byte counts, CRC, and cumulative limits remain strict. | Shipped cases R2-15, R2-23..R2-33 + `DataDescriptorComplianceTests` (20 tests). |
+| 2 | **Incorrect 24-byte ZIP64 descriptor layout.** The fixture/validator used `sig(4)+CRC(4)+CSize(4)+USize(4)+LocalOffset(8)` — that layout is not the standard ZIP64 data descriptor and does not match any independent writer. | The 24-byte form is now `sig(4)+CRC32(4)+CompressedSize64(8)+UncompressedSize64(8)` — **no local-header-offset field** (PKWARE APPNOTE 4.3.9; Go `archive/zip` `struct.go`/`writer.go`; CPython `zipfile` `struct.pack('<LLQQ', ...)`). Width is selected from verified CDH sentinel metadata; ambiguous/incompatible widths are rejected; genuine signed 16-byte and 24-byte controls shipped; the legacy unsigned form is classified `UNSUPPORTED` with documented compatibility impact (legacy streaming writers that omit the signature are not inspected — never silently accepted, never reported corrupt). | Shipped cases R2-24, R2-29, R2-30, R2-36 + `DataDescriptorComplianceTests` (24-byte acceptance, both wrong-width directions, unsigned classification). |
+| 3 | **Narrow ZIP64 EOCD-locator check.** The locator's disk fields were parsed as 16-bit. | Both locator disk fields are validated as 32-bit (`disk_number` and `total_disk_count`): the full locator structure `sig(4)+disk(4)+zip64_eocd_offset(8)+total_disks(4)` is checked positionally, and multi-disk archives remain fail-closed (`MULTI_DISK_ZIP_UNSUPPORTED`). Deliberately NOT a general ZIP parser rewrite. | Shipped cases R2-34, R2-35 + `ZipStructureRegressionTests`-style unit tests (disk field, total field, and a genuine-locator acceptance control). |
+| 4 | **ZIP64 descriptor width selected from CDH sentinels alone (REVISION-5).** A valid archive produced by CPython `zipfile` with `force_zip64=True` on a non-seekable stream keeps ordinary small 32-bit sizes in the CDH (no `0xFFFFFFFF` sentinels) while the LFH carries ZIP64 metadata (a `0x0001` extra field, with zeroed 64-bit placeholders under streaming) and a signed 24-byte descriptor. Selecting the width from CDH sentinels alone misclassified this member as 16-byte and rejected a valid archive. | The LFH ZIP64 metadata is now parsed and validated in addition to the CDH metadata (`_parse_lfh_zip64`): sentinels and/or a `0x0001` extra field in the LFH mark the member as ZIP64 format; the width is 24 bytes when EITHER the LFH or the CDH carries verified ZIP64 evidence, else 16. Non-zero `0x0001` values are cross-checked against the CDH sizes and the ACTUAL LFH position; sentinels without a resolvable `0x0001` extra, truncated/malformed extra bodies, contradictory offsets, and unresolved non-streaming sentinels are rejected (`MALFORMED_ZIP64_LFH_EXTRA` / `MALFORMED_ZIP_EXTRA_FIELD` / `MALFORMED_LFH_CDH_MISMATCH`). Width is never guessed from signature occurrence or arbitrary byte patterns. | Shipped cases R2-38, R2-39 (INSPECTED, independent writer), R2-40..R2-44 (fail-closed) + `Zip64LfhInteropTests` (11 tests). |
+
+**Sample provenance (independent writer interop evidence).** Case R2-25 is built by CPython
+3.11.2 `zipfile.ZipFile(stream, "w")` writing to a **non-seekable** in-memory stream
+(`NonSeekableBytesIO`; `seek()` raises). Observed byte layout for
+`[("stored.bin", 68 B, STORED), ("deflated.txt", 24 B, DEFLATE)]` (deterministic):
+
+- LFH `stored.bin` @0: bit 3 set, `crc/csize/usize` all zeroed; data `40..108`.
+- Descriptor @108 (16 B, signed): `50 4b 07 08 | 3c cf 51 68 (CRC32) | 44 00 00 00 (csize=68) | 44 00 00 00 (usize=68)`; next record is the next LFH.
+- LFH `deflated.txt` @124: bit 3 set, sizes zeroed; data `166..192` (26 compressed bytes).
+- Descriptor @192 (16 B, signed): CRC `0x6159c593`, `csize=26`, `usize=24`; next record is the central directory @208.
+- CDH `stored.bin`: `csize=68 usize=68` (compressed data only — descriptor excluded); CDH `deflated.txt`: `csize=26 usize=24`.
+- EOCD @322; total 344 bytes.
+
+The CPython writer source (`Lib/zipfile.py`) writes `struct.pack('<LLLL', _DD_SIGNATURE, crc,
+compress_size, file_size)` in non-zip64 mode and `struct.pack('<LLQQ', ...)` in zip64 mode — both
+signed, both **after** the member data, confirming the corrected layout. The PoC reader accepts
+exactly this archive (R2-25 `INSPECTED`), which proves reader/writer agreement on the fixture's
+validity. No byte was fabricated: the archive is produced at run time by the stdlib writer inside
+the case builder.
+
+**force_zip64 interop evidence (REVISION-5).** Case R2-38 is built with the real CPython
+standard library on a non-seekable stream:
+`zipfile.ZipFile(stream, "w", compression=ZIP_DEFLATED)` +
+`zf.open("hello.txt", "w", force_zip64=True)`, payload `b"Hello DIP security fixture!" * 3`
+(81 bytes, CRC `0xf0462bb9`). Observed layout (deterministic, 192 bytes total):
+
+- LFH @0: version=20, bit 3 set, `crc/csize/usize` all zeroed, 20-byte extra =
+  `0x0001`/size-16 with two zeroed 64-bit fields (streaming placeholders).
+- Compressed data `59..91` (32 bytes); **signed 24-byte descriptor @91**:
+  `504b0708 b92b46f0 2000000000000000 5100000000000000` (sig, CRC32, csize64=32, usize64=81).
+- CDH: `csize=32 usize=81` — ordinary small 32-bit values, NO sentinels; no ZIP64 EOCD/locator
+  (member-level ZIP64 format only). The ZIP_STORED variant (R2-39) is the same shape
+  (descriptor `504b0708 b92b46f0 5100000000000000 5100000000000000`).
+
+The independent CPython reader round-trips both archives (`testzip() is None`, exact content
+equality), and the Phase 0C reader classifies both as `INSPECTED` with the overall offline
+conclusion remaining `NOT_COMPLETE_SAFE_SCAN`.
+
+**Bidirectional cross-validation (independent reader):** CPython's own `zipfile` reader accepts
+every descriptor-bearing fixture this PoC ships — the non-seekable writer output (round-trip with
+`testzip() == None` and exact content equality on both members), the PoC-builder ZIP32 STORED +
+16-byte-descriptor archive, the ZIP32 DEFLATE + 16-byte-descriptor archive, and the ZIP64 +
+signed 24-byte-descriptor (no offset field) archive. Independent writer → independent reader,
+independent writer → PoC reader, and PoC builder → independent reader all agree on validity.
+
+**Remaining unsupported structures (fail-closed, documented):**
+- Legacy **unsigned** data descriptors (no `PK\x07\x08` signature): `UNSUPPORTED`
+  (`UNSIGNED_DATA_DESCRIPTOR_UNSUPPORTED`) — compatibility impact: archives from legacy streaming
+  writers that omit the signature are not inspected.
+- **Multi-disk** ZIP/ZIP64 archives (any non-zero disk number in the EOCD, the ZIP64 EOCD, or the
+  locator's 32-bit disk fields): `MULTI_DISK_ZIP_UNSUPPORTED`.
+- Non-standard descriptor variants (e.g. the non-standard 24-byte form with an embedded
+  local-header offset, or any width not equal to the verified 16/24-byte signed forms): rejected
+  (`INVALID_DATA_DESCRIPTOR`); only signed 16-byte and signed 24-byte forms are supported.
+- Encryption (bit 0 / strong-encryption bits / method 99): `ENCRYPTED_MEMBER`.
+- Compression methods other than 0 (STORED) and 8 (DEFLATE): `UNSUPPORTED_COMPRESSION_METHOD`.
+- ZIP descriptors with CRC/size fields that do not simultaneously match the Central Directory and
+  the ACTUAL read: rejected (never trusted in isolation).
+
+## 5. Case matrix (60 cases: original 28-case matrix preserved + 10 targeted regression cases R2-13..R2-22 + 15 data-descriptor standards-compliance cases R2-23..R2-37 + 7 ZIP64 descriptor-width interop cases R2-38..R2-44; all expected == observed in the offline run)
+
+| Case | Description | Expected | Observed |
+| --- | --- | --- | --- |
+| R1-01 | `/EmbeddedFiles` name tree → `/Filespec` → `/EF` ZIP64 EICAR attachment | INSPECTED | INSPECTED |
+| R1-02 | `/Filespec` with both `/EF /F` and `/UF` references | INSPECTED | INSPECTED |
+| R1-03 | FileAttachment annotation → `/FS` → `/Filespec` → `/EF` | INSPECTED | INSPECTED |
+| R1-04 | `/AF` associated files on Catalog | INSPECTED | INSPECTED |
+| R1-05 | Benign ZIP32 attachment (negative structural control) | INSPECTED | INSPECTED |
+| R1-06 | Unreferenced `/EmbeddedFile` stream (arbitrary-stream gap) | NOT_VERIFIED | NOT_VERIFIED |
+| R1-07 | Synthetic `/Encrypt` marker probe → fail closed | UNSUPPORTED | UNSUPPORTED |
+| R1-08 | Incremental revisions (two `%%EOF`) | NOT_VERIFIED | NOT_VERIFIED |
+| R1-09 | `/ObjStm` marker + arbitrary streams | NOT_VERIFIED | NOT_VERIFIED |
+| R1-10 | Malformed PDF (no xref/startxref/`%%EOF`) | REJECTED | REJECTED |
+| R1-11 | Duplicate indirect object ids (parser ambiguity) | NOT_VERIFIED | NOT_VERIFIED |
+| R1-12 | Filtered (`/FlateDecode`) embedded stream | UNSUPPORTED | UNSUPPORTED |
+| R1-13 | Attachment stream over materialization ceiling | REJECTED | REJECTED |
+| R2-01 | ZIP32 containing ZIP32 | INSPECTED | INSPECTED |
+| R2-02 | ZIP32 containing ZIP64 (EOCD + locator + sentinels) | INSPECTED | INSPECTED |
+| R2-03 | DEFLATE-compressed nested archive | INSPECTED | INSPECTED |
+| R2-04 | Spoofed extension (nested ZIP as `notes.txt`) | INSPECTED | INSPECTED |
+| R2-05 | Depth limit exceeded (chain of 5, ceiling 3) | REJECTED | REJECTED |
+| R2-06 | Corrupt member (CRC mismatch on actual bytes) | REJECTED | REJECTED |
+| R2-07 | Encrypted archive member | REJECTED | REJECTED |
+| R2-08 | Unsupported compression method (LZMA=14) | UNSUPPORTED | UNSUPPORTED |
+| R2-09 | Path traversal member name | REJECTED | REJECTED |
+| R2-10 | Forged declared uncompressed size | REJECTED | REJECTED |
+| R2-11 | Cumulative expanded-byte ceiling | REJECTED | REJECTED |
+| R2-12 | Entry-count ceiling | REJECTED | REJECTED |
+| R2-13 | Truncated DEFLATE stream with matching CRC/size (Revision 1) | REJECTED | REJECTED |
+| R2-14 | Trailing compressed bytes after DEFLATE end marker (Revision 1) | REJECTED | REJECTED |
+| R2-15 | Valid 16-byte ZIP data descriptor (positive descriptor control) | INSPECTED | INSPECTED |
+| R2-16 | Descriptor flag set, no descriptor present (Revision 1) | REJECTED | REJECTED |
+| R2-17 | Member exactly at per-member ceiling, multi-chunk (Revision 2) | INSPECTED | INSPECTED |
+| R2-18 | Member one byte over per-member ceiling, multi-chunk (Revision 2) | REJECTED | REJECTED |
+| R2-19 | LFH/CDH method mismatch | REJECTED | REJECTED |
+| R2-20 | Truncated ZIP container (EOCD cut) | REJECTED | REJECTED |
+| R2-21 | Cumulative expanded ceiling across several small members (Revision 2) | REJECTED | REJECTED |
+| R2-22 | Nested members share the cumulative budget (Revision 2) | REJECTED | REJECTED |
+| R2-23 | Valid 16-byte descriptor AFTER a DEFLATE member (Revision 4) | INSPECTED | INSPECTED |
+| R2-24 | Valid ZIP64 member + signed 24-byte descriptor, no offset field (Revision 4) | INSPECTED | INSPECTED |
+| R2-25 | CPython 3.11.2 `zipfile` non-seekable streaming output (independent writer) | INSPECTED | INSPECTED |
+| R2-26 | Descriptor CRC contradicts the Central Directory (Revision 4) | REJECTED | REJECTED |
+| R2-27 | Descriptor compressed size contradicts the Central Directory (Revision 4) | REJECTED | REJECTED |
+| R2-28 | Descriptor uncompressed size contradicts the Central Directory (Revision 4) | REJECTED | REJECTED |
+| R2-29 | Wrong width: ZIP32 member + 24-byte ZIP64 descriptor (Revision 4) | REJECTED | REJECTED |
+| R2-30 | Wrong width: ZIP64 member + 16-byte descriptor (Revision 4) | REJECTED | REJECTED |
+| R2-31 | Descriptor falsely embedded inside the compressed window (Revision 4) | REJECTED | REJECTED |
+| R2-32 | Multi-entry ZIP with per-member descriptors + correct LFH/CDH boundaries (Revision 4) | INSPECTED | INSPECTED |
+| R2-33 | Garbage record after the data descriptor (Revision 4) | REJECTED | REJECTED |
+| R2-34 | ZIP64 EOCD locator 32-bit disk number non-zero (Revision 4) | REJECTED | REJECTED |
+| R2-35 | ZIP64 EOCD locator 32-bit total disk count ≠ 1 (Revision 4) | REJECTED | REJECTED |
+| R2-36 | Legacy unsigned 12-byte descriptor — classified UNSUPPORTED (Revision 4) | UNSUPPORTED | UNSUPPORTED |
+| R2-37 | Undeclared descriptor signature (bit 3 not set) (Revision 4) | REJECTED | REJECTED |
+| R2-38 | CPython `force_zip64` DEFLATE non-seekable: LFH 0x0001 extra + CDH small sizes + 24-byte descriptor (Revision 5) | INSPECTED | INSPECTED |
+| R2-39 | CPython `force_zip64` STORED non-seekable (Revision 5) | INSPECTED | INSPECTED |
+| R2-40 | LFH size sentinels without a 0x0001 ZIP64 extra field (Revision 5) | REJECTED | REJECTED |
+| R2-41 | LFH 0x0001 extra TLV length overflow (Revision 5) | REJECTED | REJECTED |
+| R2-42 | LFH 0x0001 size contradicts the Central Directory size (Revision 5) | REJECTED | REJECTED |
+| R2-43 | LFH-ZIP64 member followed by a 16-byte descriptor — incompatible width (Revision 5) | REJECTED | REJECTED |
+| R2-44 | LFH 0x0001 local-header offset contradicts the actual LFH position (Revision 5) | REJECTED | REJECTED |
+| CTRL-POS-01 | Independent positive control: direct EICAR | INSPECTED | INSPECTED |
+| CTRL-NEG-01 | Independent negative control: benign bytes | INSPECTED | INSPECTED |
+| CTRL-NEG-02 | Clean nested ZIP32 — still NOT `COMPLETE_SAFE_SCAN` | INSPECTED | INSPECTED |
+
+The R1 synthetic marker cases (R1-07) are labelled as **SYNTHETIC PARSER PROBES**, not genuine
+encrypted PDFs. No real malware is used anywhere; EICAR is the only detection signature.
+
+## 6. Resource-limit evidence (measured offline run, 60 cases)
+
+- Totals: input 30,877 B; expanded 11,797 B; scanner-fed 26,354 B; peak traced process memory
+  ≈1.82 MiB (against 32 MiB ceiling); wall-clock per case ≤ 6 ms.
+- `temp_disk_bytes_used = 0` and `filesystem_writes = 0` in **every** case; no extraction
+  filesystem primitive exists in the module.
+- Limit-hit cases: `RECURSION_DEPTH_LIMIT` (R2-05), `EXPANDED_BYTE_LIMIT` (R2-11, R2-21, R2-22),
+  `ENTRY_COUNT_LIMIT` (R2-12), `MEMBER_BYTE_LIMIT` (R2-18), `MATERIALIZED_OBJECT_LIMIT` (R1-13)
+  — all fail closed with the hit recorded in the case budget snapshot.
+- `full_extraction_materialized` is `false` in every case (streaming, bounded re-parse only).
+- `live_clamav_executed: false`, `network_calls: 0`, `subprocess_calls: 0` in every report.
+
+## 7. R1 coverage achieved vs not verified
+
+**Achieved (attachment-only, offline):** `/EmbeddedFiles` name tree; `/Filespec` + `/EF /F|/UF`;
+FileAttachment annotations; `/AF` associated files; ZIP64 embedded as a referenced attachment
+(structure parsed, bytes extracted, controls fed). Malformed fail-closed; encrypted
+fail-closed; filtered streams and ambiguity gaps explicitly reported.
+
+**NOT VERIFIED / not covered (explicit gaps):** arbitrary PDF streams including unreferenced
+`/EmbeddedFile` streams; compressed `/ObjStm` object streams and indirect `/Length`; genuine
+encrypted PDFs and post-unlock output scanning; incremental-revision object enumeration; qpdf
+`--json` / PDF.js exhaustive stream inspection (explicitly **not** claimed); pdfdetach parity
+(binary absent). **This PoC does NOT claim complete R1 remediation.** R1 remains OPEN.
+
+## 8. R2 coverage achieved vs not verified
+
+**Achieved (offline):** ZIP32⊃ZIP32; ZIP32⊃ZIP64 (byte-exact EOCD/locator/sentinels, bounded
+stdlib parse that inspects what ClamAV 1.5.4 silently bypassed; locator now validated
+positionally); DEFLATE nesting with streaming reads **and strict end-of-stream enforcement**
+(truncated streams rejected even when CRC/size match — R2-13); bytes after the DEFLATE end marker
+inside the compressed window rejected (R2-14); data descriptors validated at their standards
+position `data_start + csize` with verified-metadata width selection — signed 16-byte ZIP32 form
+and signed 24-byte ZIP64 form (no local-header-offset field) both accepted from genuine writers
+(including CPython `zipfile` non-seekable streaming output, R2-25, and the `force_zip64`
+streaming combination with LFH `0x0001` metadata + small CDH sizes, R2-38/R2-39), contradictory
+fields and wrong-width combinations rejected (R2-16, R2-26..R2-31, R2-33, R2-37, R2-43),
+contradictory/missing/malformed LFH ZIP64 metadata rejected (R2-40..R2-42, R2-44), legacy
+unsigned form classified UNSUPPORTED (R2-36); spoofed-extension content sniff; depth
+limit; corrupt member; encrypted member; unsupported method; path traversal; forged declared size;
+cumulative byte/entry ceilings with the per-member boundary corrected (exactly-at-ceiling allowed,
+one byte over rejected — R2-17/R2-18/R2-21); nested members sharing the cumulative budget
+(R2-22); LFH/CDH consistency rejection (R2-19); truncated-container fail-closed (R2-20); zero-disk
+materialization.
+
+**NOT VERIFIED / not covered:** live ClamAV verdicts on nested content (forbidden in this step);
+multi-disk archives (fail-closed `MULTI_DISK_ZIP_UNSUPPORTED`, including the ZIP64 locator's
+32-bit disk fields — R2-34/R2-35); BZIP2/LZMA/PPMd/Zstd members; legacy unsigned data
+descriptors (no signature — classified UNSUPPORTED, `UNSIGNED_DATA_DESCRIPTOR_UNSUPPORTED`);
+encrypted members with a key (post-decryption scanning); production-scale expansion under a real
+tmpfs. R2 remains OPEN.
+
+## 9. Production placement question (UNRESOLVED — no architecture approved)
+
+> **Question:** How can the required R1/R2 inspection complete **before permanent storage** while
+> maintaining isolation and acceptable cost?
+
+Alternatives and trade-offs (options only — **none approved**):
+
+1. **Synchronous pre-storage inspection in the API path** (after `requireCleanUpload`, before
+   `storage.put`): strongest boundary fidelity; trade-off: API latency for large/nested inputs,
+   CPU contention on web pods, must reuse the single end-to-end budget and hard timeouts.
+2. **Pre-storage hold queue** (scan-then-store: objects land in a quarantined, non-public,
+   retention-bounded staging location only after inspection passes): keeps web path fast;
+   trade-off: staging storage is an attack surface that must itself be isolated, non-public,
+   least-privilege, and retention-bounded; "permanent storage" definition must be amended only via
+   a Change Request.
+3. **Bounded hybrid**: size-capped synchronous inspection (small/medium uploads) + hold queue for
+   the tail; trade-off: two code paths, two budgets to keep identical, higher operational cost.
+
+All options keep the rule: **nothing is durably stored before inspection completes; a post-storage
+worker scan alone never satisfies the boundary.** Decision requires Security + Product gates.
+
+## 10. Licensing observations
+
+- **No new dependencies** introduced (Python stdlib only; Node built-ins only in the test runner).
+  `package.json`, lockfiles, and production sources are untouched.
+- ClamAV remains a separate private GPL-2.0-only INSTREAM scanner (`clamav/clamav:1.4.3`, image
+  digest review required); this PoC does not link, bundle, or redistribute any ClamAV code and does
+  not require the scanner image at runtime. Operators distributing the scanner image must preserve
+  GPL source offer, license, and notices.
+- qpdf (Apache-2.0) is referenced only as an absent-offline capability; not invoked.
+- EICAR test signature is a harmless industry-standard test string, not malware.
+- The 2026-09-10 OCR licensing closure applies only to the Ghostscript-free OCR path and does not
+  close the Licensing Gate for R1/R2. **Licensing Gate remains OPEN.**
+
+## 11. Governance
+
+Preserved verbatim: `CLAMAV-CR-P01` / `CLAMAV-CR-P02` / `CLAMAV-CR-P03` and `CLAMAV-CR-R1` /
+`CLAMAV-CR-R2` are **PROPOSED — NOT APPROVED**. All existing approved decisions are preserved.
+MASTER BASELINE is not amended. Security Gate **OPEN**. Licensing Gate **OPEN**. Stage 7
+**NOT ACCEPTED**. R1/R2 **OPEN**. CI: NOT CHECKED. No live execution workflow was created; no
+workflow was dispatched or polled.
+
+## 12. How to run (offline)
+
+```bash
+# full offline suite + summary (exit 0 only if every expected verdict matches)
+python3 scripts/experiments/phase0c_r1r2_poc.py run
+# self-test: suite + hard invariants (no live scan, no writes, no COMPLETE_SAFE_SCAN, controls)
+python3 scripts/experiments/phase0c_r1r2_poc.py self-test
+# full JSON coverage report
+python3 scripts/experiments/phase0c_r1r2_poc.py report
+
+# python regression suite (explicit; npm test does not run .py files)
+python3 test/phase0c-r1r2-offline-artifacts.py
+
+# node runner (also executed by `npm test` in CI; skips honestly without python3)
+node --test test/phase0c-r1r2-offline.test.mjs
+```
+
+## 13. GO / NO-GO for a future live isolated experiment
+
+**NO-GO today / GO-conditional in future.** The offline PoC proves the bounded prototype, budget
+accounting, fail-closed behaviour, and ledger semantics. A live isolated experiment (private
+container, pinned `clamav/clamav:1.4.3` image with digest review, EICAR corpus, no production
+traffic) may proceed only after:
+
+1. Security + Product approval of the placement question (Section 9) as a Change Request.
+2. ClamAV ZIP64 behaviour re-verification on the live scanner (Phase 0A `D_eicar_zip64` regression)
+   and decision on `CLAMAV-CR-R1`/`R2` (still PROPOSED — NOT APPROVED).
+3. Encrypted-PDF fixture verification with qpdf present (SEC-REQ-02/03) and post-unlock output
+   scanning design.
+4. Live budget tuning (400 MiB cumulative vs 256 MiB tmpfs) under the single end-to-end budget,
+   with tmpfs `size=` proven against worst-case streaming peak (memory + re-parse buffer), not
+   materialised extraction.
+5. Operator preconditions (private network, non-root, read-only rootfs, bounded tmpfs, digest-pinned
+   image) documented and reviewed.
+
+Until then: `CI: NOT CHECKED. Security Gate: OPEN. Licensing Gate: OPEN. Stage 7: NOT ACCEPTED. R1/R2: OPEN.`
