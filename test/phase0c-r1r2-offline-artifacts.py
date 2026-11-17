@@ -350,11 +350,43 @@ class PoCModuleSafetyTests(unittest.TestCase):
     def test_no_filesystem_write_primitives(self) -> None:
         import ast
 
+        # `open` is a filesystem write primitive EXCEPT for `ZipFile.open`,
+        # which opens an in-memory member stream (the stdlib writer used for
+        # the force_zip64 interoperability fixture) — not a filesystem handle.
         write_attrs = {"write", "write_text", "write_bytes", "open"}
         for path in (POC_PATH, FIXTURES_PATH):
             tree = ast.parse(path.read_text())
+            # In-memory zipfile variable names (ZipFile instances): `ZipFile.open`
+            # and the resulting member-stream `.write` are NOT filesystem
+            # primitives — they operate on in-memory bytes only.
+            zip_var_names = set()
+            member_var_names = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.With):
+                    for item in node.items:
+                        expr = item.context_expr
+                        if (isinstance(expr, ast.Call)
+                                and isinstance(expr.func, ast.Attribute)
+                                and expr.func.attr == "ZipFile"
+                                and isinstance(item.optional_vars, ast.Name)):
+                            zip_var_names.add(item.optional_vars.id)
+                        elif (isinstance(expr, ast.Call)
+                                and isinstance(expr.func, ast.Attribute)
+                                and expr.func.attr == "open"
+                                and isinstance(expr.func.value, ast.Name)
+                                and expr.func.value.id in zip_var_names
+                                and isinstance(item.optional_vars, ast.Name)):
+                            member_var_names.add(item.optional_vars.id)
             for node in ast.walk(tree):
                 if isinstance(node, ast.Attribute):
+                    if node.attr == "open":
+                        if (isinstance(node.value, ast.Name)
+                                and node.value.id in zip_var_names):
+                            continue  # in-memory zip member stream, not filesystem
+                    elif node.attr == "write":
+                        if (isinstance(node.value, ast.Name)
+                                and node.value.id in member_var_names):
+                            continue  # writing bytes INTO the in-memory member
                     self.assertNotIn(
                         node.attr, write_attrs,
                         f"filesystem write primitive {node.attr!r} in {path.name}",
@@ -385,8 +417,8 @@ class OfflineSuiteTests(unittest.TestCase):
 
     def test_all_verdicts_match(self) -> None:
         summary = self.report["summary"]
-        self.assertEqual(summary["cases_total"], 53)
-        self.assertEqual(summary["r2_cases"], 37)
+        self.assertEqual(summary["cases_total"], 60)
+        self.assertEqual(summary["r2_cases"], 44)
         self.assertTrue(summary["all_verdicts_match"])
         for case in self.report["cases"]:
             self.assertEqual(case["observed_verdict"], case["expected_verdict"],
@@ -1083,10 +1115,195 @@ class DataDescriptorComplianceTests(unittest.TestCase):
         self.assertIsNone(result["error_code"])
 
 
+class Zip64LfhInteropTests(unittest.TestCase):
+    """REVISION-5: descriptor width from CONSISTENT LFH + CDH ZIP64 evidence.
+
+    The legitimate CPython `zipfile` `force_zip64` streaming combination
+    (LFH 0x0001 extra with zeroed placeholders + CDH small actual sizes +
+    signed 24-byte descriptor) must be INSPECTED; contradictory, missing,
+    truncated or malformed LFH ZIP64 metadata fails closed.
+    """
+
+    def _run_zip(self, data: bytes) -> dict[str, object]:
+        spec = P.CaseSpec("t", "R2", "probe", P.REJECTED, "zip",
+                          lambda: data, limits=P.DEFAULT_RESOURCE_LIMITS)  # type: ignore[arg-type]
+        return P.run_case(spec)
+
+    # --- mandatory positive controls ----------------------------------------
+    def test_cpython_force_zip64_deflate_nonseekable_is_inspected(self) -> None:
+        import struct as _struct
+        import zipfile as _zipfile
+
+        payload = b"Hello DIP security fixture!" * 3
+        data = F.zipfile_nonseekable_force_zip64("hello.txt", payload, method=8)
+        # Structural pre-assertions on the INDEPENDENT archive:
+        # LFH carries a 0x0001 extra ...
+        flags = _struct.unpack_from("<H", data, 6)[0]
+        self.assertEqual(flags & 0x0008, 0x0008, "bit 3 must be set (streaming descriptor)")
+        lfh_csize = _struct.unpack_from("<I", data, 18)[0]
+        lfh_usize = _struct.unpack_from("<I", data, 22)[0]
+        self.assertEqual((lfh_csize, lfh_usize), (0, 0), "streaming LFH sizes are zeroed")
+        nlen = _struct.unpack_from("<H", data, 26)[0]
+        elen = _struct.unpack_from("<H", data, 28)[0]
+        self.assertGreaterEqual(elen, 4)
+        tag, tsize = _struct.unpack_from("<HH", data, 30 + nlen)
+        self.assertEqual((tag, tsize), (0x0001, 16), "LFH 0x0001 extra required")
+        # ... and the CDH holds small ACTUAL sizes without sentinels ...
+        cdh = data.rfind(b"PK\x01\x02")
+        (ccrc, ccsize, cusize) = _struct.unpack_from("<III", data, cdh + 16)
+        self.assertNotEqual(ccsize, 0xFFFFFFFF)
+        self.assertNotEqual(cusize, 0xFFFFFFFF)
+        self.assertEqual(cusize, len(payload))
+        # ... and the signed data descriptor is exactly 24 bytes after the data.
+        dd = data[59 + ccsize:59 + ccsize + 24]
+        self.assertEqual(dd[:4], F.DATA_DESCRIPTOR_SIG)
+        d_crc, d_c, d_u = _struct.unpack_from("<IQQ", dd, 4)
+        self.assertEqual((d_crc, d_c, d_u),
+                         (__import__("zlib").crc32(payload) & 0xFFFFFFFF, ccsize, cusize))
+        # Independent reader round trip.
+        import io
+        with _zipfile.ZipFile(io.BytesIO(data)) as zf:
+            self.assertIsNone(zf.testzip())
+            self.assertEqual(zf.read("hello.txt"), payload)
+        # Phase 0C reader must classify the valid structure as INSPECTED.
+        result = self._run_zip(data)
+        self.assertEqual(result["observed_verdict"], P.INSPECTED)
+        self.assertIsNone(result["error_code"])
+        # The offline security conclusion must remain NOT_COMPLETE_SAFE_SCAN.
+        self.assertEqual(result["conclusion"]["overall_conclusion"], P.NOT_COMPLETE_SAFE_SCAN)
+
+    def test_cpython_force_zip64_stored_nonseekable_is_inspected(self) -> None:
+        payload = b"Hello DIP security fixture!" * 3
+        result = self._run_zip(F.zipfile_nonseekable_force_zip64("hello.txt", payload, method=0))
+        self.assertEqual(result["observed_verdict"], P.INSPECTED)
+        self.assertIsNone(result["error_code"])
+        self.assertEqual(result["conclusion"]["overall_conclusion"], P.NOT_COMPLETE_SAFE_SCAN)
+
+    def test_zip32_control_with_signed_16byte_descriptor_still_inspected(self) -> None:
+        import zlib as _zlib
+
+        crc = _zlib.crc32(EICAR) & 0xFFFFFFFF
+        data = F.build_zip([F.Member("a.bin", EICAR, method=0, flags=0x0008,
+                                     raw_compressed=EICAR,
+                                     raw_data_descriptor=F.zip_data_descriptor_16(
+                                         crc, len(EICAR), len(EICAR)))])
+        result = self._run_zip(data)
+        self.assertEqual(result["observed_verdict"], P.INSPECTED)
+
+    def test_zip64_cdh_sentinel_24byte_descriptor_still_inspected(self) -> None:
+        result = self._run_zip(F.zip64_with_descriptor(EICAR, method=0))
+        self.assertEqual(result["observed_verdict"], P.INSPECTED)
+        self.assertIsNone(result["error_code"])
+
+    # --- mandatory negative cases (all fail closed) ---------------------------
+    def test_lfh_sentinels_without_zip64_extra_are_rejected(self) -> None:
+        import struct as _struct
+
+        payload = EICAR
+        data = F.build_zip([F.Member("p.bin", payload, method=0, version_needed=45,
+                                     lfh_size_override=(0xFFFFFFFF, 0xFFFFFFFF),
+                                     lfh_extra_raw=_struct.pack("<HH", 0x9999, 16) + b"\x00" * 16)])
+        result = self._run_zip(data)
+        self.assertEqual(result["observed_verdict"], P.REJECTED)
+        self.assertEqual(result["error_code"], "MALFORMED_ZIP64_LFH_EXTRA")
+
+    def test_lfh_zip64_extra_tlv_overflow_is_rejected(self) -> None:
+        import struct as _struct
+
+        data = F.build_zip([F.Member("p.bin", EICAR, method=0, version_needed=45,
+                                     lfh_size_override=(0xFFFFFFFF, 0xFFFFFFFF),
+                                     lfh_extra_raw=_struct.pack("<HH", 0x0001, 0xFFFF))])
+        result = self._run_zip(data)
+        self.assertEqual(result["observed_verdict"], P.REJECTED)
+        self.assertEqual(result["error_code"], "MALFORMED_ZIP_EXTRA_FIELD")
+
+    def test_lfh_cdh_size_inconsistency_is_rejected(self) -> None:
+        import struct as _struct
+
+        data = F.build_zip([F.Member("p.bin", EICAR, method=0, version_needed=45,
+                                     lfh_size_override=(0xFFFFFFFF, 0xFFFFFFFF),
+                                     lfh_extra_raw=_struct.pack("<HH", 0x0001, 16)
+                                     + len(EICAR).to_bytes(8, "little")
+                                     + (len(EICAR) + 1).to_bytes(8, "little"))])
+        result = self._run_zip(data)
+        self.assertEqual(result["observed_verdict"], P.REJECTED)
+        self.assertEqual(result["error_code"], "MALFORMED_LFH_CDH_MISMATCH")
+
+    def test_lfh_zip64_member_with_16byte_descriptor_is_rejected(self) -> None:
+        import struct as _struct
+        import zlib as _zlib
+
+        crc = _zlib.crc32(EICAR) & 0xFFFFFFFF
+        data = F.build_zip([F.Member("p.bin", EICAR, method=0, version_needed=45, flags=0x0008,
+                                     lfh_size_override=(0xFFFFFFFF, 0xFFFFFFFF),
+                                     lfh_extra_raw=_struct.pack("<HH", 0x0001, 16)
+                                     + len(EICAR).to_bytes(8, "little")
+                                     + len(EICAR).to_bytes(8, "little"),
+                                     raw_compressed=EICAR,
+                                     raw_data_descriptor=F.zip_data_descriptor_16(
+                                         crc, len(EICAR), len(EICAR)))])
+        result = self._run_zip(data)
+        self.assertEqual(result["observed_verdict"], P.REJECTED)
+        self.assertEqual(result["error_code"], "INVALID_DATA_DESCRIPTOR")
+
+    def test_lfh_zip64_offset_contradiction_is_rejected(self) -> None:
+        import struct as _struct
+
+        data = F.build_zip([F.Member("p.bin", EICAR, method=0, version_needed=45,
+                                     lfh_size_override=(0xFFFFFFFF, 0xFFFFFFFF),
+                                     lfh_extra_raw=_struct.pack("<HH", 0x0001, 24)
+                                     + len(EICAR).to_bytes(8, "little")
+                                     + len(EICAR).to_bytes(8, "little")
+                                     + (12345).to_bytes(8, "little"))])
+        result = self._run_zip(data)
+        self.assertEqual(result["observed_verdict"], P.REJECTED)
+        self.assertEqual(result["error_code"], "MALFORMED_ZIP64_LFH_EXTRA")
+
+    def test_nonstreaming_sentinel_zero_placeholder_is_rejected(self) -> None:
+        """Unit: bit 3 NOT set — a zero 0x0001 placeholder does not resolve a sentinel."""
+        import struct as _struct
+
+        body = _struct.pack("<HH", 0x0001, 16) + b"\x00" * 16
+        with self.assertRaises(P.RejectionError) as ctx:
+            P._parse_lfh_zip64(body, lfh_csize_raw=0xFFFFFFFF, lfh_usize_raw=0xFFFFFFFF,
+                               lfh_position=0, cdh_csize=len(EICAR), cdh_usize=len(EICAR),
+                               streaming=False)
+        self.assertEqual(ctx.exception.code, "MALFORMED_ZIP64_LFH_EXTRA")
+
+    def test_streaming_zero_placeholders_are_validated_evidence(self) -> None:
+        """Unit: the CPython force_zip64 pattern (zeros, bit 3 set) is ZIP64 evidence."""
+        import struct as _struct
+
+        body = _struct.pack("<HH", 0x0001, 16) + b"\x00" * 16
+        self.assertTrue(P._parse_lfh_zip64(body, lfh_csize_raw=0, lfh_usize_raw=0,
+                                           lfh_position=0, cdh_csize=81, cdh_usize=81,
+                                           streaming=True))
+        # Non-zero values must still agree with the CDH.
+        body_bad = _struct.pack("<HH", 0x0001, 16) + (82).to_bytes(8, "little")             + (81).to_bytes(8, "little")
+        with self.assertRaises(P.RejectionError) as ctx:
+            P._parse_lfh_zip64(body_bad, lfh_csize_raw=0, lfh_usize_raw=0,
+                               lfh_position=0, cdh_csize=81, cdh_usize=81, streaming=True)
+        self.assertEqual(ctx.exception.code, "MALFORMED_LFH_CDH_MISMATCH")
+
+    def test_unexpected_trailing_compressed_bytes_still_rejected(self) -> None:
+        data = F.build_zip([F.Member("t.bin", EICAR, method=8,
+                                     raw_compressed=F.deflate_two_block(EICAR) + b"\x00\xffz")])
+        result = self._run_zip(data)
+        self.assertEqual(result["observed_verdict"], P.REJECTED)
+        self.assertEqual(result["error_code"], "UNEXPECTED_TRAILING_COMPRESSED_DATA")
+
+    def test_missing_descriptor_with_bit3_still_rejected(self) -> None:
+        result = self._run_zip(F.build_zip([F.Member("nod.bin", EICAR, method=0, flags=0x0008)]))
+        self.assertEqual(result["observed_verdict"], P.REJECTED)
+        self.assertEqual(result["error_code"], "INVALID_DATA_DESCRIPTOR")
+
+
 class ReportRevisionTests(unittest.TestCase):
     def test_report_records_revisions_and_accounting_scope(self) -> None:
         report = P.run_offline_suite()
-        self.assertEqual(len(report["revisions"]), 4)
+        self.assertEqual(len(report["revisions"]), 5)
+        self.assertIn("REVISION-5", report["revisions"][4])
+        self.assertIn("force_zip64", report["revisions"][4])
         self.assertIn("REVISION-4", report["revisions"][3])
         self.assertIn("data descriptor", report["revisions"][3])
         scope = report["resource_budget"]["accounting_scope"]
@@ -1098,14 +1315,16 @@ class ReportRevisionTests(unittest.TestCase):
             "R2-13", "R2-14", "R2-15", "R2-16", "R2-17", "R2-18",
             "R2-19", "R2-20", "R2-21", "R2-22", "R2-23", "R2-24", "R2-25",
             "R2-26", "R2-27", "R2-28", "R2-29", "R2-30", "R2-31", "R2-32",
-            "R2-33", "R2-34", "R2-35", "R2-36", "R2-37",
+            "R2-33", "R2-34", "R2-35", "R2-36", "R2-37", "R2-38", "R2-39",
+            "R2-40", "R2-41", "R2-42", "R2-43", "R2-44",
         ):
             self.assertIn(expected, ids)
         # All malformed/ambiguous structures rejected or unsupported, never INSPECTED.
         by_id = {case["case_id"]: case for case in report["cases"]}
         for case_id in ("R2-13", "R2-14", "R2-16", "R2-19", "R2-20",
                         "R2-26", "R2-27", "R2-28", "R2-29", "R2-30", "R2-31",
-                        "R2-33", "R2-34", "R2-35", "R2-37"):
+                        "R2-33", "R2-34", "R2-35", "R2-37", "R2-40", "R2-41",
+                        "R2-42", "R2-43", "R2-44"):
             self.assertIn(by_id[case_id]["observed_verdict"],
                           (P.REJECTED, P.UNSUPPORTED, P.NOT_VERIFIED))
         # Descriptor standards-compliance matrix codes (REVISION-4).
@@ -1119,12 +1338,21 @@ class ReportRevisionTests(unittest.TestCase):
             ("R2-35", "MULTI_DISK_ZIP_UNSUPPORTED"),
             ("R2-36", "UNSIGNED_DATA_DESCRIPTOR_UNSUPPORTED"),
             ("R2-37", "UNDECLARED_DATA_DESCRIPTOR"),
+            ("R2-38", None), ("R2-39", None),
+            ("R2-40", "MALFORMED_ZIP64_LFH_EXTRA"),
+            ("R2-41", "MALFORMED_ZIP_EXTRA_FIELD"),
+            ("R2-42", "MALFORMED_LFH_CDH_MISMATCH"),
+            ("R2-43", "INVALID_DATA_DESCRIPTOR"),
+            ("R2-44", "MALFORMED_ZIP64_LFH_EXTRA"),
         ):
             self.assertEqual(by_id[case_id]["error_code"], code, case_id)
         self.assertEqual(by_id["R2-24"]["observed_verdict"], P.INSPECTED)
         self.assertEqual(by_id["R2-25"]["observed_verdict"], P.INSPECTED)
         self.assertEqual(by_id["R2-32"]["observed_verdict"], P.INSPECTED)
         self.assertEqual(by_id["R2-36"]["observed_verdict"], P.UNSUPPORTED)
+        # REVISION-5: the force_zip64 interoperability cases are INSPECTED.
+        self.assertEqual(by_id["R2-38"]["observed_verdict"], P.INSPECTED)
+        self.assertEqual(by_id["R2-39"]["observed_verdict"], P.INSPECTED)
 
 
 if __name__ == "__main__":

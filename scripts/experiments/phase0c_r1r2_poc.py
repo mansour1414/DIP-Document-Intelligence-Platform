@@ -700,6 +700,79 @@ def _inflate_bounded(compressed: memoryview, chunk_bytes: int) -> tuple[Iterable
     return stream(), result
 
 
+def _parse_lfh_zip64(extra: bytes, *, lfh_csize_raw: int, lfh_usize_raw: int,
+                     lfh_position: int, cdh_csize: int, cdh_usize: int,
+                     streaming: bool) -> bool:
+    """Parse and validate the local header's 0x0001 ZIP64 extra field (APPNOTE 4.3.14).
+
+    Returns True when the member carries ZIP64 local-header metadata — size
+    sentinels (0xFFFFFFFF) and/or a 0x0001 extra field. That evidence, combined
+    with the CDH evidence, selects the signed data-descriptor width; the width
+    is NEVER guessed from the descriptor bytes themselves.
+
+    Fail-closed rules:
+      * TLV overflow or duplicate 0x0001 TLV in the LFH extra ⇒ rejected;
+      * LFH size sentinels WITHOUT a 0x0001 extra ⇒ rejected
+        (`MALFORMED_ZIP64_LFH_EXTRA`);
+      * a non-streaming member (bit 3 not set) whose sentinel is not resolved
+        by a NON-ZERO 64-bit value ⇒ rejected (zero placeholders are only
+        legitimate under bit-3 streaming, where the descriptor carries the
+        verified sizes — CPython `force_zip64` over a non-seekable stream
+        writes exactly this);
+      * non-zero provided values are verified metadata and must agree with the
+        Central Directory (usize/csize) and with the ACTUAL LFH position
+        (local offset); contradictions are rejected;
+      * a non-zero disk-start value ⇒ multi-disk ⇒ rejected.
+
+    Field order inside the local-header 0x0001 body (APPNOTE): uncompressed
+    size, compressed size, local header offset, disk start — each 8 bytes,
+    only as many as present.
+    """
+    lfh_zip64 = (lfh_csize_raw == 0xFFFFFFFF) or (lfh_usize_raw == 0xFFFFFFFF)
+    pos = 0
+    body: bytes | None = None
+    while pos + 4 <= len(extra):
+        tag, size = struct.unpack_from("<HH", extra, pos)
+        pos += 4
+        if pos + size > len(extra):
+            raise RejectionError("MALFORMED_ZIP_EXTRA_FIELD", "LFH extra TLV length overflow")
+        if tag == 0x0001:
+            if body is not None:
+                raise RejectionError("MALFORMED_ZIP_EXTRA_FIELD", "duplicate LFH 0x0001 TLV")
+            body = extra[pos:pos + size]
+        pos += size
+    if body is None:
+        if lfh_zip64:
+            raise RejectionError("MALFORMED_ZIP64_LFH_EXTRA",
+                                 "LFH size sentinels without a 0x0001 ZIP64 extra field")
+        return False
+    lfh_zip64 = True
+    if len(body) % 8 != 0 or len(body) > 32:
+        raise RejectionError("MALFORMED_ZIP64_LFH_EXTRA",
+                             "LFH 0x0001 body must hold 1..4 ordered 8-byte fields")
+    values = [struct.unpack_from("<Q", body, i)[0] for i in range(0, len(body), 8)]
+    if len(values) >= 1 and values[0] and values[0] != cdh_usize:
+        raise RejectionError("MALFORMED_LFH_CDH_MISMATCH",
+                             "LFH zip64 uncompressed size contradicts the Central Directory")
+    if len(values) >= 2 and values[1] and values[1] != cdh_csize:
+        raise RejectionError("MALFORMED_LFH_CDH_MISMATCH",
+                             "LFH zip64 compressed size contradicts the Central Directory")
+    if len(values) >= 3 and values[2] and values[2] != lfh_position:
+        raise RejectionError("MALFORMED_ZIP64_LFH_EXTRA",
+                             "LFH zip64 local-header offset contradicts the actual position")
+    if len(values) >= 4 and values[3]:
+        raise RejectionError("MULTI_DISK_ZIP_UNSUPPORTED", "LFH zip64 disk start non-zero")
+    if not streaming:
+        # Non-streaming member: the sentinel must be resolved by a NON-ZERO value.
+        if lfh_usize_raw == 0xFFFFFFFF and (len(values) < 1 or values[0] == 0):
+            raise RejectionError("MALFORMED_ZIP64_LFH_EXTRA",
+                                 "LFH usize sentinel not resolved by a non-zero 0x0001 value")
+        if lfh_csize_raw == 0xFFFFFFFF and (len(values) < 2 or values[1] == 0):
+            raise RejectionError("MALFORMED_ZIP64_LFH_EXTRA",
+                                 "LFH csize sentinel not resolved by a non-zero 0x0001 value")
+    return True
+
+
 _DATA_DESCRIPTOR_SIG = b"PK\x07\x08"
 _KNOWN_RECORD_SIGS = (LFH_SIG, CDH_SIG, EOCD_SIG, ZIP64_EOCD_SIG, ZIP64_LOCATOR_SIG)
 
@@ -716,13 +789,18 @@ def _validate_data_descriptor(*, data: bytes, data_start: int, compressed_size: 
     field describes the compressed file data and does NOT include the
     descriptor.
 
-    Width selection uses VERIFIED format metadata, never descriptor sniffing:
-    a ZIP64 member (0xFFFFFFFF sentinels resolved from the 0x0001 extra)
-    requires the signed 24-byte ZIP64 form — Signature(4) + CRC32(4) +
-    CompressedSize64(8) + UncompressedSize64(8) (APPNOTE 4.3.9; Go
-    archive/zip; CPython zipfile ``<LLQQ``). All other members require the
-    signed 16-byte form — Signature(4) + CRC32(4) + CompressedSize32(4) +
-    UncompressedSize32(4) (CPython zipfile ``<LLLL``).
+    Width selection uses VERIFIED format metadata from BOTH headers, never
+    descriptor sniffing: a member with ZIP64 local-header metadata (LFH size
+    sentinels or a 0x0001 extra field, validated by `_parse_lfh_zip64`) OR
+    ZIP64 central-directory metadata (CDH 0xFFFFFFFF sentinels resolved from
+    the 0x0001 extra) requires the signed 24-byte ZIP64 form —
+    Signature(4) + CRC32(4) + CompressedSize64(8) + UncompressedSize64(8)
+    (APPNOTE 4.3.9; Go archive/zip; CPython zipfile ``<LLQQ``). This covers
+    the legitimate CPython ``force_zip64`` streaming combination where the
+    CDH keeps ordinary small 32-bit sizes (no sentinels) but the LFH carries
+    ZIP64 metadata. All other members require the signed 16-byte form —
+    Signature(4) + CRC32(4) + CompressedSize32(4) + UncompressedSize32(4)
+    (CPython zipfile ``<LLLL``).
 
     The legacy UNSIGNED form (no signature) is out of scope: it raises
     UnsupportedError (classified UNSUPPORTED, documented compatibility
@@ -790,8 +868,8 @@ def _validate_data_descriptor(*, data: bytes, data_start: int, compressed_size: 
 
 def _stream_member(budget: ResourceBudget, *, data: bytes, entry: _CentralEntry,
                    scanner: ScannerAdapter,
-                   next_local_offset: int | None = None) -> tuple[int, int, bytes | None, str]:
-    """Stream ONE member in bounded chunks. Returns (actual_bytes, crc, nested_bytes, first_type).
+                   next_local_offset: int | None = None) -> tuple[int, int, bytes | None, str, bool]:
+    """Stream ONE member in bounded chunks. Returns (actual, crc, nested_bytes, first_type, lfh_zip64).
 
     Standards data-descriptor placement (Finding-1 correction): the member's
     compressed data occupies `data_start .. data_start + csize` EXACTLY — the
@@ -809,6 +887,14 @@ def _stream_member(budget: ResourceBudget, *, data: bytes, entry: _CentralEntry,
     lfh_flags, lfh_method = struct.unpack_from("<HH", data, entry.local_offset + 6)
     if lfh_flags != entry.flags or lfh_method != entry.method:
         raise RejectionError("MALFORMED_LFH_CDH_MISMATCH")
+    lfh_csize_raw, lfh_usize_raw = struct.unpack_from("<II", data, entry.local_offset + 18)
+    lfh_extra = data[entry.local_offset + 30 + lfh_name_len:data_start]
+    # ZIP64 local-header metadata (sentinels and/or 0x0001 extra) is validated
+    # here, together with the CDH metadata, to select the descriptor width.
+    lfh_zip64 = _parse_lfh_zip64(
+        lfh_extra, lfh_csize_raw=lfh_csize_raw, lfh_usize_raw=lfh_usize_raw,
+        lfh_position=entry.local_offset, cdh_csize=entry.csize,
+        cdh_usize=entry.usize, streaming=bool(entry.flags & 0x0008))
 
     if entry.flags & 0x0001 or entry.flags & 0x0040 or entry.flags & 0x2000 or entry.method == 99:
         raise RejectionError("ENCRYPTED_MEMBER", "encrypted archive member: no key, fail closed")
@@ -872,7 +958,8 @@ def _stream_member(budget: ResourceBudget, *, data: bytes, entry: _CentralEntry,
     # Data descriptor: AFTER the compressed data at data_start + csize.
     _validate_data_descriptor(
         data=data, data_start=data_start, compressed_size=entry.csize,
-        flags=entry.flags, zip64_sizes=entry.zip64_sizes, actual=actual, crc=crc,
+        flags=entry.flags, zip64_sizes=(lfh_zip64 or entry.zip64_sizes),
+        actual=actual, crc=crc,
         next_local_offset=next_local_offset,
     )
 
@@ -880,7 +967,7 @@ def _stream_member(budget: ResourceBudget, *, data: bytes, entry: _CentralEntry,
     if nested is not None:
         budget.reserve_memory(len(nested))
         nested_bytes = bytes(nested)
-    return actual, crc, nested_bytes, sniff_content_type(first_chunk)
+    return actual, crc, nested_bytes, sniff_content_type(first_chunk), lfh_zip64
 
 
 def _inspect_one_member(budget: ResourceBudget, ledger: CoverageLedger, *,
@@ -891,7 +978,7 @@ def _inspect_one_member(budget: ResourceBudget, ledger: CoverageLedger, *,
     budget.check_depth(depth)  # member depth also counts against the recursion budget
     scanner = scanner_factory()
     try:
-        actual, crc, nested_bytes, detected = _stream_member(
+        actual, crc, nested_bytes, detected, lfh_zip64 = _stream_member(
             budget, data=data, entry=entry, scanner=scanner,
             next_local_offset=next_local_offset
         )
@@ -931,6 +1018,8 @@ def _inspect_one_member(budget: ResourceBudget, ledger: CoverageLedger, *,
     notes = [f"declared_size={entry.usize}", f"method={entry.method}"]
     if entry.zip64_extra:
         notes.append("ZIP64_EXTRA_FIELD_RESOLVED")
+    if lfh_zip64:
+        notes.append("ZIP64_LFH_METADATA")
     record = ObjectRecord(
         object_path=member_path, depth=depth, detected_content_type=detected,
         structural_verdict="BOUNDED_STREAMING_READ_COMPLETE", verdict=INSPECTED,
@@ -1825,6 +1914,77 @@ def build_case_suite() -> list[CaseSpec]:
                                         raw_data_descriptor=_dd16_eicar)]),
         notes=["UNDECLARED_DATA_DESCRIPTOR: contradictory structure rejected"],
     ))
+    # --- ZIP64 LFH/CDH descriptor-width interoperability cases (REVISION-5) -
+    _force_payload = b"Hello DIP security fixture!" * 3
+    cases.append(CaseSpec(
+        "R2-38", "R2", "Independent writer: CPython zipfile force_zip64 (DEFLATE) over a non-seekable stream "
+                     "(LFH 0x0001 extra + CDH small sizes + signed 24-byte descriptor)",
+        INSPECTED, "zip",
+        lambda: fx.zipfile_nonseekable_force_zip64("hello.txt", _force_payload, method=8),
+        notes=["the legitimate LFH-ZIP64/CDH-small-size combination must be INSPECTED; width resolved "
+               "from verified LFH+CDH evidence, not from the CDH sentinels alone"],
+    ))
+    cases.append(CaseSpec(
+        "R2-39", "R2", "Independent writer: CPython zipfile force_zip64 (STORED) over a non-seekable stream",
+        INSPECTED, "zip",
+        lambda: fx.zipfile_nonseekable_force_zip64("hello.txt", _force_payload, method=0),
+        notes=["same combination with ZIP_STORED: INSPECTED"],
+    ))
+    _force_crc = zlib.crc32(_force_payload) & 0xFFFFFFFF
+    _force_lfh_extra_ok = struct.pack("<HH", 0x0001, 16) + len(_force_payload).to_bytes(8, "little") \
+        + len(_force_payload).to_bytes(8, "little")
+    cases.append(CaseSpec(
+        "R2-40", "R2", "LFH size sentinels WITHOUT a 0x0001 ZIP64 extra field",
+        REJECTED, "zip",
+        lambda: fx.build_zip([fx.Member("p.bin", _force_payload, method=0, version_needed=45,
+                                        lfh_size_override=(0xFFFFFFFF, 0xFFFFFFFF),
+                                        lfh_extra_raw=struct.pack("<HH", 0x9999, 16)
+                                        + b"\x00" * 16)]),
+        notes=["MALFORMED_ZIP64_LFH_EXTRA: sentinels must be resolvable from a 0x0001 extra"],
+    ))
+    cases.append(CaseSpec(
+        "R2-41", "R2", "LFH 0x0001 extra field with a TLV length overflow",
+        REJECTED, "zip",
+        lambda: fx.build_zip([fx.Member("p.bin", _force_payload, method=0, version_needed=45,
+                                        lfh_size_override=(0xFFFFFFFF, 0xFFFFFFFF),
+                                        lfh_extra_raw=struct.pack("<HH", 0x0001, 0xFFFF))]),
+        notes=["MALFORMED_ZIP_EXTRA_FIELD: truncated/malformed extra structures are rejected"],
+    ))
+    cases.append(CaseSpec(
+        "R2-42", "R2", "LFH 0x0001 compressed size contradicts the Central Directory size",
+        REJECTED, "zip",
+        lambda: fx.build_zip([fx.Member("p.bin", _force_payload, method=0, version_needed=45,
+                                        lfh_size_override=(0xFFFFFFFF, 0xFFFFFFFF),
+                                        lfh_extra_raw=struct.pack("<HH", 0x0001, 16)
+                                        + len(_force_payload).to_bytes(8, "little")
+                                        + (len(_force_payload) + 1).to_bytes(8, "little"))]),
+        notes=["MALFORMED_LFH_CDH_MISMATCH: non-zero LFH zip64 values are verified against the CDH"],
+    ))
+    cases.append(CaseSpec(
+        "R2-43", "R2", "LFH-ZIP64 member (sentinels + extra, small CDH) followed by a 16-byte descriptor",
+        REJECTED, "zip",
+        lambda: fx.build_zip([fx.Member("p.bin", _force_payload, method=0, version_needed=45,
+                                        flags=0x0008,
+                                        lfh_size_override=(0xFFFFFFFF, 0xFFFFFFFF),
+                                        lfh_extra_raw=_force_lfh_extra_ok,
+                                        raw_compressed=_force_payload,
+                                        raw_data_descriptor=fx.zip_data_descriptor_16(
+                                            _force_crc, len(_force_payload), len(_force_payload)))]),
+        notes=["INVALID_DATA_DESCRIPTOR: LFH zip64 evidence selects the 24-byte width; a 16-byte "
+               "descriptor is an incompatible width combination"],
+    ))
+    cases.append(CaseSpec(
+        "R2-44", "R2", "LFH 0x0001 local-header offset value contradicts the actual LFH position",
+        REJECTED, "zip",
+        lambda: fx.build_zip([fx.Member("p.bin", _force_payload, method=0, version_needed=45,
+                                        lfh_size_override=(0xFFFFFFFF, 0xFFFFFFFF),
+                                        lfh_extra_raw=struct.pack("<HH", 0x0001, 24)
+                                        + len(_force_payload).to_bytes(8, "little")
+                                        + len(_force_payload).to_bytes(8, "little")
+                                        + (12345).to_bytes(8, "little"))]),
+        notes=["MALFORMED_ZIP64_LFH_EXTRA: the zip64 local-header offset, when present, must match "
+               "the actual position"],
+    ))
     # --------------------------- CONTROLS ----------------------------------
     cases.append(CaseSpec(
         "CTRL-POS-01", "CONTROL", "Independent POSITIVE control: direct EICAR test signature",
@@ -1903,6 +2063,7 @@ def run_offline_suite(*, start_tracemalloc: bool = True) -> dict[str, object]:
             "REVISION-2: per-member accounting contract corrected (member_bytes = running total INCLUDING current chunk; exactly-at-ceiling allowed, one byte over rejected); cumulative expanded-byte ceiling enforced independently and shared by nested members",
             "REVISION-3: generic exception handler no longer relies on error.code (explicit bounded code UNEXPECTED_PARSER_ERROR + length-capped message); fixture generation moved inside the fail-closed boundary (unexpected builder failure => structured REJECTED case, never a crash); ZIP64 EOCD locator now validated positionally instead of by whole-file magic search",
             "REVISION-4: ZIP data descriptor STANDARDS-COMPLIANCE correction — (a) descriptors are now read/validated at data_start + csize, i.e. AFTER the compressed member data (the CDH compressed-size field excludes the descriptor); presence is required exactly when general-purpose bit 3 is set; the record following the descriptor must be a valid LFH/CDH and a following LFH must sit exactly at the next CDH local offset; malformed/overlapping/contradictory/truncated/ambiguous structures are rejected (INVALID_DATA_DESCRIPTOR / TRUNCATED_DATA_DESCRIPTOR / UNDECLARED_DATA_DESCRIPTOR / UNEXPECTED_TRAILING_COMPRESSED_DATA); (b) the 24-byte form is the signed ZIP64 descriptor Signature(4)+CRC32(4)+CompressedSize64(8)+UncompressedSize64(8) with NO local-header-offset field (APPNOTE 4.3.9; Go archive/zip; CPython zipfile <LLQQ>); width is selected from verified metadata (CDH 0xFFFFFFFF sentinels) and incompatible widths are rejected; the legacy unsigned form is classified UNSUPPORTED (UNSIGNED_DATA_DESCRIPTOR_UNSUPPORTED); (c) ZIP64 EOCD locator disk-number and total-disk-count fields validated as 32-bit with multi-disk archives fail-closed; (d) interop evidence: CPython 3.11.2 zipfile writing to a non-seekable stream (case R2-25) is accepted by this reader",
+            "REVISION-5: ZIP64 data-descriptor WIDTH RESOLUTION corrected — the signed descriptor width is now selected from CONSISTENT VALIDATED EVIDENCE across BOTH headers: LFH ZIP64 metadata (size sentinels and/or the 0x0001 extra field, parsed and cross-checked against the CDH and the ACTUAL LFH position) OR CDH 0xFFFFFFFF sentinels. This accepts the legitimate CPython `zipfile` `force_zip64` streaming combination (LFH 0x0001 extra with zeroed placeholders + CDH ordinary small 32-bit sizes + signed 24-byte descriptor, cases R2-38/R2-39) that was previously misrejected because the CDH carried no sentinels. New fail-closed codes: MALFORMED_ZIP64_LFH_EXTRA (sentinels without a 0x0001 extra, malformed/truncated 0x0001 body, contradictory local-header offset, unresolved non-streaming sentinels); inconsistent non-zero LFH/CDH sizes reuse MALFORMED_LFH_CDH_MISMATCH. No existing fail-closed test was weakened",
         ],
         "tool_capabilities": tool_capabilities(),
         "resource_budget": {

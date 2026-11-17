@@ -70,6 +70,8 @@ class Member:
     lfh_method_override: int | None = None  # write a DIFFERENT method in the LFH (mismatch probe)
     cdh_extra_raw: bytes | None = None      # verbatim CDH extra field bytes (malformed-structure probe)
     raw_data_descriptor: bytes | None = None  # appended AFTER the member data (CDH csize excludes it)
+    lfh_size_override: tuple[int, int] | None = None  # (csize, usize) written verbatim in the LFH
+    lfh_extra_raw: bytes | None = None      # verbatim LFH extra field bytes (malformed-structure probe)
 
 
 def _zip64_extra(uncompressed: int, compressed: int, local_offset: int = 0,
@@ -108,13 +110,19 @@ def build_zip(members: Iterable[Member], *, zip64_eocd: bool = False) -> bytes:
         lfh_method = (member.lfh_method_override
                       if member.lfh_method_override is not None else member.method)
 
-        lfh_extra = _zip64_extra(usize, csize) if member.lfh_zip64 else b""
+        if member.lfh_extra_raw is not None:
+            lfh_extra = member.lfh_extra_raw
+        else:
+            lfh_extra = _zip64_extra(usize, csize) if member.lfh_zip64 else b""
         if member.cdh_extra_raw is not None:
             cdh_extra = member.cdh_extra_raw
         else:
             cdh_extra = _zip64_extra(usize, csize) if member.cdh_zip64 else b""
-        lfh_csize = 0xFFFFFFFF if member.lfh_zip64 else csize
-        lfh_usize = 0xFFFFFFFF if member.lfh_zip64 else usize
+        if member.lfh_size_override is not None:
+            lfh_csize, lfh_usize = member.lfh_size_override
+        else:
+            lfh_csize = 0xFFFFFFFF if member.lfh_zip64 else csize
+            lfh_usize = 0xFFFFFFFF if member.lfh_zip64 else usize
         cdh_csize = 0xFFFFFFFF if member.cdh_zip64 else csize
         cdh_usize = member.usize_lie if member.usize_lie is not None else (
             0xFFFFFFFF if member.cdh_zip64 else usize
@@ -463,6 +471,28 @@ class NonSeekableBytesIO:
     @property
     def bytes(self) -> bytes:
         return bytes(self._buf)
+
+
+def zipfile_nonseekable_force_zip64(name: str, payload: bytes,
+                                    method: int = 8) -> bytes:
+    """CPython ``zipfile`` with ``force_zip64=True`` over a non-seekable stream.
+
+    Observed layout (CPython 3.11.2): the LFH stores zeroed CRC/size fields,
+    a 0x0001 ZIP64 extra field (zeroed 64-bit values — placeholders, since the
+    stream is written before the sizes are known), a signed 24-byte ZIP64 data
+    descriptor AFTER the compressed data, and the Central Directory keeps the
+    actual small 32-bit sizes (NO sentinels). The archive is NOT a ZIP64
+    container (no ZIP64 EOCD/locator) — ZIP64 here is member-level format.
+    This is exactly the combination that must be accepted as INSPECTED.
+    """
+    import zipfile as _zipfile
+
+    compress_type = _zipfile.ZIP_STORED if method == 0 else _zipfile.ZIP_DEFLATED
+    stream = NonSeekableBytesIO()
+    with _zipfile.ZipFile(stream, "w", compression=compress_type) as zf:
+        with zf.open(name, "w", force_zip64=True) as member:
+            member.write(payload)
+    return stream.bytes
 
 
 def zipfile_nonseekable_archive(members: list[tuple[str, bytes, int]]) -> bytes:

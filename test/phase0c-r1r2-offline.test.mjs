@@ -91,11 +91,12 @@ test("Phase 0C report: verdict taxonomy and coverage invariants", async (t) => {
   assert.equal(report.filesystem_extraction_writes, 0);
 
   // Verdicts: all expected verdicts match; COMPLETE_SAFE_SCAN is never claimed.
-  // 53 cases: original 28-case matrix preserved + 10 Finding-1/2/3 regression
+  // 60 cases: original 28-case matrix preserved + 10 Finding-1/2/3 regression
   // cases (R2-13..R2-22) + 15 data-descriptor standards-compliance cases
-  // (R2-23..R2-37) for REVISION-4.
-  assert.equal(report.summary.cases_total, 53);
-  assert.equal(report.summary.r2_cases, 37);
+  // (R2-23..R2-37) for REVISION-4 + 7 ZIP64 descriptor-width interop cases
+  // (R2-38..R2-44) for REVISION-5.
+  assert.equal(report.summary.cases_total, 60);
+  assert.equal(report.summary.r2_cases, 44);
   assert.equal(report.summary.all_verdicts_match, true);
   assert.equal(report.summary.complete_safe_scan_claimed, false);
   assert.deepEqual(report.summary.conclusions_observed, ["NOT_COMPLETE_SAFE_SCAN"]);
@@ -158,13 +159,15 @@ test("Phase 0C report: governance preserved verbatim", async (t) => {
   assert.equal(report.r1.complete_r1_remediation_claimed, false);
   assert.equal(report.r2.complete_r2_remediation_claimed, false);
 
-  // The four revision entries are recorded verbatim in the report.
-  assert.equal(report.revisions.length, 4);
+  // The five revision entries are recorded verbatim in the report.
+  assert.equal(report.revisions.length, 5);
   assert.match(report.revisions[0], /TRUNCATED_DEFLATE_STREAM/u);
   assert.match(report.revisions[1], /per-member/u);
   assert.match(report.revisions[2], /UNEXPECTED_PARSER_ERROR/u);
   assert.match(report.revisions[3], /data descriptor/u);
   assert.match(report.revisions[3], /data_start \+ csize/u);
+  assert.match(report.revisions[4], /force_zip64/u);
+  assert.match(report.revisions[4], /MALFORMED_ZIP64_LFH_EXTRA/u);
 
   // PoC accounting is explicitly distinguished from OS-enforced limits.
   assert.equal(report.resource_budget.accounting_scope.level, "APPLICATION_LEVEL_POC_ACCOUNTING");
@@ -221,6 +224,23 @@ test("Phase 0C report: governance preserved verbatim", async (t) => {
   // Undeclared descriptor signature: contradictory structure, rejected.
   assert.equal(byId2["R2-37"].error_code, "UNDECLARED_DATA_DESCRIPTOR");
   assert.equal(byId2["R2-37"].observed_verdict, "REJECTED");
+
+  // REVISION-5: ZIP64 descriptor-width resolution from consistent LFH+CDH
+  // evidence (CPython force_zip64 streaming interop).
+  for (const id of ["R2-38", "R2-39"]) {
+    assert.equal(byId2[id].observed_verdict, "INSPECTED", id);
+    assert.equal(byId2[id].error_code, null, id);
+  }
+  for (const [id, code] of [
+    ["R2-40", "MALFORMED_ZIP64_LFH_EXTRA"],
+    ["R2-41", "MALFORMED_ZIP_EXTRA_FIELD"],
+    ["R2-42", "MALFORMED_LFH_CDH_MISMATCH"],
+    ["R2-43", "INVALID_DATA_DESCRIPTOR"],
+    ["R2-44", "MALFORMED_ZIP64_LFH_EXTRA"],
+  ]) {
+    assert.equal(byId2[id].error_code, code, id);
+    assert.equal(byId2[id].observed_verdict, "REJECTED", id);
+  }
 
   // Single shared end-to-end budget, including the scanner feed.
   assert.equal(report.resource_budget.single_end_to_end_budget, true);

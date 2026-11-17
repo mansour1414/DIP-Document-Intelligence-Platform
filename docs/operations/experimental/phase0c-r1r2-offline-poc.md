@@ -215,6 +215,7 @@ dependency changed.
 | 1 | **Incorrect descriptor location.** The validator expected the data descriptor *inside* the declared compressed-size window (i.e. it assumed `csize` covered the descriptor). Standards-compliant streaming writers (e.g. CPython `zipfile` non-seekable mode) set the CDH/LFH compressed-size to the compressed data **only** and write the descriptor **after** it, so genuine streaming ZIPs were rejected and the window check contradicted the CDH. | Descriptor is now read/validated at `data_start + csize` (after the compressed data); presence is required exactly when bit 3 is set; the following record must be a valid LFH/CDH and a following LFH must match the next CDH local offset; malformed / overlapping / contradictory / truncated / ambiguous structures are rejected; DEFLATE EOF, actual-byte counts, CRC, and cumulative limits remain strict. | Shipped cases R2-15, R2-23..R2-33 + `DataDescriptorComplianceTests` (20 tests). |
 | 2 | **Incorrect 24-byte ZIP64 descriptor layout.** The fixture/validator used `sig(4)+CRC(4)+CSize(4)+USize(4)+LocalOffset(8)` — that layout is not the standard ZIP64 data descriptor and does not match any independent writer. | The 24-byte form is now `sig(4)+CRC32(4)+CompressedSize64(8)+UncompressedSize64(8)` — **no local-header-offset field** (PKWARE APPNOTE 4.3.9; Go `archive/zip` `struct.go`/`writer.go`; CPython `zipfile` `struct.pack('<LLQQ', ...)`). Width is selected from verified CDH sentinel metadata; ambiguous/incompatible widths are rejected; genuine signed 16-byte and 24-byte controls shipped; the legacy unsigned form is classified `UNSUPPORTED` with documented compatibility impact (legacy streaming writers that omit the signature are not inspected — never silently accepted, never reported corrupt). | Shipped cases R2-24, R2-29, R2-30, R2-36 + `DataDescriptorComplianceTests` (24-byte acceptance, both wrong-width directions, unsigned classification). |
 | 3 | **Narrow ZIP64 EOCD-locator check.** The locator's disk fields were parsed as 16-bit. | Both locator disk fields are validated as 32-bit (`disk_number` and `total_disk_count`): the full locator structure `sig(4)+disk(4)+zip64_eocd_offset(8)+total_disks(4)` is checked positionally, and multi-disk archives remain fail-closed (`MULTI_DISK_ZIP_UNSUPPORTED`). Deliberately NOT a general ZIP parser rewrite. | Shipped cases R2-34, R2-35 + `ZipStructureRegressionTests`-style unit tests (disk field, total field, and a genuine-locator acceptance control). |
+| 4 | **ZIP64 descriptor width selected from CDH sentinels alone (REVISION-5).** A valid archive produced by CPython `zipfile` with `force_zip64=True` on a non-seekable stream keeps ordinary small 32-bit sizes in the CDH (no `0xFFFFFFFF` sentinels) while the LFH carries ZIP64 metadata (a `0x0001` extra field, with zeroed 64-bit placeholders under streaming) and a signed 24-byte descriptor. Selecting the width from CDH sentinels alone misclassified this member as 16-byte and rejected a valid archive. | The LFH ZIP64 metadata is now parsed and validated in addition to the CDH metadata (`_parse_lfh_zip64`): sentinels and/or a `0x0001` extra field in the LFH mark the member as ZIP64 format; the width is 24 bytes when EITHER the LFH or the CDH carries verified ZIP64 evidence, else 16. Non-zero `0x0001` values are cross-checked against the CDH sizes and the ACTUAL LFH position; sentinels without a resolvable `0x0001` extra, truncated/malformed extra bodies, contradictory offsets, and unresolved non-streaming sentinels are rejected (`MALFORMED_ZIP64_LFH_EXTRA` / `MALFORMED_ZIP_EXTRA_FIELD` / `MALFORMED_LFH_CDH_MISMATCH`). Width is never guessed from signature occurrence or arbitrary byte patterns. | Shipped cases R2-38, R2-39 (INSPECTED, independent writer), R2-40..R2-44 (fail-closed) + `Zip64LfhInteropTests` (11 tests). |
 
 **Sample provenance (independent writer interop evidence).** Case R2-25 is built by CPython
 3.11.2 `zipfile.ZipFile(stream, "w")` writing to a **non-seekable** in-memory stream
@@ -234,6 +235,24 @@ signed, both **after** the member data, confirming the corrected layout. The PoC
 exactly this archive (R2-25 `INSPECTED`), which proves reader/writer agreement on the fixture's
 validity. No byte was fabricated: the archive is produced at run time by the stdlib writer inside
 the case builder.
+
+**force_zip64 interop evidence (REVISION-5).** Case R2-38 is built with the real CPython
+standard library on a non-seekable stream:
+`zipfile.ZipFile(stream, "w", compression=ZIP_DEFLATED)` +
+`zf.open("hello.txt", "w", force_zip64=True)`, payload `b"Hello DIP security fixture!" * 3`
+(81 bytes, CRC `0xf0462bb9`). Observed layout (deterministic, 192 bytes total):
+
+- LFH @0: version=20, bit 3 set, `crc/csize/usize` all zeroed, 20-byte extra =
+  `0x0001`/size-16 with two zeroed 64-bit fields (streaming placeholders).
+- Compressed data `59..91` (32 bytes); **signed 24-byte descriptor @91**:
+  `504b0708 b92b46f0 2000000000000000 5100000000000000` (sig, CRC32, csize64=32, usize64=81).
+- CDH: `csize=32 usize=81` — ordinary small 32-bit values, NO sentinels; no ZIP64 EOCD/locator
+  (member-level ZIP64 format only). The ZIP_STORED variant (R2-39) is the same shape
+  (descriptor `504b0708 b92b46f0 5100000000000000 5100000000000000`).
+
+The independent CPython reader round-trips both archives (`testzip() is None`, exact content
+equality), and the Phase 0C reader classifies both as `INSPECTED` with the overall offline
+conclusion remaining `NOT_COMPLETE_SAFE_SCAN`.
 
 **Bidirectional cross-validation (independent reader):** CPython's own `zipfile` reader accepts
 every descriptor-bearing fixture this PoC ships — the non-seekable writer output (round-trip with
@@ -256,7 +275,7 @@ independent writer → PoC reader, and PoC builder → independent reader all ag
 - ZIP descriptors with CRC/size fields that do not simultaneously match the Central Directory and
   the ACTUAL read: rejected (never trusted in isolation).
 
-## 5. Case matrix (53 cases: original 28-case matrix preserved + 10 targeted regression cases R2-13..R2-22 + 15 data-descriptor standards-compliance cases R2-23..R2-37; all expected == observed in the offline run)
+## 5. Case matrix (60 cases: original 28-case matrix preserved + 10 targeted regression cases R2-13..R2-22 + 15 data-descriptor standards-compliance cases R2-23..R2-37 + 7 ZIP64 descriptor-width interop cases R2-38..R2-44; all expected == observed in the offline run)
 
 | Case | Description | Expected | Observed |
 | --- | --- | --- | --- |
@@ -310,6 +329,13 @@ independent writer → PoC reader, and PoC builder → independent reader all ag
 | R2-35 | ZIP64 EOCD locator 32-bit total disk count ≠ 1 (Revision 4) | REJECTED | REJECTED |
 | R2-36 | Legacy unsigned 12-byte descriptor — classified UNSUPPORTED (Revision 4) | UNSUPPORTED | UNSUPPORTED |
 | R2-37 | Undeclared descriptor signature (bit 3 not set) (Revision 4) | REJECTED | REJECTED |
+| R2-38 | CPython `force_zip64` DEFLATE non-seekable: LFH 0x0001 extra + CDH small sizes + 24-byte descriptor (Revision 5) | INSPECTED | INSPECTED |
+| R2-39 | CPython `force_zip64` STORED non-seekable (Revision 5) | INSPECTED | INSPECTED |
+| R2-40 | LFH size sentinels without a 0x0001 ZIP64 extra field (Revision 5) | REJECTED | REJECTED |
+| R2-41 | LFH 0x0001 extra TLV length overflow (Revision 5) | REJECTED | REJECTED |
+| R2-42 | LFH 0x0001 size contradicts the Central Directory size (Revision 5) | REJECTED | REJECTED |
+| R2-43 | LFH-ZIP64 member followed by a 16-byte descriptor — incompatible width (Revision 5) | REJECTED | REJECTED |
+| R2-44 | LFH 0x0001 local-header offset contradicts the actual LFH position (Revision 5) | REJECTED | REJECTED |
 | CTRL-POS-01 | Independent positive control: direct EICAR | INSPECTED | INSPECTED |
 | CTRL-NEG-01 | Independent negative control: benign bytes | INSPECTED | INSPECTED |
 | CTRL-NEG-02 | Clean nested ZIP32 — still NOT `COMPLETE_SAFE_SCAN` | INSPECTED | INSPECTED |
@@ -317,10 +343,10 @@ independent writer → PoC reader, and PoC builder → independent reader all ag
 The R1 synthetic marker cases (R1-07) are labelled as **SYNTHETIC PARSER PROBES**, not genuine
 encrypted PDFs. No real malware is used anywhere; EICAR is the only detection signature.
 
-## 6. Resource-limit evidence (measured offline run, 53 cases)
+## 6. Resource-limit evidence (measured offline run, 60 cases)
 
-- Totals: input 29,391 B; expanded 11,554 B; scanner-fed 24,625 B; peak traced process memory
-  ≈1.72 MiB (against 32 MiB ceiling); wall-clock per case ≤ 6 ms.
+- Totals: input 30,877 B; expanded 11,797 B; scanner-fed 26,354 B; peak traced process memory
+  ≈1.82 MiB (against 32 MiB ceiling); wall-clock per case ≤ 6 ms.
 - `temp_disk_bytes_used = 0` and `filesystem_writes = 0` in **every** case; no extraction
   filesystem primitive exists in the module.
 - Limit-hit cases: `RECURSION_DEPTH_LIMIT` (R2-05), `EXPANDED_BYTE_LIMIT` (R2-11, R2-21, R2-22),
@@ -351,9 +377,11 @@ positionally); DEFLATE nesting with streaming reads **and strict end-of-stream e
 inside the compressed window rejected (R2-14); data descriptors validated at their standards
 position `data_start + csize` with verified-metadata width selection — signed 16-byte ZIP32 form
 and signed 24-byte ZIP64 form (no local-header-offset field) both accepted from genuine writers
-(including CPython `zipfile` non-seekable streaming output, R2-25), contradictory fields and
-wrong-width combinations rejected (R2-16, R2-26..R2-31, R2-33, R2-37), legacy unsigned form
-classified UNSUPPORTED (R2-36); spoofed-extension content sniff; depth
+(including CPython `zipfile` non-seekable streaming output, R2-25, and the `force_zip64`
+streaming combination with LFH `0x0001` metadata + small CDH sizes, R2-38/R2-39), contradictory
+fields and wrong-width combinations rejected (R2-16, R2-26..R2-31, R2-33, R2-37, R2-43),
+contradictory/missing/malformed LFH ZIP64 metadata rejected (R2-40..R2-42, R2-44), legacy
+unsigned form classified UNSUPPORTED (R2-36); spoofed-extension content sniff; depth
 limit; corrupt member; encrypted member; unsupported method; path traversal; forged declared size;
 cumulative byte/entry ceilings with the per-member boundary corrected (exactly-at-ceiling allowed,
 one byte over rejected — R2-17/R2-18/R2-21); nested members sharing the cumulative budget
