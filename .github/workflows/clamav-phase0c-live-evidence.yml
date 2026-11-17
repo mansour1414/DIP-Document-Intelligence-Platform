@@ -93,6 +93,7 @@ jobs:
             scripts/experiments/phase0c_r1r2_live_evidence.py \
             scripts/experiments/phase0c_r1r2_poc.py \
             scripts/experiments/phase0c_r1r2_fixtures.py \
+            scripts/experiments/phase0c_safe_scratch_cleanup.sh \
             scripts/experiments/clamav-phase0b-evidence.py \
             docs/operations/experimental/clamav-phase0c-client.Dockerfile \
             docs/operations/experimental/clamav-phase0c-client.Dockerfile.dockerignore \
@@ -152,6 +153,18 @@ jobs:
             --tag "$LOCAL_CLIENT_IMAGE" --load .
           client_id="$(docker image inspect "$LOCAL_CLIENT_IMAGE" --format '{{.Id}}')"
           echo "LOCAL_CLIENT_IMAGE_ID=$client_id" >> "$GITHUB_ENV"
+          docker run --rm --platform linux/arm64 --read-only --cap-drop ALL \
+            --security-opt no-new-privileges:true --memory 512m --cpus 1 --pids-limit 64 \
+            --entrypoint python3 "$LOCAL_CLIENT_IMAGE" -c '
+              import argparse, dataclasses, hashlib, io, json, pathlib, re, shutil
+              import socket, struct, sys, time, tracemalloc, typing, zipfile, zlib
+              import phase0c_r1r2_poc, phase0c_r1r2_fixtures, phase0c_r1r2_live_evidence
+              assert sys.version_info >= (3, 10)
+              assert phase0c_r1r2_live_evidence.CHUNK_BYTES == 65536
+              assert phase0c_r1r2_poc.NOT_VERIFIED == "NOT_VERIFIED"
+              assert phase0c_r1r2_fixtures.EICAR_BYTES
+              print("CLIENT_IMAGE_IMPORT_SMOKE_PASS", sys.version.split()[0])
+            '
           cid="$(docker create "$LOCAL_CLIENT_IMAGE")"
           trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
           docker cp "$cid:/usr/share/doc/dip-phase0c-client/dpkg-manifest.txt" "$EVIDENCE_DIR/client-dpkg-manifest.txt"
@@ -187,28 +200,28 @@ jobs:
           # Independent ZIP reader verifies the real Phase 0B nested ZIP32/ZIP64 EICAR fixture.
           python3 - "$WORK_DIR/fixtures" "$WORK_DIR/fixtures/fixtures-manifest.json" \
             "$WORK_DIR/fixtures/fixture-verification.json" <<'PY'
-          import hashlib, json, pathlib, sys, zipfile, io
+          import hashlib, json, pathlib, sys
+          sys.path.insert(0, 'scripts/experiments')
+          import phase0c_r1r2_live_evidence as live
           root = pathlib.Path(sys.argv[1])
           manifest_path, verification_path = map(pathlib.Path, sys.argv[2:4])
           manifest = json.loads(manifest_path.read_text())
           verification = json.loads(verification_path.read_text())
           fixtures = {item['id']: item for item in manifest['fixtures']}
           target = fixtures['R2_compressed_nested_zip64_inside_zip32_residual_risk']
-          expected = '275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f'
           outer = (root / target['filename']).read_bytes()
           assert hashlib.sha256(outer).hexdigest() == target['sha256']
-          with zipfile.ZipFile(io.BytesIO(outer)) as zf:
-              assert zf.testzip() is None
-              inner = zf.read('nested/inner_zip64_eicar.zip')
-          with zipfile.ZipFile(io.BytesIO(inner)) as zf:
-              assert zf.testzip() is None
-              eicar = zf.read('eicar.txt')
-          assert hashlib.sha256(eicar).hexdigest() == expected
-          verification.setdefault('checks', []).append({
-              'id':'R2_compressed_nested_zip64_inside_zip32_residual_risk', 'kind':'nested_zip64',
+          independent = live._verify_zip_independently(outer, eicar_expected=True)
+          checks = verification.get('checks')
+          assert isinstance(checks, list)
+          check_id = 'R2_compressed_nested_zip64_inside_zip32_residual_risk'
+          checks = [item for item in checks if item.get('id') != check_id]
+          checks.append({
+              'id':check_id, 'kind':'nested_zip64',
               'structural_check':'PASS', 'tool_verification_status':'PASS',
               'tool_details':{'reader':'python.zipfile','outer_sha256':target['sha256'],
-                              'inner_eicar_sha256':hashlib.sha256(eicar).hexdigest()}})
+                              'independent_zip_verification':independent}})
+          verification['checks'] = checks
           verification_path.write_text(json.dumps(verification, indent=2) + '\n')
           PY
 
@@ -342,9 +355,13 @@ jobs:
         if: always() && steps.boundary.outcome == 'success'
         id: cleanup
         shell: bash
+        env:
+          LIVE_STEP_OUTCOME: ${{ steps.live.outcome }}
         run: |
           set +e
           errors=0
+          runtime_verification_passed=false
+          [[ "$LIVE_STEP_OUTCOME" == "success" ]] && runtime_verification_passed=true
           clamd_absent=false; client_absent=false; network_absent=false
           candidate_absent=false; client_image_absent=false; scratch_absent=false
           if docker inspect "$CLIENT_CONTAINER" >/dev/null 2>&1; then docker rm -f "$CLIENT_CONTAINER" >/dev/null 2>&1 || errors=1; fi
@@ -359,27 +376,21 @@ jobs:
           if ! docker image inspect "$LOCAL_CANDIDATE_IMAGE" >/dev/null 2>&1; then candidate_absent=true; else errors=1; fi
           if ! docker image inspect "$LOCAL_CLIENT_IMAGE" >/dev/null 2>&1; then client_image_absent=true; else errors=1; fi
 
-          runner_temp="${RUNNER_TEMP:-}"
-          if [[ -z "$runner_temp" || "$runner_temp" != /* || "$runner_temp" == */ ]] || \
-             [[ "${runner_temp##*/}" != _temp || "${runner_temp%/*}" != */work ]] || \
-             [[ "$(realpath -e -- "$runner_temp" 2>/dev/null)" != "$runner_temp" ]]; then
-            errors=1
+          if bash scripts/experiments/phase0c_safe_scratch_cleanup.sh \
+               "${RUNNER_TEMP:-}" "${WORK_DIR:-}"; then
+            scratch_absent=true
           else
-            scratch="${runner_temp%/}/clamav-phase0c-work"
-            if [[ -L "$scratch" || "$scratch" != "$runner_temp/clamav-phase0c-work" ]]; then
-              errors=1
-            else
-              rm -rf -- "$scratch" || errors=1
-              [[ ! -e "$scratch" && ! -L "$scratch" ]] && scratch_absent=true || errors=1
-            fi
+            errors=1
           fi
           status=PASS; [[ "$errors" -eq 0 ]] || status=FAIL
-          jq -n --arg status "$status" --argjson clamd_absent "$clamd_absent" \
-            --argjson client_absent "$client_absent" --argjson network_absent "$network_absent" \
+          jq -n --arg status "$status" --argjson runtime_verification_passed "$runtime_verification_passed" \
+            --argjson clamd_absent "$clamd_absent" --argjson client_absent "$client_absent" \
+            --argjson network_absent "$network_absent" \
             --argjson candidate_image_absent "$candidate_absent" \
             --argjson client_image_absent "$client_image_absent" \
             --argjson scratch_absent "$scratch_absent" \
-            '{status:$status,clamd_container_absent:$clamd_absent,client_container_absent:$client_absent,
+            '{status:$status,runtime_verification_passed:$runtime_verification_passed,
+              clamd_container_absent:$clamd_absent,client_container_absent:$client_absent,
               internal_network_absent:$network_absent,candidate_image_absent:$candidate_image_absent,
               client_image_absent:$client_image_absent,scratch_absent:$scratch_absent}' \
             > "$EVIDENCE_DIR/cleanup-status.json"
@@ -395,10 +406,18 @@ jobs:
               --mode finalize --output "$EVIDENCE_DIR/phase0c-live-evidence.json" \
               --cleanup-status "$EVIDENCE_DIR/cleanup-status.json"
           else
-            jq -n --slurpfile cleanup "$EVIDENCE_DIR/cleanup-status.json" \
+            cleanup_record='{"status":"NOT_VERIFIED"}'
+            if [[ -s "$EVIDENCE_DIR/cleanup-status.json" ]]; then
+              cleanup_record="$(cat "$EVIDENCE_DIR/cleanup-status.json")"
+            fi
+            jq -n --argjson cleanup "$cleanup_record" \
               '{schema_version:"phase0c-live-evidence-v1",TEST_CASE_RESULT:"NOT_VERIFIED",
-                error_code:"LIVE_EVIDENCE_OR_CLEANUP_RECORD_MISSING",cleanup:$cleanup[0],
-                governance:{Security_Gate:"OPEN",Licensing_Gate:"OPEN",R1:"OPEN",R2:"OPEN"}}' \
+                OVERALL_RESULT:"FAIL",COMPLETE_SAFE_SCAN:false,
+                required_evidence:{status:"FAIL",core_status:"FAIL",cleanup_status:"FAIL",
+                  failures:["LIVE_EVIDENCE_OR_CLEANUP_RECORD_MISSING"]},
+                error_code:"LIVE_EVIDENCE_OR_CLEANUP_RECORD_MISSING",cleanup:$cleanup,
+                governance:{Security_Gate:"OPEN",Licensing_Gate:"OPEN",Stage_7:"NOT ACCEPTED",
+                  R1:"OPEN",R2:"OPEN",Change_Requests:"PROPOSED — NOT APPROVED"}}' \
               > "$EVIDENCE_DIR/phase0c-live-evidence.json"
             exit 1
           fi

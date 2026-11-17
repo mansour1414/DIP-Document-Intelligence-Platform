@@ -34,18 +34,19 @@ The input/inspection caps remain: 4 MiB input, 16 MiB cumulative expanded bytes,
 
 The machine-readable `phase0c-live-evidence.json` keeps separate:
 
-- `TEST_CASE_RESULT`: `PASS`, `FAIL`, or `NOT_VERIFIED`.
+- `TEST_CASE_RESULT`: the per-case experiment verdict (`PASS`, `FAIL`, or `NOT_VERIFIED`).
 - `SECURITY_COVERAGE_STATUS`: `INSPECTED`, `REJECTED`, `UNSUPPORTED`, or `NOT_VERIFIED`.
-- The full original input's ClamAV result, always labelled **OBSERVATIONAL_ONLY**.
-- Each structurally discovered member/attachment's INSTREAM result, labelled as directly tested evidence.
+- `ORIGINAL_CONTAINER_SCAN_RESULT`: the full original input's ClamAV result, always labelled **OBSERVATIONAL_ONLY** for R1/R2.
+- `EXTRACTED_PAYLOAD_SCAN_RESULT`: each structurally discovered member/attachment's completed INSTREAM result.
+- `OVERALL_RESULT`: `PASS` only when every mandatory case, independent fixture verification, scanner/signature provenance, runtime provenance plus the host workflow's successful runtime assertions, and verified cleanup pass. Expected fail-closed coverage gaps can have a passing negative test result but remain explicitly incomplete.
 
-A clean original-container result never proves complete nested inspection. A case may pass its experiment expectation while Security Gate and R1/R2 remain open. The offline inspector's `derive_conclusion` still receives `clamav_verified=False`; this harness does not promote its offline `COMPLETE_SAFE_SCAN` conclusion.
+A clean original-container result never proves complete nested inspection. An `INSPECTED` targeted payload does not imply every PDF stream was inspected. The report always records `COMPLETE_SAFE_SCAN: false`; it does not promote the offline inspector's `derive_conclusion` result. A missing mandatory result, any mandatory `NOT_VERIFIED`, failed scanner response, fixture, provenance, or cleanup check forces overall `FAIL` and a nonzero finalizer exit.
 
 The live set reuses the Phase 0C ZIP/PDF cases and Phase 0B generated, tool-verified fixtures. It includes:
 
 - Direct EICAR bytes checked against SHA-256 `275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f`.
 - Referenced PDF ZIP64 EICAR attachment and compressed ZIP32→ZIP64 and nested ZIP32 controls.
-- Standards-compliant ZIP32/ZIP64 data descriptors and CPython non-seekable `force_zip64` writer cases; valid archive controls are cross-read with Python `zipfile`, independent of the Phase 0C custom reader.
+- Standards-compliant ZIP32/ZIP64 data descriptors and CPython non-seekable `force_zip64` writer cases; an independent `zipfile` cross-reader streams member bytes in bounded chunks, preflights entry counts, verifies CRCs, tracks per-member/cumulative output, nesting depth, and modeled peak memory, and never calls unbounded `archive.read()`.
 - Bilingual DOCX/XLSX/PPTX and PDF controls generated and verified using Phase 0B's LibreOffice, qpdf, pdfdetach, and Poppler utilities. The independent Phase 0B R1 attachment verification compares the extracted attachment hash; an independent ZIP reader checks the nested R2 EICAR payload.
 - Truncated DEFLATE, malformed PDFs, CRC/size conflicts, encrypted archive-member flags, unsupported compression, depth/entry/expansion/member/input/memory limits, and PDF coverage gaps.
 - A genuine AES-256/R6 encrypted PDF control. Its password is used only transiently by the existing Phase 0B fixture verifier and is never passed to the client or retained. This harness classifies encrypted content `UNSUPPORTED`/`NOT_VERIFIED`; it does not perform a post-unlock scan.
@@ -64,11 +65,11 @@ The machine-readable ledger records fixture hashes and provenance, independent v
 
 The workflow keeps only JSON/text metadata, manifests, hashes, tool/version data, effective `clamconf`, bounded scan results, and cleanup verification. It does not upload fixture binaries, production documents, passwords, signature databases, images, raw input bytes, or raw ClamAV payloads. Total artifacts are capped at 5 MiB and retained 30 days.
 
-Evidence is finalized only after the cleanup step has attempted and verified removal of both containers, both local image tags, the private network, and the fixed scratch directory. Cleanup writes `cleanup-status.json`; the finalizer merges that actual result into the ledger and enforces the evidence limit. Any cleanup failure fails the job even if an artifact is uploaded for diagnosis.
+Evidence is finalized only after the cleanup step has attempted and verified removal of both containers, both local image tags, the private network, and the fixed scratch directory. Scratch removal validates the canonical runner `_temp` path, fixed leaf, and symlink/path consistency, then uses privileged deletion so files created by UID 101/102 are removable. Cleanup writes `cleanup-status.json`; the finalizer merges that actual result into the ledger and enforces the evidence limit. Any cleanup failure fails the job even if an artifact is uploaded for diagnosis.
 
 ## Client image and licensing
 
-`clamav-phase0c-client.Dockerfile` is experimental-only. It uses the immutable Ubuntu 22.04 base digest already used by the Phase 0B candidate, installs only Ubuntu's `python3-minimal` for standard-library execution, records the resolved dpkg manifest and available copyright notices, and runs as numeric UID/GID 10001. The workflow records the built local image ID and package manifest. The image is not published, shipped, or added to application dependencies. APT package resolution occurs at build time; the exact resulting package inventory is evidence, not a promise of byte-reproducible future builds.
+`clamav-phase0c-client.Dockerfile` is experimental-only. It uses the immutable Ubuntu 22.04 base digest already used by the Phase 0B candidate, installs `python3-minimal` for the interpreter/bootstrap and `libpython3.10-stdlib` for the imported standard-library modules, records installed package/source versions and package-specific copyright notices without filename collisions, and runs as numeric UID/GID 10001. The workflow also imports both Phase 0C modules and their standard-library dependencies inside the built ARM64 image before starting the experiment. The workflow records the built local image ID and package manifest. The image is not published, shipped, or added to application dependencies. APT package resolution occurs at build time; the exact resulting package inventory is evidence, not a promise of byte-reproducible future builds.
 
 Licensing considerations remain open and are not approvals:
 

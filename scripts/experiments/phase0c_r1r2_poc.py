@@ -329,6 +329,7 @@ class ObjectRecord:
     scanner_verdict: str = "NOT_SCANNED"
     scanner_reason: str = "NOT_SCANNED"
     offline_control_signature: str = "NOT_APPLICABLE"
+    scanner_response_framing: str = "NOT_VERIFIED"
     skipped: bool = False
     skip_reason: str | None = None
     resource_limits_hit: list[str] = field(default_factory=list)
@@ -1039,7 +1040,8 @@ def _inspect_one_member(budget: ResourceBudget, ledger: CoverageLedger, *,
         structural_verdict="BOUNDED_STREAMING_READ_COMPLETE", verdict=INSPECTED,
         extracted_bytes=actual, scanner_verdict=str(scan["scanner_verdict"]),
         scanner_reason=str(scan["scanner_reason"]),
-        offline_control_signature=str(scan["signature"]), notes=notes,
+        offline_control_signature=str(scan["signature"]),
+        scanner_response_framing=str(scan.get("response_framing", "NOT_VERIFIED")), notes=notes,
     )
     ledger.add(record)
 
@@ -1358,6 +1360,7 @@ def inspect_pdf(budget: ResourceBudget, ledger: CoverageLedger, *,
             scanner_verdict=str(scan["scanner_verdict"]),
             scanner_reason=str(scan["scanner_reason"]),
             offline_control_signature=str(scan["signature"]),
+            scanner_response_framing=str(scan.get("response_framing", "NOT_VERIFIED")),
             notes=[f"pdf_reference_source={source}"],
         ))
         if detected == "application/zip":

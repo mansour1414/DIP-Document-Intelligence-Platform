@@ -10,19 +10,21 @@ LABEL org.opencontainers.image.title="dip-phase0c-live-evidence-client" \
 
 RUN set -eux; \
     apt-get update -qq; \
-    apt-get install -y -qq --no-install-recommends python3-minimal; \
+    apt-get install -y -qq --no-install-recommends python3-minimal libpython3.10-stdlib; \
     command -v /usr/bin/timeout; \
-    mkdir -p /opt/dip /usr/share/doc/dip-phase0c-client; \
-    dpkg-query -W -f='${binary:Package}\t${Version}\n' | sort \
+    mkdir -p /opt/dip /usr/share/doc/dip-phase0c-client/licenses; \
+    dpkg-query -W -f='${binary:Package}\t${Version}\t${source:Package}\t${source:Version}\n' | sort \
       > /usr/share/doc/dip-phase0c-client/dpkg-manifest.txt; \
-    for path in /usr/share/doc/python3-minimal/copyright \
-                /usr/share/doc/python3.10/copyright \
-                /usr/share/doc/libpython3.10-minimal/copyright; do \
-      if [ -f "$path" ]; then cp "$path" /usr/share/doc/dip-phase0c-client/; fi; \
+    for pkg in python3-minimal python3.10-minimal libpython3.10-minimal libpython3.10-stdlib; do \
+      path="/usr/share/doc/$pkg/copyright"; \
+      if [ -f "$path" ]; then \
+        mkdir -p "/usr/share/doc/dip-phase0c-client/licenses/$pkg"; \
+        cp "$path" "/usr/share/doc/dip-phase0c-client/licenses/$pkg/copyright"; \
+      fi; \
     done; \
     rm -rf /var/lib/apt/lists/*; \
     chmod 0755 /opt/dip; \
-    chmod 0644 /usr/share/doc/dip-phase0c-client/*
+    chmod -R a+rX /usr/share/doc/dip-phase0c-client
 
 COPY scripts/experiments/phase0c_r1r2_poc.py /opt/dip/phase0c_r1r2_poc.py
 COPY scripts/experiments/phase0c_r1r2_fixtures.py /opt/dip/phase0c_r1r2_fixtures.py

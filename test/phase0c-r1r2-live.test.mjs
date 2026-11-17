@@ -46,19 +46,47 @@ test("both runtime containers use the internal network and OS resource controls"
 
 test("client image is experimental, pinned to immutable base, non-root, and manifest-recorded", () => {
   assert.match(dockerfile, /ubuntu:22\.04@sha256:[0-9a-f]{64}/u);
-  assert.match(dockerfile, /python3-minimal/u);
+  assert.match(dockerfile, /python3-minimal libpython3\.10-stdlib/u);
   assert.match(dockerfile, /dpkg-manifest\.txt/u);
+  assert.match(dockerfile, /licenses\/\$pkg\/copyright/u);
+  assert.match(workflow, /CLIENT_IMAGE_IMPORT_SMOKE_PASS/u);
+  assert.match(workflow, /docker run --rm --platform linux\/arm64 --read-only/u);
   assert.match(dockerfile, /USER 10001:10001/u);
   assert.match(dockerfile, /not production/iu);
 });
 
-test("live adapter requires explicit live mode and keeps separate evidence fields", () => {
+test("live adapter preserves independent case, coverage, original, and extracted fields", () => {
   assert.match(liveScript, /parser\.add_argument\("--mode", required=True/u);
   assert.match(liveScript, /choices=\("live", "finalize"\)/u);
   assert.match(liveScript, /"TEST_CASE_RESULT"/u);
   assert.match(liveScript, /"SECURITY_COVERAGE_STATUS"/u);
+  assert.match(liveScript, /"ORIGINAL_CONTAINER_SCAN_RESULT"/u);
+  assert.match(liveScript, /"EXTRACTED_PAYLOAD_SCAN_RESULT"/u);
   assert.match(liveScript, /"OBSERVATIONAL_ONLY"/u);
+  assert.match(liveScript, /"COMPLETE_SAFE_SCAN": False/u);
   assert.match(liveScript, /"clean_is_not_complete_nested_inspection": True/u);
+  assert.match(liveScript, /REQUIRED_EXTRACTED_EICAR_DETECTION_MISSING/u);
+  assert.match(liveScript, /def _derive_aggregate/u);
+  assert.doesNotMatch(liveScript, /\.read\(info\.filename\)|archive\.read\(/u);
+  assert.match(liveScript, /INDEPENDENT_ZIP_MAX_MEMBER_BYTES/u);
+  assert.match(liveScript, /independent_reader_memory_limit/u);
+});
+
+test("scratch cleanup uses validated fixed-path sudo removal and finalizer fails closed", () => {
+  const cleanup = workflow.slice(workflow.indexOf("id: cleanup"));
+  assert.match(cleanup, /bash scripts\/experiments\/phase0c_safe_scratch_cleanup\.sh/u);
+  assert.match(cleanup, /cleanup-status\.json/u);
+  assert.match(cleanup, /runtime_verification_passed/u);
+  assert.match(cleanup, /LIVE_STEP_OUTCOME: \$\{\{ steps\.live\.outcome \}\}/u);
+  assert.match(cleanup, /if: always\(\) && steps\.boundary\.outcome == 'success'/u);
+  assert.match(cleanup, /--mode finalize/u);
+  assert.ok(cleanup.includes('[[ "$errors" -eq 0 ]]'));
+  const helper = readFile(new URL("../scripts/experiments/phase0c_safe_scratch_cleanup.sh", import.meta.url), "utf8");
+  return helper.then((script) => {
+    assert.ok(script.includes("realpath -e"));
+    assert.ok(script.includes('[[ -L "$scratch_dir" ]]'));
+    assert.ok(script.includes('sudo rm -rf -- "$scratch_dir"'));
+  });
 });
 
 test("offline protocol and cleanup unit tests run without a ClamAV service", () => {

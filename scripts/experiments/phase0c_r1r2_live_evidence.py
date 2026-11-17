@@ -29,10 +29,47 @@ MAX_INPUT_BYTES = 4 * 1024 * 1024
 MAX_EXPANDED_BYTES = 16 * 1024 * 1024
 MAX_EVIDENCE_BYTES = 5 * 1024 * 1024
 MAX_TOTAL_TRANSFER_BYTES = 256 * 1024 * 1024
+INDEPENDENT_ZIP_CHUNK_BYTES = 64 * 1024
+INDEPENDENT_ZIP_MAX_MEMBER_BYTES = 2 * 1024 * 1024
+INDEPENDENT_ZIP_MAX_EXPANDED_BYTES = MAX_EXPANDED_BYTES
+INDEPENDENT_ZIP_MAX_ENTRIES = 256
+INDEPENDENT_ZIP_MAX_DEPTH = 3
+INDEPENDENT_ZIP_MAX_MEMORY_BYTES = 64 * 1024 * 1024
+INDEPENDENT_ZIP_INFO_ESTIMATE_BYTES = 512
+INDEPENDENT_ZIP_FIXED_OVERHEAD_BYTES = 128 * 1024
 TOTAL_DEADLINE_SECONDS = 20 * 60
 CASE_DEADLINE_SECONDS = 90
 LIVE_CPU_ACCOUNTING_SECONDS = 15.0  # client process only; clamd has its own cgroup
 EXPECTED_EICAR_SHA256 = "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f"
+REQUIRED_FIXTURE_IDS = (
+    "R1_pdf_embedded_zip64_residual_risk",
+    "R2_compressed_nested_zip64_inside_zip32_residual_risk",
+    "B10_valid_docx_control", "B11_valid_xlsx_control", "B12_valid_pptx_control",
+    "B13_valid_pdf_control", "B14_encrypted_pdf_unlock_pdf_control",
+)
+REQUIRED_CASE_EXPECTATIONS = {
+    "CTRL-EICAR-RAW": poc.INSPECTED,
+    "R1-06": poc.NOT_VERIFIED, "R1-07": poc.UNSUPPORTED,
+    "R1-08": poc.NOT_VERIFIED, "R1-09": poc.NOT_VERIFIED,
+    "R1-10": poc.REJECTED, "R1-12": poc.UNSUPPORTED, "R1-13": poc.REJECTED,
+    "R2-01": poc.INSPECTED, "R2-02": poc.INSPECTED, "R2-03": poc.INSPECTED,
+    "R2-04": poc.INSPECTED, "R2-05": poc.REJECTED, "R2-06": poc.REJECTED,
+    "R2-07": poc.REJECTED, "R2-08": poc.UNSUPPORTED, "R2-10": poc.REJECTED,
+    "R2-11": poc.REJECTED, "R2-12": poc.REJECTED, "R2-13": poc.REJECTED,
+    "R2-14": poc.REJECTED, "R2-15": poc.INSPECTED, "R2-17": poc.INSPECTED,
+    "R2-18": poc.REJECTED, "R2-24": poc.INSPECTED, "R2-25": poc.INSPECTED,
+    "R2-38": poc.INSPECTED, "R2-39": poc.INSPECTED,
+    "CTRL-NEG-01": poc.INSPECTED, "CTRL-NEG-02": poc.INSPECTED,
+    "LIMIT-INPUT-01": poc.REJECTED, "LIMIT-MEMORY-01": poc.REJECTED,
+    "R1-LIVE-01": poc.INSPECTED, "R2-LIVE-01": poc.INSPECTED,
+    "BENIGN-DOCX-EN-AR": poc.INSPECTED, "BENIGN-XLSX-EN-AR": poc.INSPECTED,
+    "BENIGN-PPTX-EN-AR": poc.INSPECTED, "BENIGN-PDF-EN-AR": poc.NOT_VERIFIED,
+    "ENCRYPTED-PDF-UNLOCK-REQUIRED": poc.UNSUPPORTED,
+}
+REQUIRED_EICAR_CASE_IDS = frozenset({
+    "CTRL-EICAR-RAW", "R2-01", "R2-02", "R2-03", "R2-04", "R2-15",
+    "R2-24", "R2-25", "R1-LIVE-01", "R2-LIVE-01",
+})
 EICAR_RE = re.compile(r"eicar", re.IGNORECASE)
 REPLY_RE = re.compile(r"^stream: (?:(?P<signature>.+) )?(?P<status>OK|FOUND|ERROR)$")
 
@@ -266,34 +303,169 @@ def _command(host: str, port: int, command: bytes, deadline: Deadline) -> str:
             sock.close()
 
 
-def _verify_zip_independently(data: bytes, *, eicar_expected: bool) -> dict[str, Any]:
-    """Independent ZIP-reader check; never calls the Phase 0C custom parser."""
-    expanded = 0
-    found = False
+def _independent_zip_entry_count(data: bytes | bytearray, maximum: int) -> int:
+    """Preflight EOCD entry count before zipfile allocates its ZipInfo table."""
+    if len(data) < 22:
+        raise ValueError("independent_reader_malformed_eocd")
+    lower = max(0, len(data) - (22 + 65535))
+    cursor = len(data)
+    eocd = -1
+    while True:
+        candidate = data.rfind(b"PK\x05\x06", lower, cursor)
+        if candidate < 0:
+            break
+        if candidate + 22 <= len(data):
+            comment_size = struct.unpack_from("<H", data, candidate + 20)[0]
+            if candidate + 22 + comment_size == len(data):
+                eocd = candidate
+                break
+        cursor = candidate
+    if eocd < 0:
+        raise ValueError("independent_reader_malformed_eocd")
+    disk, directory_disk, disk_entries, total_entries = struct.unpack_from("<HHHH", data, eocd + 4)
+    if disk != 0 or directory_disk != 0 or disk_entries != total_entries:
+        raise ValueError("independent_reader_multidisk_zip")
 
-    def visit(blob: bytes, depth: int) -> None:
-        nonlocal expanded, found
-        if depth > 3:
+    locator = eocd - 20
+    has_locator = locator >= 0 and data[locator:locator + 4] == b"PK\x06\x07"
+    if total_entries == 0xFFFF or disk_entries == 0xFFFF or has_locator:
+        if not has_locator:
+            raise ValueError("independent_reader_zip64_locator_missing")
+        locator_disk, zip64_offset, disk_count = struct.unpack_from("<IQI", data, locator + 4)
+        if locator_disk != 0 or disk_count != 1 or zip64_offset + 56 > locator:
+            raise ValueError("independent_reader_bad_zip64_locator")
+        if data[zip64_offset:zip64_offset + 4] != b"PK\x06\x06":
+            raise ValueError("independent_reader_bad_zip64_eocd")
+        record_size = struct.unpack_from("<Q", data, zip64_offset + 4)[0]
+        if record_size < 44 or zip64_offset + 12 + record_size > locator:
+            raise ValueError("independent_reader_bad_zip64_eocd")
+        zip64_disk, zip64_directory_disk = struct.unpack_from("<II", data, zip64_offset + 16)
+        zip64_disk_entries, total_entries = struct.unpack_from("<QQ", data, zip64_offset + 24)
+        if zip64_disk != 0 or zip64_directory_disk != 0 or zip64_disk_entries != total_entries:
+            raise ValueError("independent_reader_multidisk_zip")
+    if total_entries > maximum:
+        raise ValueError("independent_reader_entry_limit")
+    return total_entries
+
+
+class _IndependentZipBudget:
+    def __init__(self, input_bytes: int, *, max_member_bytes: int,
+                 max_expanded_bytes: int, max_entries: int, max_depth: int,
+                 max_memory_bytes: int) -> None:
+        self.max_member_bytes = max_member_bytes
+        self.max_expanded_bytes = max_expanded_bytes
+        self.max_entries = max_entries
+        self.max_depth = max_depth
+        self.max_memory_bytes = max_memory_bytes
+        self.expanded_bytes = 0
+        self.entries = 0
+        self.peak_memory_bytes = input_bytes
+        self.memory_bytes = input_bytes
+        self.max_depth_seen = 0
+        if input_bytes > max_memory_bytes:
+            raise ValueError("independent_reader_memory_limit")
+
+    def reserve(self, amount: int) -> None:
+        if amount < 0 or self.memory_bytes + amount > self.max_memory_bytes:
+            raise ValueError("independent_reader_memory_limit")
+        self.memory_bytes += amount
+        self.peak_memory_bytes = max(self.peak_memory_bytes, self.memory_bytes)
+
+    def release(self, amount: int) -> None:
+        self.memory_bytes -= amount
+
+    def add_entries(self, count: int) -> None:
+        if count < 0 or self.entries + count > self.max_entries:
+            raise ValueError("independent_reader_entry_limit")
+        self.entries += count
+
+    def add_output(self, amount: int, member_bytes: int) -> None:
+        if member_bytes + amount > self.max_member_bytes:
+            raise ValueError("independent_reader_member_limit")
+        if self.expanded_bytes + amount > self.max_expanded_bytes:
+            raise ValueError("independent_reader_expansion_limit")
+        self.expanded_bytes += amount
+
+
+def _verify_zip_independently(data: bytes, *, eicar_expected: bool,
+                              max_member_bytes: int = INDEPENDENT_ZIP_MAX_MEMBER_BYTES,
+                              max_expanded_bytes: int = INDEPENDENT_ZIP_MAX_EXPANDED_BYTES,
+                              max_entries: int = INDEPENDENT_ZIP_MAX_ENTRIES,
+                              max_depth: int = INDEPENDENT_ZIP_MAX_DEPTH,
+                              max_memory_bytes: int = INDEPENDENT_ZIP_MAX_MEMORY_BYTES) -> dict[str, Any]:
+    """Stream an independent CPython zipfile verification under explicit budgets."""
+    if len(data) > MAX_INPUT_BYTES:
+        raise ValueError("independent_reader_input_limit")
+    budget = _IndependentZipBudget(len(data), max_member_bytes=max_member_bytes,
+                                   max_expanded_bytes=max_expanded_bytes,
+                                   max_entries=max_entries, max_depth=max_depth,
+                                   max_memory_bytes=max_memory_bytes)
+    found = False
+    largest_member_bytes = 0
+
+    def visit(blob: bytes | bytearray, depth: int) -> None:
+        nonlocal found, largest_member_bytes
+        if depth > budget.max_depth:
             raise ValueError("independent_reader_depth_limit")
-        with zipfile.ZipFile(io.BytesIO(blob), "r") as archive:
-            bad = archive.testzip()
-            if bad is not None:
-                raise ValueError("independent_reader_crc_failure")
-            for name in archive.namelist():
-                content = archive.read(name)
-                expanded += len(content)
-                if expanded > MAX_EXPANDED_BYTES:
-                    raise ValueError("independent_reader_expansion_limit")
-                if hashlib.sha256(content).hexdigest() == EXPECTED_EICAR_SHA256:
-                    found = True
-                elif content.startswith(b"PK\x03\x04"):
-                    visit(content, depth + 1)
+        budget.max_depth_seen = max(budget.max_depth_seen, depth)
+        entry_count = _independent_zip_entry_count(blob, budget.max_entries - budget.entries)
+        budget.add_entries(entry_count)
+        parser_copy = len(blob)  # BytesIO owns a copy of the seekable ZIP input.
+        metadata_estimate = len(blob) * 3 + entry_count * INDEPENDENT_ZIP_INFO_ESTIMATE_BYTES
+        parser_overhead = INDEPENDENT_ZIP_FIXED_OVERHEAD_BYTES
+        budget.reserve(parser_copy + metadata_estimate + parser_overhead)
+        try:
+            with zipfile.ZipFile(io.BytesIO(blob), "r") as archive:
+                infos = archive.infolist()
+                if len(infos) != entry_count:
+                    raise ValueError("independent_reader_entry_count_mismatch")
+                for info in infos:
+                    actual = 0
+                    digest = hashlib.sha256()
+                    prefix = bytearray()
+                    nested: bytearray | None = None
+                    with archive.open(info, "r") as member:
+                        while True:
+                            chunk = member.read(INDEPENDENT_ZIP_CHUNK_BYTES)
+                            if not chunk:
+                                break
+                            budget.reserve(len(chunk))
+                            try:
+                                actual += len(chunk)
+                                largest_member_bytes = max(largest_member_bytes, actual)
+                                budget.add_output(len(chunk), actual - len(chunk))
+                                digest.update(chunk)
+                                if len(prefix) < 16:
+                                    prefix.extend(chunk[:16 - len(prefix)])
+                                    if (nested is None and
+                                            poc.sniff_content_type(bytes(prefix)) == "application/zip"):
+                                        nested = bytearray()
+                                if nested is not None:
+                                    budget.reserve(len(chunk))
+                                    nested.extend(chunk)
+                            finally:
+                                budget.release(len(chunk))
+                    if digest.hexdigest() == EXPECTED_EICAR_SHA256:
+                        found = True
+                    if nested is not None:
+                        try:
+                            visit(nested, depth + 1)
+                        finally:
+                            budget.release(len(nested))
+        finally:
+            budget.release(parser_copy + metadata_estimate + parser_overhead)
 
     visit(data, 0)
     if found != eicar_expected:
         raise ValueError("independent_reader_eicar_expectation_mismatch")
     return {"status": "PASS", "reader": "python.zipfile", "eicar_found": found,
-            "expanded_bytes": expanded}
+            "expanded_bytes": budget.expanded_bytes, "largest_member_bytes": largest_member_bytes,
+            "entry_count": budget.entries, "max_depth_seen": budget.max_depth_seen,
+            "peak_memory_bytes": budget.peak_memory_bytes,
+            "limits": {"member_bytes": budget.max_member_bytes,
+                       "expanded_bytes": budget.max_expanded_bytes,
+                       "entries": budget.max_entries, "depth": budget.max_depth,
+                       "memory_bytes": budget.max_memory_bytes}}
 
 
 def _read_bounded(path: Path, deadline: Deadline, maximum: int) -> bytes:
@@ -320,14 +492,18 @@ def _manifest_records(manifest_path: Path, verification_path: Path,
         raise ValueError("unsupported_phase0b_manifest")
     if verification.get("overall_status") != "PASS":
         raise ValueError("phase0b_fixture_verification_not_pass")
-    checks = {item.get("id"): item for item in verification.get("checks", [])}
-    fixtures = {item.get("id"): item for item in manifest.get("fixtures", [])}
-    required = [
-        "R1_pdf_embedded_zip64_residual_risk",
-        "R2_compressed_nested_zip64_inside_zip32_residual_risk",
-        "B10_valid_docx_control", "B11_valid_xlsx_control", "B12_valid_pptx_control",
-        "B13_valid_pdf_control", "B14_encrypted_pdf_unlock_pdf_control",
-    ]
+    check_list = verification.get("checks")
+    fixture_list = manifest.get("fixtures")
+    if (not isinstance(check_list, list) or not isinstance(fixture_list, list)
+            or any(not isinstance(item, dict) for item in check_list + fixture_list)):
+        raise ValueError("phase0b_fixture_records_malformed")
+    check_ids = [item.get("id") for item in check_list]
+    fixture_ids = [item.get("id") for item in fixture_list]
+    if len(set(check_ids)) != len(check_ids) or len(set(fixture_ids)) != len(fixture_ids):
+        raise ValueError("phase0b_fixture_records_duplicate")
+    checks = {item.get("id"): item for item in check_list}
+    fixtures = {item.get("id"): item for item in fixture_list}
+    required = list(REQUIRED_FIXTURE_IDS)
     if any(name not in fixtures or name not in checks for name in required):
         raise ValueError("required_phase0b_fixture_or_verification_missing")
     for name in required:
@@ -435,12 +611,14 @@ def _case_result(case: poc.CaseSpec, structural: dict[str, Any], original: dict[
         return "PASS" if structural.get("observed_verdict") == case.expected_verdict else "FAIL"
     scans = [obj for obj in structural.get("objects", [])
              if obj.get("scanner_reason") == "CLAMD_INSTREAM_COMPLETE"]
+    if case.expected_verdict == poc.INSPECTED and not scans:
+        return "NOT_VERIFIED"
     if eicar_required:
         if any(obj.get("scanner_verdict") == "INFECTED"
                and EICAR_RE.search(str(obj.get("offline_control_signature", ""))) for obj in scans):
             return "PASS"
         return "FAIL" if scans else "NOT_VERIFIED"
-    # Benign direct controls require a clean original and every extracted member clean.
+    # Benign controls require a clean original and every inspected payload clean.
     if original.get("scanner_verdict") != "CLEAN":
         return "FAIL" if original.get("scanner_verdict") else "NOT_VERIFIED"
     if any(obj.get("scanner_verdict") != "CLEAN" for obj in scans):
@@ -455,6 +633,180 @@ def _public_scan(result: dict[str, Any] | None) -> dict[str, Any]:
             ("scanner_verdict", "scanner_reason", "signature", "bytes_sent", "response_framing")}
 
 
+def _valid_signature_database_date(value: Any) -> bool:
+    if not isinstance(value, str) or len(value) > 128:
+        return False
+    for format_string in ("%a %b %d %H:%M:%S %Y", "%a %b %d %Y"):
+        try:
+            time.strptime(value.strip(), format_string)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def _core_evidence_failures(report: dict[str, Any]) -> list[str]:
+    failures: list[str] = []
+    if report.get("schema_version") != "phase0c-live-evidence-v1":
+        failures.append("REPORT_SCHEMA_INVALID")
+    clamd = report.get("clamd")
+    if not isinstance(clamd, dict) or clamd.get("zPING") != "PONG":
+        failures.append("CLAMD_PING_EVIDENCE_MISSING")
+    elif (clamd.get("engine_version") != "1.5.4"
+          or not re.fullmatch(r"[0-9]{1,10}", str(clamd.get("signature_database_version", "")))
+          or not _valid_signature_database_date(clamd.get("signature_database_date"))):
+        failures.append("CLAMD_SIGNATURE_PROVENANCE_INVALID")
+
+    provenance = report.get("runtime_provenance")
+    runtime_check = _validate_runtime_provenance(provenance) if isinstance(provenance, dict) else {"status": "FAIL"}
+    recorded_runtime = report.get("runtime_verification")
+    if (runtime_check.get("status") != "PASS" or not isinstance(recorded_runtime, dict)
+            or recorded_runtime.get("status") != "PASS"
+            or recorded_runtime.get("checks") != runtime_check.get("checks")):
+        failures.append("RUNTIME_VERIFICATION_MISSING_OR_INVALID")
+
+    if report.get("independent_fixture_verification_overall") != "PASS":
+        failures.append("PHASE0B_FIXTURE_VERIFICATION_NOT_PASS")
+    fixture_records = report.get("required_fixture_verification")
+    if not isinstance(fixture_records, list):
+        failures.append("REQUIRED_FIXTURE_VERIFICATION_MISSING")
+    else:
+        by_id = {item.get("id"): item for item in fixture_records if isinstance(item, dict)}
+        if len(by_id) != len(fixture_records) or set(by_id) != set(REQUIRED_FIXTURE_IDS):
+            failures.append("REQUIRED_FIXTURE_SET_INVALID")
+        for fixture_id in REQUIRED_FIXTURE_IDS:
+            item = by_id.get(fixture_id)
+            if (item is None or item.get("tool_verification_status") != "PASS"
+                    or not re.fullmatch(r"[0-9a-f]{64}", str(item.get("sha256", "")))):
+                failures.append("REQUIRED_FIXTURE_VERIFICATION_INVALID:" + fixture_id)
+
+    records = report.get("case_results")
+    if not isinstance(records, list):
+        failures.append("MANDATORY_CASE_RESULTS_MISSING")
+        return failures
+    by_case: dict[str, dict[str, Any]] = {}
+    duplicates: set[str] = set()
+    for item in records:
+        if not isinstance(item, dict) or not isinstance(item.get("case_id"), str):
+            failures.append("CASE_RESULT_MALFORMED")
+            continue
+        case_id = item["case_id"]
+        if case_id in by_case:
+            duplicates.add(case_id)
+        by_case[case_id] = item
+    for case_id in duplicates:
+        failures.append("DUPLICATE_CASE_RESULT:" + case_id)
+    for case_id, expected_coverage in REQUIRED_CASE_EXPECTATIONS.items():
+        item = by_case.get(case_id)
+        if item is None:
+            failures.append("MANDATORY_CASE_MISSING:" + case_id)
+            continue
+        if item.get("TEST_CASE_RESULT") != "PASS":
+            failures.append("MANDATORY_CASE_NOT_PASS:" + case_id)
+        if (item.get("SECURITY_COVERAGE_STATUS") != expected_coverage
+                or item.get("expected_structural_status") != expected_coverage):
+            failures.append("CASE_COVERAGE_EXPECTATION_MISMATCH:" + case_id)
+        original = item.get("ORIGINAL_CONTAINER_SCAN_RESULT")
+        if (case_id.startswith(("R1-", "R2-"))
+                and (not isinstance(original, dict)
+                     or original.get("classification") != "OBSERVATIONAL_ONLY")):
+            failures.append("ORIGINAL_CONTAINER_RESULT_NOT_OBSERVATIONAL:" + case_id)
+
+        if (not isinstance(original, dict)
+                or original.get("scanner_verdict") not in ("CLEAN", "INFECTED")
+                or original.get("scanner_reason") != "CLAMD_INSTREAM_COMPLETE"
+                or original.get("response_framing") != "ONE_NUL_TERMINATED_REPLY"):
+            failures.append("ORIGINAL_CONTAINER_SCANNER_RESPONSE_MISSING:" + case_id)
+        payloads = item.get("EXTRACTED_PAYLOAD_SCAN_RESULT")
+        if not isinstance(payloads, list):
+            failures.append("EXTRACTED_PAYLOAD_RESULTS_MISSING:" + case_id)
+            payloads = []
+        valid_payloads = []
+        for payload in payloads:
+            scan = payload.get("scanner_result") if isinstance(payload, dict) else None
+            if (not isinstance(scan, dict)
+                    or scan.get("scanner_verdict") not in ("CLEAN", "INFECTED")
+                    or scan.get("reason") != "CLAMD_INSTREAM_COMPLETE"
+                    or scan.get("response_framing") != "ONE_NUL_TERMINATED_REPLY"):
+                failures.append("EXTRACTED_PAYLOAD_SCANNER_RESPONSE_INVALID:" + case_id)
+            else:
+                valid_payloads.append(scan)
+        if expected_coverage == poc.INSPECTED and case_id != "CTRL-EICAR-RAW" and not valid_payloads:
+            failures.append("INSPECTED_CASE_HAS_NO_PAYLOAD_RESPONSE:" + case_id)
+        independent = item.get("independent_verification")
+        if (item.get("input_kind") == "zip" and expected_coverage == poc.INSPECTED
+                and (not isinstance(independent, dict) or independent.get("status") != "PASS")):
+            failures.append("INDEPENDENT_ZIP_VERIFICATION_MISSING:" + case_id)
+        if case_id in REQUIRED_EICAR_CASE_IDS:
+            scans = ([original] if case_id == "CTRL-EICAR-RAW" else valid_payloads)
+            if not any(scan.get("scanner_verdict") == "INFECTED"
+                       and EICAR_RE.search(str(scan.get("signature", ""))) for scan in scans):
+                failures.append("REQUIRED_EXTRACTED_EICAR_DETECTION_MISSING:" + case_id)
+        elif expected_coverage == poc.INSPECTED and any(scan.get("scanner_verdict") != "CLEAN"
+                                                         for scan in valid_payloads):
+            failures.append("BENIGN_PAYLOAD_NOT_CLEAN:" + case_id)
+        if (case_id.startswith("BENIGN-") or case_id.startswith("CTRL-NEG-")) and original and original.get("scanner_verdict") != "CLEAN":
+            failures.append("BENIGN_ORIGINAL_NOT_CLEAN:" + case_id)
+
+    if report.get("COMPLETE_SAFE_SCAN") is not False:
+        failures.append("COMPLETE_SAFE_SCAN_MUST_REMAIN_FALSE")
+    if not report.get("coverage_gaps"):
+        failures.append("EXPECTED_COVERAGE_GAPS_NOT_RECORDED")
+    expected_gaps = [
+        {"case_id": case_id, "coverage_status": status}
+        for case_id, status in REQUIRED_CASE_EXPECTATIONS.items() if status != poc.INSPECTED
+    ]
+    if report.get("expected_coverage_gaps") != expected_gaps:
+        failures.append("EXPECTED_COVERAGE_GAP_LEDGER_INVALID")
+    return sorted(set(failures))
+
+
+def _cleanup_evidence_failures(cleanup: Any) -> list[str]:
+    required = ("clamd_container_absent", "client_container_absent", "internal_network_absent",
+                "candidate_image_absent", "client_image_absent", "scratch_absent")
+    if not isinstance(cleanup, dict) or cleanup.get("status") != "PASS":
+        return ["CLEANUP_STATUS_NOT_PASS"]
+    failures = ["CLEANUP_VERIFICATION_MISSING_OR_FALSE:" + key for key in required
+                if cleanup.get(key) is not True]
+    if cleanup.get("runtime_verification_passed") is not True:
+        failures.append("RUNTIME_WORKFLOW_VERIFICATION_NOT_PASS")
+    return failures
+
+
+def _derive_aggregate(report: dict[str, Any], *, require_cleanup: bool) -> dict[str, Any]:
+    core_failures = _core_evidence_failures(report)
+    cleanup_failures = _cleanup_evidence_failures(report.get("cleanup")) if require_cleanup else []
+    failures = sorted(set(core_failures + cleanup_failures))
+    aggregate_status = "FAIL" if failures else ("PASS" if require_cleanup else "PENDING")
+    report["required_evidence"] = {
+        "status": aggregate_status,
+        "core_status": "PASS" if not core_failures else "FAIL",
+        "cleanup_status": ("PASS" if not cleanup_failures else "FAIL") if require_cleanup else "PENDING",
+        "failures": failures,
+    }
+    report["OVERALL_RESULT"] = "PASS" if require_cleanup and not failures else (
+        "FAIL" if failures else "PENDING_CLEANUP")
+    # This experimental client has known PDF and encrypted-content gaps; it never asserts full coverage.
+    report["COMPLETE_SAFE_SCAN"] = False
+    return report
+
+
+def _validate_runtime_provenance(provenance: dict[str, Any]) -> dict[str, Any]:
+    checks = {
+        "architecture": provenance.get("architecture") == "linux/arm64",
+        "clamav_local_image_id": bool(re.fullmatch(
+            r"sha256:[0-9a-f]{64}", str(provenance.get("clamav_local_image_id", "")))),
+        "client_local_image_id": bool(re.fullmatch(
+            r"sha256:[0-9a-f]{64}", str(provenance.get("client_local_image_id", "")))),
+        "clamav_config_sha256": bool(re.fullmatch(
+            r"[0-9a-f]{64}", str(provenance.get("clamav_config_sha256", "")))),
+        "clamav_package_version": provenance.get("clamav_package_version")
+                                  == "1.5.4+dfsg-0ubuntu0.22.04.1+dipphase0b1",
+        "network_mode": provenance.get("network_mode") == "internal_no_egress",
+    }
+    return {"status": "PASS" if all(checks.values()) else "FAIL", "checks": checks}
+
+
 def run_live(args: argparse.Namespace) -> dict[str, Any]:
     started = time.monotonic()
     total_deadline = Deadline(TOTAL_DEADLINE_SECONDS)
@@ -464,10 +816,8 @@ def run_live(args: argparse.Namespace) -> dict[str, Any]:
     fixtures, verification = _manifest_records(manifest_path, verification_path, fixture_root, total_deadline)
     provenance_path = fixture_root / "runtime-provenance.json"
     runtime_provenance = json.loads(_read_bounded(provenance_path, total_deadline, 64 * 1024).decode("utf-8"))
-    if (runtime_provenance.get("architecture") != "linux/arm64"
-            or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(runtime_provenance.get("clamav_local_image_id", "")))
-            or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(runtime_provenance.get("client_local_image_id", "")))
-            or not re.fullmatch(r"[0-9a-f]{64}", str(runtime_provenance.get("clamav_config_sha256", "")))):
+    runtime_verification = _validate_runtime_provenance(runtime_provenance)
+    if runtime_verification["status"] != "PASS":
         raise ValueError("runtime_provenance_invalid")
     host, port = args.clamd_host, args.clamd_port
     if args.expected_engine != "1.5.4":
@@ -480,6 +830,10 @@ def run_live(args: argparse.Namespace) -> dict[str, Any]:
     if not version_match or version_match.group(1) != args.expected_engine:
         raise LiveScanError("CLAMD_VERSION_UNEXPECTED")
     engine, sig_version, sig_date = version_match.groups()
+    if (not re.fullmatch(r"[0-9]{1,10}", sig_version)
+            or not _valid_signature_database_date(sig_date)
+            or any(ord(char) < 32 for char in sig_date)):
+        raise LiveScanError("CLAMD_SIGNATURE_PROVENANCE_INVALID")
 
     results: list[dict[str, Any]] = []
     transfer_budget = TransferBudget()
@@ -493,12 +847,14 @@ def run_live(args: argparse.Namespace) -> dict[str, Any]:
     direct_pass = (direct.get("scanner_verdict") == "INFECTED"
                    and EICAR_RE.search(str(direct.get("signature") or "")) is not None)
     results.append({
-        "case_id": "CTRL-EICAR-RAW", "track": "CONTROL", "input_sha256": EXPECTED_EICAR_SHA256,
+        "case_id": "CTRL-EICAR-RAW", "track": "CONTROL", "input_kind": "direct_eicar",
+        "input_sha256": EXPECTED_EICAR_SHA256,
         "fixture_provenance": "Phase 0C EICAR halves recombined at runtime; SHA-256 independently pinned",
         "independent_verification": {"status": "PASS", "method": "sha256"},
         "SECURITY_COVERAGE_STATUS": poc.INSPECTED,
-        "original_container_scanner_result": {"classification": "DIRECT_POSITIVE_CONTROL", **_public_scan(direct)},
-        "extracted_payload_scanner_results": [],
+        "ORIGINAL_CONTAINER_SCAN_RESULT": {"classification": "DIRECT_POSITIVE_CONTROL", **_public_scan(direct)},
+        "EXTRACTED_PAYLOAD_SCAN_RESULT": [],
+        "expected_structural_status": poc.INSPECTED,
         "TEST_CASE_RESULT": "PASS" if direct_pass else "FAIL",
     })
 
@@ -555,32 +911,39 @@ def run_live(args: argparse.Namespace) -> dict[str, Any]:
              "coverage_status": obj.get("verdict"), "actual_bytes": obj.get("extracted_bytes"),
              "resource_limits_hit": obj.get("resource_limits_hit", []),
              "scanner_result": {
-                 "verdict": obj.get("scanner_verdict"), "reason": obj.get("scanner_reason"),
+                 "scanner_verdict": obj.get("scanner_verdict"), "reason": obj.get("scanner_reason"),
                  "signature": obj.get("offline_control_signature"),
+                 "response_framing": obj.get("scanner_response_framing"),
              }}
             for obj in objects if obj.get("scanner_reason") == "CLAMD_INSTREAM_COMPLETE"
         ]
         results.append({
             "case_id": spec.case_id, "track": spec.track, "description": spec.description,
-            "input_sha256": input_sha, "input_bytes": len(data),
+            "input_kind": spec.kind, "input_sha256": input_sha, "input_bytes": len(data),
             "fixture_provenance": spec.notes,
             "independent_verification": independent,
             "expected_structural_status": spec.expected_verdict,
             "SECURITY_COVERAGE_STATUS": coverage_status,
             "structural_coverage": structural.get("coverage") if structural else {"status": "NOT_VERIFIED"},
             "resource_limits": structural.get("budget") if structural else {},
-            "original_container_scanner_result": {
+            "ORIGINAL_CONTAINER_SCAN_RESULT": {
                 "classification": "OBSERVATIONAL_ONLY", **_public_scan(original),
                 "clean_is_not_complete_nested_inspection": True,
             },
-            "extracted_payload_scanner_results": payload_scans,
+            "EXTRACTED_PAYLOAD_SCAN_RESULT": payload_scans,
             "post_unlock_output_scan": "NOT_VERIFIED; separate requirement; no password provided",
             "TEST_CASE_RESULT": case_result,
             "error_code": error,
         })
 
     end = time.monotonic()
-    return {
+    verification_checks = {item.get("id"): item for item in verification.get("checks", [])}
+    required_fixture_records = [
+        {"id": fixture_id, "sha256": fixtures[fixture_id].get("sha256"),
+         "tool_verification_status": verification_checks.get(fixture_id, {}).get("tool_verification_status")}
+        for fixture_id in REQUIRED_FIXTURE_IDS
+    ]
+    report = {
         "schema_version": "phase0c-live-evidence-v1",
         "experiment_id": "DIP-PHASE-0C-R1R2-LIVE-EVIDENCE-EXPERIMENTAL",
         "mode": "EXPERIMENTAL_LIVE_CLAMAV_SYNTHETIC_FIXTURES_ONLY",
@@ -588,7 +951,9 @@ def run_live(args: argparse.Namespace) -> dict[str, Any]:
         "clamd": {"engine_version": engine, "signature_database_version": sig_version,
                   "signature_database_date": sig_date, "zPING": "PONG"},
         "runtime_provenance": runtime_provenance,
+        "runtime_verification": runtime_verification,
         "independent_fixture_verification_overall": verification.get("overall_status"),
+        "required_fixture_verification": required_fixture_records,
         "single_client_deadline_seconds": TOTAL_DEADLINE_SECONDS,
         "elapsed_seconds": round(end - started, 3),
         "total_scanner_transfer_bytes": transfer_budget.transferred,
@@ -606,19 +971,28 @@ def run_live(args: argparse.Namespace) -> dict[str, Any]:
                               "post_storage_scan_satisfies_pre_storage": False},
         "coverage_gaps": ["arbitrary_pdf_streams", "PDF_Object_Streams", "unreferenced_embedded_streams",
                           "encrypted_pdf_content", "incremental_pdf_revisions", "unsupported_compression_methods"],
+        "expected_coverage_gaps": [
+            {"case_id": case_id, "coverage_status": status}
+            for case_id, status in REQUIRED_CASE_EXPECTATIONS.items() if status != poc.INSPECTED
+        ],
+        "COMPLETE_SAFE_SCAN": False,
         "governance": {"Security_Gate": "OPEN", "Licensing_Gate": "OPEN", "Stage_7": "NOT ACCEPTED",
                        "R1": "OPEN", "R2": "OPEN", "Change_Requests": "PROPOSED — NOT APPROVED"},
         "case_results": results,
         "cleanup": {"status": "PENDING_HOST_WORKFLOW_CLEANUP_VERIFICATION"},
     }
+    return _derive_aggregate(report, require_cleanup=False)
 
 
 def finalize_evidence(report_path: Path, cleanup_path: Path) -> dict[str, Any]:
+    if report_path.stat().st_size > MAX_EVIDENCE_BYTES or cleanup_path.stat().st_size > 64 * 1024:
+        raise ValueError("EVIDENCE_SIZE_LIMIT")
     report = json.loads(report_path.read_text(encoding="utf-8"))
     cleanup = json.loads(cleanup_path.read_text(encoding="utf-8"))
-    if cleanup.get("status") not in ("PASS", "FAIL"):
-        raise ValueError("cleanup_status_missing_or_invalid")
+    if not isinstance(report, dict):
+        raise ValueError("EVIDENCE_REPORT_INVALID")
     report["cleanup"] = cleanup
+    report = _derive_aggregate(report, require_cleanup=True)
     serialized = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
     if len(serialized.encode("utf-8")) > MAX_EVIDENCE_BYTES:
         raise ValueError("EVIDENCE_SIZE_LIMIT")
@@ -639,26 +1013,26 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     if args.mode == "finalize":
         report = finalize_evidence(Path(args.output), Path(args.cleanup_status))
-        return 0 if report.get("cleanup", {}).get("status") == "PASS" else 1
+        return 0 if report.get("OVERALL_RESULT") == "PASS" else 1
     try:
         report = run_live(args)
     except Exception as exc:
-        report = {
+        report = _derive_aggregate({
             "schema_version": "phase0c-live-evidence-v1",
             "mode": "EXPERIMENTAL_LIVE_CLAMAV_SYNTHETIC_FIXTURES_ONLY",
             "TEST_CASE_RESULT": "NOT_VERIFIED",
             "error_code": exc.code if isinstance(exc, LiveScanError) else type(exc).__name__,
-            "governance": {"Security_Gate": "OPEN", "Licensing_Gate": "OPEN", "R1": "OPEN", "R2": "OPEN"},
+            "governance": {"Security_Gate": "OPEN", "Licensing_Gate": "OPEN", "Stage_7": "NOT ACCEPTED",
+                           "R1": "OPEN", "R2": "OPEN", "Change_Requests": "PROPOSED — NOT APPROVED"},
             "cleanup": {"status": "PENDING_HOST_WORKFLOW_CLEANUP_VERIFICATION"},
-        }
+        }, require_cleanup=False)
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     serialized = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
     if len(serialized.encode("utf-8")) > MAX_EVIDENCE_BYTES:
         raise SystemExit("EVIDENCE_SIZE_LIMIT")
     output.write_text(serialized, encoding="utf-8")
-    has_failure = any(item.get("TEST_CASE_RESULT") == "FAIL" for item in report.get("case_results", []))
-    return 1 if has_failure or report.get("TEST_CASE_RESULT") == "NOT_VERIFIED" else 0
+    return 1 if report.get("required_evidence", {}).get("core_status") != "PASS" else 0
 
 
 if __name__ == "__main__":
