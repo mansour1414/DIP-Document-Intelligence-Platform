@@ -89,8 +89,8 @@ jobs:
             echo "WORK_DIR=$WORK_DIR"
           } >> "$GITHUB_ENV"
           rm -rf "$EVIDENCE_DIR" "$WORK_DIR"
-          mkdir -p "$EVIDENCE_DIR" "$WORK_DIR/fixtures" "$WORK_DIR/db" "$WORK_DIR/cfg-yes" "$WORK_DIR/cfg-no"
-          chmod 0755 "$WORK_DIR" "$WORK_DIR/db" "$WORK_DIR/cfg-yes" "$WORK_DIR/cfg-no"
+          mkdir -p "$EVIDENCE_DIR" "$WORK_DIR/fixtures" "$WORK_DIR/db" "$WORK_DIR/cfg-candidate" "$WORK_DIR/cfg-yes" "$WORK_DIR/cfg-no"
+          chmod 0755 "$WORK_DIR" "$WORK_DIR/db" "$WORK_DIR/cfg-candidate" "$WORK_DIR/cfg-yes" "$WORK_DIR/cfg-no"
 
           sha256sum \
             .github/workflows/clamav-phase0b-evidence.yml \
@@ -160,14 +160,41 @@ jobs:
           docker cp "$cid:/usr/share/doc/dip-phase0b/built-debs.sha256" "$EVIDENCE_DIR/built-debs.sha256"
           docker cp "$cid:/usr/share/doc/dip-phase0b/debian-patches-series.txt" "$EVIDENCE_DIR/debian-patches-series.txt"
 
-      - name: Generate deterministic Phase 0B fixtures and execute Part B preflight suite
+      - name: Install ephemeral runner-only Office/PDF verification tools (no production dependency impact)
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            fonts-dejavu-core \
+            libreoffice-calc \
+            libreoffice-impress \
+            libreoffice-writer \
+            poppler-utils \
+            qpdf
+          {
+            echo "soffice=$(soffice --version)"
+            echo "qpdf=$(qpdf --version | head -n 1)"
+            echo "pdftotext=$(pdftotext -v 2>&1 | head -n 1)"
+            echo "pdfdetach=$(pdfdetach -v 2>&1 | head -n 1)"
+          } | tee "$EVIDENCE_DIR/runner-verification-tools.txt"
+
+      - name: Generate genuine Phase 0B fixtures, verify Office/PDF authenticity, and run Part B preflight
         shell: bash
         run: |
           set -euo pipefail
           python3 scripts/experiments/clamav-phase0b-evidence.py generate \
             --out-dir "$WORK_DIR/fixtures" \
-            --max-file-size 16384
+            --max-file-size 16384 \
+            --require-qpdf
           cp "$WORK_DIR/fixtures/fixtures-manifest.json" "$EVIDENCE_DIR/fixtures-manifest.json"
+
+          # Fail-closed authenticity verification: LibreOffice EN/AR PDF conversion,
+          # qpdf AES-256/R6 encrypt+decrypt+wrong-password, and pdfdetach embedded ZIP64 check.
+          python3 scripts/experiments/clamav-phase0b-evidence.py verify-fixtures \
+            --manifest "$WORK_DIR/fixtures/fixtures-manifest.json" \
+            --out "$EVIDENCE_DIR/fixture-verification.json" \
+            --require-tool-verification
 
           python3 scripts/experiments/clamav-phase0b-evidence.py run-preflight \
             --manifest "$WORK_DIR/fixtures/fixtures-manifest.json" \
@@ -206,34 +233,44 @@ jobs:
             "$LOCAL_CANDIDATE_IMAGE" --check \
             | tee "$EVIDENCE_DIR/freshness-gate-check.log"
 
-      - name: Run isolated live scans against patched clamd (AlertExceedsMax=yes and =no controls)
+      - name: Run isolated live scans across candidate, reduced_alert_yes (16K/512K), and reduced_alert_no profiles
         shell: bash
         run: |
           set -euo pipefail
           docker network create --internal "$PHASE0B_NETWORK"
 
-          # Derive temporary isolated experiment configs from unmodified Stage 4 clamd.conf
-          # (MaxFileSize 16K, MaxScanSize 64K to exercise CLAM-3102 deterministically).
+          # Profile 1 (candidate): unmodified Stage 4 clamd.conf (StreamMaxLength 110M, MaxFileSize 110M, MaxScanSize 400M, MaxThreads 12, AlertExceedsMax yes)
+          cp docs/operations/experimental/clamav-arm64-stage4-candidate.conf "$WORK_DIR/cfg-candidate/clamd.conf"
+
+          # Profiles 2 & 3 (isolated MaxFileSize=16K under MaxScanSize=512K, StreamMaxLength=1M, MaxThreads=4,
+          # matching Phase 0A's established isolated profile so 64 KiB expanded ZIPs cannot be confounded by MaxScanSize).
           sed -E \
+            -e 's/^StreamMaxLength .*/StreamMaxLength 1M/' \
             -e 's/^MaxFileSize .*/MaxFileSize 16K/' \
-            -e 's/^MaxScanSize .*/MaxScanSize 64K/' \
+            -e 's/^MaxScanSize .*/MaxScanSize 512K/' \
+            -e 's/^MaxThreads .*/MaxThreads 4/' \
             -e 's/^AlertExceedsMax .*/AlertExceedsMax yes/' \
             docs/operations/experimental/clamav-arm64-stage4-candidate.conf \
             > "$WORK_DIR/cfg-yes/clamd.conf"
           sed -E \
+            -e 's/^StreamMaxLength .*/StreamMaxLength 1M/' \
             -e 's/^MaxFileSize .*/MaxFileSize 16K/' \
-            -e 's/^MaxScanSize .*/MaxScanSize 64K/' \
+            -e 's/^MaxScanSize .*/MaxScanSize 512K/' \
+            -e 's/^MaxThreads .*/MaxThreads 4/' \
             -e 's/^AlertExceedsMax .*/AlertExceedsMax no/' \
             docs/operations/experimental/clamav-arm64-stage4-candidate.conf \
             > "$WORK_DIR/cfg-no/clamd.conf"
-          chmod 0644 "$WORK_DIR/cfg-yes/clamd.conf" "$WORK_DIR/cfg-no/clamd.conf"
+          chmod 0644 "$WORK_DIR/cfg-candidate/clamd.conf" "$WORK_DIR/cfg-yes/clamd.conf" "$WORK_DIR/cfg-no/clamd.conf"
 
-          start_and_verify() {
-            local name="$1"
-            local cfg_dir="$2"
-            local conf_out="$3"
+          run_profile() {
+            local profile="$1"
+            local container_name="$2"
+            local cfg_dir="$3"
+            local expected_alert="$4"
+            local conf_out="$5"
+            local json_out="$6"
 
-            docker run -d --name "$name" \
+            docker run -d --name "$container_name" \
               --platform linux/arm64 \
               --network "$PHASE0B_NETWORK" \
               --read-only \
@@ -250,35 +287,47 @@ jobs:
               --exec /usr/sbin/clamd --config-file=/etc/clamav-phase0b/clamd.conf --foreground
 
             for _ in $(seq 1 80); do
-              if docker exec "$name" bash -c 'exec 3<>/dev/tcp/127.0.0.1/3310 && printf "zPING\0" >&3 && head -c 4 <&3 | grep -q PONG' >/dev/null 2>&1; then
+              if docker exec "$container_name" bash -c 'exec 3<>/dev/tcp/127.0.0.1/3310 && printf "zPING\0" >&3 && head -c 4 <&3 | grep -q PONG' >/dev/null 2>&1; then
                 break
               fi
               sleep 3
             done
-            docker exec "$name" bash -c 'exec 3<>/dev/tcp/127.0.0.1/3310 && printf "zPING\0" >&3 && head -c 4 <&3 | grep -q PONG'
-            test "$(docker exec "$name" id -u)" = "101"
-            test "$(docker exec "$name" id -g)" = "102"
-            test "$(docker inspect "$name" --format '{{.HostConfig.ReadonlyRootfs}}')" = "true"
-            test "$(docker inspect "$name" --format '{{len .HostConfig.PortBindings}}')" = "0"
-            test "$(docker inspect "$name" --format '{{.HostConfig.NetworkMode}}')" = "$PHASE0B_NETWORK"
-            docker exec "$name" /usr/bin/clamconf --config-dir=/etc/clamav-phase0b > "$conf_out"
+            docker exec "$container_name" bash -c 'exec 3<>/dev/tcp/127.0.0.1/3310 && printf "zPING\0" >&3 && head -c 4 <&3 | grep -q PONG'
+            test "$(docker exec "$container_name" id -u)" = "101"
+            test "$(docker exec "$container_name" id -g)" = "102"
+            test "$(docker inspect "$container_name" --format '{{.HostConfig.ReadonlyRootfs}}')" = "true"
+            test "$(docker inspect "$container_name" --format '{{len .HostConfig.PortBindings}}')" = "0"
+            test "$(docker inspect "$container_name" --format '{{.HostConfig.NetworkMode}}')" = "$PHASE0B_NETWORK"
+
+            docker exec "$container_name" /usr/bin/clamconf --config-dir=/etc/clamav-phase0b > "$conf_out"
+            local ip_addr
+            ip_addr="$(docker inspect "$container_name" --format "{{with index .NetworkSettings.Networks \"$PHASE0B_NETWORK\"}}{{.IPAddress}}{{end}}")"
+            test -n "$ip_addr"
+
+            # Fail closed BEFORE any scan if 22-key clamconf, zPING, or zVERSION (1.5.4) mismatches
+            local scan_rc=0
+            python3 scripts/experiments/clamav-phase0b-evidence.py scan-profile \
+              --profile "$profile" \
+              --manifest "$WORK_DIR/fixtures/fixtures-manifest.json" \
+              --host "$ip_addr" \
+              --port 3310 \
+              --clamconf-file "$conf_out" \
+              --expected-engine "1.5.4" \
+              --expected-alert-exceeds-max "$expected_alert" \
+              --out "$json_out" || scan_rc=$?
+
+            docker rm -f "$container_name" >/dev/null 2>&1 || true
+            if [[ "$scan_rc" -ne 0 ]]; then
+              return "$scan_rc"
+            fi
           }
 
-          start_and_verify "clamav-phase0b-yes" "$WORK_DIR/cfg-yes" "$EVIDENCE_DIR/clamconf-yes.txt"
-          start_and_verify "clamav-phase0b-no" "$WORK_DIR/cfg-no" "$EVIDENCE_DIR/clamconf-no.txt"
-
-          ip_yes="$(docker inspect clamav-phase0b-yes --format "{{with index .NetworkSettings.Networks \"$PHASE0B_NETWORK\"}}{{.IPAddress}}{{end}}")"
-          ip_no="$(docker inspect clamav-phase0b-no --format "{{with index .NetworkSettings.Networks \"$PHASE0B_NETWORK\"}}{{.IPAddress}}{{end}}")"
-          test -n "$ip_yes"
-          test -n "$ip_no"
-
-          python3 scripts/experiments/clamav-phase0b-evidence.py scan-live \
-            --manifest "$WORK_DIR/fixtures/fixtures-manifest.json" \
-            --host-yes "$ip_yes" \
-            --port-yes 3310 \
-            --host-no "$ip_no" \
-            --port-no 3310 \
-            --out "$EVIDENCE_DIR/live-scan-results.json"
+          run_profile "candidate" "clamav-phase0b-candidate" "$WORK_DIR/cfg-candidate" "yes" \
+            "$EVIDENCE_DIR/clamconf-candidate.txt" "$EVIDENCE_DIR/profile-candidate.json"
+          run_profile "reduced_alert_yes" "clamav-phase0b-yes" "$WORK_DIR/cfg-yes" "yes" \
+            "$EVIDENCE_DIR/clamconf-reduced-yes.txt" "$EVIDENCE_DIR/profile-reduced-yes.json"
+          run_profile "reduced_alert_no" "clamav-phase0b-no" "$WORK_DIR/cfg-no" "no" \
+            "$EVIDENCE_DIR/clamconf-reduced-no.txt" "$EVIDENCE_DIR/profile-reduced-no.json"
 
       - name: Assemble Phase 0B evidence report and enforce fail-closed verdict
         if: always() && steps.boundary.outcome == 'success'
@@ -310,13 +359,25 @@ jobs:
               patchedPackageVersion: $patchedPkgVersion,
               clam3102PatchSha256: $clam3102PatchSha256,
               baseConfSha256: $baseConfSha256,
+              isolatedReducedProfile: {
+                StreamMaxLength: "1M",
+                MaxFileSize: "16K",
+                MaxScanSize: "512K",
+                MaxThreads: 4
+              },
+              preScan22KeyClamconfAndZVersionRequired: true,
               upstreamPr1832Commit: "9f84fb3404b9a66c782e33f3e2b0da5e3d32af76",
               unreviewedZip64Pr1845Included: false,
               unrarIncluded: false,
               ghcrPublished: false
             }' > "$EVIDENCE_DIR/provenance.json"
 
-          if [[ ! -f "$EVIDENCE_DIR/fixtures-manifest.json" || ! -f "$EVIDENCE_DIR/preflight-results.json" || ! -f "$EVIDENCE_DIR/live-scan-results.json" ]]; then
+          if [[ ! -f "$EVIDENCE_DIR/fixtures-manifest.json" \
+             || ! -f "$EVIDENCE_DIR/fixture-verification.json" \
+             || ! -f "$EVIDENCE_DIR/preflight-results.json" \
+             || ! -f "$EVIDENCE_DIR/profile-candidate.json" \
+             || ! -f "$EVIDENCE_DIR/profile-reduced-yes.json" \
+             || ! -f "$EVIDENCE_DIR/profile-reduced-no.json" ]]; then
             echo "Incomplete Phase 0B evidence artifacts; failing closed." | tee "$EVIDENCE_DIR/phase0b-evidence-summary.md"
             exit 1
           fi
@@ -324,8 +385,11 @@ jobs:
           rc=0
           python3 scripts/experiments/clamav-phase0b-evidence.py assemble-report \
             --manifest "$EVIDENCE_DIR/fixtures-manifest.json" \
+            --fixture-verification "$EVIDENCE_DIR/fixture-verification.json" \
             --preflight-results "$EVIDENCE_DIR/preflight-results.json" \
-            --live-results "$EVIDENCE_DIR/live-scan-results.json" \
+            --profile-result "$EVIDENCE_DIR/profile-candidate.json" \
+            --profile-result "$EVIDENCE_DIR/profile-reduced-yes.json" \
+            --profile-result "$EVIDENCE_DIR/profile-reduced-no.json" \
             --provenance "$EVIDENCE_DIR/provenance.json" \
             --out-md "$EVIDENCE_DIR/phase0b-evidence-summary.md" \
             --out-json "$EVIDENCE_DIR/phase0b-evidence.json" || rc=$?
@@ -349,7 +413,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          docker rm -f clamav-phase0b-yes clamav-phase0b-no 2>/dev/null || true
+          docker rm -f clamav-phase0b-candidate clamav-phase0b-yes clamav-phase0b-no 2>/dev/null || true
           docker rmi -f "$LOCAL_CANDIDATE_IMAGE" 2>/dev/null || true
           docker network rm "$PHASE0B_NETWORK" 2>/dev/null || true
           if [[ -n "${WORK_DIR:-}" ]]; then

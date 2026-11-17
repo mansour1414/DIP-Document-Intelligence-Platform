@@ -17,10 +17,15 @@
  *   3. NUANCED VERSION_NEEDED=45 HANDLING: does NOT blindly reject all version_needed=45
  *      archives; allows benign version_needed=45 archives that contain no ZIP64 structures,
  *      no 0x0001 extra fields, no ZIP64 sentinels, and no 64-bit Data Descriptors.
- *   4. EXPLICIT RESIDUAL-RISK DISCLOSURE: OOXML-only preflight does NOT inspect ZIP64
- *      archives embedded inside PDF streams (upstream ClamAV issue #1888). PDF inputs
- *      (including password-protected PDFs required by DIP's unlock-pdf tool) pass through
- *      with an explicit residual-risk warning code.
+ *   4. EXPLICIT RESIDUAL-RISK DISCLOSURE:
+ *      (a) OOXML-only preflight does NOT inspect ZIP64 archives embedded inside PDF streams
+ *          (upstream ClamAV issue #1888). PDF inputs (including password-protected PDFs required
+ *          by DIP's unlock-pdf tool) pass through with an explicit residual-risk warning code.
+ *      (b) Zero-decompression preflight CANNOT inspect the interior of compressed nested
+ *          archives (e.g., a DEFLATE-compressed ZIP64 archive stored inside a ZIP32/OOXML
+ *          container). Known archive-extension nested members emit an explicit residual-risk
+ *          warning, and ANY compressed nested archive regardless of filename remains an open
+ *          residual risk.
  */
 
 import { readFileSync } from 'node:fs';
@@ -35,6 +40,8 @@ export type PreflightAction = 'ALLOW' | 'ALLOW_WITH_RESIDUAL_RISK_WARNING' | 'RE
 
 export type PreflightReasonCode =
   | 'OOXML_PREFLIGHT_DOES_NOT_INSPECT_PDF_EMBEDDED_ZIP64'
+  | 'COMPRESSED_NESTED_ARCHIVE_NOT_INSPECTED_RESIDUAL_RISK'
+  | 'UNCOMPRESSED_NESTED_ARCHIVE_NOT_RECURSIVELY_INSPECTED'
   | 'BENIGN_VERSION_NEEDED_45_NO_ZIP64_STRUCTURES'
   | 'LIMIT_EXCEEDED_INPUT_SIZE'
   | 'LIMIT_EXCEEDED_MAX_ENTRIES'
@@ -103,6 +110,12 @@ export interface ZipMemberSummary {
   readonly hasZip64ExtraField: boolean;
 }
 
+export interface ResidualRiskCapabilities {
+  readonly inspectsPdfEmbeddedZip64: false;
+  readonly inspectsCompressedNestedArchives: false;
+  readonly inspectsUncompressedNestedArchivesRecursively: false;
+}
+
 export interface ZipPreflightReport {
   readonly prototypeOnly: true;
   readonly decompressionPerformed: false;
@@ -115,6 +128,7 @@ export interface ZipPreflightReport {
   readonly totalDeclaredUncompressedBytes: number;
   readonly maxMemberDeclaredUncompressedBytes: number;
   readonly benignVersionNeeded45Count: number;
+  readonly residualRiskCapabilities: ResidualRiskCapabilities;
   readonly rejectCodes: readonly PreflightReasonCode[];
   readonly warningCodes: readonly PreflightReasonCode[];
   readonly infoCodes: readonly PreflightReasonCode[];
@@ -142,14 +156,66 @@ const SENTINEL_U32 = 0xffffffff;
 const OOXML_STRICT_METHODS: ReadonlySet<number> = new Set([0, 8]);
 const CLAMAV_SUPPORTED_METHODS: ReadonlySet<number> = new Set([0, 6, 8, 9, 12]);
 
-// Default bounded inspection limits aligned with DIP / Stage 4 clamd.conf
+// Known nested archive extensions (heuristic warning only; compressed nested archives with
+// arbitrary extensions also cannot be inspected under zero-decompression preflight).
+const NESTED_ARCHIVE_EXTENSIONS: readonly string[] = [
+  '.zip',
+  '.docx',
+  '.xlsx',
+  '.pptx',
+  '.docm',
+  '.xlsm',
+  '.pptm',
+  '.odt',
+  '.ods',
+  '.odp',
+  '.jar',
+  '.7z',
+  '.rar',
+  '.tar',
+  '.gz',
+  '.tgz',
+  '.bz2',
+  '.xz',
+];
+
+/**
+ * Authoritative DIP baseline & Stage 4 ClamAV reference limits (read-only metadata):
+ *   - src/config/index.ts BASE_LIMITS.maxBytes = 100 MiB (104,857,600 B)
+ *   - src/lib/malware/index.ts MALWARE_SCAN_MAX_BYTES = 100 MiB (104,857,600 B)
+ *   - docs/operations/experimental/clamav-arm64-stage4-candidate.conf:
+ *       StreamMaxLength = 110M, MaxFileSize = 110M, MaxScanSize = 400M, MaxFiles = 10000
+ *
+ * Defaults below are aligned with those baseline values so this experimental prototype does
+ * NOT silently introduce stricter upload/scanner ceilings. The single experimental-only
+ * structural bound (maxCentralDirectoryBytes = 16 MiB) has production compatibility explicitly
+ * marked NOT_VERIFIED until validated against real production OOXML corpora.
+ */
+export const BASELINE_LIMIT_PROVENANCE = {
+  dipToolMaxInputBytes: 100 * 1024 * 1024, // src/config/index.ts BASE_LIMITS.maxBytes
+  dipMalwareScanMaxBytes: 100 * 1024 * 1024, // src/lib/malware/index.ts MALWARE_SCAN_MAX_BYTES
+  clamdStreamMaxLengthBytes: 110 * 1024 * 1024, // clamav-arm64-stage4-candidate.conf StreamMaxLength 110M
+  clamdMaxFileSizeBytes: 110 * 1024 * 1024, // clamav-arm64-stage4-candidate.conf MaxFileSize 110M
+  clamdMaxScanSizeBytes: 400 * 1024 * 1024, // clamav-arm64-stage4-candidate.conf MaxScanSize 400M
+  clamdMaxFiles: 10000, // clamav-arm64-stage4-candidate.conf MaxFiles 10000
+  experimentalOnlyBounds: {
+    maxCentralDirectoryBytes: {
+      valueBytes: 16 * 1024 * 1024,
+      scope: 'EXPERIMENTAL_ONLY',
+      productionCompatibility: 'NOT_VERIFIED',
+      rationale:
+        'Bounds in-memory Central Directory parsing (~1.6 KiB average per entry across 10,000 entries); real-world corpus validation required before production adoption.',
+    },
+  },
+} as const;
+
 export const DEFAULT_ZIP_PREFLIGHT_LIMITS = {
-  maxInputBytes: 50 * 1024 * 1024, // 50 MiB (matches DIP MAX_FILE_SIZE_BYTES)
-  maxEntries: 1000, // bounded central directory scan
-  maxCentralDirectoryBytes: 4 * 1024 * 1024, // 4 MiB CD ceiling
-  maxExtraFieldBytes: 65535, // ZIP spec u16 ceiling
-  maxDeclaredMemberBytes: 100 * 1024 * 1024, // 100 MiB (matches clamd.conf MaxFileSize)
-  maxDeclaredTotalBytes: 300 * 1024 * 1024, // 300 MiB (matches clamd.conf MaxScanSize)
+  maxInputBytes: 100 * 1024 * 1024, // 100 MiB — aligned with DIP BASE_LIMITS.maxBytes & MALWARE_SCAN_MAX_BYTES
+  maxEntries: 10000, // 10,000 — aligned with clamav-arm64-stage4-candidate.conf MaxFiles 10000
+  maxCentralDirectoryBytes: 16 * 1024 * 1024, // 16 MiB — EXPERIMENTAL ONLY (production compatibility NOT VERIFIED)
+  maxExtraFieldBytes: 65535, // 65,535 B — ZIP APPNOTE u16 ceiling
+  maxDeclaredMemberBytes: 110 * 1024 * 1024, // 110 MiB — aligned with clamav-arm64-stage4-candidate.conf MaxFileSize 110M
+  maxDeclaredTotalBytes: 400 * 1024 * 1024, // 400 MiB — aligned with clamav-arm64-stage4-candidate.conf MaxScanSize 400M
 } as const;
 
 interface ParsedExtraField {
@@ -197,13 +263,29 @@ function readU64LESafe(bytes: Uint8Array, offset: number): { value: number; over
   return { value: hi * 4294967296 + lo, overflow: false };
 }
 
-function decodeAsciiName(bytes: Uint8Array, offset: number, length: number): string {
+function decodeEntryName(bytes: Uint8Array, offset: number, length: number, flags: number): string {
+  // General Purpose Bit 11 (0x0800) indicates UTF-8 filename encoding per APPNOTE 6.3.x.
+  // Decode UTF-8 so Arabic/Unicode member paths remain intact; sanitize ASCII control bytes.
+  const decoded =
+    (flags & 0x0800) !== 0
+      ? Buffer.from(bytes.buffer, bytes.byteOffset + offset, length).toString('utf8')
+      : Buffer.from(bytes.buffer, bytes.byteOffset + offset, length).toString('latin1');
   let out = '';
-  for (let i = 0; i < length; i += 1) {
-    const b = bytes[offset + i];
-    out += b >= 0x20 && b <= 0x7e ? String.fromCharCode(b) : '?';
+  for (let i = 0; i < decoded.length; i += 1) {
+    const code = decoded.charCodeAt(i);
+    out += code >= 0x20 && code !== 0x7f ? decoded[i] : '?';
   }
   return out;
+}
+
+function hasNestedArchiveExtension(entryName: string): boolean {
+  const lowered = entryName.toLowerCase();
+  for (const ext of NESTED_ARCHIVE_EXTENSIONS) {
+    if (lowered.endsWith(ext)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function isPdfMagic(bytes: Uint8Array): boolean {
@@ -303,6 +385,11 @@ function buildReport(params: {
     totalDeclaredUncompressedBytes: params.totalDeclaredUncompressedBytes,
     maxMemberDeclaredUncompressedBytes: params.maxMemberDeclaredUncompressedBytes,
     benignVersionNeeded45Count: params.benignVersionNeeded45Count,
+    residualRiskCapabilities: {
+      inspectsPdfEmbeddedZip64: false,
+      inspectsCompressedNestedArchives: false,
+      inspectsUncompressedNestedArchivesRecursively: false,
+    },
     rejectCodes,
     warningCodes,
     infoCodes,
@@ -660,9 +747,31 @@ export function inspectZipPreflight(
     }
 
     const nameOffsetCdh = cursor + 46;
-    const entryName = decodeAsciiName(bytes, nameOffsetCdh, nameLenCdh);
+    const entryName = decodeEntryName(bytes, nameOffsetCdh, nameLenCdh, flagsCdh);
     if (entryName === '[Content_Types].xml') {
       hasContentTypesXml = true;
+    }
+
+    // Surface explicit residual-risk warning for nested archive members that
+    // zero-decompression single-layer preflight cannot inspect internally.
+    if (hasNestedArchiveExtension(entryName)) {
+      if (methodCdh !== 0) {
+        findings.push({
+          severity: 'warning',
+          code: 'COMPRESSED_NESTED_ARCHIVE_NOT_INSPECTED_RESIDUAL_RISK',
+          message: `Compressed nested archive member '${entryName}' (method=${methodCdh}) cannot be inspected by zero-decompression preflight and remains an open residual risk.`,
+          entryIndex: i,
+          entryName,
+        });
+      } else {
+        findings.push({
+          severity: 'warning',
+          code: 'UNCOMPRESSED_NESTED_ARCHIVE_NOT_RECURSIVELY_INSPECTED',
+          message: `Uncompressed nested archive member '${entryName}' is not recursively inspected by single-layer preflight and remains a documented residual risk.`,
+          entryIndex: i,
+          entryName,
+        });
+      }
     }
 
     // Parse CDH extra fields
@@ -829,7 +938,7 @@ export function inspectZipPreflight(
           entryName,
         });
       } else {
-        const lfhName = decodeAsciiName(bytes, lfhOffset + 30, nameLenLfh);
+        const lfhName = decodeEntryName(bytes, lfhOffset + 30, nameLenLfh, flagsLfh);
         const parsedLfhExtra = parseExtraFields(
           bytes,
           lfhOffset + 30 + nameLenLfh,
@@ -1561,7 +1670,47 @@ export function runSelfTests(): { passed: number; failed: number; results: reado
         { declaredKind: 'zip', maxDeclaredMemberBytes: 16384, maxDeclaredTotalBytes: 32768 },
       ),
     },
+    {
+      id: 'allow_baseline_aligned_110m_member_and_400m_total_defaults',
+      expectedAction: 'ALLOW',
+      report: inspectZipPreflight(
+        buildSyntheticZip([
+          {
+            name: 'member1.bin',
+            payload: asciiBytes('a'),
+            declaredUncompressedSize: 110 * 1024 * 1024,
+          },
+          {
+            name: 'member2.bin',
+            payload: asciiBytes('b'),
+            declaredUncompressedSize: 110 * 1024 * 1024,
+          },
+        ]),
+        { declaredKind: 'zip' },
+      ),
+    },
+    {
+      id: 'warn_compressed_nested_archive_residual_risk',
+      expectedAction: 'ALLOW_WITH_RESIDUAL_RISK_WARNING',
+      mustContainCode: 'COMPRESSED_NESTED_ARCHIVE_NOT_INSPECTED_RESIDUAL_RISK',
+      report: inspectZipPreflight(
+        buildSyntheticZip([
+          { name: 'nested/inner_zip64.zip', payload: asciiBytes('compressed-bytes'), method: 8 },
+        ]),
+        { declaredKind: 'zip' },
+      ),
+    },
   ];
+
+  // Verify authoritative baseline alignment invariants on exported default limits
+  const baselineDefaultsOk =
+    DEFAULT_ZIP_PREFLIGHT_LIMITS.maxInputBytes === 100 * 1024 * 1024 &&
+    DEFAULT_ZIP_PREFLIGHT_LIMITS.maxDeclaredMemberBytes === 110 * 1024 * 1024 &&
+    DEFAULT_ZIP_PREFLIGHT_LIMITS.maxDeclaredTotalBytes === 400 * 1024 * 1024 &&
+    DEFAULT_ZIP_PREFLIGHT_LIMITS.maxEntries === 10000;
+  if (!baselineDefaultsOk) {
+    throw new Error('DEFAULT_ZIP_PREFLIGHT_LIMITS drifted from DIP/Stage 4 baseline limits');
+  }
 
   let passed = 0;
   let failed = 0;
@@ -1574,7 +1723,10 @@ export function runSelfTests(): { passed: number; failed: number; results: reado
     const actionOk = tc.report.action === tc.expectedAction;
     const codeOk = tc.mustContainCode ? allCodes.includes(tc.mustContainCode) : true;
     const noDecompression = tc.report.decompressionPerformed === false;
-    if (actionOk && codeOk && noDecompression) {
+    const residualFlagsOk =
+      tc.report.residualRiskCapabilities.inspectsPdfEmbeddedZip64 === false &&
+      tc.report.residualRiskCapabilities.inspectsCompressedNestedArchives === false;
+    if (actionOk && codeOk && noDecompression && residualFlagsOk) {
       passed += 1;
     } else {
       failed += 1;

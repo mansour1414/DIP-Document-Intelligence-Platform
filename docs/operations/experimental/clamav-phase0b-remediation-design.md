@@ -52,7 +52,7 @@ An earlier proposal informally referenced `CR-004` for ClamAV remediation. Repos
 | Provisional ID | Status | Title | Scope & Sunset / Exit Trigger |
 | --- | --- | --- | --- |
 | **`CLAMAV-CR-P01`** | **PROPOSED — NOT APPROVED** | Isolated ARM64 ClamAV 1.5.4 + Upstream `CLAM-3102` Candidate | Rebuilds Ubuntu Jammy DFSG `1.5.4+dfsg-0ubuntu0.22.04.1` with upstream PR `#1832` (`9f84fb34...`) only; excludes PR `#1845`. **Mandatory de-fork trigger**: retire the DIP quilt patch immediately once Ubuntu Jammy publishes an official security/updates package containing `CLAM-3102` (expected ClamAV `>= 1.5.5` or Ubuntu backport) and live tests confirm parity. |
-| **`CLAMAV-CR-P02`** | **PROPOSED — NOT APPROVED** | Bounded Zero-Decompression ZIP/OOXML Structural Preflight & PDF Residual-Risk Disclosure | Evaluates isolated TS prototype (`clamav-phase0b-zip-preflight.mts`) covering ZIP64 variants, unsupported compression methods, encrypted OOXML, and malformed headers without decompressing untrusted inputs and without blindly rejecting benign `version_needed=45`. **Explicit non-goal**: does not resolve PDF-embedded ZIP64 (`#1888`), which remains an open documented residual risk pending upstream ClamAV fix or separate bounded PDF-attachment inspection design. Production upload-pipeline integration requires a separate approved CR after live Phase 0B evidence and false-positive telemetry validation. |
+| **`CLAMAV-CR-P02`** | **PROPOSED — NOT APPROVED** | Bounded Zero-Decompression ZIP/OOXML Structural Preflight & Residual-Risk Disclosure | Evaluates isolated TS prototype (`clamav-phase0b-zip-preflight.mts`) aligned to DIP baseline (`100 MiB` upload, `110 MiB` member, `400 MiB` total, `10,000` entries; `16 MiB` experimental CD cap marked `NOT VERIFIED`) covering ZIP64 variants, unsupported compression methods, encrypted OOXML, and malformed headers without decompressing untrusted inputs and without blindly rejecting benign `version_needed=45`. **Explicit non-goals (open residual risks)**: does **not** resolve PDF-embedded ZIP64 (`#1888`, `R1`) or compressed nested archives inside ZIP/OOXML (`R2`). Production upload-pipeline integration requires a separate approved CR after live Phase 0B evidence and false-positive telemetry validation. |
 | **`CLAMAV-CR-P03`** | **PROPOSED — NOT APPROVED** | Phase 0B Live Evidence Matrix, GPLv2 Corresponding Source & SBOM Governance | Governs manual-only, default-branch, confirmation-gated, local-only (no GHCR push) live verification (`.github/workflows/clamav-phase0b-evidence.yml`) and defines mandatory Licensing Gate deliverables (GPLv2 §2(a)/§3 Corresponding Source archive, SPDX/CycloneDX SBOM covering Ubuntu + `libclamav_rust` Cargo crates, UnRAR exclusion proof, and legal sign-off) prior to any private/external registry publication. |
 
 ---
@@ -97,16 +97,20 @@ Upstream community PR `#1845` (`fca76728`) is **unreviewed and unmerged**, still
 
 Implementation: `docs/operations/experimental/clamav-phase0b-zip-preflight.mts` (zero external npm dependencies; ES2017/strict TypeScript; **NOT** wired into `src/lib/uploads/validation.ts` or `src/lib/malware/*`).
 
-### 4.1 Security & Resource Invariants
+### 4.1 Security & Resource Invariants (Aligned with DIP Baseline & Stage 4 `clamd.conf`)
 
 1. **Zero Decompression (`decompressionPerformed: false`)**: Never inflates untrusted compressed streams. Inspects strictly EOCD, ZIP64 EOCD/Locator, Central Directory File Headers (CDH), Local File Headers (LFH), TLV Extra Fields, and Data Descriptor byte geometry.
-2. **Hard Resource Bounds**:
-   - `maxInputBytes`: `50 MiB` (matches DIP `MAX_FILE_SIZE_BYTES`)
-   - `maxEntries`: `1,000`
-   - `maxCentralDirectoryBytes`: `4 MiB`
-   - `maxExtraFieldBytes`: `65,535 B`
-   - `maxDeclaredMemberBytes`: `100 MiB` (aligned with `clamd.conf` `MaxFileSize`)
-   - `maxDeclaredTotalBytes`: `300 MiB` (aligned with `clamd.conf` `MaxScanSize`)
+2. **Baseline-Aligned Resource Bounds (No Silent Stricter Production Ceilings)**:
+
+| Preflight Bound | Experimental Default | Authoritative Repo / Baseline Reference | Alignment & Production Status |
+| --- | --- | --- | --- |
+| `maxInputBytes` | **`100 MiB`** (`104,857,600 B`) | `src/config/index.ts` `BASE_LIMITS.maxBytes` (`100 MiB`) & `src/lib/malware/index.ts` `MALWARE_SCAN_MAX_BYTES` (`100 MiB`) | **Aligned** with DIP tool baseline (does not silently tighten 100 MiB limit) |
+| `maxDeclaredMemberBytes` | **`110 MiB`** (`115,343,360 B`) | `docs/operations/experimental/clamav-arm64-stage4-candidate.conf` `MaxFileSize 110M` | **Aligned** with Stage 4 `clamd.conf` |
+| `maxDeclaredTotalBytes` | **`400 MiB`** (`419,430,400 B`) | `docs/operations/experimental/clamav-arm64-stage4-candidate.conf` `MaxScanSize 400M` | **Aligned** with Stage 4 `clamd.conf` |
+| `maxEntries` | **`10,000`** | `docs/operations/experimental/clamav-arm64-stage4-candidate.conf` `MaxFiles 10000` | **Aligned** with Stage 4 `clamd.conf` |
+| `maxExtraFieldBytes` | **`65,535 B`** | PKWARE ZIP APPNOTE `u16` header ceiling | Specification ceiling |
+| `maxCentralDirectoryBytes` | **`16 MiB`** (`16,777,216 B`) | No equivalent `clamd.conf` directive (experimental header-memory cap sized at ~1.6 KiB avg per entry across 10,000 entries) | **EXPERIMENTAL ONLY — production compatibility NOT VERIFIED** (requires real corpus telemetry before production adoption) |
+
 3. **Comprehensive ZIP64 Detection**:
    - `ZIP64_EOCD_LOCATOR_PRESENT` (`PK\x06\x07`) and `ZIP64_EOCD_RECORD_PRESENT` (`PK\x06\x06`)
    - `ZIP64_EOCD_SENTINEL` (`0xFFFF` / `0xFFFFFFFF` in standard EOCD)
@@ -121,12 +125,14 @@ Implementation: `docs/operations/experimental/clamav-phase0b-zip-preflight.mts` 
    - Rejects compression methods outside `ooxml-strict` (`{0, 8}` per ECMA-376) for OOXML or `clamav-supported` (`{0, 6, 8, 9, 12}`) for generic ZIP (`UNSUPPORTED_COMPRESSION_METHOD`, e.g., LZMA `14`, Zstd `93`, PPMd `98`).
    - Rejects encrypted ZIP/OOXML (`flags & 0x0001`, `0x0040`, `0x2000`, WinZip AES method `99` / extra `0x9901`) while preserving `AlertEncrypted no` in `clamd.conf` so password-protected PDFs for `unlock-pdf` continue to function.
    - Rejects LFH/CDH mismatches, missing/ambiguous EOCD, multi-disk archives, malformed TLV extra fields, overlapping member ranges, unreferenced preambles, and missing `[Content_Types].xml` on declared OOXML inputs.
+   - Decodes UTF-8 filenames (`flags & 0x0800`) cleanly so Arabic/Unicode member names are preserved without corruption.
 
 ### 4.2 Explicit Residual Risks & Architectural Separation of Duties
 
 | Residual Risk / Boundary | Why It Exists | Disposition |
 | --- | --- | --- |
-| **PDF-Embedded ZIP64 (`upstream ClamAV #1888`)** | OOXML-only preflight returns `ALLOW_WITH_RESIDUAL_RISK_WARNING` (`OOXML_PREFLIGHT_DOES_NOT_INSPECT_PDF_EMBEDDED_ZIP64`) for PDFs so PDF processing and `unlock-pdf` are not broken. It does **NOT** parse PDF `/EmbeddedFile` object streams or detect ZIP64 payloads inside PDFs. | **OPEN RESIDUAL RISK** — Explicitly tracked in `R1_pdf_embedded_zip64_residual_risk` and `CLAMAV-CR-P02`. Requires upstream ClamAV ZIP64 fix or a dedicated, bounded PDF-attachment inspection design before closing the Security Gate for PDF-embedded archive threats. |
+| **PDF-Embedded ZIP64 (`upstream ClamAV #1888`)** | OOXML-only preflight returns `ALLOW_WITH_RESIDUAL_RISK_WARNING` (`OOXML_PREFLIGHT_DOES_NOT_INSPECT_PDF_EMBEDDED_ZIP64`) for PDFs so PDF processing and `unlock-pdf` are not broken. It does **NOT** parse PDF `/EmbeddedFiles` object streams or detect ZIP64 attachments inside PDFs. | **OPEN RESIDUAL RISK (`R1_pdf_embedded_zip64_residual_risk`)** — Explicitly flagged (`pdf_embedded_zip64_remediated: false`). Even if all scoped Phase 0B checks pass, overall remediation status remains `PARTIAL_RESIDUAL_RISKS_OPEN`. Requires upstream ClamAV ZIP64 fix or a separate bounded PDF-attachment inspection design before closing the Security Gate for PDF-embedded archive threats. |
+| **Compressed Nested Archives Inside ZIP/OOXML** | Because Part B preflight strictly performs **zero decompression** (`decompressionPerformed: false`), it **cannot** inspect inside any compressed nested archive (e.g., a DEFLATE-compressed ZIP64 archive stored inside a valid outer ZIP32 or OOXML container, regardless of filename extension). Known archive-extension nested members emit `COMPRESSED_NESTED_ARCHIVE_NOT_INSPECTED_RESIDUAL_RISK` warning; arbitrary-extension compressed nested archives cannot be detected statically without decompression. | **OPEN RESIDUAL RISK (`R2_compressed_nested_zip64_inside_zip32_residual_risk`)** — Explicitly flagged (`compressed_nested_archives_inspected_by_preflight: false`). Classified as `RESIDUAL_RISK_OPEN` (never counted as a security `PASS`). Requires upstream ClamAV ZIP64 support (`#1527`/`#1928`) or isolated bounded sandbox decompression in a separate CR. |
 | **Forged-Size ZIP32 Archives** | Because Part B preflight strictly performs **zero decompression**, an archive whose LFH/CDH falsely declares `uncompressed_size = 100` while inflating to `65,536` bytes intentionally passes Part B preflight (`A7_forged_size_header_zip32_maxfilesize`). | **MITIGATED BY PART A (`CLAM-3102`)** — Patched `clamd` counts actual inflated bytes during decompression and emits `Heuristics.Limits.Exceeded.MaxFileSize`. Proves Part A and Part B are complementary, not interchangeable. |
 
 ---
@@ -153,49 +159,69 @@ Implementation: `docs/operations/experimental/clamav-phase0b-zip-preflight.mts` 
 
 ---
 
-## 6. Complete Live Test Matrix (Prepared — NOT YET EXECUTED LIVE)
+## 6. Complete Live Test Matrix, Pre-Scan Gates & Verdict Integrity (Prepared — NOT YET EXECUTED LIVE)
 
-All 25 deterministic fixtures are generated by `scripts/experiments/clamav-phase0b-evidence.py` and executed by `.github/workflows/clamav-phase0b-evidence.yml` (under isolated experiment config `MaxFileSize=16K`, `MaxScanSize=64K`, comparing `AlertExceedsMax=yes` vs `AlertExceedsMax=no` without altering `clamav-arm64-stage4-candidate.conf`).
+All 26 deterministic fixtures are generated by `scripts/experiments/clamav-phase0b-evidence.py` and executed sequentially across **three isolated scanner profiles** by `.github/workflows/clamav-phase0b-evidence.yml`:
 
-### 6.1 Part A — CLAM-3102 Live `clamd` Matrix (9 Cases)
+| Profile | Key Effective Limits | Purpose | Pre-Scan Fail-Closed Gate |
+| --- | --- | --- | --- |
+| `candidate` | Unmodified `clamav-arm64-stage4-candidate.conf`: `StreamMaxLength=110M`, `MaxFileSize=110M`, `MaxScanSize=400M`, `MaxThreads=12`, `AlertExceedsMax=yes` | Genuine bilingual Office/PDF controls, EICAR ZIP32, observational raw-`clamd` ZIP64, open residual-risk probes (`R1`, `R2`) | Full **22-key `clamconf`** validation + `zPING` + `zVERSION` (`1.5.4`) |
+| `reduced_alert_yes` | Isolated `CLAM-3102` profile (matching Phase 0A): `StreamMaxLength=1M`, `MaxFileSize=16K`, **`MaxScanSize=512K`**, `MaxThreads=4`, `AlertExceedsMax=yes` (all other 17 baseline keys preserved verbatim) | Isolates `MaxFileSize=16K` without `MaxScanSize` confounding 64 KiB expanded ZIP inputs (`A1`–`A9`) | Full **22-key `clamconf`** validation + `zPING` + `zVERSION` (`1.5.4`) |
+| `reduced_alert_no` | Same `1M / 16K / 512K / 4` isolated limits with `AlertExceedsMax=no` | Observational comparison controls (`A4`, `A7`) confirming `AlertExceedsMax` wiring | Full **22-key `clamconf`** validation + `zPING` + `zVERSION` (`1.5.4`) |
 
-| ID | Input Description | Expected Preflight | Expected Patched `clamd` (`AlertExceedsMax=yes`) | Expected Control (`AlertExceedsMax=no`) |
+### 6.0 Genuine Fixture Authenticity & Verdict Taxonomy Rules
+
+- **Genuine Office/PDF/Attachment Authenticity (`verify-fixtures`)**:
+  - `B9`, `B10`, `B11`, `B12` are complete ECMA-376 OPC packages containing **both English and Arabic UTF-8 content** (`_rels/.rels`, `[Content_Types].xml`, WordprocessingML/SpreadsheetML/PresentationML XML parts). In the live workflow, ephemeral runner-only LibreOffice (`soffice --headless --convert-to pdf`) + `qpdf --check` + `pdftotext` verify real open/convert compatibility and English/Arabic text preservation.
+  - `B14` is encrypted with real `qpdf --password-mode=unicode --encrypt ... 256` (AES-256/R6) and verified via `--show-encryption`, valid-password `--decrypt` + `--check`, and wrong-password exit-code-2 rejection.
+  - `R1` embeds `B1` via a genuine ISO 32000-1 `/Catalog -> /Names << /EmbeddedFiles >> -> /Filespec -> /EF -> /EmbeddedFile` attachment tree, verified via `qpdf --check` and `pdfdetach -list`/`-save` SHA-256 parity.
+  - **Offline honesty rule**: When `soffice`, `qpdf`, or `pdfdetach` are absent offline, fixture tool verification is recorded as **`NOT VERIFIED`** (never `PASS`), and `assemble-report` / `--require-tool-verification` fail closed.
+- **Strict Verdict Taxonomy**:
+  - Unexpected `CLEAN` on any required security check (`EICAR_FOUND`, `MAXFILESIZE_FOUND`) is classified explicitly as **`SECURITY FAILURE`**.
+  - Wrong limit alert (e.g., `MaxScanSize` firing when `MaxFileSize` was required) is classified as **`FAIL`**.
+  - `OBSERVATIONAL_CONTROL_OK` (`AlertExceedsMax=no`), `OBSERVATIONAL_RECORD_ONLY` (direct raw `clamd` scans of `B1`/`B2`/`B3` bypassing preflight), and `RESIDUAL_RISK_OPEN` (`R1`, `R2`) are **NEVER** counted as security passes.
+  - Even when all scoped required checks pass, `overall_remediation_status` is explicitly **`PARTIAL_RESIDUAL_RISKS_OPEN`** with `pdf_embedded_zip64_remediated: false` and `compressed_nested_archives_inspected_by_preflight: false`.
+
+### 6.1 Part A — CLAM-3102 Live `clamd` Matrix (9 Cases under `MaxFileSize=16K`, `MaxScanSize=512K`)
+
+| ID | Input Description | Expected Preflight | Expected `reduced_alert_yes` | Expected `reduced_alert_no` |
 | --- | --- | --- | --- | --- |
-| `A1_eicar_zip32_control` | EICAR in normal ZIP32 | `ALLOW` | `EICAR_FOUND` | — |
+| `A1_eicar_zip32_control` | EICAR in normal ZIP32 | `ALLOW` | `EICAR_FOUND` (also `candidate`) | — |
 | `A2_exact_boundary_zip32_eq_maxfilesize` | DEFLATE ZIP32 expanding to **exact** `16,384 B` (`== MaxFileSize`) | `ALLOW` | `CLEAN` (`stream: OK\0`) | — |
 | `A3_over_boundary_plus1_zip32_deflate` | DEFLATE ZIP32 expanding to `16,385 B` (`MaxFileSize + 1`) | `ALLOW` | `Heuristics.Limits.Exceeded.MaxFileSize` | — |
-| `A4_phase0a_e1_repro_zip32_64k_deflate` | Phase 0A `E1_yes` reproduction (`65,536 B` DEFLATE ZIP32) | `ALLOW` | `Heuristics.Limits.Exceeded.MaxFileSize` | `CLEAN` |
+| `A4_phase0a_e1_repro_zip32_64k_deflate` | Phase 0A `E1_yes` reproduction (`65,536 B` DEFLATE ZIP32, `<< 512K MaxScanSize`) | `ALLOW` | `Heuristics.Limits.Exceeded.MaxFileSize` | `OBSERVATIONAL_CONTROL_OK` (`CLEAN`) |
 | `A5_over_boundary_zip32_stored` | STORED (method 0) `20,480 B` ZIP32 (`unz()` line 166) | `ALLOW` | `Heuristics.Limits.Exceeded.MaxFileSize` | — |
 | `A6_over_boundary_zip32_bzip2` | BZIP2 (method 12) `32,768 B` ZIP32 (`unz()` line 274) | `ALLOW` | `Heuristics.Limits.Exceeded.MaxFileSize` | — |
-| `A7_forged_size_header_zip32_maxfilesize` | **Forged-size control**: LFH/CDH lie `usize=100`, DEFLATE inflates to `65,536 B` | `ALLOW` (zero-decomp boundary) | `Heuristics.Limits.Exceeded.MaxFileSize` | `CLEAN` |
+| `A7_forged_size_header_zip32_maxfilesize` | **Forged-size control**: LFH/CDH lie `usize=100`, DEFLATE inflates to `65,536 B` | `ALLOW` (zero-decomp boundary) | `Heuristics.Limits.Exceeded.MaxFileSize` | `OBSERVATIONAL_CONTROL_OK` (`CLEAN`) |
 | `A8_eicar_hidden_past_maxfilesize_zip32` | EICAR placed after byte `20,480` inside DEFLATE ZIP32 | `ALLOW` | `Heuristics.Limits.Exceeded.MaxFileSize` | — |
 | `A9_raw_non_zip_64k_maxfilesize_control` | Raw non-ZIP `65,536 B` payload | `REJECT` (`MALFORMED_NOT_ZIP_MAGIC`) | `Heuristics.Limits.Exceeded.MaxFileSize` | — |
 
-### 6.2 Part B — Bounded ZIP/OOXML Preflight & Controls Matrix (15 Cases)
+### 6.2 Part B — Bounded ZIP/OOXML Preflight & Genuine Bilingual Controls Matrix (15 Cases)
 
-| ID | Input Description | Expected Preflight Action | Required Reason / Telemetry Code | Live `clamd` Role |
+| ID | Input Description | Expected Preflight Action | Required Reason / Telemetry Code | Live `candidate` Profile Role |
 | --- | --- | --- | --- | --- |
-| `B1_zip64_eicar_lfh_python312` | Phase 0A `D_eicar_zip64` repro (`0xFFFFFFFF` LFH + `0x0001`) | `REJECT` | `ZIP64_LFH_SENTINEL` | `RECORD_ONLY` (PR `#1845` excluded) |
+| `B1_zip64_eicar_lfh_python312` | Phase 0A `D_eicar_zip64` repro (`0xFFFFFFFF` LFH + `0x0001`) | `REJECT` | `ZIP64_LFH_SENTINEL` | `OBSERVATIONAL_RECORD_ONLY` (not counted as PASS) |
 | `B1b_zip64_extra_field_without_sentinels` | `0x0001` extra field without `0xFFFFFFFF` sentinels | `REJECT` | `ZIP64_EXTRA_FIELD_PRESENT` | — |
-| `B2_zip64_eicar_full_eocd_cdh` | Full ZIP64 EOCD + Locator + CDH/LFH sentinels + EICAR | `REJECT` | `ZIP64_EOCD_LOCATOR_PRESENT` | `RECORD_ONLY` |
-| `B3_zip64_data_descriptor_no_sentinels` | `version_needed=45`, bit `0x0008`, 24B 64-bit DD, no sentinels | `REJECT` | `ZIP64_DATA_DESCRIPTOR_DETECTED` | `RECORD_ONLY` |
+| `B2_zip64_eicar_full_eocd_cdh` | Full ZIP64 EOCD + Locator + CDH/LFH sentinels + EICAR | `REJECT` | `ZIP64_EOCD_LOCATOR_PRESENT` | `OBSERVATIONAL_RECORD_ONLY` (not counted as PASS) |
+| `B3_zip64_data_descriptor_no_sentinels` | `version_needed=45`, bit `0x0008`, 24B 64-bit DD, no sentinels | `REJECT` | `ZIP64_DATA_DESCRIPTOR_DETECTED` | `OBSERVATIONAL_RECORD_ONLY` (not counted as PASS) |
 | `B4_unsupported_method_lzma_14` | ZIP member compressed with LZMA (`method=14`) | `REJECT` | `UNSUPPORTED_COMPRESSION_METHOD` | — |
 | `B5_unsupported_method_ppmd_98` | ZIP member compressed with PPMd (`method=98`) | `REJECT` | `UNSUPPORTED_COMPRESSION_METHOD` | — |
 | `B6_encrypted_ooxml_traditional` | OOXML with PKWARE encryption bit `0x0001` | `REJECT` | `ENCRYPTED_MEMBER_TRADITIONAL` | — |
 | `B7_encrypted_ooxml_winzip_aes` | OOXML with WinZip AES (`method=99` / `0x9901`) | `REJECT` | `ENCRYPTED_MEMBER_AES` | — |
 | `B8_malformed_lfh_cdh_mismatch` | OOXML with LFH/CDH compression method mismatch | `REJECT` | `MALFORMED_LFH_CDH_MISMATCH` | — |
-| `B9_benign_version_needed_45_docx` | Valid DOCX with `version_needed=45`, standard 32-bit headers | `ALLOW` | `BENIGN_VERSION_NEEDED_45_NO_ZIP64_STRUCTURES` | `CLEAN` |
-| `B10_valid_docx_control` | Clean valid DOCX | `ALLOW` | — | `CLEAN` |
-| `B11_valid_xlsx_control` | Clean valid XLSX | `ALLOW` | — | `CLEAN` |
-| `B12_valid_pptx_control` | Clean valid PPTX | `ALLOW` | — | `CLEAN` |
-| `B13_valid_pdf_control` | Clean valid PDF | `ALLOW_WITH_RESIDUAL_RISK_WARNING` | `OOXML_PREFLIGHT_DOES_NOT_INSPECT_PDF_EMBEDDED_ZIP64` | `CLEAN` |
-| `B14_encrypted_pdf_unlock_pdf_control` | Encrypted PDF (`/Encrypt` dict, `unlock-pdf` control) | `ALLOW_WITH_RESIDUAL_RISK_WARNING` | `OOXML_PREFLIGHT_DOES_NOT_INSPECT_PDF_EMBEDDED_ZIP64` | `CLEAN` |
+| `B9_benign_version_needed_45_docx` | Genuine bilingual (EN/AR) OPC DOCX with `version_needed=45`, 32-bit headers | `ALLOW` | `BENIGN_VERSION_NEEDED_45_NO_ZIP64_STRUCTURES` | `CLEAN` + LibreOffice verification |
+| `B10_valid_docx_control` | Genuine bilingual (EN/AR) ECMA-376 OPC DOCX | `ALLOW` | — | `CLEAN` + LibreOffice verification |
+| `B11_valid_xlsx_control` | Genuine bilingual (EN/AR) ECMA-376 OPC XLSX | `ALLOW` | — | `CLEAN` + LibreOffice verification |
+| `B12_valid_pptx_control` | Genuine bilingual (EN/AR) ECMA-376 OPC PPTX | `ALLOW` | — | `CLEAN` + LibreOffice verification |
+| `B13_valid_pdf_control` | Valid ISO 32000-1 PDF (EN body + EN/AR UTF-16BE metadata) | `ALLOW_WITH_RESIDUAL_RISK_WARNING` | `OOXML_PREFLIGHT_DOES_NOT_INSPECT_PDF_EMBEDDED_ZIP64` | `CLEAN` + `qpdf --check` |
+| `B14_encrypted_pdf_unlock_pdf_control` | Genuinely AES-256/R6 encrypted PDF via `qpdf` (`unlock-pdf` control) | `ALLOW_WITH_RESIDUAL_RISK_WARNING` | `OOXML_PREFLIGHT_DOES_NOT_INSPECT_PDF_EMBEDDED_ZIP64` | `CLEAN` + `qpdf` decrypt & wrong-pw check |
 
-### 6.3 Residual Risk Probe (1 Case)
+### 6.3 Open Residual Risk Probes (2 Cases — NEVER Counted as PASS)
 
-| ID | Input Description | Expected Preflight Action | Live `clamd` Role |
+| ID | Input Description | Expected Preflight Action | Live `candidate` Classification |
 | --- | --- | --- | --- |
-| `R1_pdf_embedded_zip64_residual_risk` | Minimal PDF embedding ZIP64 EICAR stream (`#1888`) | `ALLOW_WITH_RESIDUAL_RISK_WARNING` (`OOXML_PREFLIGHT_DOES_NOT_INSPECT_PDF_EMBEDDED_ZIP64`) | `RECORD_ONLY` (explicitly documents open residual risk) |
+| `R1_pdf_embedded_zip64_residual_risk` | ISO 32000-1 PDF with structurally referenced `/Names -> /EmbeddedFiles -> /Filespec -> /EmbeddedFile` ZIP64 EICAR attachment (`#1888`) | `ALLOW_WITH_RESIDUAL_RISK_WARNING` (`OOXML_PREFLIGHT_DOES_NOT_INSPECT_PDF_EMBEDDED_ZIP64`) | **`RESIDUAL_RISK_OPEN`** (verified extractable via `pdfdetach`; never counted as `PASS`) |
+| `R2_compressed_nested_zip64_inside_zip32_residual_risk` | Valid outer ZIP32 containing DEFLATE-compressed inner ZIP64 EICAR archive | `ALLOW_WITH_RESIDUAL_RISK_WARNING` (`COMPRESSED_NESTED_ARCHIVE_NOT_INSPECTED_RESIDUAL_RISK`) | **`RESIDUAL_RISK_OPEN`** (proves zero-decompression preflight cannot inspect compressed nested archives; never counted as `PASS`) |
 
 ---
 
@@ -203,17 +229,18 @@ All 25 deterministic fixtures are generated by `scripts/experiments/clamav-phase
 
 | Risk ID | Severity | Description | Mitigation / Exit Condition |
 | --- | --- | --- | --- |
-| `R-P0B-01` | High | PDF-embedded ZIP64 bypass (`#1888`) remains unmitigated by OOXML-only preflight | Explicitly surfaced as warning + documented residual risk; track upstream ClamAV fix or design bounded PDF attachment preflight in separate CR |
-| `R-P0B-02` | High | GPLv2 §3 / Rust staticlib transitive license noncompliance if image is distributed before legal review | Zero GHCR push in Phase 0B; `corresponding-source` stage + `/usr/share/doc/dip-phase0b/` artifacts prepared for legal/SBOM review; Licensing Gate remains OPEN |
-| `R-P0B-03` | Medium | Custom `CLAM-3102` quilt patch drift if Ubuntu Jammy issues subsequent ClamAV security updates | Pinned source SHA-256 fails closed on drift; mandatory de-fork trigger under `CLAMAV-CR-P01` once Ubuntu ships official `CLAM-3102` fix |
-| `R-P0B-04` | Medium | Streaming OOXML writers emitting `0x0001` extra fields or 64-bit Data Descriptors rejected by Part B preflight | Benign `version_needed=45` without ZIP64 structures is allowed; require shadow-mode telemetry before any future production CR enables blocking |
-| `R-P0B-05` | Low | `ubuntu-24.04-arm` native build time or Ubuntu `jammy-security` source index rollover | Dockerfile resolves `Build-Depends` directly from SHA-256-verified extracted `debian/control` with Launchpad archive fallback; 60-minute job timeout |
+| `R-P0B-01` | High | PDF-embedded ZIP64 bypass (`#1888`) remains unmitigated by OOXML-only preflight | Explicitly flagged (`RESIDUAL_RISK_OPEN`, `pdf_embedded_zip64_remediated: false`); track upstream ClamAV fix or design bounded PDF attachment preflight in separate CR |
+| `R-P0B-02` | High | Compressed nested archives inside ZIP/OOXML cannot be inspected by zero-decompression preflight (`R2`) | Explicitly flagged (`RESIDUAL_RISK_OPEN`, `compressed_nested_archives_inspected_by_preflight: false`); requires upstream ClamAV ZIP64 fix or isolated sandboxed decompression in a separate CR |
+| `R-P0B-03` | High | GPLv2 §3 / Rust staticlib transitive license noncompliance if image is distributed before legal review | Zero GHCR push in Phase 0B; `corresponding-source` stage + `/usr/share/doc/dip-phase0b/` artifacts prepared for legal/SBOM review; Licensing Gate remains OPEN |
+| `R-P0B-04` | Medium | Custom `CLAM-3102` quilt patch drift if Ubuntu Jammy issues subsequent ClamAV security updates | Pinned source SHA-256 fails closed on drift; mandatory de-fork trigger under `CLAMAV-CR-P01` once Ubuntu ships official `CLAM-3102` fix |
+| `R-P0B-05` | Medium | Streaming OOXML writers emitting `0x0001` extra fields or 64-bit Data Descriptors rejected by Part B preflight; experimental `maxCentralDirectoryBytes = 16 MiB` ceiling not verified on production corpora | Benign `version_needed=45` without ZIP64 structures is allowed; `maxCentralDirectoryBytes` explicitly marked `EXPERIMENTAL ONLY — production compatibility NOT VERIFIED`; require shadow-mode telemetry before any future production CR enables blocking |
+| `R-P0B-06` | Low | `ubuntu-24.04-arm` native build time or Ubuntu `jammy-security` source index rollover | Dockerfile resolves `Build-Depends` directly from SHA-256-verified extracted `debian/control` with Launchpad archive fallback; 60-minute job timeout |
 
 ---
 
 ## 8. Operator Execution Preconditions (DO NOT RUN BEFORE MERGE & AUTHORIZATION)
 
-1. Review this Draft PR and obtain explicit human approval before merging to `main`.
+1. Review Draft PR `#14` and obtain explicit human approval before merging to `main`.
 2. Only **after** merge to `main`, an authorized maintainer may manually dispatch `.github/workflows/clamav-phase0b-evidence.yml` on branch `main` with confirmation string `run-phase0b-clamav-remediation-poc`.
-3. Inspect the uploaded evidence artifact (`phase0b-evidence-summary.md`, `phase0b-evidence.json`, `dpkg-manifest.txt`, `clamconf-yes.txt`, `clamconf-no.txt`).
-4. Even if all 25 live tests pass, **Security Gate** and **Licensing Gate** remain **OPEN** until formal approval of `CLAMAV-CR-P01`, `CLAMAV-CR-P02`, and `CLAMAV-CR-P03`, SBOM/legal sign-off, and separate audited production integration.
+3. Inspect the uploaded evidence artifact (`phase0b-evidence-summary.md`, `phase0b-evidence.json`, `fixture-verification.json`, `dpkg-manifest.txt`, `clamconf-candidate.txt`, `clamconf-reduced-yes.txt`, `clamconf-reduced-no.txt`).
+4. Even if all scoped live checks pass (`overall_remediation_status = PARTIAL_RESIDUAL_RISKS_OPEN`), **Security Gate** and **Licensing Gate** remain **OPEN** until formal approval of `CLAMAV-CR-P01`, `CLAMAV-CR-P02`, and `CLAMAV-CR-P03`, SBOM/legal sign-off, residual-risk disposition for `R1`/`R2`, and separate audited production integration.
