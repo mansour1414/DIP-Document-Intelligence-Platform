@@ -626,6 +626,134 @@ def _case_result(case: poc.CaseSpec, structural: dict[str, Any], original: dict[
     return "PASS"
 
 
+_REASON_CODE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,119}")
+_REASON_CODE_LIMIT = 24
+
+
+def _safe_reason_code(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if not _REASON_CODE_RE.fullmatch(candidate):
+        return None
+    return candidate
+
+
+def _collect_reason_codes(values: list[Any]) -> tuple[list[str], int, bool]:
+    codes: list[str] = []
+    malformed = 0
+    for value in values:
+        if value is None or value == "":
+            continue
+        code = _safe_reason_code(value)
+        if code is None:
+            malformed += 1
+            continue
+        if code not in codes:
+            codes.append(code)
+    truncated = len(codes) > _REASON_CODE_LIMIT
+    return codes[:_REASON_CODE_LIMIT], malformed, truncated
+
+
+def _case_reason_record(*, case_id: str, expected_status: str,
+                        structural: dict[str, Any] | None,
+                        original: dict[str, Any] | None,
+                        objects: list[dict[str, Any]], case_result: str,
+                        observed_error: str | None = None) -> dict[str, Any]:
+    structural_error_raw = structural.get("error_code") if isinstance(structural, dict) else None
+    structural_error = _safe_reason_code(structural_error_raw)
+    observed_error_code = _safe_reason_code(observed_error)
+    malformed = int(structural_error_raw not in (None, "") and structural_error is None)
+    malformed += int(observed_error not in (None, "") and observed_error_code is None)
+
+    structural_values: list[Any] = []
+    coverage_reason_values: list[Any] = []
+    coverage_gap_values: list[Any] = []
+    limit_values: list[Any] = []
+    coverage = structural.get("coverage") if isinstance(structural, dict) else None
+    if isinstance(coverage, dict):
+        coverage_reason_values.extend(coverage.get("reasons", [])
+                                      if isinstance(coverage.get("reasons"), list) else [])
+        coverage_gap_values.extend(coverage.get("uninspected_stream_gaps", [])
+                                   if isinstance(coverage.get("uninspected_stream_gaps"), list) else [])
+        limit_values.extend(coverage.get("resource_limits_hit", [])
+                            if isinstance(coverage.get("resource_limits_hit"), list) else [])
+    budget = structural.get("budget") if isinstance(structural, dict) else None
+    if isinstance(budget, dict):
+        limit_values.extend(budget.get("resource_limits_hit", [])
+                            if isinstance(budget.get("resource_limits_hit"), list) else [])
+    for obj in objects:
+        if not isinstance(obj, dict):
+            malformed += 1
+            continue
+        verdict = obj.get("verdict")
+        skipped = bool(obj.get("skipped"))
+        if skipped or verdict != poc.INSPECTED:
+            structural_values.extend((obj.get("structural_verdict"), obj.get("skip_reason")))
+        obj_limits = obj.get("resource_limits_hit")
+        if isinstance(obj_limits, list):
+            limit_values.extend(obj_limits)
+    structural_reasons, malformed_structural, structural_truncated = _collect_reason_codes(structural_values)
+    coverage_reasons, malformed_coverage_reasons, coverage_reasons_truncated = _collect_reason_codes(
+        coverage_reason_values)
+    coverage_gaps, malformed_coverage_gaps, coverage_gaps_truncated = _collect_reason_codes(
+        coverage_gap_values)
+    resource_limits, malformed_limits, limits_truncated = _collect_reason_codes(limit_values)
+    malformed = min(999, malformed + malformed_structural + malformed_coverage_reasons
+                    + malformed_coverage_gaps + malformed_limits)
+    reason_codes_truncated = (structural_truncated or coverage_reasons_truncated
+                              or coverage_gaps_truncated or limits_truncated)
+
+    has_original_response = (
+        isinstance(original, dict)
+        and original.get("scanner_verdict") in ("CLEAN", "INFECTED")
+        and original.get("scanner_reason") == "CLAMD_INSTREAM_COMPLETE"
+        and original.get("response_framing") == "ONE_NUL_TERMINATED_REPLY"
+    )
+    inspected_objects = [obj for obj in objects
+                         if isinstance(obj, dict) and obj.get("verdict") == poc.INSPECTED]
+    scanner_missing = (
+        not has_original_response
+        or any(obj.get("scanner_reason") != "CLAMD_INSTREAM_COMPLETE"
+               or obj.get("scanner_verdict") not in ("CLEAN", "INFECTED")
+               for obj in inspected_objects)
+        or (expected_status == poc.INSPECTED and case_id != "CTRL-EICAR-RAW"
+            and not inspected_objects)
+    )
+    structural_matches = (case_id == "CTRL-EICAR-RAW" or (
+        isinstance(structural, dict)
+        and structural.get("verdict_match") is True
+        and structural.get("observed_verdict") == expected_status
+    ))
+    has_reason = bool(structural_error or structural_reasons or coverage_reasons
+                      or coverage_gaps or resource_limits)
+    if scanner_missing:
+        classification = "MISSING_SCANNER_RESULT"
+    elif case_result != "PASS" or (expected_status == poc.INSPECTED and not structural_matches):
+        classification = "UNEXPECTED_RESULT"
+    elif expected_status != poc.INSPECTED:
+        applicable_reasons = (coverage_gaps or structural_reasons) if expected_status == poc.NOT_VERIFIED else (
+            structural_error or structural_reasons or resource_limits)
+        classification = ("EXPECTED_NEGATIVE" if structural_matches and applicable_reasons and not malformed
+                          else "UNEXPECTED_RESULT")
+    else:
+        classification = "OBSERVED"
+
+    integrity = "MALFORMED" if malformed else ("OBSERVED" if has_reason else "NONE_OBSERVED")
+    reason = {
+        "classification": classification,
+        "integrity": integrity,
+        "reason_codes_truncated": reason_codes_truncated,
+        "observed_error_code": observed_error_code,
+        "structural_error_code": structural_error,
+        "structural_reason_codes": structural_reasons,
+        "coverage_reason_codes": coverage_reasons,
+        "coverage_gap_codes": coverage_gaps,
+        "resource_limit_codes": resource_limits,
+    }
+    return reason
+
+
 def _public_scan(result: dict[str, Any] | None) -> dict[str, Any]:
     if result is None:
         return {"status": "NOT_VERIFIED"}
@@ -706,6 +834,36 @@ def _core_evidence_failures(report: dict[str, Any]) -> list[str]:
         if (item.get("SECURITY_COVERAGE_STATUS") != expected_coverage
                 or item.get("expected_structural_status") != expected_coverage):
             failures.append("CASE_COVERAGE_EXPECTATION_MISMATCH:" + case_id)
+        reason = item.get("CASE_REASON")
+        if expected_coverage == poc.INSPECTED:
+            if (not isinstance(reason, dict) or reason.get("classification") != "OBSERVED"
+                    or reason.get("integrity") == "MALFORMED"):
+                failures.append("MANDATORY_CASE_REASON_INVALID:" + case_id)
+        else:
+            if not isinstance(reason, dict) or reason.get("classification") != "EXPECTED_NEGATIVE" \
+                    or reason.get("integrity") != "OBSERVED":
+                failures.append("MANDATORY_CASE_REASON_MISSING:" + case_id)
+            else:
+                structural_codes = reason.get("structural_reason_codes")
+                coverage_codes = reason.get("coverage_gap_codes")
+                limit_codes = reason.get("resource_limit_codes")
+                has_structural_reason = (
+                    _safe_reason_code(reason.get("structural_error_code")) is not None
+                    or (isinstance(structural_codes, list) and any(
+                        _safe_reason_code(code) is not None for code in structural_codes[:_REASON_CODE_LIMIT]))
+                    or (isinstance(limit_codes, list) and any(
+                        _safe_reason_code(code) is not None for code in limit_codes[:_REASON_CODE_LIMIT]))
+                )
+                has_coverage_gap = (
+                    (isinstance(coverage_codes, list) and any(
+                        _safe_reason_code(code) is not None for code in coverage_codes[:_REASON_CODE_LIMIT]))
+                    or (isinstance(structural_codes, list) and any(
+                        _safe_reason_code(code) is not None for code in structural_codes[:_REASON_CODE_LIMIT]))
+                )
+                if ((expected_coverage == poc.NOT_VERIFIED and not has_coverage_gap)
+                        or (expected_coverage in (poc.REJECTED, poc.UNSUPPORTED)
+                            and not has_structural_reason)):
+                    failures.append("MANDATORY_CASE_STRUCTURAL_REASON_MISSING:" + case_id)
         original = item.get("ORIGINAL_CONTAINER_SCAN_RESULT")
         if (case_id.startswith(("R1-", "R2-"))
                 and (not isinstance(original, dict)
@@ -846,6 +1004,10 @@ def run_live(args: argparse.Namespace) -> dict[str, Any]:
                          transfer_budget=transfer_budget, max_bytes=len(fx.EICAR_BYTES))
     direct_pass = (direct.get("scanner_verdict") == "INFECTED"
                    and EICAR_RE.search(str(direct.get("signature") or "")) is not None)
+    direct_case_result = "PASS" if direct_pass else "FAIL"
+    direct_case_reason = _case_reason_record(
+        case_id="CTRL-EICAR-RAW", expected_status=poc.INSPECTED,
+        structural=None, original=direct, objects=[], case_result=direct_case_result)
     results.append({
         "case_id": "CTRL-EICAR-RAW", "track": "CONTROL", "input_kind": "direct_eicar",
         "input_sha256": EXPECTED_EICAR_SHA256,
@@ -855,7 +1017,9 @@ def run_live(args: argparse.Namespace) -> dict[str, Any]:
         "ORIGINAL_CONTAINER_SCAN_RESULT": {"classification": "DIRECT_POSITIVE_CONTROL", **_public_scan(direct)},
         "EXTRACTED_PAYLOAD_SCAN_RESULT": [],
         "expected_structural_status": poc.INSPECTED,
-        "TEST_CASE_RESULT": "PASS" if direct_pass else "FAIL",
+        "CASE_REASON": direct_case_reason,
+        "error_code": None,
+        "TEST_CASE_RESULT": direct_case_result,
     })
 
     for spec, independent in candidates:
@@ -864,7 +1028,12 @@ def run_live(args: argparse.Namespace) -> dict[str, Any]:
         data = spec.builder()
         case_deadline.remaining()
         if len(data) > MAX_INPUT_BYTES:
+            case_reason = _case_reason_record(
+                case_id=spec.case_id, expected_status=spec.expected_verdict,
+                structural=None, original=None, objects=[], case_result="FAIL",
+                observed_error="INPUT_BYTE_LIMIT")
             results.append({"case_id": spec.case_id, "track": spec.track,
+                            "CASE_REASON": case_reason,
                             "TEST_CASE_RESULT": "FAIL", "SECURITY_COVERAGE_STATUS": poc.REJECTED,
                             "error_code": "INPUT_BYTE_LIMIT"})
             continue
@@ -906,6 +1075,10 @@ def run_live(args: argparse.Namespace) -> dict[str, Any]:
                 "R2-15", "R2-24", "R2-25", "CTRL-POS-01", "R1-LIVE-01", "R2-LIVE-01",
             }
             case_result = _case_result(spec, structural, original or {}, eicar_required=eicar_required)
+        case_reason = _case_reason_record(
+            case_id=spec.case_id, expected_status=spec.expected_verdict,
+            structural=structural, original=original, objects=objects,
+            case_result=case_result, observed_error=error)
         payload_scans = [
             {"structural_path": obj.get("object_path"), "depth": obj.get("depth"),
              "coverage_status": obj.get("verdict"), "actual_bytes": obj.get("extracted_bytes"),
@@ -923,6 +1096,7 @@ def run_live(args: argparse.Namespace) -> dict[str, Any]:
             "fixture_provenance": spec.notes,
             "independent_verification": independent,
             "expected_structural_status": spec.expected_verdict,
+            "CASE_REASON": case_reason,
             "SECURITY_COVERAGE_STATUS": coverage_status,
             "structural_coverage": structural.get("coverage") if structural else {"status": "NOT_VERIFIED"},
             "resource_limits": structural.get("budget") if structural else {},

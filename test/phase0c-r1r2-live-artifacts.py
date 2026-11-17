@@ -211,6 +211,90 @@ class LiveAdapterTests(unittest.TestCase):
         self.assertEqual(live._case_result(spec, benign, {"scanner_verdict": "INFECTED"},
                                            eicar_required=False), "FAIL")
 
+    def test_case_reason_preserves_expected_rejection_unsupported_limits_and_gaps(self) -> None:
+        scanner = {"scanner_verdict": "CLEAN", "scanner_reason": "CLAMD_INSTREAM_COMPLETE",
+                   "response_framing": "ONE_NUL_TERMINATED_REPLY"}
+        cases = (
+            (poc.REJECTED, {
+                "error_code": "MALFORMED_PDF",
+                "observed_verdict": poc.REJECTED, "verdict_match": True,
+                "coverage": {"reasons": [], "uninspected_stream_gaps": [],
+                             "resource_limits_hit": []},
+                "budget": {"resource_limits_hit": []},
+                "objects": [{"verdict": poc.REJECTED, "structural_verdict": "MALFORMED_PDF"}],
+            }, ("MALFORMED_PDF",)),
+            (poc.UNSUPPORTED, {
+                "observed_verdict": poc.UNSUPPORTED, "verdict_match": True,
+                "coverage": {"reasons": [], "uninspected_stream_gaps": [],
+                             "resource_limits_hit": []},
+                "objects": [{"verdict": poc.UNSUPPORTED,
+                             "structural_verdict": "UNSUPPORTED_COMPRESSION_METHOD"}],
+            }, ("UNSUPPORTED_COMPRESSION_METHOD",)),
+            (poc.REJECTED, {
+                "observed_verdict": poc.REJECTED, "verdict_match": True,
+                "coverage": {"reasons": ["RESOURCE_LIMIT_HIT"],
+                             "uninspected_stream_gaps": [], "resource_limits_hit": ["ENTRY_LIMIT"]},
+                "budget": {"resource_limits_hit": ["ENTRY_LIMIT"]},
+                "objects": [{"verdict": poc.REJECTED, "structural_verdict": "ENTRY_LIMIT",
+                             "resource_limits_hit": ["ENTRY_LIMIT"]}],
+            }, ("ENTRY_LIMIT",)),
+            (poc.NOT_VERIFIED, {
+                "observed_verdict": poc.NOT_VERIFIED, "verdict_match": True,
+                "coverage": {"reasons": ["ARBITRARY_PDF_STREAMS_NOT_INSPECTED"],
+                             "uninspected_stream_gaps": ["UNREFERENCED_STREAM"],
+                             "resource_limits_hit": []},
+                "objects": [{"verdict": poc.NOT_VERIFIED,
+                             "structural_verdict": "UNREFERENCED_STREAM_NOT_INSPECTED"}],
+            }, ("UNREFERENCED_STREAM",)),
+        )
+        for expected, structural, expected_code in cases:
+            with self.subTest(expected=expected, expected_code=expected_code):
+                reason = live._case_reason_record(
+                    case_id="CASE", expected_status=expected, structural=structural,
+                    original=scanner, objects=structural["objects"], case_result="PASS")
+                self.assertEqual(reason["classification"], "EXPECTED_NEGATIVE")
+                self.assertEqual(reason["integrity"], "OBSERVED")
+                codes = (reason["structural_reason_codes"] + reason["coverage_gap_codes"]
+                         + reason["resource_limit_codes"])
+                self.assertTrue(set(expected_code).issubset(codes))
+                if structural.get("error_code"):
+                    self.assertEqual(reason["structural_error_code"], structural["error_code"])
+
+        oversized = {
+            "error_code": "MALFORMED_PDF", "observed_verdict": poc.REJECTED,
+            "verdict_match": True,
+            "coverage": {"reasons": [f"COVERAGE_{index}" for index in range(30)],
+                         "uninspected_stream_gaps": [], "resource_limits_hit": []},
+            "objects": [{"verdict": poc.REJECTED, "structural_verdict": "MALFORMED_PDF"}],
+        }
+        reason = live._case_reason_record(
+            case_id="CASE", expected_status=poc.REJECTED, structural=oversized,
+            original=scanner, objects=oversized["objects"], case_result="PASS")
+        self.assertTrue(reason["reason_codes_truncated"])
+        self.assertEqual(len(reason["coverage_reason_codes"]), live._REASON_CODE_LIMIT)
+
+    def test_case_reason_distinguishes_missing_scanner_result_and_sanitizes_malformed_codes(self) -> None:
+        structural = {"error_code": "BAD\\nREASON", "observed_verdict": poc.REJECTED,
+                      "verdict_match": True,
+                      "coverage": {"reasons": ["OK_REASON", {"untrusted": "object"}],
+                                   "uninspected_stream_gaps": [], "resource_limits_hit": []},
+                      "objects": [{"verdict": poc.REJECTED, "structural_verdict": "MALFORMED_PDF"}]}
+        missing = live._case_reason_record(
+            case_id="CASE", expected_status=poc.REJECTED, structural=structural,
+            original=None, objects=structural["objects"], case_result="NOT_VERIFIED")
+        self.assertEqual(missing["classification"], "MISSING_SCANNER_RESULT")
+        malformed = live._case_reason_record(
+            case_id="CASE", expected_status=poc.REJECTED, structural=structural,
+            original={"scanner_verdict": "CLEAN", "scanner_reason": "CLAMD_INSTREAM_COMPLETE",
+                      "response_framing": "ONE_NUL_TERMINATED_REPLY"},
+            objects=structural["objects"], case_result="PASS")
+        self.assertEqual(malformed["classification"], "UNEXPECTED_RESULT")
+        self.assertEqual(malformed["integrity"], "MALFORMED")
+        self.assertIsNone(malformed["structural_error_code"])
+        self.assertEqual(malformed["structural_reason_codes"], ["MALFORMED_PDF"])
+
+        self.assertEqual(malformed["coverage_reason_codes"], ["OK_REASON"])
+
     def test_malformed_missing_error_and_trailing_replies_fail_closed(self) -> None:
         bad_replies = [b"", b"stream: OK", b"stream: OK\x00garbage", b"unexpected\x00",
                        b"stream: test ERROR\x00"]
@@ -328,8 +412,20 @@ class LiveAdapterTests(unittest.TestCase):
             kind = "direct_eicar" if direct else (
                 "pdf" if case_id.startswith("R1-") or case_id in
                 {"BENIGN-PDF-EN-AR", "ENCRYPTED-PDF-UNLOCK-REQUIRED"} else "zip")
+            case_reason = {
+                "classification": "EXPECTED_NEGATIVE" if coverage != poc.INSPECTED else "OBSERVED",
+                "integrity": "OBSERVED",
+                "structural_error_code": "MALFORMED_PDF" if coverage == poc.REJECTED else None,
+                "structural_reason_codes": (["UNSUPPORTED_COMPRESSION_METHOD"]
+                                             if coverage == poc.UNSUPPORTED else []),
+                "coverage_reason_codes": [],
+                "coverage_gap_codes": (["ARBITRARY_PDF_STREAMS_NOT_INSPECTED"]
+                                        if coverage == poc.NOT_VERIFIED else []),
+                "resource_limit_codes": [],
+            }
             cases.append({
                 "case_id": case_id, "input_kind": kind,
+                "CASE_REASON": case_reason,
                 "independent_verification": {"status": "PASS"},
                 "TEST_CASE_RESULT": "PASS",
                 "SECURITY_COVERAGE_STATUS": coverage,
@@ -373,6 +469,30 @@ class LiveAdapterTests(unittest.TestCase):
         gap = next(case for case in report["case_results"] if case["case_id"] == "R1-06")
         self.assertEqual(gap["TEST_CASE_RESULT"], "PASS")
         self.assertEqual(gap["SECURITY_COVERAGE_STATUS"], poc.NOT_VERIFIED)
+
+    def test_mandatory_negative_cases_require_structural_reason_evidence(self) -> None:
+        for case_id, field, invalid_value in (
+            ("R1-06", "coverage_gap_codes", []),
+            ("R1-07", "structural_reason_codes", []),
+        ):
+            with self.subTest(case_id=case_id):
+                report = self._passing_aggregate_report()
+                reason = next(case for case in report["case_results"]
+                              if case["case_id"] == case_id)["CASE_REASON"]
+                reason[field] = invalid_value
+                aggregated = live._derive_aggregate(report, require_cleanup=True)
+                self.assertEqual(aggregated["OVERALL_RESULT"], "FAIL")
+                self.assertIn("MANDATORY_CASE_STRUCTURAL_REASON_MISSING:" + case_id,
+                              aggregated["required_evidence"]["failures"])
+
+    def test_mandatory_inspected_case_rejects_missing_scanner_classification(self) -> None:
+        report = self._passing_aggregate_report()
+        mandatory = next(case for case in report["case_results"] if case["case_id"] == "R2-01")
+        mandatory["CASE_REASON"]["classification"] = "MISSING_SCANNER_RESULT"
+        aggregated = live._derive_aggregate(report, require_cleanup=True)
+        self.assertEqual(aggregated["OVERALL_RESULT"], "FAIL")
+        self.assertIn("MANDATORY_CASE_REASON_INVALID:R2-01",
+                      aggregated["required_evidence"]["failures"])
 
     def test_mandatory_not_verified_fixture_scanner_runtime_or_cleanup_cannot_pass(self) -> None:
         report = self._passing_aggregate_report()

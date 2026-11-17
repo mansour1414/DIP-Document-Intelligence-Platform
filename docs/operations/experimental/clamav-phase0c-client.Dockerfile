@@ -30,6 +30,12 @@ COPY scripts/experiments/phase0c_r1r2_poc.py /opt/dip/phase0c_r1r2_poc.py
 COPY scripts/experiments/phase0c_r1r2_fixtures.py /opt/dip/phase0c_r1r2_fixtures.py
 COPY scripts/experiments/phase0c_r1r2_live_evidence.py /opt/dip/phase0c_r1r2_live_evidence.py
 
+RUN set -eux; \
+    cd /opt/dip; \
+    sha256sum phase0c_r1r2_poc.py phase0c_r1r2_fixtures.py phase0c_r1r2_live_evidence.py \
+      > /usr/share/doc/dip-phase0c-client/source-manifest.sha256; \
+    chmod 0644 /usr/share/doc/dip-phase0c-client/source-manifest.sha256
+
 WORKDIR /opt/dip
 USER 10001:10001
 ENTRYPOINT ["python3", "/opt/dip/phase0c_r1r2_live_evidence.py"]
