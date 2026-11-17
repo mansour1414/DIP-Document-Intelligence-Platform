@@ -401,7 +401,7 @@ jobs:
 
       - name: Upload bounded non-sensitive Phase 0B evidence artifact
         if: always() && steps.boundary.outcome == 'success'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: clamav-phase0b-evidence-${{ github.run_id }}-${{ github.sha }}
           path: ${{ runner.temp }}/clamav-phase0b-evidence
@@ -414,8 +414,42 @@ jobs:
         run: |
           set -euo pipefail
           docker rm -f clamav-phase0b-candidate clamav-phase0b-yes clamav-phase0b-no 2>/dev/null || true
-          docker rmi -f "$LOCAL_CANDIDATE_IMAGE" 2>/dev/null || true
-          docker network rm "$PHASE0B_NETWORK" 2>/dev/null || true
-          if [[ -n "${WORK_DIR:-}" ]]; then
-            rm -rf "$WORK_DIR"
+          docker rmi -f "${LOCAL_CANDIDATE_IMAGE:-dip-clamav-phase0b-poc:local}" 2>/dev/null || true
+          docker network rm "${PHASE0B_NETWORK:-dip-phase0b-private}" 2>/dev/null || true
+
+          # Only remove the single, fixed scratch leaf below GitHub's runner temp.
+          # Do not trust WORK_DIR for privileged deletion; it is only checked as a consistency guard.
+          runner_temp="${RUNNER_TEMP:-}"
+          if [[ -z "$runner_temp" || "$runner_temp" != /* || "$runner_temp" == */ ]]; then
+            echo "Refusing scratch cleanup: RUNNER_TEMP is unset or not a normalized absolute path." >&2
+            exit 1
           fi
+          case "/$runner_temp/" in
+            *"/../"*|*"/./"*)
+              echo "Refusing scratch cleanup: RUNNER_TEMP contains a dot path component." >&2
+              exit 1
+              ;;
+          esac
+          if [[ "${runner_temp##*/}" != "_temp" || "${runner_temp%/*}" != */work ]]; then
+            echo "Refusing scratch cleanup: RUNNER_TEMP is not the expected runner work/_temp directory." >&2
+            exit 1
+          fi
+          runner_temp_real="$(realpath -e -- "$runner_temp")"
+          if [[ "$runner_temp_real" != "$runner_temp" ]]; then
+            echo "Refusing scratch cleanup: RUNNER_TEMP is not a canonical, non-symlink path." >&2
+            exit 1
+          fi
+          scratch_dir="${runner_temp%/}/clamav-phase0b-work"
+          if [[ "$scratch_dir" != "$runner_temp/clamav-phase0b-work" || "$scratch_dir" == /clamav-phase0b-work ]]; then
+            echo "Refusing scratch cleanup: derived scratch path is outside the validated runner temp directory." >&2
+            exit 1
+          fi
+          if [[ -n "${WORK_DIR:-}" && "$WORK_DIR" != "$scratch_dir" ]]; then
+            echo "Refusing scratch cleanup: initialized WORK_DIR does not match the validated scratch path." >&2
+            exit 1
+          fi
+          if [[ -L "$scratch_dir" ]]; then
+            echo "Refusing scratch cleanup: scratch path is a symbolic link." >&2
+            exit 1
+          fi
+          sudo rm -rf -- "$scratch_dir"

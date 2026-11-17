@@ -9,7 +9,7 @@ on:
 jobs:
   lint:
     name: Lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -21,7 +21,7 @@ jobs:
 
   typecheck:
     name: Type Check
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -34,7 +34,7 @@ jobs:
 
   build:
     name: Build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -50,7 +50,7 @@ jobs:
 
   test:
     name: Test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     services:
       postgres:
         image: postgres:16-alpine
@@ -112,7 +112,7 @@ jobs:
 
   processing-integration:
     name: Integration / Processing
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       CLAMD_HOST: 127.0.0.1
       CLAMD_PORT: "3310"
@@ -225,7 +225,7 @@ jobs:
 
   worker-image:
     name: Production worker image
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
       - name: Build dedicated document worker
@@ -243,7 +243,7 @@ jobs:
           chmod 0777 "$RUNNER_TEMP/qpdf-sbom"
           docker run --rm --read-only --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777 --tmpfs /tmp/dip:rw,nosuid,nodev,noexec,size=256m,uid=10001,gid=10001,mode=0700 --mount type=bind,source="$RUNNER_TEMP/qpdf-sbom",target=/sbom --env QPDF_SBOM_PATH=/sbom/qpdf-worker.spdx.json --entrypoint node dip-document-worker:release-a scripts/verify-qpdf-security-runtime.mjs
           test -s "$RUNNER_TEMP/qpdf-sbom/qpdf-worker.spdx.json"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: qpdf-production-worker-sbom
           path: ${{ runner.temp }}/qpdf-sbom/qpdf-worker.spdx.json
@@ -274,7 +274,7 @@ jobs:
 
   structural-grayscale-stage3c:
     name: Structural Grayscale Stage 3C sandbox
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 35
     permissions:
       contents: read
@@ -313,7 +313,7 @@ jobs:
             "${RUNNER_TEMP}/dip-gray-stage3c-output"
       - name: Publish validated Stage 3C evidence
         if: success()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: structural-grayscale-stage3c-evidence
           path: ${{ runner.temp }}/dip-gray-stage3c-output
@@ -330,7 +330,7 @@ jobs:
           fi
       - name: Publish minimal Stage 3C failure diagnostic
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: structural-grayscale-stage3c-failure
           path: ${{ runner.temp }}/dip-gray-stage3c-failure/ci-diagnostic.json
@@ -339,7 +339,7 @@ jobs:
 
   browser-accessibility:
     name: Browser / Accessibility
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     services:
       postgres:
         image: postgres:16-alpine
@@ -386,7 +386,7 @@ jobs:
 
   groq-evaluation:
     name: CR-002 Groq evaluation (non-production)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       GEMINI_MODEL: gemini-3.8-flash
@@ -418,7 +418,7 @@ jobs:
 
   release-b-e2e:
     name: Full Release B E2E
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       AI_PROVIDER: groq
       GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
