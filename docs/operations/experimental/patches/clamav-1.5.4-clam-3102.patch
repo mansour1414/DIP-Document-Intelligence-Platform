@@ -1,0 +1,66 @@
+Description: Backport upstream CLAM-3102 (libclamav: Alert on truncated ZIP members)
+ Backport the officially merged Cisco Talos ClamAV fix (PR #1832 / commit
+ 9f84fb3404b9a66c782e33f3e2b0da5e3d32af76, merged to main via commit
+ cbb9caa0084c9aa55b9e42334e35770d151069bd on 2026-10-22) to ClamAV 1.5.4.
+ .
+ ZIP decompression in unz() truncates member output that exceeds MaxFileSize,
+ but ClamAV 1.5.4 did not invoke cli_append_potentially_unwanted_if_heur_exceedsmax()
+ at those four truncation sites (stored, DEFLATE/DEFLATE64, BZIP2, IMPLODE).
+ With AlertExceedsMax=yes, an oversized ZIP32 member therefore returned CLEAN
+ silently. This patch adds the four upstream alert calls only, plus a prominent
+ GPLv2 Section 2(a) modification notice. It intentionally does NOT include the
+ unreviewed ZIP64 PR #1845.
+Origin: upstream, https://github.com/Cisco-Talos/clamav/commit/9f84fb3404b9a66c782e33f3e2b0da5e3d32af76
+Bug-Upstream: https://github.com/Cisco-Talos/clamav/pull/1832
+Author: Valerie Snyder <valsnyde@cisco.com>
+Reviewed-By: DIP Phase 0B Isolated Security Remediation PoC (2026-11-16)
+Last-Update: 2026-11-16
+License: GPL-2.0-only
+
+--- a/libclamav/unzip.c
++++ b/libclamav/unzip.c
+@@ -19,6 +19,12 @@
+  *  MA 02110-1301, USA.
+  */
+ 
++/*
++ *  Modified 2026-11-16 by DIP (Phase 0B isolated experiment):
++ *  Backported upstream Cisco Talos ClamAV commit 9f84fb3404b9a66c782e33f3e2b0da5e3d32af76
++ *  (PR #1832 / CLAM-3102: alert on ZIP member truncation exceeding MaxFileSize).
++ */
++
+ /* FIXME: get a clue about masked stuff */
+ 
+ #if HAVE_CONFIG_H
+@@ -166,6 +172,7 @@ static cl_error_t unz(
+                 if (ctx->engine->maxfilesize && csize > ctx->engine->maxfilesize) {
+                     cli_dbgmsg("cli_unzip: trimming output size to maxfilesize (" STDu64 ")\n",
+                                ctx->engine->maxfilesize);
++                    cli_append_potentially_unwanted_if_heur_exceedsmax(ctx, "Heuristics.Limits.Exceeded.MaxFileSize");
+                     csize = ctx->engine->maxfilesize;
+                 }
+                 if (cli_writen(out_file, src, csize) != csize)
+@@ -231,6 +238,7 @@ static cl_error_t unz(
+                     if (ctx->engine->maxfilesize && written > ctx->engine->maxfilesize) {
+                         cli_dbgmsg("cli_unzip: trimming output size to maxfilesize (" STDu64 ")\n",
+                                    ctx->engine->maxfilesize);
++                        cli_append_potentially_unwanted_if_heur_exceedsmax(ctx, "Heuristics.Limits.Exceeded.MaxFileSize");
+                         res = Z_STREAM_END;
+                         break;
+                     }
+@@ -274,6 +282,7 @@ static cl_error_t unz(
+                     written += sizeof(obuf) - strm.avail_out;
+                     if (ctx->engine->maxfilesize && written > ctx->engine->maxfilesize) {
+                         cli_dbgmsg("cli_unzip: trimming output size to maxfilesize (" STDu64 ")\n", ctx->engine->maxfilesize);
++                        cli_append_potentially_unwanted_if_heur_exceedsmax(ctx, "Heuristics.Limits.Exceeded.MaxFileSize");
+                         res = BZ_STREAM_END;
+                         break;
+                     }
+@@ -309,6 +318,7 @@ static cl_error_t unz(
+                     written += sizeof(obuf) - strm.avail_out;
+                     if (ctx->engine->maxfilesize && written > ctx->engine->maxfilesize) {
+                         cli_dbgmsg("cli_unzip: trimming output size to maxfilesize (" STDu64 ")\n", ctx->engine->maxfilesize);
++                        cli_append_potentially_unwanted_if_heur_exceedsmax(ctx, "Heuristics.Limits.Exceeded.MaxFileSize");
+                         res = 0;
+                         break;
+                     }
