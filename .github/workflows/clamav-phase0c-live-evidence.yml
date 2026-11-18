@@ -176,18 +176,20 @@ jobs:
             --tag "$LOCAL_CLIENT_IMAGE" --load .
           client_id="$(docker image inspect "$LOCAL_CLIENT_IMAGE" --format '{{.Id}}')"
           echo "LOCAL_CLIENT_IMAGE_ID=$client_id" >> "$GITHUB_ENV"
+          python_code="$(cat <<'PY'
+          import argparse, dataclasses, hashlib, io, json, pathlib, re, shutil
+          import socket, struct, sys, time, tracemalloc, typing, zipfile, zlib
+          import phase0c_r1r2_poc, phase0c_r1r2_fixtures, phase0c_r1r2_live_evidence
+          assert sys.version_info >= (3, 10)
+          assert phase0c_r1r2_live_evidence.CHUNK_BYTES == 65536
+          assert phase0c_r1r2_poc.NOT_VERIFIED == "NOT_VERIFIED"
+          assert phase0c_r1r2_fixtures.EICAR_BYTES
+          print("CLIENT_IMAGE_IMPORT_SMOKE_PASS", sys.version.split()[0])
+          PY
+          )"
           docker run --rm --platform linux/arm64 --read-only --cap-drop ALL \
             --security-opt no-new-privileges:true --memory 512m --cpus 1 --pids-limit 64 \
-            --entrypoint python3 "$LOCAL_CLIENT_IMAGE" -c '
-              import argparse, dataclasses, hashlib, io, json, pathlib, re, shutil
-              import socket, struct, sys, time, tracemalloc, typing, zipfile, zlib
-              import phase0c_r1r2_poc, phase0c_r1r2_fixtures, phase0c_r1r2_live_evidence
-              assert sys.version_info >= (3, 10)
-              assert phase0c_r1r2_live_evidence.CHUNK_BYTES == 65536
-              assert phase0c_r1r2_poc.NOT_VERIFIED == "NOT_VERIFIED"
-              assert phase0c_r1r2_fixtures.EICAR_BYTES
-              print("CLIENT_IMAGE_IMPORT_SMOKE_PASS", sys.version.split()[0])
-            '
+            --entrypoint python3 "$LOCAL_CLIENT_IMAGE" -c "$python_code"
           cid="$(docker create "$LOCAL_CLIENT_IMAGE")"
           trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
           docker cp "$cid:/usr/share/doc/dip-phase0c-client/dpkg-manifest.txt" "$EVIDENCE_DIR/client-dpkg-manifest.txt"

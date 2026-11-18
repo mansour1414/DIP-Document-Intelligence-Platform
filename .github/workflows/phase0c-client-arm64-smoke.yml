@@ -4,6 +4,8 @@ on:
   pull_request:
     paths:
       - ".github/workflows/phase0c-client-arm64-smoke.yml"
+      - ".github/workflows/clamav-phase0c-live-evidence.yml"
+      - "test/phase0c-client-smoke.test.mjs"
       - "docs/operations/experimental/clamav-phase0c-client.Dockerfile"
       - "docs/operations/experimental/clamav-phase0c-client.Dockerfile.dockerignore"
       - "scripts/experiments/phase0c_r1r2_poc.py"
@@ -80,10 +82,17 @@ jobs:
           print('ARM64 non-root imports, package/source manifests, and license paths verified')
           PY
           )"
-          timeout --signal=TERM --kill-after=10s 2m docker run --rm \
-            --platform linux/arm64 --network none --read-only \
-            --cap-drop ALL --security-opt no-new-privileges:true \
-            --memory 256m --memory-swap 256m --cpus 1 --pids-limit 32 \
-            --ulimit cpu=60:60 --env PYTHONDONTWRITEBYTECODE=1 \
-            --entrypoint python3 dip-phase0c-client:pr-smoke \
-            -c "$python_code"
+          run_client_smoke() {
+            timeout --signal=TERM --kill-after=10s 2m docker run --rm \
+              --platform linux/arm64 --network none --read-only \
+              --cap-drop ALL --security-opt no-new-privileges:true \
+              --memory 256m --memory-swap 256m --cpus 1 --pids-limit 32 \
+              --ulimit cpu=60:60 --env PYTHONDONTWRITEBYTECODE=1 \
+              --entrypoint python3 dip-phase0c-client:pr-smoke \
+              -c "$1"
+          }
+          run_client_smoke "$python_code"
+
+          # Check the exact live-workflow payload using only the isolated PR client image.
+          live_python_code="$(node test/phase0c-client-smoke.test.mjs --print-payload)"
+          run_client_smoke "$live_python_code"
