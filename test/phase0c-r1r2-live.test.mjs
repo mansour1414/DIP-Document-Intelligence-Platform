@@ -101,12 +101,152 @@ test("offline protocol and cleanup unit tests run without a ClamAV service", () 
   assert.equal(python.status, 0, python.stderr || python.stdout);
 });
 
+function workflowStep(id) {
+  const step = workflow.split(/^ {6}- name:/mu).find((item) => item.includes(`\n        id: ${id}\n`));
+  const runBlock = step?.match(/^ {8}run: \|\n((?: {10}[^\n]*\n|\n)+)/mu);
+  assert.ok(runBlock, `expected a literal Bash script in the ${id} step`);
+  return runBlock[1].replace(/^ {10}/gmu, "");
+}
+
+function evidenceHandoff() {
+  const live = workflowStep("live");
+  const handoff = live.match(/^evidence_permission_fail\(\) \{\n[\s\S]+?(?=^docker run -d --name "\$CLIENT_CONTAINER")/mu);
+  assert.ok(handoff, "expected evidence handoff immediately before client launch");
+  return handoff[0];
+}
+
+function runBash(input) {
+  const result = spawnSync("bash", ["--noprofile", "--norc", "-eu", "-o", "pipefail", "-s"], {
+    input, encoding: "utf8", timeout: 15000,
+  });
+  assert.ifError(result.error);
+  return result;
+}
+
+const modeCommand = 'chmod 0755 -- "$EVIDENCE_DIR" 2>/dev/null || evidence_permission_fail mode';
+const handoffCommand = 'sudo -n chown -h -- 10001:10001 "$EVIDENCE_DIR" 2>/dev/null || evidence_permission_fail ownership';
+const restoreCommand = 'sudo -n chown -hRP -- "$(id -u):$(id -g)" "$EVIDENCE_DIR"';
+
+test("Phase 0C sets 0755 as runner before handing off to the non-root client", () => {
+  const handoff = evidenceHandoff();
+  assert.deepEqual(handoff.trimEnd().split("\n").slice(-2), [modeCommand, handoffCommand]);
+  // Pin all mode/ownership commands in the live step that target evidence.
+  assert.deepEqual(workflowStep("live").split("\n").filter((line) =>
+    /\b(?:chmod|chown)\b.*\$EVIDENCE_DIR/u.test(line)), [
+    modeCommand, handoffCommand, `${restoreCommand} 2>/dev/null || evidence_permission_fail restore`,
+  ]);
+});
+
+test("Phase 0C fails closed with a sanitized diagnostic on either handoff failure", () => {
+  for (const [modeFailure, stage, trace] of [[1, "mode", "mode\n"], [0, "ownership", "mode\nownership\n"]]) {
+    const result = runBash(`EVIDENCE_DIR=/not-used
+chmod() { echo mode; echo sensitive-mode-error >&2; return ${modeFailure}; }
+# Do not call sudo in this failure-injection test.
+sudo() { echo ownership; echo sensitive-ownership-error >&2; return 1; }
+${evidenceHandoff()}
+echo client-started
+`);
+    assert.equal(result.status, 1);
+    assert.equal(result.stdout, trace);
+    assert.equal(result.stderr, `::error::Phase 0C evidence permission setup failed: ${stage}\n`);
+  }
+});
+
+test("Phase 0C restores evidence only after a successful wait or verified client removal", () => {
+  assert.ok(workflowStep("live").includes(`test "$wait_rc" -eq 0\n${restoreCommand}`));
+  const cleanup = workflowStep("cleanup");
+  assert.match(cleanup, /docker rm -f "\$CLIENT_CONTAINER"[\s\S]+?client_ids=.*docker container ls --all --quiet/mu);
+  const recovery = cleanup.slice(cleanup.indexOf('if client_ids='), cleanup.indexOf('if docker network inspect'));
+  for (const [state, allowed] of [["absent", true], ["present", false], ["docker-failed", false], ["chown-failed", false]]) {
+    const result = runBash(`
+CLIENT_CONTAINER=unstarted
+CLAMD_CONTAINER=unstarted
+EVIDENCE_DIR=/not-used
+GITHUB_OUTPUT="$(mktemp)"
+trap 'rm -f -- "$GITHUB_OUTPUT"' EXIT
+errors=0
+client_absent=false
+docker() {
+  [[ "$1 $2" == 'container ls' ]] || return 1
+  case ${state} in
+    present) echo fake-id ;;
+    docker-failed) return 1 ;;
+  esac
+}
+sudo() { echo restoring; [[ ${state} != chown-failed ]]; }
+${recovery}
+cat -- "$GITHUB_OUTPUT"
+`);
+    assert.equal(result.status, 0, result.stderr);
+    const attempted = allowed || state === "chown-failed" ? "restoring\n" : "";
+    assert.equal(result.stdout, `${attempted}evidence_restored=${allowed}\n`);
+    assert.equal(result.stderr, allowed ? "" : "::error::Phase 0C evidence permission recovery failed\n");
+  }
+  assert.equal(workflow.match(/if: .*steps\.cleanup\.outputs\.evidence_restored == 'true'/gu)?.length, 2);
+});
+
+test("Linux runner can hand off, write as UID 10001, and reclaim evidence without Docker", (t) => {
+  const hosted = process.env.GITHUB_ACTIONS === "true" && process.env.RUNNER_ENVIRONMENT === "github-hosted";
+  if (process.platform !== "linux" || (!hosted && process.env.PHASE0C_TEST_PERMISSIONS !== "1")) {
+    return t.skip("requires hosted Linux CI or PHASE0C_TEST_PERMISSIONS=1 with passwordless sudo");
+  }
+  assert.notEqual(process.getuid(), 0, "test must run as a non-root runner");
+  assert.ok(![10001, 10002].includes(process.getuid()), "runner and test users must be distinct");
+  const live = workflowStep("live");
+  assert.ok(live.includes(`\n${restoreCommand} 2>/dev/null || evidence_permission_fail restore\n`));
+  const result = runBash(`
+root="$(mktemp -d)"
+EVIDENCE_DIR="$root/clamav-phase0c-evidence"
+cleanup() {
+  if [[ -d "$EVIDENCE_DIR" ]]; then ${restoreCommand}; fi
+  rm -rf -- "$root"
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+chmod 0711 -- "$root"
+mkdir -m 0700 -- "$EVIDENCE_DIR"
+runner="$(id -u):$(id -g)"
+test "$(stat -c '%u:%g %a' -- "$EVIDENCE_DIR")" = "$runner 700"
+${evidenceHandoff()}
+test "$(stat -c '%u:%g %a' -- "$EVIDENCE_DIR")" = '10001:10001 755'
+
+as_identity() {
+  local uid="$1"
+  sudo -n setpriv --reuid "$uid" --regid "$uid" --clear-groups \\
+    --bounding-set=-all --inh-caps=-all --ambient-caps=-all --no-new-privs -- \\
+    sh -c '
+      set -eu
+      test "$(id -u):$(id -g)" = "$1:$1"
+      EVIDENCE_DIR="$2"
+      case "$1" in
+        10001) umask 077; printf evidence > "$EVIDENCE_DIR/evidence.json" ;;
+        10002)
+          test -x "$EVIDENCE_DIR"
+          test ! -w "$EVIDENCE_DIR"
+          if (printf unexpected > "$EVIDENCE_DIR/other.json") 2>/dev/null; then exit 1; fi
+          ;;
+        *) exit 1 ;;
+      esac
+    ' sh "$uid" "$EVIDENCE_DIR"
+}
+# Reproduce the old failure with the actual Linux DAC checks.
+if chmod 0755 -- "$EVIDENCE_DIR" 2>/dev/null; then exit 1; fi
+as_identity 10001
+as_identity 10002
+test "$(stat -c '%u:%g %a' -- "$EVIDENCE_DIR/evidence.json")" = '10001:10001 600'
+${restoreCommand} 2>/dev/null || evidence_permission_fail restore
+test "$(stat -c '%u:%g %a' -- "$EVIDENCE_DIR")" = "$runner 755"
+test "$(cat "$EVIDENCE_DIR/evidence.json")" = evidence
+printf finalized > "$EVIDENCE_DIR/finalized.json"
+rm -rf -- "$EVIDENCE_DIR"
+test ! -e "$EVIDENCE_DIR"
+`);
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+});
+
 async function boundarySandbox(t) {
   // Execute the actual boundary step, never the later workflow steps.
-  const step = workflow.split(/^ {6}- name:/mu).find((item) => /^ {8}id: boundary$/mu.test(item));
-  const runBlock = step?.match(/^ {8}run: \|\n((?: {10}[^\n]*\n|\n)+)/mu);
-  assert.ok(runBlock, "expected a literal Bash script in the boundary step");
-  const script = runBlock[1].replace(/^ {10}/gmu, "");
+  const script = workflowStep("boundary");
   const root = await mkdtemp(join(await realpath(tmpdir()), "phase0c-boundary-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const runnerTemp = join(root, "work", "_temp");
