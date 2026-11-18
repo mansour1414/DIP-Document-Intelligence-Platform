@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -97,4 +99,130 @@ test("offline protocol and cleanup unit tests run without a ClamAV service", () 
   });
   if (python.error?.code === "ENOENT") return;
   assert.equal(python.status, 0, python.stderr || python.stdout);
+});
+
+async function boundarySandbox(t) {
+  // Execute the actual boundary step, never the later workflow steps.
+  const step = workflow.split(/^ {6}- name:/mu).find((item) => /^ {8}id: boundary$/mu.test(item));
+  const runBlock = step?.match(/^ {8}run: \|\n((?: {10}[^\n]*\n|\n)+)/mu);
+  assert.ok(runBlock, "expected a literal Bash script in the boundary step");
+  const script = runBlock[1].replace(/^ {10}/gmu, "");
+  const root = await mkdtemp(join(await realpath(tmpdir()), "phase0c-boundary-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const runnerTemp = join(root, "work", "_temp");
+  const githubEnv = join(root, "github-env");
+  await mkdir(runnerTemp, { recursive: true });
+  await writeFile(githubEnv, "");
+  // Stub only uname so the runtime architecture check is exercised on any CI host.
+  await writeFile(join(root, "uname"), '#!/bin/bash\nprintf "%s\\n" "$TEST_MACHINE"\n', { mode: 0o755 });
+  const env = {
+    ...process.env,
+    ...Object.fromEntries([...workflow.matchAll(/^ {6}(EXPECTED_\w+): (\S+)$/gmu)].map(([, key, value]) => [key, value])),
+    PATH: `${root}:${process.env.PATH}`,
+    TEST_MACHINE: "aarch64",
+    GITHUB_EVENT_NAME: "workflow_dispatch",
+    GITHUB_REPOSITORY: "mansour1414/DIP-Document-Intelligence-Platform",
+    GITHUB_REF: "refs/heads/main",
+    GITHUB_REF_NAME: "main",
+    CONFIRMATION_INPUT: "run-phase0c-r1r2-isolated-live-evidence",
+    GITHUB_ENV: githubEnv,
+    RUNNER_TEMP: runnerTemp,
+  };
+  return {
+    root, runnerTemp, githubEnv,
+    run(overrides) {
+      const result = spawnSync("bash", ["--noprofile", "--norc", "-e", "-o", "pipefail", "-s"], {
+        cwd: fileURLToPath(new URL("..", import.meta.url)),
+        env: { ...env, ...overrides },
+        input: script,
+        encoding: "utf8",
+        timeout: 5000,
+      });
+      assert.ifError(result.error);
+      return result;
+    },
+  };
+}
+
+function assertBoundaryFailure(result, assertion) {
+  assert.equal(result.status, 1, assertion);
+  assert.equal(result.stdout, "", assertion);
+  assert.equal(result.stderr, `::error::Phase 0C boundary failed: ${assertion}\n`);
+}
+
+test("Phase 0C boundary accepts a canonical work/_temp directory", async (t) => {
+  const { run, runnerTemp, githubEnv } = await boundarySandbox(t);
+  const result = run();
+  assert.equal(result.status, 0, result.stderr);
+  const evidence = join(runnerTemp, "clamav-phase0c-evidence");
+  const work = join(runnerTemp, "clamav-phase0c-work");
+  assert.equal(await readFile(githubEnv, "utf8"), `EVIDENCE_DIR=${evidence}\nWORK_DIR=${work}\n`);
+  assert.deepEqual((await readdir(work)).sort(), ["cfg", "client-fixtures", "db", "fixtures"]);
+  assert.match(await readFile(join(evidence, "source-files.sha256"), "utf8"), /^[a-f0-9]{64}  \.github\/workflows\/clamav-phase0c-live-evidence\.yml$/mu);
+});
+
+test("Phase 0C boundary rejects invalid runner paths before setup", async (t) => {
+  const { run, root, runnerTemp, githubEnv } = await boundarySandbox(t);
+  const otherParent = join(root, "other", "_temp");
+  const wrongLeaf = join(root, "work", "_tmp");
+  const symlinkLeaf = join(root, "link-leaf", "work", "_temp");
+  const symlinkParent = join(root, "link-parent", "work");
+  const file = join(root, "file", "work", "_temp");
+  const newline = `${root}/line\nbreak/work/_temp`;
+  for (const path of [otherParent, wrongLeaf, newline]) await mkdir(path, { recursive: true });
+  for (const path of [symlinkLeaf, symlinkParent, file]) await mkdir(dirname(path), { recursive: true });
+  await symlink(runnerTemp, symlinkLeaf);
+  await symlink(join(root, "work"), symlinkParent);
+  await writeFile(file, "");
+  for (const [path, assertion] of [
+    ["", "runner-temp-required"],
+    ["work/_temp", "runner-temp-absolute"],
+    [`${runnerTemp}/`, "runner-temp-absolute"],
+    [newline, "runner-temp-absolute"],
+    [`${root}/./work/_temp`, "runner-temp-dot-component"],
+    [`${root}/other/../work/_temp`, "runner-temp-dot-component"],
+    [otherParent, "runner-temp-parent"],
+    [wrongLeaf, "runner-temp-leaf"],
+    [`${root}//work/_temp`, "runner-temp-canonical"],
+    [symlinkLeaf, "runner-temp-canonical"],
+    [join(symlinkParent, "_temp"), "runner-temp-canonical"],
+    [join(root, "missing", "work", "_temp"), "runner-temp-directory"],
+    [file, "runner-temp-directory"],
+  ]) {
+    assertBoundaryFailure(run({ RUNNER_TEMP: path }), assertion);
+  }
+  assert.equal(await readFile(githubEnv, "utf8"), "");
+  for (const path of [runnerTemp, otherParent, wrongLeaf, newline]) assert.deepEqual(await readdir(path), []);
+});
+
+test("Phase 0C authorization and checksum failures leave no scratch or evidence", async (t) => {
+  const { run, runnerTemp, githubEnv } = await boundarySandbox(t);
+  for (const [key, value, assertion] of [
+    ["GITHUB_EVENT_NAME", "push", "manual-dispatch"],
+    ["GITHUB_REPOSITORY", "other/repository", "repository"],
+    ["GITHUB_REF", "refs/heads/other", "branch-ref"],
+    ["GITHUB_REF_NAME", "other", "branch-name"],
+    ["CONFIRMATION_INPUT", "invalid", "confirmation"],
+    ["TEST_MACHINE", "x86_64", "arm64"],
+    ...["EXPECTED_CLAM3102_PATCH_SHA256", "EXPECTED_BASE_CONF_SHA256", "EXPECTED_FRESHNESS_GATE_SHA256"]
+      .map((key) => [key, "0".repeat(64), "source-checksums"]),
+  ]) {
+    assertBoundaryFailure(run({ [key]: value }), assertion);
+    assert.deepEqual(await readdir(runnerTemp), []);
+    assert.equal(await readFile(githubEnv, "utf8"), "");
+  }
+});
+
+test("Phase 0C rolls back incomplete setup without touching an existing scratch path", async (t) => {
+  const { run, runnerTemp, githubEnv } = await boundarySandbox(t);
+  assertBoundaryFailure(run({ GITHUB_ENV: runnerTemp }), "publish-runner-paths");
+  assert.deepEqual(await readdir(runnerTemp), []);
+
+  const work = join(runnerTemp, "clamav-phase0c-work");
+  await mkdir(work);
+  await writeFile(join(work, "sentinel"), "keep");
+  assertBoundaryFailure(run(), "scratch-directory-create");
+  assert.deepEqual(await readdir(runnerTemp), ["clamav-phase0c-work"]);
+  assert.equal(await readFile(join(work, "sentinel"), "utf8"), "keep");
+  assert.equal(await readFile(githubEnv, "utf8"), "");
 });
