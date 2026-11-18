@@ -59,36 +59,36 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$GITHUB_EVENT_NAME" = "workflow_dispatch"
-          test "$GITHUB_REPOSITORY" = "$EXPECTED_REPOSITORY"
-          test "$GITHUB_REF" = "refs/heads/${EXPECTED_DEFAULT_BRANCH}"
-          test "$GITHUB_REF_NAME" = "$EXPECTED_DEFAULT_BRANCH"
-          test "$CONFIRMATION_INPUT" = "$EXPECTED_CONFIRMATION"
-          test "$(uname -m)" = "aarch64"
-          test -n "${RUNNER_TEMP:-}"
-          [[ "$RUNNER_TEMP" == /* && "$RUNNER_TEMP" != */ ]]
-          case "/$RUNNER_TEMP/" in *"/../"*|*"/./"*) exit 2 ;; esac
-          test "${RUNNER_TEMP##*/}" = "_temp"
-          test "${RUNNER_TEMP%/*}" = */work
-          test "$(realpath -e -- "$RUNNER_TEMP")" = "$RUNNER_TEMP"
+          boundary_fail() {
+            printf '::error::Phase 0C boundary failed: %s\n' "$1" >&2
+            exit 1
+          }
 
-          EVIDENCE_DIR="${RUNNER_TEMP%/}/clamav-phase0c-evidence"
-          WORK_DIR="${RUNNER_TEMP%/}/clamav-phase0c-work"
-          {
-            echo "EVIDENCE_DIR=$EVIDENCE_DIR"
-            echo "WORK_DIR=$WORK_DIR"
-          } >> "$GITHUB_ENV"
-          mkdir -p "$EVIDENCE_DIR" "$WORK_DIR/fixtures" "$WORK_DIR/client-fixtures" \
-            "$WORK_DIR/db" "$WORK_DIR/cfg"
-          chmod 0755 "$EVIDENCE_DIR" "$WORK_DIR" "$WORK_DIR/fixtures" \
-            "$WORK_DIR/client-fixtures" "$WORK_DIR/db" "$WORK_DIR/cfg"
+          test "${GITHUB_EVENT_NAME:-}" = workflow_dispatch || boundary_fail manual-dispatch
+          test "${GITHUB_REPOSITORY:-}" = "$EXPECTED_REPOSITORY" || boundary_fail repository
+          test "${GITHUB_REF:-}" = "refs/heads/${EXPECTED_DEFAULT_BRANCH}" || boundary_fail branch-ref
+          test "${GITHUB_REF_NAME:-}" = "$EXPECTED_DEFAULT_BRANCH" || boundary_fail branch-name
+          test "${CONFIRMATION_INPUT:-}" = "$EXPECTED_CONFIRMATION" || boundary_fail confirmation
+          machine="$(uname -m 2>/dev/null)" || boundary_fail arm64
+          test "$machine" = aarch64 || boundary_fail arm64
 
+          test -n "${RUNNER_TEMP:-}" || boundary_fail runner-temp-required
+          [[ "$RUNNER_TEMP" == /* && "$RUNNER_TEMP" != */ &&
+             "$RUNNER_TEMP" != *$'\n'* && "$RUNNER_TEMP" != *$'\r'* ]] || boundary_fail runner-temp-absolute
+          case "/$RUNNER_TEMP/" in *"/../"*|*"/./"*) boundary_fail runner-temp-dot-component ;; esac
+          test "${RUNNER_TEMP##*/}" = _temp || boundary_fail runner-temp-leaf
+          [[ "${RUNNER_TEMP%/*}" == */work ]] || boundary_fail runner-temp-parent
+          test -d "$RUNNER_TEMP" || boundary_fail runner-temp-directory
+          runner_temp_real="$(realpath -e -- "$RUNNER_TEMP" 2>/dev/null)" || boundary_fail runner-temp-canonical
+          test "$runner_temp_real" = "$RUNNER_TEMP" || boundary_fail runner-temp-canonical
+
+          # Verify source before creating any experimental directories.
           printf '%s  %s\n' \
             "$EXPECTED_CLAM3102_PATCH_SHA256" "docs/operations/experimental/patches/clamav-1.5.4-clam-3102.patch" \
             "$EXPECTED_BASE_CONF_SHA256" "docs/operations/experimental/clamav-arm64-stage4-candidate.conf" \
             "$EXPECTED_FRESHNESS_GATE_SHA256" "docs/operations/experimental/clamd-freshness-gate.sh" \
-            | sha256sum --check --strict
-          sha256sum \
+            | sha256sum --check --strict >/dev/null 2>&1 || boundary_fail source-checksums
+          source_manifest="$(sha256sum \
             .github/workflows/clamav-phase0c-live-evidence.yml \
             scripts/experiments/phase0c_r1r2_live_evidence.py \
             scripts/experiments/phase0c_r1r2_poc.py \
@@ -101,7 +101,30 @@ jobs:
             docs/operations/experimental/clamav-arm64-phase0b-candidate.Dockerfile.dockerignore \
             docs/operations/experimental/clamav-arm64-stage4-candidate.conf \
             docs/operations/experimental/clamd-freshness-gate.sh \
-            > "$EVIDENCE_DIR/source-files.sha256"
+            2>/dev/null)" || boundary_fail source-manifest
+
+          # The job's normal cleanup only runs after this step succeeds. Roll
+          # back partial setup here, touching only directories created below.
+          EVIDENCE_DIR="$RUNNER_TEMP/clamav-phase0c-evidence"
+          WORK_DIR="$RUNNER_TEMP/clamav-phase0c-work"
+          created_dirs=()
+          rollback_setup() {
+            if (( ${#created_dirs[@]} )) && ! rm -rf -- "${created_dirs[@]}" 2>/dev/null; then
+              printf '::error::Phase 0C boundary failed: scratch-rollback\n' >&2
+            fi
+          }
+          trap rollback_setup EXIT
+          mkdir -m 0755 -- "$EVIDENCE_DIR" 2>/dev/null || boundary_fail evidence-directory-create
+          created_dirs+=("$EVIDENCE_DIR")
+          mkdir -m 0755 -- "$WORK_DIR" 2>/dev/null || boundary_fail scratch-directory-create
+          created_dirs+=("$WORK_DIR")
+          mkdir -m 0755 -- "$WORK_DIR/fixtures" "$WORK_DIR/client-fixtures" \
+            "$WORK_DIR/db" "$WORK_DIR/cfg" 2>/dev/null || boundary_fail scratch-subdirectories-create
+          printf '%s\n' "$source_manifest" 2>/dev/null > "$EVIDENCE_DIR/source-files.sha256" \
+            || boundary_fail source-manifest-write
+          printf 'EVIDENCE_DIR=%s\nWORK_DIR=%s\n' "$EVIDENCE_DIR" "$WORK_DIR" 2>/dev/null >> "${GITHUB_ENV:-}" \
+            || boundary_fail publish-runner-paths
+          trap - EXIT
 
       - name: Set up Python 3.12 for offline fixture verification
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
