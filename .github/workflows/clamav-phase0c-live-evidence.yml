@@ -336,8 +336,13 @@ jobs:
           docker exec "$CLAMD_CONTAINER" /usr/bin/clamconf --config-dir=/etc/clamav-phase0c \
             > "$EVIDENCE_DIR/clamconf-effective.txt"
 
-          sudo chown 10001:10001 "$EVIDENCE_DIR"
-          chmod 0755 "$EVIDENCE_DIR"
+          # Set the mode while the runner still owns the directory.
+          evidence_permission_fail() {
+            printf '::error::Phase 0C evidence permission setup failed: %s\n' "$1" >&2
+            exit 1
+          }
+          chmod 0755 -- "$EVIDENCE_DIR" 2>/dev/null || evidence_permission_fail mode
+          sudo -n chown -h -- 10001:10001 "$EVIDENCE_DIR" 2>/dev/null || evidence_permission_fail ownership
           docker run -d --name "$CLIENT_CONTAINER" \
             --platform linux/arm64 --network "$PHASE0C_NETWORK" --read-only \
             --cap-drop ALL --security-opt no-new-privileges:true \
@@ -370,10 +375,11 @@ jobs:
           wait_rc=0
           client_rc="$(timeout --signal=TERM --kill-after=10s 1210s docker wait "$CLIENT_CONTAINER")" || wait_rc=$?
           set -e
-          sudo chown -R "$(id -u):$(id -g)" "$EVIDENCE_DIR"
+          # A failed wait does not prove the client stopped. Leave recovery to cleanup.
+          test "$wait_rc" -eq 0
+          sudo -n chown -hRP -- "$(id -u):$(id -g)" "$EVIDENCE_DIR" 2>/dev/null || evidence_permission_fail restore
           printf '{"docker_wait_exit_code":%s,"client_exit_code":"%s"}\n' \
             "$wait_rc" "${client_rc:-unknown}" > "$EVIDENCE_DIR/live-exit-status.json"
-          test "$wait_rc" -eq 0
           test "$client_rc" = 0
 
       - name: Always clean containers, images, network, and scratch; record actual cleanup result
@@ -391,9 +397,21 @@ jobs:
           candidate_absent=false; client_image_absent=false; scratch_absent=false
           if docker inspect "$CLIENT_CONTAINER" >/dev/null 2>&1; then docker rm -f "$CLIENT_CONTAINER" >/dev/null 2>&1 || errors=1; fi
           if docker inspect "$CLAMD_CONTAINER" >/dev/null 2>&1; then docker rm -f "$CLAMD_CONTAINER" >/dev/null 2>&1 || errors=1; fi
-          if ! docker inspect "$CLIENT_CONTAINER" >/dev/null 2>&1; then client_absent=true; else errors=1; fi
+          # Require a successful Docker query, not just a failed inspect, before reclaiming evidence.
+          if client_ids="$(docker container ls --all --quiet --filter "name=^/${CLIENT_CONTAINER}$" 2>/dev/null)" && [[ -z "$client_ids" ]]; then
+            client_absent=true
+          else
+            errors=1
+          fi
           if ! docker inspect "$CLAMD_CONTAINER" >/dev/null 2>&1; then clamd_absent=true; else errors=1; fi
-          sudo chown -R "$(id -u):$(id -g)" "$EVIDENCE_DIR" >/dev/null 2>&1 || errors=1
+          evidence_restored=false
+          if [[ "$client_absent" == true ]] && sudo -n chown -hRP -- "$(id -u):$(id -g)" "$EVIDENCE_DIR" 2>/dev/null; then
+            evidence_restored=true
+          else
+            printf '::error::Phase 0C evidence permission recovery failed\n' >&2
+            errors=1
+          fi
+          printf 'evidence_restored=%s\n' "$evidence_restored" >> "$GITHUB_OUTPUT" || errors=1
           if docker network inspect "$PHASE0C_NETWORK" >/dev/null 2>&1; then docker network rm "$PHASE0C_NETWORK" >/dev/null 2>&1 || errors=1; fi
           if ! docker network inspect "$PHASE0C_NETWORK" >/dev/null 2>&1; then network_absent=true; else errors=1; fi
           if docker image inspect "$LOCAL_CANDIDATE_IMAGE" >/dev/null 2>&1; then docker rmi -f "$LOCAL_CANDIDATE_IMAGE" >/dev/null 2>&1 || errors=1; fi
@@ -407,6 +425,7 @@ jobs:
           else
             errors=1
           fi
+          [[ "$evidence_restored" == true ]] || exit 1
           status=PASS; [[ "$errors" -eq 0 ]] || status=FAIL
           jq -n --arg status "$status" --argjson runtime_verification_passed "$runtime_verification_passed" \
             --argjson clamd_absent "$clamd_absent" --argjson client_absent "$client_absent" \
@@ -422,7 +441,7 @@ jobs:
           [[ "$errors" -eq 0 ]]
 
       - name: Finalize bounded evidence with verified cleanup status
-        if: always() && steps.boundary.outcome == 'success'
+        if: always() && steps.boundary.outcome == 'success' && steps.cleanup.outputs.evidence_restored == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -450,7 +469,7 @@ jobs:
           test "$bytes" -le 5242880
 
       - name: Upload bounded sanitized evidence (30-day retention)
-        if: always() && steps.boundary.outcome == 'success'
+        if: always() && steps.boundary.outcome == 'success' && steps.cleanup.outputs.evidence_restored == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: clamav-phase0c-live-evidence-${{ github.run_id }}-${{ github.sha }}
