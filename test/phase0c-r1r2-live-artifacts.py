@@ -79,7 +79,90 @@ def budget() -> poc.ResourceBudget:
     return poc.ResourceBudget(poc.DEFAULT_RESOURCE_LIMITS)
 
 
+class DeterministicClamdScanner:
+    """Offline adapter for exercising the live result contract without a daemon."""
+    name = "DETERMINISTIC_TEST_CLAMD"
+
+    def __init__(self) -> None:
+        self._data = bytearray()
+
+    def feed(self, chunk: bytes, resource_budget: poc.ResourceBudget) -> None:
+        self._data.extend(chunk)
+        resource_budget.charge_scanned(len(chunk))
+
+    def finish(self) -> dict[str, object]:
+        infected = poc.EICAR_SIGNATURE in self._data
+        return {
+            "is_clamav_scanner": True,
+            "scanner_verdict": "INFECTED" if infected else "CLEAN",
+            "scanner_reason": "CLAMD_INSTREAM_COMPLETE",
+            "signature": "Win.Test.EICAR" if infected else "NONE",
+            "response_framing": "ONE_NUL_TERMINATED_REPLY",
+            "bytes_sent": len(self._data),
+        }
+
+
+def deterministic_clamd_scan(data: bytes) -> dict[str, object]:
+    scanner = DeterministicClamdScanner()
+    scanner.feed(data, budget())
+    return scanner.finish()
+
+
 class LiveAdapterTests(unittest.TestCase):
+    def _real_structural_case(self, case_id: str) -> tuple[
+            poc.CaseSpec, dict[str, object], dict[str, object], dict[str, object], str]:
+        spec = next(case for case in poc.build_case_suite() if case.case_id == case_id)
+        spec = poc.replace(spec, scanner_factory=DeterministicClamdScanner)
+        structural = poc.run_case(
+            spec, container_scanner_factory=poc.OfflineEicarControlProbe)
+        original = deterministic_clamd_scan(spec.builder())
+        eicar_required = case_id in {
+            "R1-01", "R1-02", "R1-04", "R2-01", "R2-02", "R2-03", "R2-04",
+            "R2-15", "R2-24", "R2-25", "CTRL-POS-01", "R1-LIVE-01", "R2-LIVE-01",
+        }
+        case_result = live._case_result(spec, structural, original, eicar_required=eicar_required)
+        reason = live._case_reason_record(
+            case_id=case_id, expected_status=spec.expected_verdict,
+            structural=structural, original=original, objects=structural["objects"],
+            case_result=case_result)
+        return spec, structural, original, reason, case_result
+
+    @staticmethod
+    def _payload_scan_records(structural: dict[str, object]) -> list[dict[str, object]]:
+        objects = structural.get("objects", [])
+        return [
+            {"structural_path": obj.get("object_path"), "depth": obj.get("depth"),
+             "coverage_status": obj.get("verdict"), "actual_bytes": obj.get("extracted_bytes"),
+             "resource_limits_hit": obj.get("resource_limits_hit", []),
+             "scanner_result": {
+                 "scanner_verdict": obj.get("scanner_verdict"), "reason": obj.get("scanner_reason"),
+                 "signature": obj.get("offline_control_signature"),
+                 "response_framing": obj.get("scanner_response_framing"),
+             }}
+            for obj in objects if isinstance(obj, dict) and obj.get("record_role") == "EXTRACTED_PAYLOAD"
+        ]
+
+    def _replace_aggregate_case_with_real_records(
+            self, report: dict[str, object], case_id: str,
+            case: tuple[poc.CaseSpec, dict[str, object], dict[str, object], dict[str, object], str]
+    ) -> None:
+        spec, structural, original, reason, case_result = case
+        record = next(item for item in report["case_results"] if item["case_id"] == case_id)
+        record.update({
+            "input_kind": spec.kind,
+            "CASE_REASON": reason,
+            "TEST_CASE_RESULT": case_result,
+            "SECURITY_COVERAGE_STATUS": structural["observed_verdict"],
+            "expected_structural_status": spec.expected_verdict,
+            "structural_coverage": structural["coverage"],
+            "resource_limits": structural["budget"],
+            "ORIGINAL_CONTAINER_SCAN_RESULT": {
+                "classification": "OBSERVATIONAL_ONLY", **original,
+                "clean_is_not_complete_nested_inspection": True,
+            },
+            "EXTRACTED_PAYLOAD_SCAN_RESULT": self._payload_scan_records(structural),
+        })
+
     def _run_safe_cleanup(self, runner_temp: Path, expected_work: Path, fakebin: Path) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env["PATH"] = str(fakebin) + os.pathsep + env.get("PATH", "")
@@ -294,6 +377,96 @@ class LiveAdapterTests(unittest.TestCase):
         self.assertEqual(malformed["structural_reason_codes"], ["MALFORMED_PDF"])
 
         self.assertEqual(malformed["coverage_reason_codes"], ["OK_REASON"])
+
+    def test_real_structural_paths_use_explicit_roles_for_live_payload_scans(self) -> None:
+        for case_id in ("R2-01", "R2-02", "R1-01", "CTRL-NEG-01"):
+            with self.subTest(case_id=case_id):
+                spec, structural, original, reason, case_result = self._real_structural_case(case_id)
+                objects = structural["objects"]
+                container_controls = [obj for obj in objects
+                                      if obj.get("record_role") == "STRUCTURAL_CONTAINER_CONTROL"]
+                payloads = [obj for obj in objects if obj.get("record_role") == "EXTRACTED_PAYLOAD"]
+                self.assertTrue(container_controls)
+                self.assertTrue(payloads)
+                self.assertTrue(all(obj["scanner_reason"] ==
+                                    "CLAMAV_OFFLINE_UNAVAILABLE_CONTROL_PROBE_ONLY"
+                                    and obj["scanner_verdict"] == poc.NOT_VERIFIED
+                                    for obj in container_controls))
+                self.assertTrue(all(obj["scanner_reason"] == "CLAMD_INSTREAM_COMPLETE"
+                                    and obj["scanner_verdict"] in ("CLEAN", "INFECTED")
+                                    and obj["scanner_response_framing"] == "ONE_NUL_TERMINATED_REPLY"
+                                    for obj in payloads))
+                self.assertEqual(reason["classification"], "OBSERVED")
+                self.assertEqual(case_result, "PASS")
+                self.assertIn(original["scanner_verdict"], ("CLEAN", "INFECTED"))
+                self.assertEqual(original["response_framing"], "ONE_NUL_TERMINATED_REPLY")
+                self.assertEqual(structural["conclusion"]["overall_conclusion"],
+                                 poc.NOT_COMPLETE_SAFE_SCAN)
+                if case_id in live.REQUIRED_EICAR_CASE_IDS or case_id == "R1-01":
+                    self.assertTrue(any(obj["scanner_verdict"] == "INFECTED"
+                                        and obj["offline_control_signature"] == "Win.Test.EICAR"
+                                        for obj in payloads))
+                self.assertEqual(len(self._payload_scan_records(structural)), len(payloads))
+                self.assertTrue(all(item["scanner_result"]["reason"] == "CLAMD_INSTREAM_COMPLETE"
+                                    for item in self._payload_scan_records(structural)))
+
+    def test_real_structural_records_join_reason_and_aggregate_validation(self) -> None:
+        real_case = self._real_structural_case("R2-01")
+        real_negative_case = self._real_structural_case("R2-08")
+        report = self._passing_aggregate_report()
+        self._replace_aggregate_case_with_real_records(report, "R2-01", real_case)
+        self._replace_aggregate_case_with_real_records(report, "R2-08", real_negative_case)
+        aggregated = live._derive_aggregate(report, require_cleanup=True)
+        self.assertEqual(aggregated["OVERALL_RESULT"], "PASS")
+        actual_case = next(item for item in aggregated["case_results"] if item["case_id"] == "R2-01")
+        self.assertEqual(actual_case["CASE_REASON"]["classification"], "OBSERVED")
+        self.assertEqual(actual_case["ORIGINAL_CONTAINER_SCAN_RESULT"]["classification"],
+                         "OBSERVATIONAL_ONLY")
+        actual_negative_case = next(item for item in aggregated["case_results"]
+                                    if item["case_id"] == "R2-08")
+        self.assertEqual(actual_negative_case["CASE_REASON"]["classification"], "EXPECTED_NEGATIVE")
+        self.assertIn("UNSUPPORTED_COMPRESSION_METHOD",
+                      actual_negative_case["CASE_REASON"]["structural_reason_codes"])
+        self.assertFalse(aggregated["COMPLETE_SAFE_SCAN"])
+
+    def test_real_unsupported_case_preserves_structural_reason_codes(self) -> None:
+        spec, structural, original, reason, case_result = self._real_structural_case("R2-08")
+        self.assertEqual(spec.expected_verdict, poc.UNSUPPORTED)
+        self.assertEqual(structural["observed_verdict"], poc.UNSUPPORTED)
+        self.assertEqual(case_result, "PASS")
+        self.assertEqual(reason["classification"], "EXPECTED_NEGATIVE")
+        self.assertIn("UNSUPPORTED_COMPRESSION_METHOD", reason["structural_reason_codes"])
+        self.assertEqual(reason["structural_error_code"], "UNSUPPORTED_COMPRESSION_METHOD")
+        self.assertEqual(original["response_framing"], "ONE_NUL_TERMINATED_REPLY")
+        self.assertNotEqual(structural["conclusion"]["overall_conclusion"], poc.COMPLETE_SAFE_SCAN)
+
+    def test_real_missing_extracted_scanner_response_fails_case_and_aggregate(self) -> None:
+        spec, structural, original, _reason, _case_result = self._real_structural_case("R2-01")
+        payload = next(obj for obj in structural["objects"]
+                       if obj.get("record_role") == "EXTRACTED_PAYLOAD")
+        payload["scanner_reason"] = "CLAMD_INSTREAM_NO_COMPLETE_REPLY"
+        payload["scanner_verdict"] = poc.NOT_VERIFIED
+        payload["scanner_response_framing"] = "NOT_VERIFIED"
+        case_result = live._case_result(spec, structural, original, eicar_required=True)
+        reason = live._case_reason_record(
+            case_id=spec.case_id, expected_status=spec.expected_verdict,
+            structural=structural, original=original, objects=structural["objects"],
+            case_result=case_result)
+        self.assertEqual(case_result, "NOT_VERIFIED")
+        self.assertEqual(reason["classification"], "MISSING_SCANNER_RESULT")
+
+        report = self._passing_aggregate_report()
+        self._replace_aggregate_case_with_real_records(
+            report, spec.case_id, (spec, structural, original, reason, case_result))
+        aggregated = live._derive_aggregate(report, require_cleanup=True)
+        self.assertEqual(aggregated["OVERALL_RESULT"], "FAIL")
+        self.assertFalse(aggregated["COMPLETE_SAFE_SCAN"])
+        self.assertIn("MANDATORY_CASE_NOT_PASS:R2-01", aggregated["required_evidence"]["failures"])
+        self.assertIn("MANDATORY_CASE_REASON_INVALID:R2-01",
+                      aggregated["required_evidence"]["failures"])
+        self.assertIn("EXTRACTED_PAYLOAD_SCANNER_RESPONSE_INVALID:R2-01",
+                      aggregated["required_evidence"]["failures"])
+
 
     def test_malformed_missing_error_and_trailing_replies_fail_closed(self) -> None:
         bad_replies = [b"", b"stream: OK", b"stream: OK\x00garbage", b"unexpected\x00",

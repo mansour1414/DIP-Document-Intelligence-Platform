@@ -330,13 +330,17 @@ class ObjectRecord:
     scanner_reason: str = "NOT_SCANNED"
     offline_control_signature: str = "NOT_APPLICABLE"
     scanner_response_framing: str = "NOT_VERIFIED"
+    record_role: str | None = None
     skipped: bool = False
     skip_reason: str | None = None
     resource_limits_hit: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, object]:
-        return dataclasses.asdict(self)
+        record = dataclasses.asdict(self)
+        if record["record_role"] is None:
+            record.pop("record_role")
+        return record
 
 
 class CoverageLedger:
@@ -1041,7 +1045,8 @@ def _inspect_one_member(budget: ResourceBudget, ledger: CoverageLedger, *,
         extracted_bytes=actual, scanner_verdict=str(scan["scanner_verdict"]),
         scanner_reason=str(scan["scanner_reason"]),
         offline_control_signature=str(scan["signature"]),
-        scanner_response_framing=str(scan.get("response_framing", "NOT_VERIFIED")), notes=notes,
+        scanner_response_framing=str(scan.get("response_framing", "NOT_VERIFIED")),
+        record_role="EXTRACTED_PAYLOAD", notes=notes,
     )
     ledger.add(record)
 
@@ -1093,7 +1098,8 @@ def inspect_zip_container(budget: ResourceBudget, ledger: CoverageLedger, *,
             structural_verdict=structural, verdict=INSPECTED, extracted_bytes=len(data),
             scanner_verdict=str(container_scan["scanner_verdict"]),
             scanner_reason=str(container_scan["scanner_reason"]),
-            offline_control_signature=str(container_scan["signature"]), notes=notes,
+            offline_control_signature=str(container_scan["signature"]),
+            record_role="STRUCTURAL_CONTAINER_CONTROL", notes=notes,
         ))
         for entry in entries:
             budget.check_time()
@@ -1361,6 +1367,7 @@ def inspect_pdf(budget: ResourceBudget, ledger: CoverageLedger, *,
             scanner_reason=str(scan["scanner_reason"]),
             offline_control_signature=str(scan["signature"]),
             scanner_response_framing=str(scan.get("response_framing", "NOT_VERIFIED")),
+            record_role="EXTRACTED_PAYLOAD",
             notes=[f"pdf_reference_source={source}"],
         ))
         if detected == "application/zip":

@@ -609,8 +609,19 @@ def _case_result(case: poc.CaseSpec, structural: dict[str, Any], original: dict[
         return "FAIL"
     if structural.get("observed_verdict") in (poc.REJECTED, poc.UNSUPPORTED, poc.NOT_VERIFIED):
         return "PASS" if structural.get("observed_verdict") == case.expected_verdict else "FAIL"
-    scans = [obj for obj in structural.get("objects", [])
-             if obj.get("scanner_reason") == "CLAMD_INSTREAM_COMPLETE"]
+    objects = [obj for obj in structural.get("objects", []) if isinstance(obj, dict)]
+    has_explicit_roles = any("record_role" in obj for obj in objects)
+    if has_explicit_roles:
+        scans = [obj for obj in objects if obj.get("record_role") == "EXTRACTED_PAYLOAD"]
+        if (case.expected_verdict == poc.INSPECTED and not scans) or any(
+                obj.get("scanner_reason") != "CLAMD_INSTREAM_COMPLETE"
+                or obj.get("scanner_verdict") not in ("CLEAN", "INFECTED")
+                or obj.get("scanner_response_framing") != "ONE_NUL_TERMINATED_REPLY"
+                for obj in scans):
+            return "NOT_VERIFIED"
+    else:
+        # Backward compatibility for old adapter records without explicit roles.
+        scans = [obj for obj in objects if obj.get("scanner_reason") == "CLAMD_INSTREAM_COMPLETE"]
     if case.expected_verdict == poc.INSPECTED and not scans:
         return "NOT_VERIFIED"
     if eicar_required:
@@ -710,15 +721,16 @@ def _case_reason_record(*, case_id: str, expected_status: str,
         and original.get("scanner_reason") == "CLAMD_INSTREAM_COMPLETE"
         and original.get("response_framing") == "ONE_NUL_TERMINATED_REPLY"
     )
-    inspected_objects = [obj for obj in objects
-                         if isinstance(obj, dict) and obj.get("verdict") == poc.INSPECTED]
+    payload_objects = [obj for obj in objects
+                       if isinstance(obj, dict) and obj.get("record_role") == "EXTRACTED_PAYLOAD"]
     scanner_missing = (
         not has_original_response
         or any(obj.get("scanner_reason") != "CLAMD_INSTREAM_COMPLETE"
                or obj.get("scanner_verdict") not in ("CLEAN", "INFECTED")
-               for obj in inspected_objects)
+               or obj.get("scanner_response_framing") != "ONE_NUL_TERMINATED_REPLY"
+               for obj in payload_objects)
         or (expected_status == poc.INSPECTED and case_id != "CTRL-EICAR-RAW"
-            and not inspected_objects)
+            and not payload_objects)
     )
     structural_matches = (case_id == "CTRL-EICAR-RAW" or (
         isinstance(structural, dict)
@@ -1088,7 +1100,7 @@ def run_live(args: argparse.Namespace) -> dict[str, Any]:
                  "signature": obj.get("offline_control_signature"),
                  "response_framing": obj.get("scanner_response_framing"),
              }}
-            for obj in objects if obj.get("scanner_reason") == "CLAMD_INSTREAM_COMPLETE"
+            for obj in objects if obj.get("record_role") == "EXTRACTED_PAYLOAD"
         ]
         results.append({
             "case_id": spec.case_id, "track": spec.track, "description": spec.description,
