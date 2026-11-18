@@ -1,0 +1,7 @@
+# Minimal build context for the isolated experimental client image.
+**
+!scripts/
+!scripts/experiments/
+!scripts/experiments/phase0c_r1r2_poc.py
+!scripts/experiments/phase0c_r1r2_fixtures.py
+!scripts/experiments/phase0c_r1r2_live_evidence.py

@@ -1,0 +1,89 @@
+name: Phase 0C experimental client image ARM64 smoke
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/phase0c-client-arm64-smoke.yml"
+      - "docs/operations/experimental/clamav-phase0c-client.Dockerfile"
+      - "docs/operations/experimental/clamav-phase0c-client.Dockerfile.dockerignore"
+      - "scripts/experiments/phase0c_r1r2_poc.py"
+      - "scripts/experiments/phase0c_r1r2_fixtures.py"
+      - "scripts/experiments/phase0c_r1r2_live_evidence.py"
+
+permissions:
+  contents: read
+
+jobs:
+  client-image-smoke:
+    name: Build and import experimental Python client image (ARM64)
+    if: github.repository == 'mansour1414/DIP-Document-Intelligence-Platform'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - name: Check out source without persisted credentials
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Enforce repository and ARM64 runner boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = pull_request
+          test "$GITHUB_REPOSITORY" = mansour1414/DIP-Document-Intelligence-Platform
+          test "$(uname -m)" = aarch64
+          docker info --format '{{.Architecture}}' | grep -E '^(aarch64|arm64)$'
+
+      - name: Build only the existing experimental Python client image locally
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=20s 8m docker build \
+            --platform linux/arm64 \
+            --file docs/operations/experimental/clamav-phase0c-client.Dockerfile \
+            --tag dip-phase0c-client:pr-smoke .
+
+      - name: Import and verify the built image under bounded runtime limits
+        shell: bash
+        run: |
+          set -euo pipefail
+          python_code="$(cat <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+
+          import phase0c_r1r2_fixtures
+          import phase0c_r1r2_live_evidence
+          import phase0c_r1r2_poc
+
+          assert os.getuid() == 10001, f"unexpected uid: {os.getuid()}"
+          assert os.getgid() == 10001, f"unexpected gid: {os.getgid()}"
+          assert not Path('/var/run/docker.sock').exists(), 'Docker socket must not be mounted'
+
+          root = Path('/opt/dip')
+          package_manifest = Path('/usr/share/doc/dip-phase0c-client/dpkg-manifest.txt')
+          source_manifest = Path('/usr/share/doc/dip-phase0c-client/source-manifest.sha256')
+          assert package_manifest.is_file() and package_manifest.stat().st_size > 0
+          assert source_manifest.is_file() and source_manifest.stat().st_size > 0
+          for line in source_manifest.read_text(encoding='utf-8').splitlines():
+              digest, name = line.split(maxsplit=1)
+              source = root / name
+              assert source.is_file() and hashlib.sha256(source.read_bytes()).hexdigest() == digest
+          assert len(source_manifest.read_text(encoding='utf-8').splitlines()) == 3
+
+          license_root = Path('/usr/share/doc/dip-phase0c-client/licenses')
+          copyright_files = sorted(license_root.glob('*/copyright'))
+          package_dirs = [path.parent.name for path in copyright_files]
+          assert len(copyright_files) >= 2, 'expected package copyright records'
+          assert len(package_dirs) == len(set(package_dirs)), 'copyright destinations collide'
+          assert all(path.parent.parent == license_root for path in copyright_files)
+          print('ARM64 non-root imports, package/source manifests, and license paths verified')
+          PY
+          )"
+          timeout --signal=TERM --kill-after=10s 2m docker run --rm \
+            --platform linux/arm64 --network none --read-only \
+            --cap-drop ALL --security-opt no-new-privileges:true \
+            --memory 256m --memory-swap 256m --cpus 1 --pids-limit 32 \
+            --ulimit cpu=60:60 --env PYTHONDONTWRITEBYTECODE=1 \
+            --entrypoint python3 dip-phase0c-client:pr-smoke \
+            -c "$python_code"
