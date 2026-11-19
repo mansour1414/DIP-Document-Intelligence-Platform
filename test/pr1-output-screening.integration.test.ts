@@ -24,18 +24,18 @@ const storageReady = ["STORAGE_ENDPOINT", "STORAGE_BUCKET", "STORAGE_ACCESS_KEY"
 const scannerReady = Boolean(process.env.CLAMD_HOST);
 const integrationTest = runtimeUrl && ownerUrl && storageReady && scannerReady ? test : test.skip;
 
-type Fixture = { user: string; document: string; inputFile: string; job: string; inputKey: string; inputBytes: Uint8Array };
+type Fixture = { user: string; document: string; inputFiles: string[]; inputKeys: string[]; job: string };
 type Spy = { puts: string[]; deletes: string[]; failPutAt?: number };
 
 integrationTest("PR-1 (integration): generated outputs are screened before storage", { timeout: 240_000 }, async (t) => {
   const { PrismaPg } = await import("@prisma/adapter-pg");
   const { PrismaClient } = await import("@prisma/client");
   const pg = await import("pg");
+  const { PDFDocument } = await import("pdf-lib");
   const { createS3Storage } = await import("../src/lib/storage");
   const { processDocumentJob } = await import("../src/lib/jobs/document-pipeline");
   const { getMalwareScanner } = await import("../src/lib/malware");
   const { OutputScanError } = await import("../src/lib/outputs/screening");
-  const { PDFDocument: Pdf } = await import("pdf-lib");
 
   const owner = new pg.default.Client({ connectionString: ownerUrl });
   const runtime = new PrismaClient({ adapter: new PrismaPg({ connectionString: runtimeUrl }), log: ["error"] });
@@ -73,21 +73,30 @@ integrationTest("PR-1 (integration): generated outputs are screened before stora
   };
 
   const pdfBytes = async (pages: number) => {
-    const document = await Pdf.create();
+    const document = await PDFDocument.create();
     for (let index = 0; index < pages; index += 1) document.addPage();
     return new Uint8Array(await document.save());
   };
 
-  const seed = async (toolId: string, pages: number): Promise<Fixture> => {
-    const user = randomUUID(); const document = randomUUID(); const inputFile = randomUUID(); const job = randomUUID();
-    const inputBytes = await pdfBytes(pages);
-    const inputKey = `input/${user}/${inputFile}-in.pdf`;
-    await bucket.put({ key: inputKey, bytes: inputBytes, contentType: "application/pdf" });
+  /**
+   * `merge-pdf` requires at least two inputs, so the fixture seeds one file per
+   * requested input; `split-pdf` needs a single multi-page file instead.
+   */
+  const seed = async (toolId: string, pages: number, inputCount = 1): Promise<Fixture> => {
+    const user = randomUUID(); const document = randomUUID(); const job = randomUUID();
+    const inputFiles: string[] = []; const inputKeys: string[] = [];
     await owner.query(`INSERT INTO users (id,email,status,created_at,updated_at) VALUES ($1,$2,'ACTIVE',now(),now())`, [user, `pr1-${user}@example.invalid`]);
     await owner.query(`INSERT INTO documents (id,user_id,title,status,created_at,updated_at) VALUES ($1,$2,'PR-1 input','ACTIVE',now(),now())`, [document, user]);
-    await owner.query(`INSERT INTO files (id,document_id,original_name,mime_type,size,storage_key,version,created_at) VALUES ($1,$2,'in.pdf','application/pdf',$3,$4,1,now())`, [inputFile, document, inputBytes.byteLength, inputKey]);
-    await owner.query(`INSERT INTO jobs (id,tool_id,idempotency_key,requester_id,status,params,correlation_id,created_at,updated_at) VALUES ($1,$2,$3,$4,'QUEUED',$5::jsonb,$6,now(),now())`, [job, toolId, `pr1-${job}`, user, JSON.stringify({ inputFileIds: [inputFile], options: {} }), randomUUID()]);
-    return { user, document, inputFile, job, inputKey, inputBytes };
+    for (let index = 0; index < inputCount; index += 1) {
+      const inputFile = randomUUID();
+      const inputBytes = await pdfBytes(pages);
+      const inputKey = `input/${user}/${inputFile}-${index}.pdf`;
+      await bucket.put({ key: inputKey, bytes: inputBytes, contentType: "application/pdf" });
+      await owner.query(`INSERT INTO files (id,document_id,original_name,mime_type,size,storage_key,version,created_at) VALUES ($1,$2,$3,'application/pdf',$4,$5,1,now())`, [inputFile, document, `in-${index}.pdf`, inputBytes.byteLength, inputKey]);
+      inputFiles.push(inputFile); inputKeys.push(inputKey);
+    }
+    await owner.query(`INSERT INTO jobs (id,tool_id,idempotency_key,requester_id,status,params,correlation_id,created_at,updated_at) VALUES ($1,$2,$3,$4,'QUEUED',$5::jsonb,$6,now(),now())`, [job, toolId, `pr1-${job}`, user, JSON.stringify({ inputFileIds: inputFiles, options: {} }), randomUUID()]);
+    return { user, document, inputFiles, inputKeys, job };
   };
 
   const cleanup = async (fixture: Fixture, extraKeys: string[] = []) => {
@@ -98,16 +107,19 @@ integrationTest("PR-1 (integration): generated outputs are screened before stora
     await owner.query(`DELETE FROM files WHERE document_id IN (SELECT id FROM documents WHERE user_id = $1)`, [fixture.user]);
     await owner.query(`DELETE FROM documents WHERE user_id = $1`, [fixture.user]);
     await owner.query(`DELETE FROM users WHERE id = $1`, [fixture.user]);
-    for (const key of [fixture.inputKey, ...extraKeys]) await bucket.deleteObject(key).catch(() => undefined);
+    for (const key of [...fixture.inputKeys, ...extraKeys]) await bucket.deleteObject(key).catch(() => undefined);
   };
 
   const message = (fixture: Fixture) => ({ jobId: fixture.job, toolId: "", idempotencyKey: `pr1-${fixture.job}`, correlationId: randomUUID(), userId: fixture.user });
   const jobRow = async (id: string) => (await owner.query(`SELECT status, error_code, output_file_id FROM jobs WHERE id = $1`, [id])).rows[0];
-  const outputRows = async (fixture: Fixture) => (await owner.query(`SELECT f.id, f.storage_key, f.checksum FROM files f JOIN documents d ON d.id = f.document_id WHERE d.user_id = $1 AND f.id <> $2`, [fixture.user, fixture.inputFile])).rows;
+  const outputRows = async (fixture: Fixture) => (await owner.query(`SELECT f.id, f.storage_key, f.checksum FROM files f JOIN documents d ON d.id = f.document_id WHERE d.user_id = $1 AND f.id <> ALL($2::uuid[])`, [fixture.user, fixture.inputFiles])).rows;
+  /** Security events written by this run, scoped by time because `details` carries no job id. */
+  const securityEventsSince = async (since: Date) => (await owner.query(`SELECT id, details FROM security_events WHERE created_at >= $1 AND details->>'source' = 'output' ORDER BY created_at ASC`, [since])).rows;
+  const purgeSecurityEventsSince = async (since: Date) => { await owner.query(`DELETE FROM security_events WHERE created_at >= $1 AND details->>'source' = 'output'`, [since]); };
 
   try {
     await t.test("clean output is scanned with real clamd, stored once and the job succeeds", async () => {
-      const fixture = await seed("merge-pdf", 1);
+      const fixture = await seed("merge-pdf", 1, 2);
       const spy: Spy = { puts: [], deletes: [] };
       try {
         await processDocumentJob(message(fixture), { storage: spyStorage(spy), scanner: getMalwareScanner(), client: runtime });
@@ -125,9 +137,10 @@ integrationTest("PR-1 (integration): generated outputs are screened before stora
       } catch (error) { await cleanup(fixture, spy.puts); throw error; }
     });
 
-    await t.test("an infected output is rejected before storage and the job fails closed", async () => {
-      const fixture = await seed("merge-pdf", 1);
+    await t.test("an infected output is rejected before storage, the job fails closed and the rejection is persisted", async () => {
+      const fixture = await seed("merge-pdf", 1, 2);
       const spy: Spy = { puts: [], deletes: [] };
+      const since = new Date();
       try {
         await assert.rejects(
           () => processDocumentJob(message(fixture), { storage: spyStorage(spy), scanner: scannerReturning("INFECTED").scanner, client: runtime }),
@@ -139,13 +152,24 @@ integrationTest("PR-1 (integration): generated outputs are screened before stora
         assert.equal(row.output_file_id, null);
         assert.deepEqual(spy.puts, [], "no bytes may reach object storage");
         assert.deepEqual(await outputRows(fixture), [], "no file row may be created");
+
+        // PR-1 regression: the raw insert must supply `security_events.id`
+        // (there is no database default), otherwise every rejection was dropped.
+        const events = await securityEventsSince(since);
+        assert.equal(events.length, 1, "exactly one output rejection is persisted");
+        assert.ok(events[0].id, "security_events.id must be non-null");
+        assert.equal(events[0].details.result, "INFECTED");
+        assert.equal(events[0].details.source, "output");
+        assert.equal(events[0].details.engine, "pr1-stub");
+        await purgeSecurityEventsSince(since);
         await cleanup(fixture);
-      } catch (error) { await cleanup(fixture, spy.puts); throw error; }
+      } catch (error) { await purgeSecurityEventsSince(since); await cleanup(fixture, spy.puts); throw error; }
     });
 
     await t.test("an unavailable scanner fails the job closed without storing anything", async () => {
-      const fixture = await seed("merge-pdf", 1);
+      const fixture = await seed("merge-pdf", 1, 2);
       const spy: Spy = { puts: [], deletes: [] };
+      const since = new Date();
       try {
         await assert.rejects(
           () => processDocumentJob(message(fixture), { storage: spyStorage(spy), scanner: scannerReturning("SCANNER_UNAVAILABLE").scanner, client: runtime }),
@@ -156,14 +180,19 @@ integrationTest("PR-1 (integration): generated outputs are screened before stora
         assert.equal(row.error_code, "SCANNER_UNAVAILABLE");
         assert.deepEqual(spy.puts, []);
         assert.deepEqual(await outputRows(fixture), []);
+        const events = await securityEventsSince(since);
+        assert.equal(events.length, 1);
+        assert.equal(events[0].details.result, "SCANNER_UNAVAILABLE");
+        await purgeSecurityEventsSince(since);
         await cleanup(fixture);
-      } catch (error) { await cleanup(fixture, spy.puts); throw error; }
+      } catch (error) { await purgeSecurityEventsSince(since); await cleanup(fixture, spy.puts); throw error; }
     });
 
     await t.test("a multi-output batch with one infected member stores nothing at all", async () => {
       const fixture = await seed("split-pdf", 2);
       const spy: Spy = { puts: [], deletes: [] };
       const scripted = scannerReturning("CLEAN", "INFECTED");
+      const since = new Date();
       try {
         await assert.rejects(
           () => processDocumentJob(message(fixture), { storage: spyStorage(spy), scanner: scripted.scanner, client: runtime }),
@@ -173,8 +202,12 @@ integrationTest("PR-1 (integration): generated outputs are screened before stora
         assert.deepEqual(spy.puts, [], "the clean sibling must not be published either");
         assert.equal((await jobRow(fixture.job)).status, "FAILED");
         assert.deepEqual(await outputRows(fixture), []);
+        const events = await securityEventsSince(since);
+        assert.equal(events.length, 1, "only the infected member is persisted as a rejection");
+        assert.equal(events[0].details.result, "INFECTED");
+        await purgeSecurityEventsSince(since);
         await cleanup(fixture);
-      } catch (error) { await cleanup(fixture, spy.puts); throw error; }
+      } catch (error) { await purgeSecurityEventsSince(since); await cleanup(fixture, spy.puts); throw error; }
     });
 
     await t.test("a storage failure mid-batch deletes the partial object and fails the job", async () => {
