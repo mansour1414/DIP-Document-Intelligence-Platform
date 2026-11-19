@@ -9,16 +9,18 @@ import {
   type JobExpiryFacts,
   type JobExpiryPlan,
   type JobLifecycleState,
+  type QueueEvidence,
 } from "@/lib/retention/job-expiry";
-import { createQueueActivityLookup, emptyQueueActivityLookup, type QueueActivityLookup } from "@/lib/retention/queue-activity";
-import { AI_JOB_QUEUE_NAME, getQueueConnection, JOB_QUEUE_NAME } from "@/lib/queue";
+import { createQueueActivityLookup, resolveEvidence, unknownEvidence, type QueueReadResult } from "@/lib/retention/queue-activity";
+import { openRetentionRedis, type RetentionRedisHandle } from "@/lib/retention/queue-connection";
+import { AI_JOB_QUEUE_NAME, JOB_QUEUE_NAME } from "@/lib/queue";
 
 /**
  * Legacy export retained for compatibility.
  *
- * It is no longer the single expiry window. RUNNING work is judged by activity
- * and lease, not age; `abandonedGraceMs()` is the effective bound for
- * QUEUED/RETRYING jobs.
+ * It is no longer the single expiry window. RUNNING work is judged by queue
+ * evidence and a 24h-minimum silence window; `abandonedGraceMs()` is the
+ * effective bound for QUEUED/RETRYING jobs.
  */
 export const EXPIRY_CUTOFF_MS = 24 * 60 * 60 * 1000;
 
@@ -33,6 +35,9 @@ type CandidateRow = {
   updatedAt: Date;
   completedAt: Date | null;
 };
+
+/** The queues this deployment actually uses, in read order. */
+const QUEUE_NAMES = [JOB_QUEUE_NAME, AI_JOB_QUEUE_NAME] as const;
 
 /**
  * Load the facts the expiry policy needs.
@@ -67,31 +72,74 @@ async function loadCandidates(now: Date): Promise<CandidateRow[]> {
   return [...queueLike, ...running];
 }
 
-/** Default lookup: real BullMQ keys over the shared Redis connection. */
-export function redisQueueActivity(nowMs: () => number): (queueName: string) => QueueActivityLookup {
-  try {
-    const redis = getQueueConnection();
-    return (queueName) => createQueueActivityLookup({ redis, queueName, now: nowMs });
-  } catch {
-    // Without Redis the sweep still runs, but every job looks queue-unknown, so
-    // the database silence window alone has to elapse before expiry.
-    return () => emptyQueueActivityLookup;
+export type QueueEvidenceProvider = {
+  /**
+   * Set when the provider cannot read at all (e.g. `REDIS_URL` is not
+   * configured). Every job is then `unknown`, never `absent`.
+   */
+  unavailable?: Extract<QueueEvidence, { state: "unknown" }>["reason"];
+  /** Reads every configured queue, returning one result per queue. */
+  read(jobIds: readonly string[]): Promise<QueueReadResult[]>;
+  /** Releases any connection this provider owns. Must be idempotent. */
+  close(): Promise<void>;
+};
+
+/**
+ * Provider backed by a bounded, explicitly-configured Redis connection.
+ *
+ * When `REDIS_URL` is absent the sweep must not invent a localhost endpoint
+ * (see `queue-connection.ts`): every job becomes `unknown`, and unknown never
+ * permits expiry.
+ */
+export function redisEvidenceProvider(): QueueEvidenceProvider {
+  const handle: RetentionRedisHandle = openRetentionRedis();
+  if (!handle.connection) {
+    return {
+      unavailable: "not_configured",
+      async read() {
+        return [];
+      },
+      close: handle.close,
+    };
   }
+  const connection = handle.connection;
+  const nowMs = () => Date.now();
+  const lookups = QUEUE_NAMES.map((queueName) => createQueueActivityLookup({ redis: connection, queueName, now: nowMs }));
+  return {
+    async read(jobIds) {
+      // Sequential reads keep load on the worker's Redis predictable.
+      const results: QueueReadResult[] = [];
+      for (const lookup of lookups) results.push(await lookup.read(jobIds));
+      return results;
+    },
+    close: handle.close,
+  };
 }
 
 /**
- * Attach queue liveness evidence, trying the document queue then the AI queue.
- * A job known to neither is left with `queue: null`.
+ * Attach queue evidence to every candidate.
+ *
+ * Presence anywhere wins; otherwise any incomplete read poisons the batch to
+ * `unknown`. Only a fully successful, fully empty read set may conclude absence.
  */
-async function withQueueActivity(
+async function withQueueEvidence(
   jobs: CandidateRow[],
-  lookupFor: (queueName: string) => QueueActivityLookup,
+  provider: QueueEvidenceProvider,
+  unavailableReason: Extract<QueueEvidence, { state: "unknown" }>["reason"] | null = null,
 ): Promise<JobExpiryFacts[]> {
-  const ids = jobs.map((job) => job.id);
-  const documentQueue = await lookupFor(JOB_QUEUE_NAME).lookup(ids);
-  const remaining = ids.filter((id) => !documentQueue.has(id));
-  const aiQueue = remaining.length ? await lookupFor(AI_JOB_QUEUE_NAME).lookup(remaining) : new Map();
-  return jobs.map((job) => ({ ...job, queue: documentQueue.get(job.id) ?? aiQueue.get(job.id) ?? null }));
+  if (jobs.length === 0) return [];
+  if (unavailableReason) return jobs.map((job) => ({ ...job, queue: unknownEvidence(unavailableReason) }));
+
+  let reads: QueueReadResult[];
+  try {
+    reads = await provider.read(jobs.map((job) => job.id));
+  } catch {
+    // A provider-level failure is UNKNOWN for the whole batch, never absence.
+    return jobs.map((job) => ({ ...job, queue: unknownEvidence("error") }));
+  }
+  // Reading zero queues proves nothing about the job, so it cannot be absence.
+  if (reads.length === 0) return jobs.map((job) => ({ ...job, queue: unknownEvidence("error") }));
+  return jobs.map((job) => ({ ...job, queue: resolveEvidence(job.id, reads) }));
 }
 
 export type ExpireStalledJobsOptions = {
@@ -101,7 +149,9 @@ export type ExpireStalledJobsOptions = {
    */
   mode?: "apply" | "plan";
   /** Test seam: replaces the Redis-backed queue evidence provider. */
-  queueActivity?: (queueName: string) => QueueActivityLookup;
+  evidence?: QueueEvidenceProvider;
+  /** Test seam: forces the "queue is unusable" path without touching Redis. */
+  queueUnavailable?: Extract<QueueEvidence, { state: "unknown" }>["reason"] | null;
 };
 
 export type ExpireStalledJobsResult = { expired: number; plan: JobExpiryPlan };
@@ -114,6 +164,9 @@ function expiryLogContext(plan: JobExpiryPlan, mode: "apply" | "plan") {
     stale_queue: plan.counts.staleQueue,
     active_running: plan.counts.runningStillActive,
     within_grace: plan.counts.withinGrace,
+    // Visible on every sweep: a Redis outage shows up as a non-zero count here
+    // rather than silently suppressing cleanup.
+    queue_unknown: plan.counts.queueUnknown,
     abandoned_grace_ms: plan.policy.abandonedGraceMs,
     running_silence_ms: plan.policy.runningSilenceMs,
     mode,
@@ -129,11 +182,19 @@ function expiryLogContext(plan: JobExpiryPlan, mode: "apply" | "plan") {
 export async function planStalledJobExpiry(options: ExpireStalledJobsOptions = {}): Promise<ExpireStalledJobsResult> {
   const now = options.now ?? new Date();
   const mode = options.mode ?? "plan";
-  const lookupFor = options.queueActivity ?? redisQueueActivity(() => now.getTime());
-  const candidates = await loadCandidates(now);
-  const plan = planJobExpiry(await withQueueActivity(candidates, lookupFor), now);
-  logger.info("jobs.expiry_planned", expiryLogContext(plan, mode));
-  return { expired: 0, plan };
+  const ownsProvider = !options.evidence;
+  const provider = options.evidence ?? redisEvidenceProvider();
+  try {
+    const candidates = await loadCandidates(now);
+    const facts = await withQueueEvidence(candidates, provider, options.queueUnavailable ?? provider.unavailable ?? null);
+    const plan = planJobExpiry(facts, now);
+    logger.info("jobs.expiry_planned", expiryLogContext(plan, mode));
+    return { expired: 0, plan };
+  } finally {
+    // Always release the connection: a one-shot scheduler process must not leak
+    // a Redis socket when planning throws.
+    if (ownsProvider) await provider.close().catch(() => undefined);
+  }
 }
 
 /**
