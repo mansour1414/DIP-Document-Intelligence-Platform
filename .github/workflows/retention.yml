@@ -5,9 +5,16 @@ on:
     - cron: "17 2 * * *"
   workflow_dispatch:
 
+# A sweep must never overlap another sweep: concurrent apply runs could issue
+# duplicate deletes and race on the same metadata rows.
+concurrency:
+  group: retention-cleanup
+  cancel-in-progress: false
+
 jobs:
   cleanup:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -25,12 +32,23 @@ jobs:
           RETENTION_STORAGE_ACCESS_KEY: ${{ secrets.RETENTION_STORAGE_ACCESS_KEY }}
           RETENTION_STORAGE_SECRET_KEY: ${{ secrets.RETENTION_STORAGE_SECRET_KEY }}
         run: |
+          # Credentials are mandatory: without them the scheduler cannot read or
+          # verify anything, so a missing credential always fails closed.
           failed=0
           for name in RETENTION_DATABASE_URL RETENTION_STORAGE_ENDPOINT RETENTION_STORAGE_BUCKET RETENTION_STORAGE_ACCESS_KEY RETENTION_STORAGE_SECRET_KEY; do
             if test -n "${!name}"; then echo "${name}_PRESENT=true"; else echo "${name}_PRESENT=false"; failed=1; fi
           done
-          if test "${{ vars.RETENTION_APPLY }}" = "1"; then echo "RETENTION_APPLY_ENABLED=true"; else echo "RETENTION_APPLY_ENABLED=false"; failed=1; fi
-          test "$failed" = 0 || { echo "Retention configuration error: required secret(s) or RETENTION_APPLY=1 are missing."; exit 1; }
+          test "$failed" = 0 || { echo "Retention configuration error: required credential(s) are missing."; exit 1; }
+          # RETENTION_APPLY is a mode switch, not a prerequisite. Unset (or any
+          # value other than 1) selects the read-only dry-run, which is safe and
+          # expected to succeed. Applying deletions requires the explicit "1".
+          if test "${{ vars.RETENTION_APPLY }}" = "1"; then
+            echo "RETENTION_APPLY_ENABLED=true"
+            echo "RETENTION_MODE=apply"
+          else
+            echo "RETENTION_APPLY_ENABLED=false"
+            echo "RETENTION_MODE=dry_run"
+          fi
       - run: npm run jobs:cleanup
         env:
           DATABASE_URL: ${{ secrets.RETENTION_DATABASE_URL }}
@@ -39,4 +57,5 @@ jobs:
           STORAGE_ACCESS_KEY: ${{ secrets.RETENTION_STORAGE_ACCESS_KEY }}
           STORAGE_SECRET_KEY: ${{ secrets.RETENTION_STORAGE_SECRET_KEY }}
           STORAGE_REGION: ${{ vars.RETENTION_STORAGE_REGION }}
+          # Unset or anything other than "1" resolves to a read-only dry-run.
           RETENTION_APPLY: ${{ vars.RETENTION_APPLY }}
