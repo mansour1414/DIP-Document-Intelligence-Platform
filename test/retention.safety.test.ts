@@ -66,8 +66,12 @@ test("dry-run is strictly read-only: the service never writes, calls storage or 
   assert.equal(countDeleteCalls, 1);
   assert.ok(source.indexOf("storage.deleteObject(") > dryRunIndex);
 
-  // Job expiry is a mutation and must be gated behind apply mode.
-  assert.match(schedulerSource, /const expiredJobs = apply \? await expireStalledJobs\(\) : 0;/);
+  // Job expiry is a mutation and must be gated behind apply mode. The dry-run
+  // branch must only plan (read-only) and report the candidate count.
+  assert.match(schedulerSource, /const expiredJobs = apply\s*\n?\s*\? await expireStalledJobs\(\{ mode: "apply" \}\)/);
+  assert.equal(/const expiredJobs = apply \? await expireStalledJobs\(\) : 0;/.test(schedulerSource), false, "expiry must not be an unconditional apply call");
+  const dryRunExpiry = schedulerSource.slice(schedulerSource.indexOf("const expiredJobs = apply"));
+  assert.match(dryRunExpiry, /^[^;]*planStalledJobExpiry\(\{ mode: "plan" \}\)[^;]*;/, "dry-run must plan, not apply");
 });
 
 test("planner never reports a candidate for retained, protected, missing or out-of-scope files", () => {
