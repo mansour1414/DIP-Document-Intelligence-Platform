@@ -288,11 +288,16 @@ test("an entirely unknown batch expires nothing", () => {
 test("the scheduler never writes job state while planning", async () => {
   const source = await readFile(new URL("../scripts/cleanup-expired-jobs.ts", import.meta.url), "utf8");
   const planFn = source.slice(source.indexOf("export async function planStalledJobExpiry"), source.indexOf("export async function expireStalledJobs"));
-  for (const write of ["updateMany", "update(", "create(", "delete("]) {
+  for (const write of ["updateMany", "update(", "create(", "delete(", "applyExpiryPlan"]) {
     assert.equal(planFn.includes(write), false, `planning must not call ${write}`);
   }
   assert.match(source, /if \(mode !== "apply" \|\| plan\.expireIds\.length === 0\) return 0;/);
-  assert.match(source, /status: \{ in: \["QUEUED", "RETRYING", "RUNNING"\] \}/);
+  // The status guard now lives in the guarded write port alongside the
+  // optimistic `updatedAt` bound.
+  assert.match(source, /applyExpiryPlan\(/);
+  const writePort = await readFile(new URL("../src/lib/retention/expiry-write.ts", import.meta.url), "utf8");
+  assert.match(writePort, /status: { in: EXPIRABLE_STATUSES }/);
+  assert.match(writePort, /updatedAt: { lte: input\.sweepStartedAt }/);
 });
 
 test("dry-run reports candidates without terminating them", async () => {

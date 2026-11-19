@@ -13,6 +13,7 @@ import {
 } from "@/lib/retention/job-expiry";
 import { createQueueActivityLookup, resolveEvidence, unknownEvidence, type QueueReadResult } from "@/lib/retention/queue-activity";
 import { openRetentionRedis, type RetentionRedisHandle } from "@/lib/retention/queue-connection";
+import { applyExpiryPlan } from "@/lib/retention/expiry-write";
 import { AI_JOB_QUEUE_NAME, JOB_QUEUE_NAME } from "@/lib/queue";
 
 /**
@@ -206,21 +207,27 @@ export async function planStalledJobExpiry(options: ExpireStalledJobsOptions = {
 export async function expireStalledJobs(options: ExpireStalledJobsOptions = {}): Promise<number> {
   const mode = options.mode ?? "apply";
   const now = options.now ?? new Date();
+  // Captured BEFORE planning: the write is only allowed to touch rows that were
+  // already quiet when the sweep began. See `expiry-write.ts` for why the plain
+  // status guard is not enough.
+  const sweepStartedAt = now;
   const { plan } = await planStalledJobExpiry({ ...options, now, mode });
   if (mode !== "apply" || plan.expireIds.length === 0) return 0;
 
-  // The update repeats the status guard so a job that reached a terminal state
-  // between planning and writing is never overwritten.
-  const result = await db.job.updateMany({
-    where: { id: { in: plan.expireIds }, status: { in: ["QUEUED", "RETRYING", "RUNNING"] } },
-    data: { status: "EXPIRED", errorCode: "JOB_EXPIRED", completedAt: now },
-  });
+  const count = await applyExpiryPlan(
+    { updateMany: (args) => db.job.updateMany(args as Parameters<typeof db.job.updateMany>[0]) },
+    { expireIds: plan.expireIds, sweepStartedAt, completedAt: now },
+  );
   logger.info("jobs.expired_cleanup", {
-    count: result.count,
+    count,
+    planned: plan.expireIds.length,
+    // A shortfall means the sweep lost the race to a legitimate state change,
+    // which is the desired outcome — surface it rather than hiding it.
+    skipped_changed_since_sweep: plan.expireIds.length - count,
     abandoned_running: plan.counts.abandonedRunning,
     stale_queue: plan.counts.staleQueue,
   });
-  return result.count;
+  return count;
 }
 
 /**

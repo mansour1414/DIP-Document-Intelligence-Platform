@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { Queue, Worker } from "bullmq";
 import Redis from "ioredis";
 import { randomUUID } from "node:crypto";
-import { classifyJobExpiry, runningSilenceMs, type JobExpiryFacts } from "../src/lib/retention/job-expiry";
+import { abandonedGraceMs, classifyJobExpiry, runningSilenceMs, type JobExpiryFacts } from "../src/lib/retention/job-expiry";
 import { createQueueActivityLookup, resolveEvidence } from "../src/lib/retention/queue-activity";
 
 /**
@@ -147,15 +147,38 @@ test("a delayed retry is reported present, so it is never expired mid-backoff", 
     }
     assert.equal(state, "delayed", "fixture must reach the delayed retry state");
 
+    // The fixture must be genuinely *beyond* the grace window, or the test
+    // proves nothing: a freshly added job has `timestamp = now`, which alone
+    // satisfies the grace check and would mask a missing presence rule.
+    //
+    // Age the stored evidence the way a real long-delayed retry would look: the
+    // hash timestamp moves back while the delayed ZSET entry stays put, so the
+    // job is still genuinely tracked by BullMQ but every timestamp is stale.
+    const graceMs = abandonedGraceMs();
+    const agedMs = Date.now() - graceMs - 6 * HOUR;
+    await connection.hset(`bull:${queueName}:${jobId}`, "timestamp", String(agedMs));
+
     const observedAt = new Date();
     const read = await lookup.read([jobId]);
     assert.equal(read.ok, true);
     assert.ok(read.present.has(jobId), "a delayed retry is still tracked by BullMQ");
 
-    // Even with everything else ancient, presence blocks expiry.
-    const decision = classifyJobExpiry(facts(jobId, "RETRYING", observedAt, { state: "present", ...read.present.get(jobId)! }, 48), observedAt);
-    assert.equal(decision.expire, false);
+    const presence = read.present.get(jobId)!;
+    // Prove the fixture actually exercises the post-grace path. (The state was
+    // already asserted "delayed" above; re-querying here would race the backoff
+    // timer promoting the job mid-assertion.)
+    assert.ok(observedAt.getTime() - presence.lastActivityMs > graceMs, "queue evidence must be older than the grace window");
+    assert.equal(presence.leased, false);
+
+    // Presence alone blocks expiry, even though every timestamp is past grace.
+    const decision = classifyJobExpiry(facts(jobId, "RETRYING", observedAt, { state: "present", ...presence }, 48), observedAt);
+    assert.equal(decision.expire, false, "a tracked delayed retry must never be expired");
     assert.equal(decision.reason, "retry_queue_present");
+
+    // Control: with identical stale timestamps but confirmed absence, the same
+    // job *would* be expired. This isolates presence as the deciding factor.
+    const absentDecision = classifyJobExpiry(facts(jobId, "RETRYING", observedAt, { state: "absent" }, 48), observedAt);
+    assert.equal(absentDecision.expire, true, "the fixture must be past grace, or the assertion above is vacuous");
   } finally {
     await queue.obliterate({ force: true }).catch(() => undefined);
     await settleBounded([worker.close(), queue.close()]);
