@@ -30,6 +30,14 @@ applies `validateUpload -> requireCleanUpload -> storage.put` before enqueueing
 to the document worker, with progress from `GET /api/jobs/status/[jobId]` and
 authorized downloads from `GET /api/files/[fileId]`.
 
+`GET /api/jobs/status/[jobId]` also returns `pollBudgetMs`, derived by
+`jobPollBudgetMs()` from the configurable worker timeouts (engine timeout +
+storage persist + queue grace, capped at 30 minutes). The browser polls at 1s
+within that budget. If the budget ends while the job is still `QUEUED`,
+`RUNNING` or `RETRYING`, the UI reports "still processing" and offers a
+status re-check that resumes polling for the same job — it never marks a
+running job as failed and never submits a duplicate job.
+
 Install LibreOffice (`soffice`) for Office conversion. The approved OCR image uses
 OCRmyPDF 17.10.0, pypdfium2 5.13.0 and Tesseract with Arabic/English data; it must
 not contain a resolvable `gs` executable. Run `python scripts/verify-ocr-runtime.py`

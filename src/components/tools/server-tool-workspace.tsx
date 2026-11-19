@@ -10,29 +10,17 @@ import { UploadZone } from "@/components/ui/upload-zone";
 import { Progress } from "@/components/ui/progress";
 import { StatusFeedback } from "@/components/ui/status-feedback";
 import { BrandMark } from "@/components/brand/brand-mark";
+import {
+  ServerToolJobError,
+  createRunGuard,
+  downloadServerToolOutput,
+  formatJobError,
+  retainsIdempotencyKey,
+  pollJobOutput,
+  submitServerToolJob,
+} from "@/lib/client/server-tool-job";
 
-/**
- * Bounded polling for the async document-worker pipeline.
- * Office timeout is 120s and OCR timeout is 300s (runtimeLimits); the client
- * must wait beyond the server timeout plus queue wait, but never unbounded.
- * OCR therefore polls up to 390s and Office up to 210s at 1s intervals.
- */
-async function waitForServerJob(jobId: string, isOcr: boolean) {
-  const maxAttempts = isOcr ? 390 : 210;
-  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-    const response = await fetch(`/api/jobs/status/${jobId}`, { cache: "no-store" });
-    const job = await response.json() as { status?: string; result?: { outputFileIds?: string[] }; errorCode?: string; error?: { message?: string } };
-    if (!response.ok) throw new Error(job.errorCode ?? "JOB_STATUS_FAILED");
-    if (job.status === "succeeded") {
-      const outputFileIds = job.result?.outputFileIds ?? [];
-      if (!outputFileIds.length) throw new Error("OUTPUT_MISSING: The worker finished without an output file.");
-      return outputFileIds;
-    }
-    if (["failed", "cancelled", "expired"].includes(job.status ?? "")) throw new Error(`${job.errorCode ?? "PROCESSING_FAILED"}: ${job.error?.message ?? "The worker could not process this document."}`);
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-  }
-  throw new Error("PROCESSING_TIMEOUT: The worker did not finish in time.");
-}
+type Phase = "idle" | "processing" | "waiting" | "done" | "error";
 
 export function ServerToolWorkspace({ tool, embedded: _embedded = false }: { tool: ToolDefinition; embedded?: boolean }) {
   void _embedded;
@@ -40,38 +28,113 @@ export function ServerToolWorkspace({ tool, embedded: _embedded = false }: { too
   const inputRef = useRef<HTMLInputElement>(null);
   const [file, setFile] = useState<File | null>(null);
   const [language, setLanguage] = useState("ara+eng");
-  const [status, setStatus] = useState<"idle" | "processing" | "done" | "error">("idle");
+  const [status, setStatus] = useState<Phase>("idle");
   const [message, setMessage] = useState("");
   const [output, setOutput] = useState<{ url: string; name: string } | null>(null);
   const isOcr = tool.id === "ocr-pdf";
   const isArabic = locale === "ar";
-  const copy = isArabic ? { isolated: "معالجة خادمية معزولة", temporary: "يُعالَج الملف في عامل مستندات معزول ويُخزَّن في تخزين كائني خاص وفق سياسة الاحتفاظ.", upload: "حمّل مستنداً ممسوحاً", uploadOne: "حمّل مستنداً واحداً", drop: "اسحب ملفاً هنا أو اختره", limit: "ملف واحد، حتى 100 ميجابايت", recognition: "لغة التعرّف", searchable: "يضيف OCR طبقة نص قابلة للبحث مع الحفاظ على شكل الصفحات الأصلي.", process: "تتم المعالجة بأمان…", searchableAction: "اجعل المستند قابلاً للبحث", ready: "أصبح المستند المحوّل جاهزاً. يُخزَّن وفق سياسة الاحتفاظ ويمكن تنزيله الآن.", waiting: "قد تستغرق معالجة الملفات الممسوحة الكبيرة عدة دقائق.", download: "تحميل", remove: "إزالة" } : { isolated: "Isolated server processing", temporary: "The file is processed by an isolated document worker and stored in private object storage under the retention policy.", upload: "Upload a scanned document", uploadOne: "Upload one document", drop: "Drop a file here or browse", limit: "One file, up to 100 MB", recognition: "Recognition language", searchable: "OCR adds a searchable text layer while preserving the original page appearance.", process: "Processing securely…", searchableAction: "Make document searchable", ready: "Your converted document is ready. It is stored under the retention policy and can be downloaded now.", waiting: "Processing may take a few minutes for large scanned files.", download: "Download", remove: "Remove" };
-  useEffect(() => inputRef.current?.setAttribute("aria-label", isOcr ? copy.upload : copy.uploadOne), [copy.upload, copy.uploadOne, isOcr]);
+  const copy = isArabic ? { isolated: "معالجة خادمية معزولة", temporary: "يُعالَج الملف في عامل مستندات معزول ويُخزَّن في تخزين كائني خاص وفق سياسة الاحتفاظ.", upload: "حمّل مستنداً ممسوحاً", uploadOne: "حمّل مستنداً واحداً", drop: "اسحب ملفاً هنا أو اختره", limit: "ملف واحد، حتى 100 ميجابايت", recognition: "لغة التعرّف", searchable: "يضيف OCR طبقة نص قابلة للبحث مع الحفاظ على شكل الصفحات الأصلي.", process: "تتم المعالجة بأمان…", searchableAction: "اجعل المستند قابلاً للبحث", ready: "أصبح المستند المحوّل جاهزاً. يُخزَّن وفق سياسة الاحتفاظ ويمكن تنزيله الآن.", waiting: "قد تستغرق معالجة الملفات الممسوحة الكبيرة عدة دقائق.", stillRunning: "ما زال العامل يعالج المستند. يمكنك التحقق من الحالة مرة أخرى؛ لن تُنشأ مهمة جديدة.", checkAgain: "التحقق من الحالة", queued: "تم إدراج المستند في قائمة الانتظار، وتجري المعالجة في عامل المستندات المعزول…", sending: "يجري إرسال المستند إلى محرك المعالجة المعزول…", removeBusy: "لا يمكن إزالة الملف أثناء المعالجة؛ تستمر المهمة في الخلفية.", download: "تحميل", remove: "إزالة" } : { isolated: "Isolated server processing", temporary: "The file is processed by an isolated document worker and stored in private object storage under the retention policy.", upload: "Upload a scanned document", uploadOne: "Upload one document", drop: "Drop a file here or browse", limit: "One file, up to 100 MB", recognition: "Recognition language", searchable: "OCR adds a searchable text layer while preserving the original page appearance.", process: "Processing securely…", searchableAction: "Make document searchable", ready: "Your converted document is ready. It is stored under the retention policy and can be downloaded now.", waiting: "Processing may take a few minutes for large scanned files.", stillRunning: "The worker is still processing this document. You can check the status again; no new job will be created.", checkAgain: "Check status", queued: "Document queued; the isolated document worker is processing it…", sending: "Securely sending the document to the isolated processing engine…", removeBusy: "The file cannot be removed while processing; the job keeps running in the background.", download: "Download", remove: "Remove" };
+  useEffect(() => { inputRef.current?.setAttribute("aria-label", isOcr ? copy.upload : copy.uploadOne); }, [copy.upload, copy.uploadOne, isOcr]);
   const accept = tool.id === "word-to-pdf" ? ".doc,.docx,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document" : tool.id === "excel-to-pdf" ? ".xls,.xlsx,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" : tool.id === "powerpoint-to-pdf" ? ".ppt,.pptx,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation" : isOcr ? ".pdf,.jpg,.jpeg,.png,application/pdf,image/jpeg,image/png" : ".pdf,application/pdf";
 
+  const guardRef = useRef<ReturnType<typeof createRunGuard> | null>(null);
+  guardRef.current ??= createRunGuard();
+  const idempotencyKeyRef = useRef<string | null>(null);
+  const [pendingJobId, setPendingJobId] = useState<string | null>(null);
+  const outputUrlRef = useRef<string | null>(null);
+
+  const releaseOutputUrl = () => {
+    if (outputUrlRef.current) { URL.revokeObjectURL(outputUrlRef.current); outputUrlRef.current = null; }
+  };
+  const clearOutput = () => { releaseOutputUrl(); setOutput(null); };
+  useEffect(() => () => { guardRef.current?.cancel(); releaseOutputUrl(); }, []);
+
+  // `busy` = an in-flight submit/poll in this tab (guards duplicate submits and
+  // blocks the selection controls). `pending` additionally covers a job that is
+  // still running server-side after local polling ended.
+  const busy = status === "processing";
+  const pending = busy || status === "waiting";
+
   const select = (candidate?: File) => {
-    if (!candidate) return;
+    if (!candidate || busy) return;
     if (candidate.size > tool.limits.maxBytes) { setStatus("error"); setMessage("FILE_LIMIT: Choose a file no larger than 100 MB."); return; }
-    if (output) URL.revokeObjectURL(output.url);
-    setOutput(null); setFile(candidate); setStatus("idle"); setMessage("");
+    guardRef.current?.cancel();
+    idempotencyKeyRef.current = null; setPendingJobId(null);
+    clearOutput(); setFile(candidate); setStatus("idle"); setMessage("");
   };
-  const process = async () => {
-    if (!file) return;
-    window.dispatchEvent(new CustomEvent("dip:analytics", { detail: { name: "tool_started" } })); setStatus("processing"); setMessage(isArabic ? "يجري إرسال المستند إلى محرك المعالجة المعزول…" : "Securely sending the document to the isolated processing engine…");
-    const form = new FormData(); form.append("files", file); form.set("options", JSON.stringify(isOcr ? { language } : {}));
+
+  const removeFile = () => {
+    // Removing the local selection never cancels background work; while a job is
+    // running the action is disabled so it cannot be mistaken for a cancel.
+    if (busy) return;
+    guardRef.current?.cancel();
+    idempotencyKeyRef.current = null; setPendingJobId(null);
+    clearOutput(); setFile(null); setStatus("idle"); setMessage("");
+  };
+
+  const finish = (run: number, phase: Phase, text: string) => {
+    if (!guardRef.current?.isCurrent(run)) return;
+    guardRef.current?.finish(run);
+    setStatus(phase); setMessage(text);
+  };
+
+  const runPolling = async (run: number, jobId: string) => {
+    setPendingJobId(jobId);
     try {
-      const queued = await fetch(`/api/jobs/${tool.id}`, { method: "POST", headers: { "Idempotency-Key": crypto.randomUUID(), "X-Correlation-Id": crypto.randomUUID() }, body: form });
-      const accepted = await queued.json() as { jobId?: string; code?: string; message?: string };
-      if (!queued.ok || !accepted.jobId) throw new Error(`${accepted.code ?? "QUEUE_FAILED"}: ${accepted.message ?? "The job could not be queued."}`);
-      setMessage(isArabic ? "تم إدراج المستند في قائمة الانتظار، وتجري المعالجة في عامل المستندات المعزول…" : "Document queued; the isolated document worker is processing it…");
-      const outputFileIds = await waitForServerJob(accepted.jobId, isOcr);
-      const response = await fetch(`/api/files/${outputFileIds[0]}`);
-      if (!response.ok) throw new Error("OUTPUT_DOWNLOAD_FAILED: The output file could not be downloaded.");
-      const disposition = response.headers.get("content-disposition") ?? "";
-      const name = disposition.match(/filename="?([^";]+)"?/)?.[1] ?? `${file.name}.output`;
-      const url = URL.createObjectURL(await response.blob());
-      setOutput({ url, name }); setStatus("done"); setMessage(copy.ready); window.dispatchEvent(new CustomEvent("dip:analytics", { detail: { name: "tool_completed" } }));
-    } catch (error) { setStatus("error"); setMessage(error instanceof Error ? error.message : "PROCESSING_FAILED: The document could not be processed."); window.dispatchEvent(new CustomEvent("dip:analytics", { detail: { name: "tool_failed", error_code: "PROCESSING_FAILED" } })); }
+      const result = await pollJobOutput({ jobId, isOcr });
+      if (!guardRef.current?.isCurrent(run)) return;
+      const download = await downloadServerToolOutput({ fileId: result.fileId, fallbackName: `${file?.name ?? "document"}.output` });
+      if (!guardRef.current?.isCurrent(run)) return;
+      releaseOutputUrl();
+      outputUrlRef.current = URL.createObjectURL(download.blob);
+      setOutput({ url: outputUrlRef.current, name: download.filename });
+      setPendingJobId(null); idempotencyKeyRef.current = null;
+      finish(run, "done", copy.ready);
+      window.dispatchEvent(new CustomEvent("dip:analytics", { detail: { name: "tool_completed" } }));
+    } catch (error) {
+      if (!guardRef.current?.isCurrent(run)) return;
+      window.dispatchEvent(new CustomEvent("dip:analytics", { detail: { name: "tool_failed", error_code: error instanceof ServerToolJobError ? error.code : "PROCESSING_FAILED" } }));
+      if (error instanceof ServerToolJobError && error.code === "STILL_PROCESSING") {
+        // The job is still running server-side: keep its id so "Check status"
+        // resumes polling instead of queueing a duplicate job.
+        finish(run, "waiting", copy.stillRunning);
+        return;
+      }
+      setPendingJobId(null);
+      if (!retainsIdempotencyKey(error)) idempotencyKeyRef.current = null;
+      finish(run, "error", formatJobError(error));
+    }
   };
-  return <main className="min-h-screen bg-muted/35 text-foreground"><header className="border-b bg-card"><div className="mx-auto flex min-h-16 max-w-5xl items-center gap-3 px-4 sm:px-6"><BrandMark href="/" /><span aria-hidden="true" className="text-border">/</span><span className="flex-1 font-semibold">{isArabic ? tool.nameAr : tool.name}</span><LanguageToggle /></div></header><div className="mx-auto max-w-3xl px-4 py-10 sm:px-6"><div className="mb-7"><div className="mb-3 inline-flex items-center gap-2 rounded-full bg-secondary px-3 py-1 text-sm font-semibold text-secondary-foreground"><Lock aria-hidden="true" className="h-4 w-4" />{copy.isolated}</div><h1 className="text-3xl font-bold tracking-tight sm:text-4xl">{isArabic ? tool.nameAr : tool.name}</h1><p className="mt-3 max-w-2xl text-base leading-7 text-muted-foreground">{isArabic ? tool.descriptionAr : tool.description}. {copy.temporary}</p></div><Card><CardHeader><CardTitle>{isOcr ? copy.upload : copy.uploadOne}</CardTitle></CardHeader><CardContent className="space-y-6"><UploadZone title={copy.drop} description={copy.limit} hint={isArabic ? "تحقق آمن ومعالجة معزولة" : "Secure validation and isolated processing"} invalid={status === "error" && !file} onClick={() => inputRef.current?.click()} onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); select(event.dataTransfer.files.item(0) ?? undefined); }} /><input ref={inputRef} className="sr-only" type="file" accept={accept} onChange={(event) => select(event.target.files?.[0])} />{file && <div className="flex min-h-14 items-center gap-3 rounded-xl border bg-card px-3 shadow-sm"><FileText aria-hidden="true" className="h-5 w-5 shrink-0 text-primary" /><div className="min-w-0 flex-1"><p className="truncate text-sm font-medium">{file.name}</p><p className="text-xs text-muted-foreground">{(file.size / 1024 / 1024).toFixed(2)} MB</p></div><Button aria-label={`${copy.remove} ${file.name}`} variant="ghost" size="icon" onClick={() => { setFile(null); setOutput(null); setStatus("idle"); }}><X className="h-4 w-4" /></Button></div>}{isOcr && <fieldset className="rounded-xl border bg-muted/30 p-4"><legend className="px-1 text-sm font-medium">{copy.recognition}</legend><div className="mt-2 flex flex-wrap gap-3">{[["ara+eng", isArabic ? "العربية والإنجليزية" : "Arabic + English"], ["ara", isArabic ? "العربية" : "Arabic"], ["eng", isArabic ? "الإنجليزية" : "English"]].map(([value, label]) => <label key={value} className="flex min-h-11 items-center gap-2 text-sm"><input className="accent-primary" type="radio" name="ocr-language" value={value} checked={language === value} onChange={() => setLanguage(value)} /><Languages aria-hidden="true" className="h-4 w-4 text-muted-foreground" />{label}</label>)}</div><p className="mt-3 text-sm text-muted-foreground"><ScanText aria-hidden="true" className="me-1 inline h-4 w-4" />{copy.searchable}</p></fieldset>}<Button className="min-h-12 w-full" size="lg" disabled={!file || status === "processing"} onClick={process}>{status === "processing" ? copy.process : isOcr ? copy.searchableAction : `${isArabic ? "تحويل إلى" : "Convert to"} ${tool.id === "pdf-to-word" ? "Word" : "PDF"}`}</Button>{status === "processing" && <div className="dip-ai-card relative overflow-hidden rounded-2xl border border-info/30 bg-info-surface/35 p-5" data-streaming="true" role="status"><div aria-hidden="true" className="dip-laser"/><p className="relative font-semibold">{copy.process}</p><p className="relative mt-1 text-sm text-muted-foreground">{copy.waiting}</p><Progress className="relative mt-4" label={copy.waiting} /></div>}{message && <StatusFeedback status={status === "error" ? "error" : status === "done" ? "success" : "info"}>{message}</StatusFeedback>}{output && <Button className="w-full" variant="outline" asChild><a href={output.url} download={output.name}><Download aria-hidden="true" className="h-4 w-4" />{copy.download} {output.name}</a></Button>}</CardContent></Card></div></main>;
+
+  const process = async () => {
+    if (!file || guardRef.current?.busy()) return;
+    const run = guardRef.current?.start() ?? -1;
+    if (run < 0) return;
+    idempotencyKeyRef.current ??= globalThis.crypto.randomUUID();
+    setStatus("processing"); setMessage(copy.sending);
+    window.dispatchEvent(new CustomEvent("dip:analytics", { detail: { name: "tool_started" } }));
+    try {
+      const submission = await submitServerToolJob({ toolId: tool.id, file, options: isOcr ? { language } : {}, idempotencyKey: idempotencyKeyRef.current, correlationId: globalThis.crypto.randomUUID() });
+      if (!guardRef.current?.isCurrent(run)) return;
+      setMessage(copy.queued);
+      await runPolling(run, submission.jobId);
+    } catch (error) {
+      if (!guardRef.current?.isCurrent(run)) return;
+      setPendingJobId(null);
+      if (!retainsIdempotencyKey(error)) idempotencyKeyRef.current = null;
+      window.dispatchEvent(new CustomEvent("dip:analytics", { detail: { name: "tool_failed", error_code: error instanceof ServerToolJobError ? error.code : "PROCESSING_FAILED" } }));
+      finish(run, "error", formatJobError(error));
+    }
+  };
+
+  const checkAgain = async () => {
+    const jobId = pendingJobId;
+    if (!jobId || guardRef.current?.busy()) return;
+    const run = guardRef.current?.start() ?? -1;
+    if (run < 0) return;
+    setStatus("processing"); setMessage(copy.queued);
+    await runPolling(run, jobId);
+  };
+
+  return <main className="min-h-screen bg-muted/35 text-foreground"><header className="border-b bg-card"><div className="mx-auto flex min-h-16 max-w-5xl items-center gap-3 px-4 sm:px-6"><BrandMark href="/" /><span aria-hidden="true" className="text-border">/</span><span className="flex-1 font-semibold">{isArabic ? tool.nameAr : tool.name}</span><LanguageToggle /></div></header><div className="mx-auto max-w-3xl px-4 py-10 sm:px-6"><div className="mb-7"><div className="mb-3 inline-flex items-center gap-2 rounded-full bg-secondary px-3 py-1 text-sm font-semibold text-secondary-foreground"><Lock aria-hidden="true" className="h-4 w-4" />{copy.isolated}</div><h1 className="text-3xl font-bold tracking-tight sm:text-4xl">{isArabic ? tool.nameAr : tool.name}</h1><p className="mt-3 max-w-2xl text-base leading-7 text-muted-foreground">{isArabic ? tool.descriptionAr : tool.description}. {copy.temporary}</p></div><Card><CardHeader><CardTitle>{isOcr ? copy.upload : copy.uploadOne}</CardTitle></CardHeader><CardContent className="space-y-6"><UploadZone title={copy.drop} description={copy.limit} hint={isArabic ? "تحقق آمن ومعالجة معزولة" : "Secure validation and isolated processing"} invalid={status === "error" && !file} disabled={busy} onClick={() => inputRef.current?.click()} onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); select(event.dataTransfer.files.item(0) ?? undefined); }} /><input ref={inputRef} className="sr-only" type="file" accept={accept} disabled={busy} onChange={(event) => select(event.target.files?.[0])} />{file && <div className="flex min-h-14 items-center gap-3 rounded-xl border bg-card px-3 shadow-sm"><FileText aria-hidden="true" className="h-5 w-5 shrink-0 text-primary" /><div className="min-w-0 flex-1"><p className="truncate text-sm font-medium">{file.name}</p><p className="text-xs text-muted-foreground">{(file.size / 1024 / 1024).toFixed(2)} MB</p></div><Button aria-label={`${copy.remove} ${file.name}`} title={busy ? copy.removeBusy : copy.remove} aria-disabled={busy || undefined} disabled={busy} variant="ghost" size="icon" onClick={removeFile}><X className="h-4 w-4" /></Button></div>}{isOcr && <fieldset className="rounded-xl border bg-muted/30 p-4"><legend className="px-1 text-sm font-medium">{copy.recognition}</legend><div className="mt-2 flex flex-wrap gap-3">{([["ara+eng", isArabic ? "العربية والإنجليزية" : "Arabic + English"], ["ara", isArabic ? "العربية" : "Arabic"], ["eng", isArabic ? "الإنجليزية" : "English"]] as const).map(([value, label]) => <label key={value} className="flex min-h-11 items-center gap-2 text-sm"><input className="accent-primary" type="radio" name="ocr-language" value={value} checked={language === value} disabled={busy} onChange={() => setLanguage(value)} /><Languages aria-hidden="true" className="h-4 w-4 text-muted-foreground" />{label}</label>)}</div><p className="mt-3 text-sm text-muted-foreground"><ScanText aria-hidden="true" className="me-1 inline h-4 w-4" />{copy.searchable}</p></fieldset>}{status !== "waiting" && <Button className="min-h-12 w-full" size="lg" disabled={!file || busy} onClick={process}>{busy ? copy.process : isOcr ? copy.searchableAction : `${isArabic ? "تحويل إلى" : "Convert to"} ${tool.id === "pdf-to-word" ? "Word" : "PDF"}`}</Button>}{pending && <div className="dip-ai-card relative overflow-hidden rounded-2xl border border-info/30 bg-info-surface/35 p-5" data-streaming="true" role="status"><div aria-hidden="true" className="dip-laser"/><p className="relative font-semibold">{copy.process}</p><p className="relative mt-1 text-sm text-muted-foreground">{copy.waiting}</p><Progress className="relative mt-4" label={copy.waiting} /></div>}{message && <StatusFeedback status={status === "error" ? "error" : status === "done" ? "success" : "info"}>{message}</StatusFeedback>}{status === "waiting" && <Button className="min-h-12 w-full" size="lg" variant="outline" disabled={!pendingJobId} onClick={checkAgain}>{copy.checkAgain}</Button>}{output && <Button className="w-full" variant="outline" asChild><a href={output.url} download={output.name}><Download aria-hidden="true" className="h-4 w-4" />{copy.download} {output.name}</a></Button>}</CardContent></Card></div></main>;
 }

@@ -1,3 +1,11 @@
+/**
+ * PR-0 source-contract tests.
+ *
+ * These are structural assertions over files, not executed behaviour. The
+ * behavioural evidence for the same contracts lives in
+ * pr0-server-tools.behavior.test.ts (fake fetch/clock over the real client
+ * module and the real route handler).
+ */
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
@@ -7,30 +15,23 @@ const root = new URL("../", import.meta.url).pathname;
 const read = (rel: string) => readFileSync(join(root, rel), "utf8");
 
 const serverTools = ["word-to-pdf", "pdf-to-word", "excel-to-pdf", "powerpoint-to-pdf", "ocr-pdf"] as const;
+const workspace = "src/components/tools/server-tool-workspace.tsx";
+const clientModule = "src/lib/client/server-tool-job.ts";
 
-test("PR-0: legacy /api/tools/[tool] route is fail-closed and never executes processing", async () => {
+test("PR-0 (structure): the legacy route contains no processing, auth, job or storage path", () => {
   const source = read("src/app/api/tools/[tool]/route.ts");
-  assert.doesNotMatch(source, /processServerDocument/);
-  assert.doesNotMatch(source, /beginJob|finishJob/);
-  assert.doesNotMatch(source, /requireUser/);
-  assert.doesNotMatch(source, /DocumentProcessingError/);
+  for (const forbidden of [/processServerDocument/, /beginJob|finishJob/, /requireUser/, /DocumentProcessingError/, /getStorage/, /@\/lib\/db/, /@\/lib\/queue/]) {
+    assert.doesNotMatch(source, forbidden);
+  }
   assert.match(source, /SYNC_PROCESSING_DISABLED/);
   assert.match(source, /\/api\/jobs\/\$\{tool\}/);
-
-  const { POST } = await import("../src/app/api/tools/[tool]/route");
-  for (const tool of serverTools) {
-    const response = await POST(new Request("http://localhost/api/tools/" + tool, { method: "POST" }), { params: Promise.resolve({ tool }) });
-    assert.equal(response.status, 409, tool);
-    const body = await response.json() as { code?: string; message?: string };
-    assert.equal(body.code, "SYNC_PROCESSING_DISABLED", tool);
-    assert.match(body.message ?? "", new RegExp("/api/jobs/" + tool.replace(/-/g, "\\-")));
-  }
-  const unknown = await POST(new Request("http://localhost/api/tools/merge-pdf", { method: "POST" }), { params: Promise.resolve({ tool: "merge-pdf" }) });
-  assert.equal(unknown.status, 404);
-  assert.equal((await unknown.json() as { code?: string }).code, "NOT_FOUND");
+  // The fail-closed contract is documented next to the worker boundary.
+  const readme = read("workers/README.md");
+  assert.match(readme, /SYNC_PROCESSING_DISABLED/);
+  assert.match(readme, /409/);
 });
 
-test("PR-0: no HTTP route invokes Office/OCR processing directly", () => {
+test("PR-0 (structure): no HTTP route invokes Office/OCR processing directly", () => {
   const apiDir = join(root, "src/app/api");
   const routeFiles: string[] = [];
   const walk = (dir: string) => {
@@ -47,39 +48,69 @@ test("PR-0: no HTTP route invokes Office/OCR processing directly", () => {
     assert.doesNotMatch(source, /processServerDocument/, file);
     assert.doesNotMatch(source, /runPdfWorkerTool/, file);
   }
-  // The only production callers of processServerDocument are the worker and the lib itself.
-  const worker = read("workers/document-worker.ts");
-  assert.match(worker, /processServerDocument/);
+  // The document worker remains the only production caller of the engines.
+  assert.match(read("workers/document-worker.ts"), /processServerDocument/);
 });
 
-test("PR-0: ServerToolWorkspace uses the async job pipeline with existing contracts", () => {
-  const source = read("src/components/tools/server-tool-workspace.tsx");
+test("PR-0 (structure): the UI transports jobs only through the client pipeline module", () => {
+  const source = read(workspace);
   assert.doesNotMatch(source, /\/api\/tools\//);
-  assert.match(source, /\/api\/jobs\/\$\{tool\.id\}/);
-  assert.match(source, /\/api\/jobs\/status\/\$\{jobId\}/);
-  assert.match(source, /\/api\/files\/\$\{outputFileIds\[0\]\}/);
-  assert.match(source, /form\.append\("files", file\)/);
-  assert.match(source, /form\.set\("options", JSON\.stringify\(isOcr \? \{ language \} : \{\}\)\)/);
-  assert.match(source, /"Idempotency-Key": crypto\.randomUUID\(\)/);
-  assert.match(source, /"X-Correlation-Id": crypto\.randomUUID\(\)/);
-  assert.doesNotMatch(source, /form\.set\("file"/);
-  assert.doesNotMatch(source, /form\.set\("language"/);
+  assert.doesNotMatch(source, /new FormData\(/);
+  assert.doesNotMatch(source, /fetch\(/);
+  assert.match(source, /submitServerToolJob/);
+  assert.match(source, /pollJobOutput/);
+  assert.match(source, /downloadServerToolOutput/);
+  const clientSource = read(clientModule);
+  assert.match(clientSource, /`\/api\/jobs\/\$\{input\.toolId\}`/);
+  assert.match(clientSource, /`\/api\/jobs\/status\/\$\{input\.jobId\}`/);
+  assert.match(clientSource, /`\/api\/files\/\$\{input\.fileId\}`/);
+  assert.match(clientSource, /form\.append\("files", input\.file/);
+  assert.match(clientSource, /form\.set\("options", JSON\.stringify/);
+  assert.match(clientSource, /"Idempotency-Key": input\.idempotencyKey/);
+  assert.match(clientSource, /"X-Correlation-Id": correlationId/);
 });
 
-test("PR-0: polling is bounded and OCR-aware (not a fixed 120s timeout)", () => {
-  const source = read("src/components/tools/server-tool-workspace.tsx");
-  assert.match(source, /const maxAttempts = isOcr \? 390 : 210/);
-  assert.match(source, /setTimeout\(resolve, 1000\)/);
-  assert.match(source, /OCR timeout is 300s/);
-  assert.match(source, /never unbounded/);
-  // Terminal states and missing-output handling are explicit.
-  assert.match(source, /\["failed", "cancelled", "expired"\]/);
-  assert.match(source, /OUTPUT_MISSING/);
-  assert.match(source, /OUTPUT_DOWNLOAD_FAILED/);
+test("PR-0 (structure): polling budgets are bounded, clamped and server-derived", () => {
+  const clientSource = read(clientModule);
+  assert.match(clientSource, /JOB_POLL_MIN_BUDGET_MS = 30_000/);
+  assert.match(clientSource, /JOB_POLL_MAX_BUDGET_MS = 30 \* 60_000/);
+  assert.match(clientSource, /export function resolvePollBudgetMs/);
+  assert.match(clientSource, /STILL_PROCESSING/);
+  const statusRoute = read("src/app/api/jobs/status/[jobId]/route.ts");
+  assert.match(statusRoute, /findJobForUser/);
+  assert.match(statusRoute, /pollBudgetMs: jobPollBudgetMs\(job\.toolId\)/);
+  assert.match(read("src/lib/runtime/config.ts"), /export function jobPollBudgetMs/);
 });
 
-test("PR-0: five tools, MIME accepts, and OCR language options are preserved", () => {
-  const source = read("src/components/tools/server-tool-workspace.tsx");
+test("PR-0 (structure): job and output reads are tenant-scoped through one helper", () => {
+  const access = read("src/lib/jobs/access.ts");
+  assert.match(access, /requesterId: userId/);
+  assert.match(access, /document: \{ userId \}/);
+  assert.match(read("src/app/api/jobs/status/[jobId]/route.ts"), /findJobForUser/);
+  assert.match(read("src/app/api/files/[fileId]/route.ts"), /findOutputFileForUser/);
+});
+
+test("PR-0 (structure): the workspace guards the processing lifecycle", () => {
+  const source = read(workspace);
+  // Remove cannot be mistaken for cancelling background work.
+  assert.match(source, /if \(busy\) return;/);
+  assert.match(source, /disabled=\{busy\}/);
+  assert.match(source, /removeBusy/);
+  // Stale responses cannot restore a cleared output.
+  assert.match(source, /createRunGuard/);
+  assert.match(source, /isCurrent\(run\)/);
+  assert.match(source, /guardRef\.current\?\.cancel\(\)/);
+  // Object URLs are always revoked.
+  assert.match(source, /URL\.revokeObjectURL/);
+  assert.match(source, /useEffect\(\(\) => \(\) => \{ guardRef\.current\?\.cancel\(\); releaseOutputUrl\(\); \}, \[\]\)/);
+  // "Still processing" is resumable without a duplicate job.
+  assert.match(source, /checkAgain/);
+  assert.match(source, /pendingJobId/);
+  assert.match(source, /STILL_PROCESSING/);
+});
+
+test("PR-0 (structure): five tools, MIME accepts, and OCR language options are preserved", () => {
+  const source = read(workspace);
   for (const tool of serverTools) assert.match(source, new RegExp(tool.replace(/-/g, "\\-")));
   assert.match(source, /application\/msword/);
   assert.match(source, /application\/vnd\.ms-excel/);
@@ -88,14 +119,14 @@ test("PR-0: five tools, MIME accepts, and OCR language options are preserved", (
   assert.match(source, /\["ara\+eng",/);
   assert.match(source, /\["ara",/);
   assert.match(source, /\["eng",/);
-  // Registry still exposes all five as worker tools with OCR language contract.
   const registry = read("src/lib/tools/registry.ts");
   for (const tool of serverTools) assert.match(registry, new RegExp('"' + tool + '"'));
-  const options = read("src/lib/tools/options.ts");
-  assert.match(options, /"ocr-pdf": \{ version: "1", properties: \{ language:/);
+  assert.match(read("src/lib/tools/options.ts"), /"ocr-pdf": \{ version: "1", properties: \{ language:/);
+  // The registry still declares exactly the 34 catalog tools.
+  assert.match(read("test/merge-pdf.runtime.test.ts"), /Object\.keys\(toolRegistry\)\.length, toolsConfig\.length/);
 });
 
-test("PR-0: job ingress boundary order is validateUpload -> requireCleanUpload -> storage.put -> enqueue", () => {
+test("PR-0 (structure): job ingress order is validateUpload -> requireCleanUpload -> storage.put -> enqueue", () => {
   const orchestrator = read("src/lib/jobs/orchestrator.ts");
   const validateIdx = orchestrator.indexOf("validateUpload(");
   const scanIdx = orchestrator.indexOf("requireCleanUpload(");
@@ -107,12 +138,19 @@ test("PR-0: job ingress boundary order is validateUpload -> requireCleanUpload -
   assert.match(jobsRoute, /workerToolIds\.has\(tool\)/);
 });
 
-test("PR-0: retention copy no longer claims outputs are not retained", () => {
-  const source = read("src/components/tools/server-tool-workspace.tsx");
-  assert.doesNotMatch(source, /not retained by DIP/);
-  assert.doesNotMatch(source, /لا يحتفظ DIP به/);
-  assert.doesNotMatch(source, /removed after the result is created/);
-  assert.doesNotMatch(source, /يُحذف مباشرةً بعد إنشاء النتيجة/);
+test("PR-0 (structure): the malware gate resolves persistence lazily and still fails closed", () => {
+  const source = read("src/lib/malware/index.ts");
+  assert.doesNotMatch(source, /^import \{ db \} from "@\/lib\/db";$/m);
+  assert.match(source, /const \{ db \} = await import\("@\/lib\/db"\)/);
+  const rejectionIdx = source.indexOf("if (scan.result !== \"CLEAN\")");
+  assert.ok(rejectionIdx > 0 && source.indexOf("throw new MalwareScanError(scan.result)", rejectionIdx) > rejectionIdx);
+});
+
+test("PR-0 (structure): retention copy describes the verified lifecycle without a period", () => {
+  const source = read(workspace);
+  for (const wrong of [/not retained by DIP/, /لا يحتفظ DIP به/, /removed after the result is created/, /يُحذف مباشرةً بعد إنشاء النتيجة/, /\b7 days\b/, /30 days/, /7 أيام/, /30 يوماً/]) {
+    assert.doesNotMatch(source, wrong);
+  }
   assert.match(source, /stored in private object storage under the retention policy/);
   assert.match(source, /يُخزَّن في تخزين كائني خاص وفق سياسة الاحتفاظ/);
   assert.match(source, /stored under the retention policy and can be downloaded now/);
