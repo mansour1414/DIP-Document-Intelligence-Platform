@@ -47,9 +47,14 @@ test("PR-0 (structure): no HTTP route invokes Office/OCR processing directly", (
     const source = readFileSync(file, "utf8");
     assert.doesNotMatch(source, /processServerDocument/, file);
     assert.doesNotMatch(source, /runPdfWorkerTool/, file);
+    // PR-1 moved the job body into the pipeline module; routes must not reach it either.
+    assert.doesNotMatch(source, /jobs\/document-pipeline/, file);
   }
-  // The document worker remains the only production caller of the engines.
-  assert.match(read("workers/document-worker.ts"), /processServerDocument/);
+  // The document worker remains the only production caller of the engines: the
+  // worker runs the pipeline module, and the pipeline is the only module that
+  // invokes the Office/OCR engines.
+  assert.match(read("workers/document-worker.ts"), /processDocumentJob/);
+  assert.match(read("src/lib/jobs/document-pipeline.ts"), /processServerDocument/);
 });
 
 test("PR-0 (structure): the UI transports jobs only through the client pipeline module", () => {
