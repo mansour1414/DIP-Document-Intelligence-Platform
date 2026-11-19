@@ -55,6 +55,41 @@ Client-side safety rules (see `src/lib/client/server-tool-job.ts`):
   `src/lib/jobs/access.ts`, which runs the query inside `withTenant` (RLS
   context) **and** keeps the explicit owner predicate.
 
+## Output screening (PR-1)
+
+Generated outputs are malware-screened before they are published. The document
+job body now lives in `src/lib/jobs/document-pipeline.ts` (the BullMQ worker is a
+thin shell around it) and the order is fixed:
+
+```
+validateWorkerOutputs()  ->  screenWorkerOutputs()  ->  storeWorkerOutputs()  ->  metadata transaction
+```
+
+- **Every** output is scanned; one verdict never hides another. Scanning stops the
+  job before the first object write, so a rejected batch leaves no object, no
+  `File` row and no `SUCCEEDED` status behind.
+- A batch is published only if **all** of its outputs return an explicit `CLEAN`.
+  `INFECTED` on a single member rejects the whole batch, including its clean
+  siblings.
+- Scanner faults (`SCANNER_UNAVAILABLE`, `SCAN_ERROR`, `SCAN_TIMEOUT`) also fail
+  closed. They stay retryable because the next attempt can succeed.
+- `INFECTED` is deterministic (the same engines regenerate the same bytes), so it
+  is escalated to a BullMQ `UnrecoverableError`: the job ends on the first
+  attempt instead of re-running three times and re-alerting. The persisted job
+  `errorCode` is still the precise `INFECTED` / `SCANNER_UNAVAILABLE` /
+  `SCAN_ERROR` value.
+- Storage writes are serial and compensating: a mid-batch write fault deletes the
+  objects already written, and a failing metadata transaction deletes the
+  objects it orphaned. Output keys are deterministic
+  (`output/<userId>/<jobId>/<index>-<name>`), so a retry overwrites its own
+  objects rather than accumulating new ones.
+- Rejections record a content-free `security_events` row
+  (`MALWARE_SCAN_REJECTED`, `source: "output"`) and the existing
+  `malware_scan_total` / `worker_output_scan_rejected_total` metrics.
+- Upload screening still requires `CLAMD_HOST`; the same fail-closed rule now
+  applies to generated outputs, so a worker without a reachable scanner stores
+  nothing.
+
 Install LibreOffice (`soffice`) for Office conversion. The approved OCR image uses
 OCRmyPDF 17.10.0, pypdfium2 5.13.0 and Tesseract with Arabic/English data; it must
 not contain a resolvable `gs` executable. Run `python scripts/verify-ocr-runtime.py`

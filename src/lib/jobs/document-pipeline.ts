@@ -1,0 +1,102 @@
+import type { PrismaClient } from "@prisma/client";
+import { getStorage, type ObjectStorage } from "@/lib/storage";
+import { pdfWorkerEngine, runPdfWorkerTool, type PdfWorkerTool } from "@/lib/pdf/server";
+import { processServerDocument, type ServerToolId } from "@/lib/document-processing/server";
+import { logger } from "@/lib/logging";
+import { timeoutFor } from "@/lib/runtime/config";
+import { withTimeout } from "@/lib/runtime/timeout";
+import { validateWorkerOutputs } from "@/lib/outputs/validation";
+import { discardStoredObjects, screenAndStoreWorkerOutputs } from "@/lib/outputs/screening";
+import { recordMetric } from "@/lib/observability/metrics";
+import { configuredCostRates, estimateJobCost } from "@/lib/cost/model";
+import { withTenant } from "@/lib/db/tenant";
+import type { QueuedJob } from "@/lib/queue";
+import { validateToolOptions } from "@/lib/tools/options";
+import { deletePhase1Secret, takePhase1Secret, type Phase1SecretPurpose } from "@/lib/secrets/phase1";
+import { APPROVED_QPDF_VERSION, runQpdfTool } from "@/lib/pdf/qpdf";
+import type { MalwareScanner } from "@/lib/malware";
+
+/**
+ * PR-1 moved the document job body out of `workers/document-worker.ts` so the
+ * pipeline can be exercised against real Postgres, object storage and clamd
+ * without instantiating a BullMQ worker and its Redis connection. Behaviour is
+ * unchanged apart from two deliberate additions:
+ *   1. generated outputs are screened before the first object write, and
+ *   2. a failed metadata write deletes the objects it orphaned.
+ */
+export type DocumentPipelineDeps = {
+  /** Test seams. Production resolves the configured S3 adapter and clamd scanner. */
+  storage?: ObjectStorage;
+  scanner?: MalwareScanner;
+  client?: PrismaClient;
+};
+
+export async function processDocumentJob(message: QueuedJob, deps: DocumentPipelineDeps = {}) {
+  if (!message.userId) throw Object.assign(new Error("Worker job requires a tenant identity"), { code: "TENANT_CONTEXT_REQUIRED" });
+  const tenant = <T>(operation: Parameters<typeof withTenant<T>>[1]) => withTenant({ userId: message.userId! }, operation, deps.client);
+  const job = await tenant((tx) => tx.job.findUnique({ where: { id: message.jobId }, include: { steps: true } }));
+  if (!job) throw new Error("JOB_NOT_FOUND");
+  const context = { job_id: job.id, correlation_id: job.correlationId ?? message.correlationId, tool_id: job.toolId };
+  const rawParams = job.params as { inputFileIds?: string[]; options?: Record<string, unknown>; secretRef?: string };
+  if (job.status === "SUCCEEDED" || job.outputFileId) { logger.info("job.idempotent_skip", context); return; }
+  if (job.status === "CANCELLED" || job.status === "EXPIRED") { await deletePhase1Secret(rawParams.secretRef).catch(() => undefined); return; }
+  const step = job.steps.find((item) => item.name === job.toolId);
+  try {
+    await tenant((tx) => tx.job.update({ where: { id: job.id }, data: { status: "RUNNING", startedAt: job.startedAt ?? new Date(), error: undefined, errorCode: null } }));
+    if (step) await tenant((tx) => tx.jobStep.update({ where: { id: step.id }, data: { status: "RUNNING", startedAt: new Date() } }));
+    const params = rawParams; const ids = params.inputFileIds;
+    if (!ids?.length) throw Object.assign(new Error("Unsupported job payload"), { code: "INVALID_JOB_INPUT" });
+    const files = await tenant((tx) => tx.file.findMany({ where: { id: { in: ids } }, include: { document: true } }));
+    if (files.length !== ids.length) throw Object.assign(new Error("Input file is missing"), { code: "INPUT_NOT_FOUND" });
+    const inputById = new Map(files.map((file) => [file.id, file]));
+    const storage = deps.storage ?? getStorage();
+    const bytes = await Promise.all(ids.map((id) => storage.get(inputById.get(id)!.storageKey))); const options: Record<string, unknown> = { ...validateToolOptions(job.toolId, params.options ?? {}), inputMimeTypes: ids.map((id) => inputById.get(id)!.mimeType) };
+    const started = Date.now(); let engine = "pdf-lib"; let engineVersion = "1.17.1";
+    const pdfTools = new Set(["merge-pdf", "split-pdf", "organize-pdf", "rotate-pdf", "delete-pages", "extract-pages", "jpg-to-pdf", "compress-pdf", "pdf-to-jpg", "watermark-pdf", "crop-pdf", "page-numbers", "header-footer", "resize-pages", "alternate-mix", "flip-pages", "split-pdf-by-size", "split-pdf-by-bookmarks", "split-pdf-by-text", "n-up-pdf", "remove-annotations", "extract-images"]);
+    const qpdfTools = new Set(["protect-pdf", "unlock-pdf", "pdf-permissions", "repair-pdf"]);
+    const documentTools = new Set(["word-to-pdf", "pdf-to-word", "excel-to-pdf", "powerpoint-to-pdf", "ocr-pdf"]);
+    let outputs: Array<{ name: string; mimeType: string; bytes: Uint8Array }>;
+    if (pdfTools.has(job.toolId)) { const pdfTool = job.toolId as PdfWorkerTool; outputs = await withTimeout(job.toolId, timeoutFor("pdf"), runPdfWorkerTool(pdfTool, bytes, options)); ({ engine, engineVersion } = pdfWorkerEngine(pdfTool)); }
+    else if (qpdfTools.has(job.toolId)) { const secret = params.secretRef ? await takePhase1Secret({ reference: params.secretRef, tenantId: message.userId, jobId: job.id, purpose: job.toolId as Phase1SecretPurpose }) : undefined; outputs = [await withTimeout(job.toolId, timeoutFor("pdf"), runQpdfTool(job.toolId as "protect-pdf" | "unlock-pdf" | "pdf-permissions" | "repair-pdf", bytes[0], options, secret))]; engine = "qpdf"; engineVersion = APPROVED_QPDF_VERSION; }
+    else if (documentTools.has(job.toolId)) { const input = inputById.get(ids[0])!; const result = await processServerDocument(job.toolId as ServerToolId, new File([bytes[0] as BlobPart], input.originalName, { type: input.mimeType }), typeof options.language === "string" ? options.language : "ara+eng"); outputs = [{ name: result.filename, mimeType: result.contentType, bytes: result.bytes }]; engine = job.toolId === "ocr-pdf" ? "ocrmypdf" : "libreoffice"; engineVersion = "host"; }
+    else throw Object.assign(new Error("Tool is not enabled on this worker"), { code: "TOOL_NOT_WORKER_ENABLED" });
+    const preservePages = ["compress-pdf", "rotate-pdf", "watermark-pdf", "crop-pdf", "page-numbers", "header-footer", "resize-pages", "flip-pages", "remove-annotations", "ocr-pdf"].includes(job.toolId) ? files[0]?.pageCount ?? undefined : undefined;
+    const validated = await validateWorkerOutputs(outputs, preservePages, { encryptedPdfAlreadyValidated: job.toolId === "protect-pdf" || job.toolId === "pdf-permissions" });
+    recordMetric("storage_bytes_out", validated.totalBytes, "bytes", { tool_id: job.toolId, engine, engine_version: engineVersion, status: "succeeded" });
+    if (job.toolId === "compress-pdf") recordMetric("compression_ratio", validated.totalBytes / bytes[0].byteLength, "ratio", { tool_id: job.toolId, engine, engine_version: engineVersion });
+    // PR-1: every output is scanned first, then the batch is stored. A rejection
+    // throws before the first object write, so no object, file row or SUCCEEDED
+    // status can exist for a batch that was not explicitly declared clean.
+    const { stored: storedOutputs } = await screenAndStoreWorkerOutputs(outputs, { job, storage, scanner: deps.scanner });
+    try {
+      await tenant(async (tx) => {
+        const current = await tx.job.findUniqueOrThrow({ where: { id: job.id }, select: { outputFileId: true } });
+        if (current.outputFileId) return;
+        const outputDocument = await tx.document.create({ data: { userId: job.requesterId!, organizationId: job.organizationId, title: `${job.toolId} output` } }); const outputFileIds: string[] = [];
+        for (const item of storedOutputs) { const outputFile = await tx.file.create({ data: { document: { connect: { id: outputDocument.id } }, originalName: item.output.name, mimeType: item.output.mimeType, size: BigInt(item.output.bytes.byteLength), storageKey: item.object.key, checksum: item.checksum, storageObject: { connectOrCreate: { where: { provider_bucket_objectKey: { provider: "s3", bucket: item.object.bucket, objectKey: item.object.key } }, create: { provider: "s3", bucket: item.object.bucket, objectKey: item.object.key, size: BigInt(item.output.bytes.byteLength), checksum: item.checksum } } } } }); await tx.fileVersion.create({ data: { fileId: outputFile.id, ownerId: job.requesterId!, version: 1, storageKey: item.object.key, checksum: item.checksum } }); outputFileIds.push(outputFile.id); }
+        await tx.job.update({ where: { id: job.id }, data: { outputFileId: outputFileIds[0], status: "SUCCEEDED", result: { outputFileIds }, completedAt: new Date() } });
+        if (step) await tx.jobStep.update({ where: { id: step.id }, data: { status: "SUCCEEDED", output: { outputFileIds }, completedAt: new Date() } });
+        await tx.toolExecution.create({ data: { jobId: job.id, toolId: job.toolId, mode: "SERVER", input: { inputFileIds: ids }, output: { outputFileIds }, correlationId: job.correlationId, engine, engineVersion, durationMs: Date.now() - started } });
+      });
+    } catch (error) {
+      // The metadata transaction rolled back, so these objects reference no file
+      // row. Deleting them keeps a retry from accumulating orphaned outputs.
+      await discardStoredObjects(storage, storedOutputs.map((item) => item.object.key));
+      throw error;
+    }
+    const durationMs = Date.now() - started;
+    recordMetric("job_duration_ms", durationMs, "ms", { tool_id: job.toolId, engine, engine_version: engineVersion, status: "succeeded" });
+    recordMetric("tool_execution_duration_ms", durationMs, "ms", { tool_id: job.toolId, engine, engine_version: engineVersion, status: "succeeded" });
+    recordMetric("jobs_success_total", 1, "count", { tool_id: job.toolId, engine, engine_version: engineVersion, status: "succeeded" });
+    const memoryClassMb = job.toolId === "ocr-pdf" ? 1024 : documentTools.has(job.toolId) ? 512 : 256;
+    const estimatedCost = estimateJobCost({ cpuDurationMs: durationMs, memoryClassMb, storageBytes: validated.totalBytes, storageOperations: outputs.length, aiInputTokens: 0, aiOutputTokens: 0, ocrPages: job.toolId === "ocr-pdf" ? files[0]?.pageCount ?? 0 : 0, officeDurationMs: documentTools.has(job.toolId) && job.toolId !== "ocr-pdf" ? durationMs : 0, succeeded: true }, configuredCostRates());
+    recordMetric("cost_per_successful_job", estimatedCost.costPerSuccessfulJob ?? 0, "ratio", { tool_id: job.toolId, engine, engine_version: engineVersion, status: "succeeded" });
+    logger.info("job.succeeded", { ...context, engine, engine_version: engineVersion, duration_ms: durationMs, status: "succeeded" });
+  } catch (error) {
+    const errorCode = typeof error === "object" && error && "code" in error ? String(error.code) : "PROCESSING_FAILED";
+    await tenant((tx) => tx.job.update({ where: { id: job.id }, data: { status: "FAILED", errorCode, error: { message: error instanceof Error ? error.message : "Processing failed" }, completedAt: new Date() } }));
+    if (step) await tenant((tx) => tx.jobStep.update({ where: { id: step.id }, data: { status: "FAILED", errorCode, error: { message: error instanceof Error ? error.message : "Processing failed" }, completedAt: new Date() } }));
+    recordMetric("jobs_failure_total", 1, "count", { tool_id: job.toolId, status: "failed" });
+    logger.error("job.failed", { ...context, error_code: errorCode, status: "failed" }); throw error;
+  } finally { await deletePhase1Secret(rawParams.secretRef).catch(() => undefined); }
+}
