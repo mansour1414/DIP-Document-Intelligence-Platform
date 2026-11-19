@@ -208,6 +208,47 @@ export async function downloadServerToolOutput(input: DownloadInput): Promise<Do
   return { blob, filename: filenameFromDisposition(response.headers.get("content-disposition")) ?? input.fallbackName ?? `${input.fileId}.bin` };
 }
 
+export type SubmissionRequest = {
+  toolId: string;
+  options?: Record<string, string | number | boolean>;
+  file: { name?: string; size?: number; lastModified?: number };
+};
+
+export type PendingSubmission = { key: string; fingerprint: string };
+
+/**
+ * Stable description of exactly what was submitted. Two submissions with the
+ * same fingerprint are the same operation; any change to the tool, the file or
+ * the options (for example the OCR language) is a different operation and must
+ * not silently reuse the previous job.
+ */
+export function submissionFingerprint(request: SubmissionRequest) {
+  const options = Object.keys(request.options ?? {}).sort().map((name) => [name, request.options?.[name]]);
+  return JSON.stringify({
+    toolId: request.toolId,
+    options,
+    file: { name: request.file.name ?? "", size: request.file.size ?? 0, lastModified: request.file.lastModified ?? 0 },
+  });
+}
+
+/**
+ * Resolve the idempotency key for a submission.
+ *
+ * A retained key is reused only when the new request is byte-for-byte the same
+ * operation (same fingerprint) — that is what makes an ambiguous retry safe.
+ * Changing the OCR language, the file or the tool therefore starts a genuinely
+ * new operation under a new key instead of attaching to the original job.
+ */
+export function idempotencyFor(
+  pending: PendingSubmission | null,
+  request: SubmissionRequest,
+  createKey: () => string = () => globalThis.crypto.randomUUID(),
+): PendingSubmission {
+  const fingerprint = submissionFingerprint(request);
+  if (pending && pending.fingerprint === fingerprint) return pending;
+  return { key: createKey(), fingerprint };
+}
+
 /**
  * Keep the submitted idempotency key only when the outcome is unknown
  * (timeout, aborted poll, unreadable status, transport error). Re-submitting
@@ -217,6 +258,37 @@ export async function downloadServerToolOutput(input: DownloadInput): Promise<Do
 export function retainsIdempotencyKey(error: unknown) {
   if (!(error instanceof ServerToolJobError)) return true;
   return error.code === "STILL_PROCESSING" || error.code === "ABORTED" || error.code === "JOB_STATUS_UNAVAILABLE";
+}
+
+/** Bounded retry schedule for retrieving an already-produced output. */
+export const DOWNLOAD_RETRY_ATTEMPTS = 3;
+export const DOWNLOAD_RETRY_DELAY_MS = 500;
+
+/**
+ * Download an output that the worker already produced, retrying transient
+ * transport/5xx failures only.
+ *
+ * This never submits work: a failed download must not turn into a second
+ * processing execution. Authorization failures (401/403/404) are returned
+ * immediately because retrying them cannot succeed.
+ */
+export async function downloadServerToolOutputWithRetry(
+  input: DownloadInput & { attempts?: number; sleep?: (ms: number) => Promise<void> },
+): Promise<DownloadResult> {
+  const attempts = Math.min(Math.max(input.attempts ?? DOWNLOAD_RETRY_ATTEMPTS, 1), DOWNLOAD_RETRY_ATTEMPTS);
+  const sleep = input.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  let lastError: unknown;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      return await downloadServerToolOutput(input);
+    } catch (error) {
+      lastError = error;
+      const retryable = error instanceof ServerToolJobError && error.code === "OUTPUT_DOWNLOAD_FAILED";
+      if (!retryable || attempt === attempts - 1) throw error;
+      await sleep(DOWNLOAD_RETRY_DELAY_MS * (attempt + 1));
+    }
+  }
+  throw lastError;
 }
 
 /** Human-readable, locale-neutral rendering of a pipeline failure. */

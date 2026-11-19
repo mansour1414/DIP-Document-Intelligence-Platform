@@ -10,6 +10,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   DEFAULT_POLL_BUDGET_MS,
+  DOWNLOAD_RETRY_ATTEMPTS,
+  downloadServerToolOutputWithRetry,
+  idempotencyFor,
+  submissionFingerprint,
   JOB_POLL_INTERVAL_MS,
   JOB_POLL_MAX_BUDGET_MS,
   JOB_POLL_MIN_BUDGET_MS,
@@ -301,6 +305,102 @@ test("PR-0 (behaviour): a retry after an unknown outcome reuses the idempotency 
   for (const code of ["JOB_FAILED", "JOB_CANCELLED", "JOB_EXPIRED", "JOB_REJECTED", "AUTH_REQUIRED", "OUTPUT_MISSING", "OUTPUT_UNAUTHORIZED"] as const) {
     assert.equal(retainsIdempotencyKey(new ServerToolJobError(code, "terminal")), false, code);
   }
+});
+
+test("PR-0 (behaviour): an ambiguous OCR submission followed by a language change starts a new operation", async () => {
+  const file = new File([new Uint8Array([1, 2, 3])], "scan.pdf", { type: "application/pdf" });
+  const original = { toolId: "ocr-pdf", options: { language: "ara" }, file };
+  const first = idempotencyFor(null, original, () => "key-original");
+
+  // Ambiguous outcome: the job may or may not exist, so the key is retained.
+  const ambiguous = new ServerToolJobError("JOB_STATUS_UNAVAILABLE", "status unreadable", { jobId: "job-1", status: 500 });
+  assert.equal(retainsIdempotencyKey(ambiguous), true);
+
+  // Retrying the identical request reuses the key (the API would reuse job-1).
+  assert.equal(idempotencyFor(first, { ...original, options: { language: "ara" } }, () => "key-retry").key, "key-original");
+  // Option key order must not change the identity of the request.
+  assert.equal(submissionFingerprint({ ...original, options: { language: "ara" } }), submissionFingerprint(original));
+
+  // Changing the OCR language is a different operation and must not attach to job-1.
+  const changedLanguage = idempotencyFor(first, { ...original, options: { language: "eng" } }, () => "key-new-language");
+  assert.equal(changedLanguage.key, "key-new-language");
+  assert.notEqual(submissionFingerprint({ ...original, options: { language: "eng" } }), first.fingerprint);
+
+  // Prove that the changed request really is submitted under the new key.
+  const { fetchImpl, calls } = jsonFetch([{ status: 202, body: { jobId: "job-2" } }]);
+  await submitServerToolJob({ ...original, options: { language: "eng" }, idempotencyKey: changedLanguage.key, fetchImpl });
+  assert.equal((calls[0].init?.headers as Record<string, string>)["Idempotency-Key"], "key-new-language");
+  assert.equal((calls[0].init?.body as FormData).get("options"), JSON.stringify({ language: "eng" }));
+
+  // A different file or tool is likewise a new operation.
+  const otherFile = new File([new Uint8Array([9])], "scan.pdf", { type: "application/pdf" });
+  assert.notEqual(idempotencyFor(first, { ...original, file: otherFile }, () => "key-other-file").key, "key-original");
+  assert.notEqual(idempotencyFor(first, { ...original, toolId: "pdf-to-word" }, () => "key-other-tool").key, "key-original");
+});
+
+test("PR-0 (behaviour): a transient output download failure retries without a second job", async () => {
+  const calls: string[] = [];
+  let statusReads = 0;
+  let downloadAttempts = 0;
+  const fetchImpl = async (url: string, init?: RequestInit) => {
+    calls.push(`${init?.method ?? "GET"} ${url}`);
+    if (url === "/api/jobs/ocr-pdf") return new Response(JSON.stringify({ jobId: "job-download", status: "queued" }), { status: 202, headers: { "content-type": "application/json" } });
+    if (url.startsWith("/api/jobs/status/")) { statusReads += 1; return new Response(JSON.stringify({ status: "succeeded", result: { outputFileIds: ["file-download"] } }), { status: 200 }); }
+    if (url === "/api/files/file-download") {
+      downloadAttempts += 1;
+      if (downloadAttempts < 3) return new Response("upstream unavailable", { status: 500 });
+      return new Response(new Uint8Array([0x25, 0x50, 0x44, 0x46]), { status: 200, headers: { "content-disposition": 'attachment; filename="out.pdf"' } });
+    }
+    throw new Error(`unexpected request ${url}`);
+  };
+
+  const file = new File([new Uint8Array([1])], "scan.pdf", { type: "application/pdf" });
+  const submission = await submitServerToolJob({ toolId: "ocr-pdf", file, options: { language: "ara" }, idempotencyKey: "idem-download", fetchImpl });
+  const time = clock();
+  const poll = await pollJobOutput({ jobId: submission.jobId, isOcr: true, fetchImpl, now: time.now, sleep: time.sleep });
+  const download = await downloadServerToolOutputWithRetry({ fileId: poll.fileId, fetchImpl, sleep: async () => {} });
+
+  assert.equal(download.filename, "out.pdf");
+  assert.equal(statusReads, 1, "one status read for one finished job");
+  assert.equal(downloadAttempts, 3, "the download is retried up to three times");
+  assert.equal(calls.filter((call) => call.startsWith("POST /api/jobs")).length, 1, "exactly one processing job is created");
+  assert.equal(calls.filter((call) => call.startsWith("POST ")).length, 1, "no retry may submit work");
+});
+
+test("PR-0 (behaviour): a persistent download failure keeps the produced output addressable for another attempt", async () => {
+  const posts: string[] = [];
+  let failDownload = true;
+  const fetchImpl = async (url: string, init?: RequestInit) => {
+    if (init?.method === "POST") { posts.push(url); return new Response(JSON.stringify({ jobId: "job-x" }), { status: 202 }); }
+    if (url === "/api/files/file-keep") {
+      if (failDownload) return new Response("still failing", { status: 503 });
+      return new Response(new Uint8Array([1, 2]), { status: 200, headers: { "content-disposition": 'attachment; filename="kept.pdf"' } });
+    }
+    throw new Error(`unexpected ${url}`);
+  };
+
+  await assert.rejects(
+    () => downloadServerToolOutputWithRetry({ fileId: "file-keep", fetchImpl, sleep: async () => {} }),
+    (error: unknown) => error instanceof ServerToolJobError && error.code === "OUTPUT_DOWNLOAD_FAILED",
+  );
+  assert.equal(posts.length, 0, "a failed download must never enqueue processing work");
+
+  // The retained file id still resolves once the transient fault clears.
+  failDownload = false;
+  const retried = await downloadServerToolOutputWithRetry({ fileId: "file-keep", fetchImpl, sleep: async () => {} });
+  assert.equal(retried.filename, "kept.pdf");
+  assert.equal(posts.length, 0, "the retry is a download only, not a new job");
+});
+
+test("PR-0 (behaviour): authorization failures are not retried", async () => {
+  let attempts = 0;
+  const fetchImpl = async () => { attempts += 1; return new Response(JSON.stringify({ code: "NOT_FOUND" }), { status: 404 }); };
+  await assert.rejects(
+    () => downloadServerToolOutputWithRetry({ fileId: "not-mine", fetchImpl, sleep: async () => { throw new Error("must not sleep"); } }),
+    (error: unknown) => error instanceof ServerToolJobError && error.code === "OUTPUT_UNAUTHORIZED",
+  );
+  assert.equal(attempts, 1, "401/403/404 must not be retried");
+  assert.equal(DOWNLOAD_RETRY_ATTEMPTS, 3);
 });
 
 test("PR-0 (behaviour): failures render a machine code with a readable message", () => {

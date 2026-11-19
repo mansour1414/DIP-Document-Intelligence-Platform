@@ -38,6 +38,20 @@ within that budget. If the budget ends while the job is still `QUEUED`,
 status re-check that resumes polling for the same job — it never marks a
 running job as failed and never submits a duplicate job.
 
+Client-side safety rules (see `src/lib/client/server-tool-job.ts`):
+
+- A retained `Idempotency-Key` is bound to the exact submitted request
+  (tool, file name/size/lastModified and options). Changing the OCR language or
+  the file is a new operation and is submitted under a new key, so an ambiguous
+  retry can never attach to a job that processed different options.
+- An output download that fails after the job succeeded is retried up to three
+  times and then re-offered from the retained file id; it never re-submits the
+  document, so a transient storage or network fault cannot cause a second
+  processing execution.
+- `GET /api/jobs/status/[jobId]` and `GET /api/files/[fileId]` read through
+  `src/lib/jobs/access.ts`, which runs the query inside `withTenant` (RLS
+  context) **and** keeps the explicit owner predicate.
+
 Install LibreOffice (`soffice`) for Office conversion. The approved OCR image uses
 OCRmyPDF 17.10.0, pypdfium2 5.13.0 and Tesseract with Arabic/English data; it must
 not contain a resolvable `gs` executable. Run `python scripts/verify-ocr-runtime.py`

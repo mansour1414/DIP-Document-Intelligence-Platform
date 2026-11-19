@@ -82,12 +82,26 @@ test("PR-0 (structure): polling budgets are bounded, clamped and server-derived"
   assert.match(read("src/lib/runtime/config.ts"), /export function jobPollBudgetMs/);
 });
 
-test("PR-0 (structure): job and output reads are tenant-scoped through one helper", () => {
+test("PR-0 (structure): job and output reads are tenant-scoped through one RLS-aware helper", () => {
   const access = read("src/lib/jobs/access.ts");
   assert.match(access, /requesterId: userId/);
   assert.match(access, /document: \{ userId \}/);
+  // Reads run inside the tenant transaction, so RLS applies as well as the predicate.
+  assert.match(access, /withTenant\(\{ userId \}/);
+  assert.doesNotMatch(access, /db\.job\.findFirst/);
+  assert.doesNotMatch(access, /db\.file\.findFirst/);
   assert.match(read("src/app/api/jobs/status/[jobId]/route.ts"), /findJobForUser/);
   assert.match(read("src/app/api/files/[fileId]/route.ts"), /findOutputFileForUser/);
+});
+
+test("PR-0 (structure): a retained idempotency key is bound to the submitted request", () => {
+  const clientSource = read(clientModule);
+  assert.match(clientSource, /export function submissionFingerprint/);
+  assert.match(clientSource, /export function idempotencyFor/);
+  assert.match(clientSource, /pending\.fingerprint === fingerprint/);
+  const source = read(workspace);
+  assert.match(source, /idempotencyFor\(pendingSubmissionRef\.current, request\)/);
+  assert.doesNotMatch(source, /idempotencyKeyRef/);
 });
 
 test("PR-0 (structure): the workspace guards the processing lifecycle", () => {
@@ -107,6 +121,12 @@ test("PR-0 (structure): the workspace guards the processing lifecycle", () => {
   assert.match(source, /checkAgain/);
   assert.match(source, /pendingJobId/);
   assert.match(source, /STILL_PROCESSING/);
+  // A finished job whose download failed keeps its output reference and can
+  // only be re-downloaded, never re-submitted.
+  assert.match(source, /completedOutputFileId/);
+  assert.match(source, /retryDownload/);
+  assert.match(source, /downloadServerToolOutputWithRetry/);
+  assert.match(source, /status !== "output-retry"/);
 });
 
 test("PR-0 (structure): five tools, MIME accepts, and OCR language options are preserved", () => {
