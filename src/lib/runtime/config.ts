@@ -32,3 +32,17 @@ export function timeoutFor(resource: TimeoutClass) {
   return runtimeLimits.jobTimeoutMs;
 }
 
+
+/**
+ * Client polling budget for an asynchronous job, derived from the same
+ * configurable timeouts the worker enforces: engine timeout + object-storage
+ * persist + queue/retry grace, capped at 30 minutes.
+ *
+ * The value is only a bound for how long the browser waits before reporting
+ * "still processing"; it never marks a running job as failed and it never
+ * cancels server-side work.
+ */
+export function jobPollBudgetMs(toolId: string) {
+  const engineTimeoutMs = toolId === "ocr-pdf" ? runtimeLimits.ocrTimeoutMs : runtimeLimits.officeTimeoutMs;
+  return Math.min(engineTimeoutMs + runtimeLimits.storageTimeoutMs + 90_000, 30 * 60_000);
+}
