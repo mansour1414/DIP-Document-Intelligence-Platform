@@ -40,6 +40,19 @@ test("PR-1 (structure): the screening module scans the whole batch before storin
   assert.match(malware, /source: "output"/, "output rejections are recorded as output-sourced security events");
 });
 
+test("PR-1a (structure): job state is only written through compare-and-set guards", async () => {
+  const pipeline = await read("src/lib/jobs/document-pipeline.ts");
+  assert.doesNotMatch(pipeline, /tx\.job\.update\(/, "job state must never be written as an unconditional row update");
+  assert.doesNotMatch(pipeline, /tx\.jobStep\.update\(/, "step state must never be written as an unconditional row update");
+  assert.match(pipeline, /updateMany\(\{\s*where: \{ id: job\.id, outputFileId: null, status: \{ notIn:/, "the SUCCEEDED commit is a compare-and-set on an uncommitted job");
+  assert.match(pipeline, /status: \{ not: "SUCCEEDED" \}/, "a failure write cannot overwrite a committed job or step");
+  assert.match(pipeline, /OutputCommitSupersededError/, "a lost commit race is recognised explicitly");
+  assert.match(pipeline, /isReferenced: async \(key\) => owned\.has\(key\)/, "cleanup deletes only unreferenced objects");
+  const screening = await read("src/lib/outputs/screening.ts");
+  assert.match(screening, /\/\$\{attemptId\}\//, "output keys are attempt-scoped");
+  assert.doesNotMatch(screening, /output\/\$\{job\.requesterId \?\? "system"\}\/\$\{job\.id\}\/\$\{index\}-/, "the shared per-job key must be gone");
+});
+
 test("PR-1 (structure): no retention, registry, licensing or security-gate configuration was touched", async () => {
   const screening = await read("src/lib/outputs/screening.ts");
   for (const forbidden of [/retention/i, /toolRegistry|tool-registry|src\/config/, /licen[cs]/i, /R1|R2/]) {

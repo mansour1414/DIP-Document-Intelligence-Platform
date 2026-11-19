@@ -111,20 +111,76 @@ export async function screenWorkerOutputs(
 
 export type StoredOutput = { output: WorkerOutput; object: StoredObject; checksum: string };
 
-/** Deterministic keys keep a retried job overwriting its own objects instead of orphaning new ones. */
-export function outputStorageKey(job: { id: string; requesterId: string | null }, output: WorkerOutput, index: number) {
-  return `output/${job.requesterId ?? "system"}/${job.id}/${index}-${output.name.replace(/[^a-zA-Z0-9._-]/g, "_")}`;
+/**
+ * Raised when a concurrent attempt of the same job won the commit race. It never
+ * escapes the pipeline: the losing attempt deletes only the objects it wrote and
+ * returns, because the winner's output is already committed and must not be
+ * failed, overwritten or deleted. It is deliberately not a `MalwareScanError`, so
+ * `toDocumentQueueError()` leaves it retryable rather than unrecoverable.
+ */
+export class OutputCommitSupersededError extends Error {
+  readonly code = "OUTPUT_COMMIT_SUPERSEDED";
+  constructor() {
+    super("Another attempt already committed this job's output.");
+    this.name = "OutputCommitSupersededError";
+  }
 }
 
-/** Best-effort compensating delete. A cleanup failure is logged and never masks the original error. */
-export async function discardStoredObjects(storage: ObjectStorage, keys: string[]) {
+/**
+ * Attempt-scoped object keys.
+ *
+ * `output/<userId>/<jobId>/<attemptId>/<index>-<name>` means two attempts of the same job can
+ * never write the same object: a losing or stale attempt physically cannot
+ * overwrite the bytes a winning attempt committed, and its compensating delete
+ * can only ever remove its own objects. The metadata compare-and-set in
+ * `processDocumentJob()` decides which attempt is allowed to publish, so key
+ * isolation is the storage half of the guarantee and the CAS is the database
+ * half — neither relies on a plain status read.
+ *
+ * Consequence, documented in `workers/README.md`: an attempt killed between
+ * `put()` and commit leaves unreferenced objects behind, so the bucket needs a
+ * lifecycle rule (or the retry's own cleanup) to expire them.
+ */
+export function outputStorageKey(
+  job: { id: string; requesterId: string | null },
+  output: WorkerOutput,
+  index: number,
+  attemptId: string,
+) {
+  return `output/${job.requesterId ?? "system"}/${job.id}/${attemptId}/${index}-${output.name.replace(/[^a-zA-Z0-9._-]/g, "_")}`;
+}
+
+/**
+ * Best-effort compensating delete. A cleanup failure is logged and never masks
+ * the original error.
+ *
+ * `isReferenced` is the ownership check: an object that a committed `File` row
+ * already points at is *not* deleted, even if this attempt thinks it wrote it
+ * (e.g. the transaction actually committed but the client saw a connection
+ * error). Callers that cannot verify ownership simply do not delete.
+ */
+export async function discardStoredObjects(
+  storage: ObjectStorage,
+  keys: string[],
+  options: { isReferenced?: (key: string) => Promise<boolean> } = {},
+): Promise<{ deleted: string[]; skipped: string[] }> {
+  const deleted: string[] = [];
+  const skipped: string[] = [];
   for (const key of keys) {
     try {
+      if (options.isReferenced && await options.isReferenced(key)) {
+        skipped.push(key);
+        // Never log the key itself: it embeds the tenant id and the output name.
+        logger.warn("worker.output_cleanup_skipped", { reason: "referenced" });
+        continue;
+      }
       await storage.deleteObject(key);
+      deleted.push(key);
     } catch (error) {
       logger.error("worker.output_cleanup_failed", { error_code: error instanceof Error ? error.name : "UNKNOWN" });
     }
   }
+  return { deleted, skipped };
 }
 
 /**
@@ -156,12 +212,12 @@ export async function storeWorkerOutputs(
 /** Scan the whole batch, then store it. Nothing is written unless every output is clean. */
 export async function screenAndStoreWorkerOutputs(
   outputs: WorkerOutput[],
-  options: { job: { id: string; requesterId: string | null }; storage: ObjectStorage; scanner?: MalwareScanner },
+  options: { job: { id: string; requesterId: string | null }; storage: ObjectStorage; scanner?: MalwareScanner; attemptId: string },
 ): Promise<{ stored: StoredOutput[]; scans: CleanOutputScan[] }> {
   const scans = await screenWorkerOutputs(outputs, { scanner: options.scanner });
   const stored = await storeWorkerOutputs(outputs, {
     storage: options.storage,
-    keyFor: (output, index) => outputStorageKey(options.job, output, index),
+    keyFor: (output, index) => outputStorageKey(options.job, output, index, options.attemptId),
   });
   return { stored, scans };
 }

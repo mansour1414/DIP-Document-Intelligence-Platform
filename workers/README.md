@@ -80,15 +80,60 @@ validateWorkerOutputs()  ->  screenWorkerOutputs()  ->  storeWorkerOutputs()  ->
   `SCAN_ERROR` value.
 - Storage writes are serial and compensating: a mid-batch write fault deletes the
   objects already written, and a failing metadata transaction deletes the
-  objects it orphaned. Output keys are deterministic
-  (`output/<userId>/<jobId>/<index>-<name>`), so a retry overwrites its own
-  objects rather than accumulating new ones.
+  objects it orphaned.
 - Rejections record a content-free `security_events` row
   (`MALWARE_SCAN_REJECTED`, `source: "output"`) and the existing
   `malware_scan_total` / `worker_output_scan_rejected_total` metrics.
 - Upload screening still requires `CLAMD_HOST`; the same fail-closed rule now
   applies to generated outputs, so a worker without a reachable scanner stores
   nothing.
+
+### Effective rejection behaviour for very large outputs (unchanged limits)
+
+`MALWARE_SCAN_MAX_BYTES` (100 MiB) is smaller than `MAX_OUTPUT_BYTES` (250 MiB),
+and both approved values are **unchanged** by this work. The consequence,
+documented rather than silently accepted: a single generated file larger than the
+scan cap cannot be screened, so `requireCleanBytes()` fails closed and the job
+ends `FAILED`. Today that surfaces as `SCAN_ERROR`, i.e. it looks like a scanner
+fault rather than "output too large to scan".
+
+Operational policy until a follow-up separates the code path (still without
+changing either limit):
+
+- treat **100 MiB per generated file** as the effective ceiling for the
+  many-output tools (`pdf-to-jpg`, `extract-images`, split tools, large OCR
+  PDFs) and publish that number in user-facing size-limit copy;
+- alert on `worker_output_scan_rejected_total{status="scan_error"}` — a spike is
+  more likely to be oversized outputs than a clamd outage;
+- do **not** raise `MALWARE_SCAN_MAX_BYTES` / clamd `StreamMaxLength` ad hoc: they
+  must move together and are an approved-limit change, not an operational one.
+
+### Concurrent attempts of the same job (PR-1a)
+
+BullMQ normally serialises a job, but stalled-job recovery can briefly run two
+attempts of the same job id. Both are now harmless:
+
+- **Attempt-scoped keys.** Outputs are written to
+  `output/<userId>/<jobId>/<attemptId>/<index>-<name>`, so no attempt can ever
+  overwrite another attempt's bytes.
+- **Compare-and-set commit.** The `RUNNING` transition and the `SUCCEEDED` write
+  are `updateMany` calls guarded on `outputFileId IS NULL` and a non-terminal
+  status. Exactly one attempt can publish; the loser's document/file/version/
+  `ToolExecution` rows are rolled back by Postgres, so duplicate successful
+  metadata is impossible.
+- **Safe cleanup ownership.** A losing or failing attempt deletes only the keys it
+  wrote itself, and only when no committed `File` row references them
+  (`worker.output_cleanup_skipped`). If ownership cannot be verified the objects
+  are left behind (`worker.output_cleanup_unverified`): an orphan is recoverable,
+  a deleted committed output is not.
+- **No state rollback.** A losing attempt never marks a committed job `FAILED` or
+  resets its step (`job.failure_suppressed`, `job.output_commit_superseded`,
+  `job.terminal_skip`).
+- **Orphan window.** An attempt killed between `put()` and commit (SIGKILL, no
+  `finally`) leaves unreferenced objects under its own prefix. Add a bucket
+  lifecycle rule (or a periodic sweep of `output/<user>/<job>/<attempt>/`
+  prefixes with no `File` row) so they expire; they are never readable through
+  the API because no row references them.
 
 Install LibreOffice (`soffice`) for Office conversion. The approved OCR image uses
 OCRmyPDF 17.10.0, pypdfium2 5.13.0 and Tesseract with Arabic/English data; it must
@@ -101,6 +146,7 @@ isolated worker runtime described above, with storage and queue persistence.
 `npm run worker:documents` starts the modular-monolith worker. It loads jobs using
 the `Job → JobStep → ToolExecution` model, reads/writes only object keys in
 S3-compatible storage, and emits structured `job_id` / `correlation_id` logs.
-BullMQ retries three times with exponential backoff; a stable output key based on
-the job id means retries cannot create duplicate output objects. Run
+BullMQ retries three times with exponential backoff; output keys are scoped to the
+attempt and the `SUCCEEDED` commit is a compare-and-set on `outputFileId`, so
+retries and duplicate attempts cannot create duplicate output objects. Run
 `npm run jobs:cleanup` from the platform scheduler to expire work older than 24h.

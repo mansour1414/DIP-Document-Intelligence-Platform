@@ -10,6 +10,10 @@
  * The CI "Integration / Processing" job provisions all of the above, so these
  * cases execute there. Locally they report as skipped (see the PR description).
  *
+ * The PR-1a cases at the end are the concurrency and failure-recovery evidence:
+ * two attempts of one job run against the same database row and bucket, and the
+ * assertions are on what Postgres and MinIO actually committed.
+ *
  * Injected scanners are used only where a real infection or outage cannot be
  * produced on demand; the storage adapter, database and RLS path are always real.
  */
@@ -116,6 +120,57 @@ integrationTest("PR-1 (integration): generated outputs are screened before stora
   /** Security events written by this run, scoped by time because `details` carries no job id. */
   const securityEventsSince = async (since: Date) => (await owner.query(`SELECT id, details FROM security_events WHERE created_at >= $1 AND details->>'source' = 'output' ORDER BY created_at ASC`, [since])).rows;
   const purgeSecurityEventsSince = async (since: Date) => { await owner.query(`DELETE FROM security_events WHERE created_at >= $1 AND details->>'source' = 'output'`, [since]); };
+  const count = async (sql: string, parameters: unknown[]) => Number((await owner.query(sql, parameters)).rows[0].count);
+  const outputFileCount = (fixture: Fixture) => count(`SELECT count(*) FROM files f JOIN documents d ON d.id = f.document_id WHERE d.user_id = $1 AND f.id <> ALL($2::uuid[])`, [fixture.user, fixture.inputFiles]);
+  const documentCount = (fixture: Fixture) => count(`SELECT count(*) FROM documents WHERE user_id = $1`, [fixture.user]);
+  const executionCount = (jobId: string) => count(`SELECT count(*) FROM tool_executions WHERE job_id = $1`, [jobId]);
+
+  /**
+   * A losing attempt must not simply be lucky. Both attempts are held inside
+   * `storeWorkerOutputs()` until the other one arrives, so the commit race is
+   * always exercised instead of occasionally resolving to an early idempotent skip.
+   */
+  const barrier = (parties: number, timeoutMs = 20_000) => {
+    let arrived = 0;
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    return async () => {
+      arrived += 1;
+      if (arrived >= parties) release();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([gate, new Promise<void>((resolve) => { timer = setTimeout(resolve, timeoutMs); timer.unref?.(); })]);
+      if (timer) clearTimeout(timer);
+    };
+  };
+
+  const gatedStorage = (spy: Spy, gate: () => Promise<void>): ObjectStorage => {
+    const storage = spyStorage(spy);
+    const put = storage.put.bind(storage);
+    return { ...storage, put: async (input) => { await gate(); return put(input); } };
+  };
+
+  /** Fails the metadata transaction exactly where it would publish the output. */
+  const commitFailingClient = (): typeof runtime => ({
+    $transaction: (operation: (transaction: unknown) => Promise<unknown>) => runtime.$transaction(async (transaction) => {
+      const guarded = new Proxy(transaction as object, {
+        get(target, property, receiver) {
+          const value = Reflect.get(target, property, receiver);
+          if (property !== "job" || !value) return typeof value === "function" ? value.bind(target) : value;
+          return new Proxy(value as object, {
+            get(model, method, modelReceiver) {
+              const operation2 = Reflect.get(model, method, modelReceiver);
+              if (method !== "updateMany" || typeof operation2 !== "function") return typeof operation2 === "function" ? operation2.bind(model) : operation2;
+              return (args: { data?: { status?: string } }) => {
+                if (args?.data?.status === "SUCCEEDED") throw Object.assign(new Error("simulated metadata commit failure"), { code: "SIMULATED_COMMIT_FAILURE" });
+                return operation2.call(model, args);
+              };
+            },
+          });
+        },
+      });
+      return operation(guarded);
+    }),
+  } as unknown as typeof runtime);
 
   try {
     await t.test("clean output is scanned with real clamd, stored once and the job succeeds", async () => {
@@ -225,6 +280,109 @@ integrationTest("PR-1 (integration): generated outputs are screened before stora
         assert.deepEqual(await outputRows(fixture), []);
         await cleanup(fixture);
       } catch (error) { await cleanup(fixture, spy.puts); throw error; }
+    });
+    await t.test("two concurrent attempts of one job commit exactly one output and remove only the loser's objects", async () => {
+      const fixture = await seed("merge-pdf", 1, 2);
+      const gate = barrier(2);
+      const a: Spy = { puts: [], deletes: [] };
+      const b: Spy = { puts: [], deletes: [] };
+      const keys: string[] = [];
+      try {
+        const results = await Promise.allSettled([
+          processDocumentJob(message(fixture), { storage: gatedStorage(a, gate), scanner: getMalwareScanner(), client: runtime, attemptId: "attempt-a" }),
+          processDocumentJob(message(fixture), { storage: gatedStorage(b, gate), scanner: getMalwareScanner(), client: runtime, attemptId: "attempt-b" }),
+        ]);
+        keys.push(...a.puts, ...b.puts);
+        assert.deepEqual(results.map((result) => result.status), ["fulfilled", "fulfilled"], "a lost commit race returns instead of throwing");
+        assert.equal(a.puts.length, 1, "both attempts reached the write, so the commit race really happened");
+        assert.equal(b.puts.length, 1);
+        assert.notEqual(a.puts[0], b.puts[0], "each attempt owns a distinct object key");
+
+        const row = await jobRow(fixture.job);
+        assert.equal(row.status, "SUCCEEDED");
+        assert.equal(row.error_code, null, "a losing attempt must not stamp a failure code on a committed job");
+        assert.ok(row.output_file_id, "the job references one output");
+
+        const outputs = await outputRows(fixture);
+        assert.equal(outputs.length, 1, "exactly one output file row exists");
+        assert.equal(await outputFileCount(fixture), 1, "no duplicate output file was left behind");
+        assert.equal(await documentCount(fixture), 2, "one input document plus exactly one output document");
+        assert.equal(await executionCount(fixture.job), 1, "exactly one ToolExecution was committed");
+
+        const committed = outputs[0].storage_key;
+        assert.ok(committed === a.puts[0] || committed === b.puts[0], "the committed row points at one attempt's object");
+        assert.ok(await bucket.head(committed), "the committed object exists in object storage");
+        for (const key of [a.puts[0], b.puts[0]].filter((key) => key !== committed)) {
+          assert.equal(await bucket.head(key), undefined, "the losing attempt deleted its own object");
+        }
+        await cleanup(fixture, keys);
+      } catch (error) { await cleanup(fixture, keys); throw error; }
+    });
+
+    await t.test("a committed attempt never touches objects left by an abandoned attempt", async () => {
+      const fixture = await seed("merge-pdf", 1, 2);
+      const staleKey = `output/${fixture.user}/${fixture.job}/attempt-crashed/0-stale.pdf`;
+      await bucket.put({ key: staleKey, bytes: await pdfBytes(1), contentType: "application/pdf" });
+      const spy: Spy = { puts: [], deletes: [] };
+      try {
+        await processDocumentJob(message(fixture), { storage: spyStorage(spy), scanner: getMalwareScanner(), client: runtime, attemptId: "attempt-live" });
+        const outputs = await outputRows(fixture);
+        assert.equal(outputs.length, 1);
+        assert.match(outputs[0].storage_key, new RegExp(`/attempt-live/0-`), "the committed key belongs to the live attempt");
+        assert.deepEqual(spy.deletes, [], "no delete was issued for another attempt's object");
+        assert.ok(await bucket.head(staleKey), "an abandoned attempt's object is neither deleted nor overwritten");
+        await cleanup(fixture, [...spy.puts, staleKey]);
+      } catch (error) { await cleanup(fixture, [...spy.puts, staleKey]); throw error; }
+    });
+
+    await t.test("a failed metadata commit deletes only its own objects, and the retry then commits once", async () => {
+      const fixture = await seed("merge-pdf", 1, 2);
+      const failing: Spy = { puts: [], deletes: [] };
+      const retry: Spy = { puts: [], deletes: [] };
+      try {
+        await assert.rejects(
+          () => processDocumentJob(message(fixture), { storage: spyStorage(failing), scanner: getMalwareScanner(), client: commitFailingClient(), attemptId: "attempt-fail" }),
+          (error: unknown) => (error as { code?: string }).code === "SIMULATED_COMMIT_FAILURE",
+        );
+        assert.equal(failing.puts.length, 1);
+        assert.equal(await bucket.head(failing.puts[0]), undefined, "the object orphaned by the rolled-back transaction is deleted");
+        assert.deepEqual(await outputRows(fixture), [], "the rolled-back transaction created no file rows");
+        assert.equal(await executionCount(fixture.job), 0, "no ToolExecution survived the rollback");
+        assert.equal((await jobRow(fixture.job)).status, "FAILED");
+
+        await processDocumentJob(message(fixture), { storage: spyStorage(retry), scanner: getMalwareScanner(), client: runtime, attemptId: "attempt-retry" });
+        const row = await jobRow(fixture.job);
+        assert.equal(row.status, "SUCCEEDED");
+        assert.ok(await bucket.head(retry.puts[0]), "the retry's object is committed");
+        assert.equal(await outputFileCount(fixture), 1, "the retry produced exactly one output file");
+        assert.equal(await executionCount(fixture.job), 1);
+        await cleanup(fixture, [...failing.puts, ...retry.puts]);
+      } catch (error) { await cleanup(fixture, [...failing.puts, ...retry.puts]); throw error; }
+    });
+
+    await t.test("a failing duplicate attempt cannot fail a job another attempt commits", async () => {
+      const fixture = await seed("merge-pdf", 1, 2);
+      const broken: Spy = { puts: [], deletes: [], failPutAt: 0 };
+      const good: Spy = { puts: [], deletes: [] };
+      // Both attempts are held inside screening until the other one arrives, so the
+      // broken attempt cannot be skipped as an idempotent duplicate: it is already
+      // past the job read when the healthy attempt commits.
+      const scanGate = barrier(2);
+      const real = getMalwareScanner();
+      const sharedScanner = { async scan(bytes: Uint8Array) { await scanGate(); return real.scan(bytes); } };
+      try {
+        const results = await Promise.allSettled([
+          processDocumentJob(message(fixture), { storage: spyStorage(broken), scanner: sharedScanner, client: runtime, attemptId: "attempt-broken" }),
+          processDocumentJob(message(fixture), { storage: spyStorage(good), scanner: sharedScanner, client: runtime, attemptId: "attempt-good" }),
+        ]);
+        assert.equal(results.some((result) => result.status === "rejected"), true, "the storage fault is still reported to the queue");
+        const row = await jobRow(fixture.job);
+        assert.equal(row.status, "SUCCEEDED", "the committed attempt owns the terminal state");
+        assert.equal(row.error_code, null, "a suppressed failure cannot stamp the committed job");
+        assert.equal(await outputFileCount(fixture), 1);
+        assert.ok(await bucket.head(good.puts[0]), "the committed output survives the duplicate's failure");
+        await cleanup(fixture, [...broken.puts, ...good.puts]);
+      } catch (error) { await cleanup(fixture, [...broken.puts, ...good.puts]); throw error; }
     });
   } finally {
     await runtime.$disconnect();

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { PrismaClient } from "@prisma/client";
 import { getStorage, type ObjectStorage } from "@/lib/storage";
 import { pdfWorkerEngine, runPdfWorkerTool, type PdfWorkerTool } from "@/lib/pdf/server";
@@ -6,7 +7,7 @@ import { logger } from "@/lib/logging";
 import { timeoutFor } from "@/lib/runtime/config";
 import { withTimeout } from "@/lib/runtime/timeout";
 import { validateWorkerOutputs } from "@/lib/outputs/validation";
-import { discardStoredObjects, screenAndStoreWorkerOutputs } from "@/lib/outputs/screening";
+import { OutputCommitSupersededError, discardStoredObjects, screenAndStoreWorkerOutputs } from "@/lib/outputs/screening";
 import { recordMetric } from "@/lib/observability/metrics";
 import { configuredCostRates, estimateJobCost } from "@/lib/cost/model";
 import { withTenant } from "@/lib/db/tenant";
@@ -20,30 +21,60 @@ import type { MalwareScanner } from "@/lib/malware";
  * PR-1 moved the document job body out of `workers/document-worker.ts` so the
  * pipeline can be exercised against real Postgres, object storage and clamd
  * without instantiating a BullMQ worker and its Redis connection. Behaviour is
- * unchanged apart from two deliberate additions:
- *   1. generated outputs are screened before the first object write, and
- *   2. a failed metadata write deletes the objects it orphaned.
+ * unchanged apart from three deliberate additions:
+ *   1. generated outputs are screened before the first object write,
+ *   2. a failed metadata write deletes the objects it orphaned, and
+ *   3. concurrent attempts of the same job are serialised at commit time.
+ *
+ * PR-1a (concurrency safety) closes the last gap from the PR #25 review. Two
+ * attempts of one job can overlap (BullMQ stalled-job recovery) so:
+ *   - every attempt writes to its own key prefix (`output/<user>/<job>/<attempt>/…`)
+ *     and may only delete objects it wrote and that no committed row references,
+ *   - the RUNNING transition and the SUCCEEDED commit are compare-and-set
+ *     `updateMany` calls guarded on `outputFileId IS NULL`, so exactly one attempt
+ *     can publish, and
+ *   - the FAILED and step writes refuse to overwrite a job another attempt has
+ *     already committed.
  */
 export type DocumentPipelineDeps = {
   /** Test seams. Production resolves the configured S3 adapter and clamd scanner. */
   storage?: ObjectStorage;
   scanner?: MalwareScanner;
   client?: PrismaClient;
+  /** Test seam only: pins the attempt id that scopes output keys. Production uses a fresh uuid. */
+  attemptId?: string;
 };
+
+/** Job states in which no attempt may (re)enter the pipeline. */
+const CLOSED_JOB_STATES = ["SUCCEEDED", "CANCELLED", "EXPIRED"] as const;
 
 export async function processDocumentJob(message: QueuedJob, deps: DocumentPipelineDeps = {}) {
   if (!message.userId) throw Object.assign(new Error("Worker job requires a tenant identity"), { code: "TENANT_CONTEXT_REQUIRED" });
   const tenant = <T>(operation: Parameters<typeof withTenant<T>>[1]) => withTenant({ userId: message.userId! }, operation, deps.client);
   const job = await tenant((tx) => tx.job.findUnique({ where: { id: message.jobId }, include: { steps: true } }));
   if (!job) throw new Error("JOB_NOT_FOUND");
-  const context = { job_id: job.id, correlation_id: job.correlationId ?? message.correlationId, tool_id: job.toolId };
+  const attemptId = deps.attemptId ?? randomUUID();
+  const context = { job_id: job.id, correlation_id: job.correlationId ?? message.correlationId, tool_id: job.toolId, attempt_id: attemptId };
   const rawParams = job.params as { inputFileIds?: string[]; options?: Record<string, unknown>; secretRef?: string };
   if (job.status === "SUCCEEDED" || job.outputFileId) { logger.info("job.idempotent_skip", context); return; }
   if (job.status === "CANCELLED" || job.status === "EXPIRED") { await deletePhase1Secret(rawParams.secretRef).catch(() => undefined); return; }
   const step = job.steps.find((item) => item.name === job.toolId);
   try {
-    await tenant((tx) => tx.job.update({ where: { id: job.id }, data: { status: "RUNNING", startedAt: job.startedAt ?? new Date(), error: undefined, errorCode: null } }));
-    if (step) await tenant((tx) => tx.jobStep.update({ where: { id: step.id }, data: { status: "RUNNING", startedAt: new Date() } }));
+    // Atomic run claim: the fast idempotency read above is not enough on its own,
+    // because a duplicate attempt can be between its read and this write when the
+    // winner commits. A compare-and-set on `outputFileId IS NULL` plus a closed
+    // terminal state makes that window harmless instead of a status rollback.
+    const claim = await tenant((tx) => tx.job.updateMany({
+      where: { id: job.id, outputFileId: null, status: { notIn: [...CLOSED_JOB_STATES] } },
+      data: { status: "RUNNING", startedAt: job.startedAt ?? new Date(), error: undefined, errorCode: null },
+    }));
+    if (claim.count === 0) {
+      const latest = await tenant((tx) => tx.job.findUnique({ where: { id: job.id }, select: { status: true, outputFileId: true } }));
+      if (latest?.outputFileId || latest?.status === "SUCCEEDED") logger.info("job.idempotent_skip", context);
+      else logger.info("job.terminal_skip", { ...context, result: latest?.status ?? "MISSING" });
+      return;
+    }
+    if (step) await tenant((tx) => tx.jobStep.updateMany({ where: { id: step.id, status: { not: "SUCCEEDED" } }, data: { status: "RUNNING", startedAt: new Date() } }));
     const params = rawParams; const ids = params.inputFileIds;
     if (!ids?.length) throw Object.assign(new Error("Unsupported job payload"), { code: "INVALID_JOB_INPUT" });
     const files = await tenant((tx) => tx.file.findMany({ where: { id: { in: ids } }, include: { document: true } }));
@@ -67,21 +98,37 @@ export async function processDocumentJob(message: QueuedJob, deps: DocumentPipel
     // PR-1: every output is scanned first, then the batch is stored. A rejection
     // throws before the first object write, so no object, file row or SUCCEEDED
     // status can exist for a batch that was not explicitly declared clean.
-    const { stored: storedOutputs } = await screenAndStoreWorkerOutputs(outputs, { job, storage, scanner: deps.scanner });
+    const { stored: storedOutputs } = await screenAndStoreWorkerOutputs(outputs, { job, storage, scanner: deps.scanner, attemptId });
     try {
       await tenant(async (tx) => {
         const current = await tx.job.findUniqueOrThrow({ where: { id: job.id }, select: { outputFileId: true } });
-        if (current.outputFileId) return;
+        if (current.outputFileId) throw new OutputCommitSupersededError();
         const outputDocument = await tx.document.create({ data: { userId: job.requesterId!, organizationId: job.organizationId, title: `${job.toolId} output` } }); const outputFileIds: string[] = [];
         for (const item of storedOutputs) { const outputFile = await tx.file.create({ data: { document: { connect: { id: outputDocument.id } }, originalName: item.output.name, mimeType: item.output.mimeType, size: BigInt(item.output.bytes.byteLength), storageKey: item.object.key, checksum: item.checksum, storageObject: { connectOrCreate: { where: { provider_bucket_objectKey: { provider: "s3", bucket: item.object.bucket, objectKey: item.object.key } }, create: { provider: "s3", bucket: item.object.bucket, objectKey: item.object.key, size: BigInt(item.output.bytes.byteLength), checksum: item.checksum } } } } }); await tx.fileVersion.create({ data: { fileId: outputFile.id, ownerId: job.requesterId!, version: 1, storageKey: item.object.key, checksum: item.checksum } }); outputFileIds.push(outputFile.id); }
-        await tx.job.update({ where: { id: job.id }, data: { outputFileId: outputFileIds[0], status: "SUCCEEDED", result: { outputFileIds }, completedAt: new Date() } });
-        if (step) await tx.jobStep.update({ where: { id: step.id }, data: { status: "SUCCEEDED", output: { outputFileIds }, completedAt: new Date() } });
+        // The commit itself is the compare-and-set. Under READ COMMITTED a second
+        // attempt blocks on this row, re-evaluates `outputFileId IS NULL` after the
+        // winner commits, matches nothing, and rolls its own rows back — so exactly
+        // one attempt can ever publish and duplicate metadata is impossible.
+        const commit = await tx.job.updateMany({ where: { id: job.id, outputFileId: null, status: { notIn: [...CLOSED_JOB_STATES] } }, data: { outputFileId: outputFileIds[0], status: "SUCCEEDED", result: { outputFileIds }, errorCode: null, completedAt: new Date() } });
+        if (commit.count !== 1) throw new OutputCommitSupersededError();
+        if (step) await tx.jobStep.updateMany({ where: { id: step.id, status: { not: "SUCCEEDED" } }, data: { status: "SUCCEEDED", output: { outputFileIds }, completedAt: new Date() } });
         await tx.toolExecution.create({ data: { jobId: job.id, toolId: job.toolId, mode: "SERVER", input: { inputFileIds: ids }, output: { outputFileIds }, correlationId: job.correlationId, engine, engineVersion, durationMs: Date.now() - started } });
       });
     } catch (error) {
       // The metadata transaction rolled back, so these objects reference no file
-      // row. Deleting them keeps a retry from accumulating orphaned outputs.
-      await discardStoredObjects(storage, storedOutputs.map((item) => item.object.key));
+      // row. Deleting them keeps a retry from accumulating orphaned outputs — but
+      // only the ones this attempt wrote *and* that no committed row points at, so
+      // a committed output is never deleted. If ownership cannot be verified, the
+      // objects are left in place: an orphan is recoverable, a deleted output is not.
+      const keys = storedOutputs.map((item) => item.object.key);
+      let referenced: Set<string> | undefined;
+      try {
+        referenced = new Set((await tenant((tx) => tx.file.findMany({ where: { storageKey: { in: keys } }, select: { storageKey: true } }))).map((row) => row.storageKey));
+      } catch {
+        logger.error("worker.output_cleanup_unverified", { error_code: "OWNERSHIP_UNKNOWN" });
+      }
+      if (referenced) { const owned = referenced; await discardStoredObjects(storage, keys, { isReferenced: async (key) => owned.has(key) }); }
+      if (error instanceof OutputCommitSupersededError) { logger.info("job.output_commit_superseded", context); return; }
       throw error;
     }
     const durationMs = Date.now() - started;
@@ -94,8 +141,17 @@ export async function processDocumentJob(message: QueuedJob, deps: DocumentPipel
     logger.info("job.succeeded", { ...context, engine, engine_version: engineVersion, duration_ms: durationMs, status: "succeeded" });
   } catch (error) {
     const errorCode = typeof error === "object" && error && "code" in error ? String(error.code) : "PROCESSING_FAILED";
-    await tenant((tx) => tx.job.update({ where: { id: job.id }, data: { status: "FAILED", errorCode, error: { message: error instanceof Error ? error.message : "Processing failed" }, completedAt: new Date() } }));
-    if (step) await tenant((tx) => tx.jobStep.update({ where: { id: step.id }, data: { status: "FAILED", errorCode, error: { message: error instanceof Error ? error.message : "Processing failed" }, completedAt: new Date() } }));
+    // A losing attempt must never fail a job that another attempt committed, so the
+    // failure write is guarded exactly like the success write.
+    const failed = await tenant((tx) => tx.job.updateMany({ where: { id: job.id, outputFileId: null, status: { not: "SUCCEEDED" } }, data: { status: "FAILED", errorCode, error: { message: error instanceof Error ? error.message : "Processing failed" }, completedAt: new Date() } }));
+    if (failed.count === 0) {
+      // Either another attempt committed (the normal race) or the row is gone
+      // (retention expired it mid-run). Both are "do not write", but only one is
+      // "already committed", so the log says which happened.
+      const latest = await Promise.resolve(tenant((tx) => tx.job.findUnique({ where: { id: job.id }, select: { status: true, outputFileId: true } }))).catch(() => undefined);
+      logger.warn(latest?.outputFileId ? "job.failure_suppressed" : "job.failure_not_recorded", { ...context, result: latest?.status ?? "MISSING" });
+    }
+    if (step) await tenant((tx) => tx.jobStep.updateMany({ where: { id: step.id, status: { not: "SUCCEEDED" } }, data: { status: "FAILED", errorCode, error: { message: error instanceof Error ? error.message : "Processing failed" }, completedAt: new Date() } }));
     recordMetric("jobs_failure_total", 1, "count", { tool_id: job.toolId, status: "failed" });
     logger.error("job.failed", { ...context, error_code: errorCode, status: "failed" }); throw error;
   } finally { await deletePhase1Secret(rawParams.secretRef).catch(() => undefined); }
