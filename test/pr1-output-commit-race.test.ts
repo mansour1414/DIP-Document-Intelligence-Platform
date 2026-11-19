@@ -211,13 +211,15 @@ async function fixture() {
     inputIds.push(id);
   }
   db.state.jobs.set(jobId, { id: jobId, toolId: "merge-pdf", status: "QUEUED", requesterId: user, organizationId: null, correlationId: randomUUID(), params: { inputFileIds: inputIds, options: {} }, startedAt: null, outputFileId: null, errorCode: null, result: null, completedAt: null });
+  const stepId = randomUUID();
+  db.state.steps.set(stepId, { id: stepId, jobId, name: "merge-pdf", status: "QUEUED", startedAt: null, completedAt: null });
   const message = { jobId, toolId: "", idempotencyKey: `pr1-${jobId}`, correlationId: randomUUID(), userId: user };
   const attemptStorage = (options: { failPutAt?: number; gate?: () => Promise<void> } = {}) => {
     const recording = recordingStorage(options);
     for (const [key, bytes] of inputs) recording.objects.set(key, bytes);
     return recording;
   };
-  return { db, jobId, user, inputIds, message, attemptStorage };
+  return { db, jobId, stepId, user, inputIds, message, attemptStorage };
 }
 
 const barrier = (parties: number) => {
@@ -228,6 +230,21 @@ const barrier = (parties: number) => {
 };
 
 const outputFiles = (db: FakeDb, inputIds: string[]) => db.state.files.filter((row) => !inputIds.includes(String(row.id)));
+
+/** Pauses the pipeline inside `storage.put` so the test can change job state mid-run. */
+const handshake = () => {
+  let enter = () => {};
+  let release = () => {};
+  const entered = new Promise<void>((resolve) => { enter = resolve; });
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  return { entered, gate: () => { enter(); return blocked; }, release: () => release() };
+};
+
+/** Exactly what the cancel API / retention expiry write: job and step become terminal together. */
+const settleTerminal = (db: FakeDb, jobId: string, stepId: string, status: "CANCELLED" | "EXPIRED") => {
+  Object.assign(db.state.jobs.get(jobId)!, { status, completedAt: new Date() });
+  Object.assign(db.state.steps.get(stepId)!, { status, completedAt: new Date() });
+};
 const asClient = (value: unknown) => value as PrismaClient;
 
 // ---------------------------------------------------------------------- cases
@@ -334,4 +351,53 @@ test("PR-1a: a commit that succeeds but loses its acknowledgement still deletes 
   assert.equal(outputFiles(db, inputIds).length, 1);
   assert.deepEqual(attempt.deletes(), [], "a referenced object is never deleted");
   assert.ok(await attempt.storage.head(String(outputFiles(db, inputIds)[0].storageKey)), "the committed output survives the lost acknowledgement");
+});
+
+for (const terminal of ["CANCELLED", "EXPIRED"] as const) {
+  test(`PR-1a: a job ${terminal.toLowerCase()} during processing is never rewritten as FAILED`, async (t) => {
+    const pipeline = await loadPipeline(t);
+    if (!pipeline) return;
+    const { processDocumentJob } = pipeline;
+    const { db, jobId, stepId, inputIds, message, attemptStorage } = await fixture();
+    const hs = handshake();
+    const attempt = attemptStorage({ failPutAt: 0, gate: hs.gate });
+
+    const running = processDocumentJob(message, { storage: attempt.storage, scanner: cleanScanner, client: asClient(db), attemptId: `attempt-${terminal.toLowerCase()}` });
+    await hs.entered; // past screening and the RUNNING claim, inside the first storage write
+    settleTerminal(db, jobId, stepId, terminal);
+    hs.release();
+    await assert.rejects(running, (error: unknown) => (error as { code?: string }).code === "STORAGE_FAILURE");
+
+    const job = db.state.jobs.get(jobId)!;
+    assert.equal(job.status, terminal, "the terminal state survives a later processing failure");
+    assert.equal(job.errorCode, null, "no failure code is stamped on a cancelled or expired job");
+    assert.equal(job.outputFileId, null);
+    assert.equal(db.state.steps.get(stepId)!.status, terminal, "the step is not revived as FAILED");
+    assert.deepEqual(outputFiles(db, inputIds), [], "no metadata was created");
+    assert.equal(db.state.executions.length, 0);
+  });
+}
+
+test("PR-1a: a cancellation that arrives before the commit discards the generated output", async (t) => {
+  const pipeline = await loadPipeline(t);
+  if (!pipeline) return;
+  const { processDocumentJob } = pipeline;
+  const { db, jobId, stepId, inputIds, message, attemptStorage } = await fixture();
+  const hs = handshake();
+  const attempt = attemptStorage({ gate: hs.gate });
+
+  const running = processDocumentJob(message, { storage: attempt.storage, scanner: cleanScanner, client: asClient(db), attemptId: "attempt-cancel-race" });
+  await hs.entered;
+  settleTerminal(db, jobId, stepId, "CANCELLED");
+  hs.release();
+  await running; // the superseded attempt returns instead of failing the terminal job
+
+  const job = db.state.jobs.get(jobId)!;
+  assert.equal(job.status, "CANCELLED", "the commit cannot overwrite a cancelled job");
+  assert.equal(job.outputFileId, null, "no output is attached to a cancelled job");
+  assert.equal(db.state.steps.get(stepId)!.status, "CANCELLED");
+  assert.deepEqual(outputFiles(db, inputIds), [], "no file rows were committed");
+  assert.equal(db.state.executions.length, 0);
+  assert.equal(attempt.puts().length, 1);
+  assert.deepEqual(attempt.deletes(), attempt.puts(), "the generated object is discarded");
 });

@@ -45,7 +45,11 @@ test("PR-1a (structure): job state is only written through compare-and-set guard
   assert.doesNotMatch(pipeline, /tx\.job\.update\(/, "job state must never be written as an unconditional row update");
   assert.doesNotMatch(pipeline, /tx\.jobStep\.update\(/, "step state must never be written as an unconditional row update");
   assert.match(pipeline, /updateMany\(\{\s*where: \{ id: job\.id, outputFileId: null, status: \{ notIn:/, "the SUCCEEDED commit is a compare-and-set on an uncommitted job");
-  assert.match(pipeline, /status: \{ not: "SUCCEEDED" \}/, "a failure write cannot overwrite a committed job or step");
+  assert.doesNotMatch(pipeline, /status: \{ not: "SUCCEEDED" \}/, "every terminal state must be guarded, not just SUCCEEDED");
+  assert.match(pipeline, /const CLOSED_JOB_STATES = \["SUCCEEDED", "CANCELLED", "EXPIRED"\] as const/, "the closed-state list must cover all three terminal states");
+  assert.match(pipeline, /updateMany\(\{ where: \{ id: job\.id, outputFileId: null, status: \{ notIn: \[\.\.\.CLOSED_JOB_STATES\] \} \}, data: \{ status: "FAILED"/, "the failure write cannot overwrite a cancelled or expired job");
+  assert.match(pipeline, /const failed = await tenant/, "the failure write result is inspected");
+  assert.match(pipeline, /step && failed\.count === 1/, "a JobStep is only failed when its job was recorded as failed");
   assert.match(pipeline, /OutputCommitSupersededError/, "a lost commit race is recognised explicitly");
   assert.match(pipeline, /isReferenced: async \(key\) => owned\.has\(key\)/, "cleanup deletes only unreferenced objects");
   const screening = await read("src/lib/outputs/screening.ts");

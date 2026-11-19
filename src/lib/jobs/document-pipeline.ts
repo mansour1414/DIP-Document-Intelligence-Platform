@@ -74,7 +74,7 @@ export async function processDocumentJob(message: QueuedJob, deps: DocumentPipel
       else logger.info("job.terminal_skip", { ...context, result: latest?.status ?? "MISSING" });
       return;
     }
-    if (step) await tenant((tx) => tx.jobStep.updateMany({ where: { id: step.id, status: { not: "SUCCEEDED" } }, data: { status: "RUNNING", startedAt: new Date() } }));
+    if (step) await tenant((tx) => tx.jobStep.updateMany({ where: { id: step.id, status: { notIn: [...CLOSED_JOB_STATES] } }, data: { status: "RUNNING", startedAt: new Date() } }));
     const params = rawParams; const ids = params.inputFileIds;
     if (!ids?.length) throw Object.assign(new Error("Unsupported job payload"), { code: "INVALID_JOB_INPUT" });
     const files = await tenant((tx) => tx.file.findMany({ where: { id: { in: ids } }, include: { document: true } }));
@@ -111,7 +111,7 @@ export async function processDocumentJob(message: QueuedJob, deps: DocumentPipel
         // one attempt can ever publish and duplicate metadata is impossible.
         const commit = await tx.job.updateMany({ where: { id: job.id, outputFileId: null, status: { notIn: [...CLOSED_JOB_STATES] } }, data: { outputFileId: outputFileIds[0], status: "SUCCEEDED", result: { outputFileIds }, errorCode: null, completedAt: new Date() } });
         if (commit.count !== 1) throw new OutputCommitSupersededError();
-        if (step) await tx.jobStep.updateMany({ where: { id: step.id, status: { not: "SUCCEEDED" } }, data: { status: "SUCCEEDED", output: { outputFileIds }, completedAt: new Date() } });
+        if (step) await tx.jobStep.updateMany({ where: { id: step.id, status: { notIn: [...CLOSED_JOB_STATES] } }, data: { status: "SUCCEEDED", output: { outputFileIds }, completedAt: new Date() } });
         await tx.toolExecution.create({ data: { jobId: job.id, toolId: job.toolId, mode: "SERVER", input: { inputFileIds: ids }, output: { outputFileIds }, correlationId: job.correlationId, engine, engineVersion, durationMs: Date.now() - started } });
       });
     } catch (error) {
@@ -141,17 +141,19 @@ export async function processDocumentJob(message: QueuedJob, deps: DocumentPipel
     logger.info("job.succeeded", { ...context, engine, engine_version: engineVersion, duration_ms: durationMs, status: "succeeded" });
   } catch (error) {
     const errorCode = typeof error === "object" && error && "code" in error ? String(error.code) : "PROCESSING_FAILED";
-    // A losing attempt must never fail a job that another attempt committed, so the
-    // failure write is guarded exactly like the success write.
-    const failed = await tenant((tx) => tx.job.updateMany({ where: { id: job.id, outputFileId: null, status: { not: "SUCCEEDED" } }, data: { status: "FAILED", errorCode, error: { message: error instanceof Error ? error.message : "Processing failed" }, completedAt: new Date() } }));
+    // A losing attempt must never fail a job that another attempt committed, and a
+    // cancellation or expiry that arrived while the job was running must survive:
+    // every terminal state is guarded, not just SUCCEEDED.
+    const failed = await tenant((tx) => tx.job.updateMany({ where: { id: job.id, outputFileId: null, status: { notIn: [...CLOSED_JOB_STATES] } }, data: { status: "FAILED", errorCode, error: { message: error instanceof Error ? error.message : "Processing failed" }, completedAt: new Date() } }));
     if (failed.count === 0) {
-      // Either another attempt committed (the normal race) or the row is gone
-      // (retention expired it mid-run). Both are "do not write", but only one is
-      // "already committed", so the log says which happened.
+      // Either another attempt committed, the job was cancelled/expired mid-run, or
+      // the row is gone (retention). All mean "do not write"; the log says which.
       const latest = await Promise.resolve(tenant((tx) => tx.job.findUnique({ where: { id: job.id }, select: { status: true, outputFileId: true } }))).catch(() => undefined);
       logger.warn(latest?.outputFileId ? "job.failure_suppressed" : "job.failure_not_recorded", { ...context, result: latest?.status ?? "MISSING" });
     }
-    if (step) await tenant((tx) => tx.jobStep.updateMany({ where: { id: step.id, status: { not: "SUCCEEDED" } }, data: { status: "FAILED", errorCode, error: { message: error instanceof Error ? error.message : "Processing failed" }, completedAt: new Date() } }));
+    // The step may only follow the job: a terminal job's step is never rewritten,
+    // and a terminal step is never revived.
+    if (step && failed.count === 1) await tenant((tx) => tx.jobStep.updateMany({ where: { id: step.id, status: { notIn: [...CLOSED_JOB_STATES] } }, data: { status: "FAILED", errorCode, error: { message: error instanceof Error ? error.message : "Processing failed" }, completedAt: new Date() } }));
     recordMetric("jobs_failure_total", 1, "count", { tool_id: job.toolId, status: "failed" });
     logger.error("job.failed", { ...context, error_code: errorCode, status: "failed" }); throw error;
   } finally { await deletePhase1Secret(rawParams.secretRef).catch(() => undefined); }
