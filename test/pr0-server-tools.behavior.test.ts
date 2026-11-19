@@ -13,6 +13,7 @@ import {
   DOWNLOAD_RETRY_ATTEMPTS,
   downloadServerToolOutputWithRetry,
   idempotencyFor,
+  isRetryableDownloadError,
   submissionFingerprint,
   JOB_POLL_INTERVAL_MS,
   JOB_POLL_MAX_BUDGET_MS,
@@ -309,7 +310,7 @@ test("PR-0 (behaviour): a retry after an unknown outcome reuses the idempotency 
 
 test("PR-0 (behaviour): an ambiguous OCR submission followed by a language change starts a new operation", async () => {
   const file = new File([new Uint8Array([1, 2, 3])], "scan.pdf", { type: "application/pdf" });
-  const original = { toolId: "ocr-pdf", options: { language: "ara" }, file };
+  const original = { toolId: "ocr-pdf", options: { language: "ara" }, file, selectionToken: "selection-1" };
   const first = idempotencyFor(null, original, () => "key-original");
 
   // Ambiguous outcome: the job may or may not exist, so the key is retained.
@@ -332,10 +333,81 @@ test("PR-0 (behaviour): an ambiguous OCR submission followed by a language chang
   assert.equal((calls[0].init?.headers as Record<string, string>)["Idempotency-Key"], "key-new-language");
   assert.equal((calls[0].init?.body as FormData).get("options"), JSON.stringify({ language: "eng" }));
 
-  // A different file or tool is likewise a new operation.
+  // A different file selection or tool is likewise a new operation.
   const otherFile = new File([new Uint8Array([9])], "scan.pdf", { type: "application/pdf" });
-  assert.notEqual(idempotencyFor(first, { ...original, file: otherFile }, () => "key-other-file").key, "key-original");
+  assert.notEqual(idempotencyFor(first, { ...original, file: otherFile, selectionToken: "selection-2" }, () => "key-other-file").key, "key-original");
   assert.notEqual(idempotencyFor(first, { ...original, toolId: "pdf-to-word" }, () => "key-other-tool").key, "key-original");
+});
+
+test("PR-0 (behaviour): different file contents cannot reuse a retained key even with identical metadata", () => {
+  // Same name/size/lastModified, different bytes: only the per-selection token differs.
+  const metadata = { name: "scan.pdf", size: 3, lastModified: 1_700_000_000_000 };
+  const firstSelection = { toolId: "ocr-pdf", options: { language: "ara" }, file: metadata, selectionToken: "selection-a" };
+  const pending = idempotencyFor(null, firstSelection, () => "key-a");
+
+  // Same selection, same metadata and same options: safe retry keeps the key.
+  assert.equal(idempotencyFor(pending, { ...firstSelection }, () => "key-unused").key, "key-a");
+
+  // A new selection of a file with identical metadata/options must get a new key.
+  const reselected = { ...firstSelection, file: { ...metadata }, selectionToken: "selection-b" };
+  assert.equal(idempotencyFor(pending, reselected, () => "key-b").key, "key-b");
+  assert.notEqual(submissionFingerprint(reselected), pending.fingerprint);
+
+  // The fingerprint is not a content hash: it never reads bytes.
+  const fingerprintInputs = JSON.parse(pending.fingerprint) as Record<string, unknown>;
+  assert.deepEqual(fingerprintInputs.file, metadata);
+  assert.equal(fingerprintInputs.selection, "selection-a");
+  assert.equal("bytes" in fingerprintInputs || "sha256" in fingerprintInputs || "hash" in fingerprintInputs, false);
+
+  // Metadata drift within the same selection is still treated as a new operation.
+  assert.notEqual(idempotencyFor(pending, { ...firstSelection, file: { ...metadata, size: 4 } }, () => "key-c").key, "key-a");
+});
+
+test("PR-0 (behaviour): network failures during download are retried within the bound", async () => {
+  const attempts: string[] = [];
+  let calls = 0;
+  const fetchImpl = async () => {
+    calls += 1;
+    attempts.push(`attempt-${calls}`);
+    if (calls < 3) throw new TypeError("Failed to fetch");
+    return new Response(new Uint8Array([7, 8]), { status: 200, headers: { "content-disposition": 'attachment; filename="network.pdf"' } });
+  };
+  const result = await downloadServerToolOutputWithRetry({ fileId: "file-network", fetchImpl, sleep: async () => {} });
+  assert.equal(result.filename, "network.pdf");
+  assert.equal(calls, 3, "two transport failures must be retried");
+
+  // Exhausting the bound surfaces the original transport error, not a fake success.
+  let failingCalls = 0;
+  const alwaysFailing = async () => { failingCalls += 1; throw new TypeError("Failed to fetch"); };
+  await assert.rejects(
+    () => downloadServerToolOutputWithRetry({ fileId: "file-network", fetchImpl: alwaysFailing, sleep: async () => {} }),
+    (error: unknown) => error instanceof TypeError && error.message === "Failed to fetch",
+  );
+  assert.equal(failingCalls, DOWNLOAD_RETRY_ATTEMPTS, "network retries stay bounded");
+});
+
+test("PR-0 (behaviour): authentication, authorization and abort failures are never retried", async () => {
+  // Authorization codes are terminal.
+  for (const code of ["OUTPUT_UNAUTHORIZED", "AUTH_REQUIRED"] as const) {
+    assert.equal(isRetryableDownloadError(new ServerToolJobError(code, "no access")), false, code);
+  }
+  for (const code of ["OUTPUT_DOWNLOAD_FAILED", "JOB_FAILED"] as const) {
+    assert.equal(isRetryableDownloadError(new ServerToolJobError(code, "transient")), code === "OUTPUT_DOWNLOAD_FAILED", code);
+  }
+  assert.equal(isRetryableDownloadError(new TypeError("Failed to fetch")), true, "transport errors are retryable");
+  const abort = new Error("The operation was aborted"); abort.name = "AbortError";
+  assert.equal(isRetryableDownloadError(abort), false, "aborts are caller intent");
+  const controller = new AbortController(); controller.abort();
+  assert.equal(isRetryableDownloadError(new TypeError("Failed to fetch"), controller.signal), false, "an aborted signal stops retrying");
+
+  // A 401 response must perform exactly one attempt.
+  let attempts = 0;
+  const unauthorized = async () => { attempts += 1; return new Response("{}", { status: 401 }); };
+  await assert.rejects(
+    () => downloadServerToolOutputWithRetry({ fileId: "f", fetchImpl: unauthorized, sleep: async () => { throw new Error("must not sleep"); } }),
+    (error: unknown) => error instanceof ServerToolJobError && error.code === "OUTPUT_UNAUTHORIZED",
+  );
+  assert.equal(attempts, 1);
 });
 
 test("PR-0 (behaviour): a transient output download failure retries without a second job", async () => {

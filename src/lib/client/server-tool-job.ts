@@ -212,21 +212,39 @@ export type SubmissionRequest = {
   toolId: string;
   options?: Record<string, string | number | boolean>;
   file: { name?: string; size?: number; lastModified?: number };
+  /**
+   * Opaque token generated once per file selection in this tab.
+   *
+   * Identity is scoped to the selection, not to the bytes: the same `File`
+   * object cannot change contents after it is picked, and picking any file
+   * again (including one with identical name/size/mtime) produces a new token.
+   * A different token therefore always means a new operation, so a retained
+   * idempotency key can never be reused for different file contents without
+   * hashing the whole file in the browser.
+   */
+  selectionToken: string;
 };
 
 export type PendingSubmission = { key: string; fingerprint: string };
 
 /**
- * Stable description of exactly what was submitted. Two submissions with the
- * same fingerprint are the same operation; any change to the tool, the file or
- * the options (for example the OCR language) is a different operation and must
- * not silently reuse the previous job.
+ * Stable description of the operation that was submitted.
+ *
+ * The fingerprint covers the tool, the option values and the *selection* of the
+ * file (per-selection token plus name/size/lastModified metadata). It is
+ * deliberately **not** a content hash: no bytes are read or hashed here, and
+ * equal fingerprints must not be described as "byte-identical". The guarantee it
+ * provides is narrower and sufficient — a retained key is reused only while the
+ * same selection is submitted with the same options, and any new selection (even
+ * of a file with identical metadata) or any option change produces a different
+ * fingerprint and therefore a new key.
  */
 export function submissionFingerprint(request: SubmissionRequest) {
   const options = Object.keys(request.options ?? {}).sort().map((name) => [name, request.options?.[name]]);
   return JSON.stringify({
     toolId: request.toolId,
     options,
+    selection: request.selectionToken,
     file: { name: request.file.name ?? "", size: request.file.size ?? 0, lastModified: request.file.lastModified ?? 0 },
   });
 }
@@ -234,10 +252,11 @@ export function submissionFingerprint(request: SubmissionRequest) {
 /**
  * Resolve the idempotency key for a submission.
  *
- * A retained key is reused only when the new request is byte-for-byte the same
- * operation (same fingerprint) — that is what makes an ambiguous retry safe.
- * Changing the OCR language, the file or the tool therefore starts a genuinely
- * new operation under a new key instead of attaching to the original job.
+ * A retained key is reused only when the fingerprint matches, i.e. the same
+ * selected file is submitted with the same options for the same tool. That is
+ * what makes an ambiguous retry safe. Changing the OCR language, re-selecting
+ * the file (regardless of its metadata) or switching tool starts a genuinely new
+ * operation under a new key instead of attaching to the original job.
  */
 export function idempotencyFor(
   pending: PendingSubmission | null,
@@ -265,8 +284,26 @@ export const DOWNLOAD_RETRY_ATTEMPTS = 3;
 export const DOWNLOAD_RETRY_DELAY_MS = 500;
 
 /**
+ * Whether a failed output download may be retried.
+ *
+ * Retried: transient HTTP failures (`OUTPUT_DOWNLOAD_FAILED`, i.e. 5xx/other
+ * non-auth statuses) and genuine transport failures thrown by `fetch`
+ * (`TypeError`, socket/DNS errors, and anything else that is not an abort).
+ * Never retried: authentication/authorization failures
+ * (`OUTPUT_UNAUTHORIZED`, `AUTH_REQUIRED`) and caller-initiated aborts.
+ */
+export function isRetryableDownloadError(error: unknown, signal?: AbortSignal) {
+  if (signal?.aborted) return false;
+  if (error instanceof ServerToolJobError) return error.code === "OUTPUT_DOWNLOAD_FAILED";
+  if (error instanceof Error && error.name === "AbortError") return false;
+  // fetch rejects network faults with a TypeError (`Failed to fetch`); they are
+  // transient and must not discard the already-produced output.
+  return true;
+}
+
+/**
  * Download an output that the worker already produced, retrying transient
- * transport/5xx failures only.
+ * HTTP and network failures within a bounded budget.
  *
  * This never submits work: a failed download must not turn into a second
  * processing execution. Authorization failures (401/403/404) are returned
@@ -283,8 +320,7 @@ export async function downloadServerToolOutputWithRetry(
       return await downloadServerToolOutput(input);
     } catch (error) {
       lastError = error;
-      const retryable = error instanceof ServerToolJobError && error.code === "OUTPUT_DOWNLOAD_FAILED";
-      if (!retryable || attempt === attempts - 1) throw error;
+      if (!isRetryableDownloadError(error, input.signal) || attempt === attempts - 1) throw error;
       await sleep(DOWNLOAD_RETRY_DELAY_MS * (attempt + 1));
     }
   }

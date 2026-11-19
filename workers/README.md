@@ -40,14 +40,17 @@ running job as failed and never submits a duplicate job.
 
 Client-side safety rules (see `src/lib/client/server-tool-job.ts`):
 
-- A retained `Idempotency-Key` is bound to the exact submitted request
-  (tool, file name/size/lastModified and options). Changing the OCR language or
-  the file is a new operation and is submitted under a new key, so an ambiguous
-  retry can never attach to a job that processed different options.
+- A retained `Idempotency-Key` is bound to the submitted request: tool, option
+  values, file name/size/lastModified and a per-selection token generated when
+  the file is picked. This is **not** a content hash — the browser never hashes
+  the file — but every new file selection (including one with identical
+  metadata) and every option change yields a new key, so an ambiguous retry can
+  never attach to a job that processed different options or different contents.
 - An output download that fails after the job succeeded is retried up to three
-  times and then re-offered from the retained file id; it never re-submits the
-  document, so a transient storage or network fault cannot cause a second
-  processing execution.
+  times for transient HTTP (5xx) and network (`fetch` TypeError) faults, then
+  re-offered from the retained file id; authentication, authorization and abort
+  failures are never retried. It never re-submits the document, so a transient
+  storage or network fault cannot cause a second processing execution.
 - `GET /api/jobs/status/[jobId]` and `GET /api/files/[fileId]` read through
   `src/lib/jobs/access.ts`, which runs the query inside `withTenant` (RLS
   context) **and** keeps the explicit owner predicate.

@@ -42,6 +42,10 @@ export function ServerToolWorkspace({ tool, embedded: _embedded = false }: { too
   const guardRef = useRef<ReturnType<typeof createRunGuard> | null>(null);
   guardRef.current ??= createRunGuard();
   const pendingSubmissionRef = useRef<PendingSubmission | null>(null);
+  // One token per file selection: re-picking any file (even with identical
+  // name/size/mtime) is a new operation, so a retained idempotency key can never
+  // be reused for different file contents.
+  const selectionTokenRef = useRef<string | null>(null);
   const [pendingJobId, setPendingJobId] = useState<string | null>(null);
   // Output already produced by the worker: retrying its download must never
   // enqueue a second processing job.
@@ -65,6 +69,7 @@ export function ServerToolWorkspace({ tool, embedded: _embedded = false }: { too
     if (candidate.size > tool.limits.maxBytes) { setStatus("error"); setMessage("FILE_LIMIT: Choose a file no larger than 100 MB."); return; }
     guardRef.current?.cancel();
     pendingSubmissionRef.current = null; setPendingJobId(null); setCompletedOutputFileId(null);
+    selectionTokenRef.current = globalThis.crypto.randomUUID();
     clearOutput(); setFile(candidate); setStatus("idle"); setMessage("");
   };
 
@@ -74,6 +79,7 @@ export function ServerToolWorkspace({ tool, embedded: _embedded = false }: { too
     if (busy) return;
     guardRef.current?.cancel();
     pendingSubmissionRef.current = null; setPendingJobId(null); setCompletedOutputFileId(null);
+    selectionTokenRef.current = null;
     clearOutput(); setFile(null); setStatus("idle"); setMessage("");
   };
 
@@ -130,7 +136,8 @@ export function ServerToolWorkspace({ tool, embedded: _embedded = false }: { too
     if (!file || guardRef.current?.busy()) return;
     const run = guardRef.current?.start() ?? -1;
     if (run < 0) return;
-    const request = { toolId: tool.id, options, file };
+    selectionTokenRef.current ??= globalThis.crypto.randomUUID();
+    const request = { toolId: tool.id, options, file, selectionToken: selectionTokenRef.current };
     // Reuse the retained key only for the identical request; a changed OCR
     // language (or file) is a new operation and gets a new key.
     const pending = idempotencyFor(pendingSubmissionRef.current, request);
@@ -138,7 +145,7 @@ export function ServerToolWorkspace({ tool, embedded: _embedded = false }: { too
     setStatus("processing"); setMessage(copy.sending);
     window.dispatchEvent(new CustomEvent("dip:analytics", { detail: { name: "tool_started" } }));
     try {
-      const submission = await submitServerToolJob({ ...request, idempotencyKey: pending.key, correlationId: globalThis.crypto.randomUUID() });
+      const submission = await submitServerToolJob({ toolId: request.toolId, options: request.options, file: request.file, idempotencyKey: pending.key, correlationId: globalThis.crypto.randomUUID() });
       if (!guardRef.current?.isCurrent(run)) return;
       setMessage(copy.queued);
       await runPolling(run, submission.jobId);

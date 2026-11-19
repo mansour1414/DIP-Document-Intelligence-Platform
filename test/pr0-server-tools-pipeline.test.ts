@@ -102,6 +102,25 @@ test("PR-0 (structure): a retained idempotency key is bound to the submitted req
   const source = read(workspace);
   assert.match(source, /idempotencyFor\(pendingSubmissionRef\.current, request\)/);
   assert.doesNotMatch(source, /idempotencyKeyRef/);
+  // Identity is scoped to a per-selection token; the module never hashes bytes.
+  assert.match(source, /selectionTokenRef\.current = globalThis\.crypto\.randomUUID\(\)/);
+  assert.match(source, /selectionToken: selectionTokenRef\.current/);
+  assert.match(clientSource, /selection: request\.selectionToken/);
+  assert.doesNotMatch(clientSource, /subtle\.digest|crypto\.createHash|sha256\(.*bytes/i);
+});
+
+test("PR-0 (structure): output downloads retry transient faults only, through one classifier", () => {
+  const clientSource = read(clientModule);
+  assert.match(clientSource, /export function isRetryableDownloadError/);
+  assert.match(clientSource, /if \(signal\?\.aborted\) return false;/);
+  assert.match(clientSource, /error\.code === "OUTPUT_DOWNLOAD_FAILED"/);
+  assert.match(clientSource, /error\.name === "AbortError"/);
+  assert.match(clientSource, /return true;/);
+  assert.match(clientSource, /if \(!isRetryableDownloadError\(error, input\.signal\) \|\| attempt === attempts - 1\) throw error;/);
+  // The workspace uses the bounded retry helper, never a bare download.
+  const source = read(workspace);
+  assert.match(source, /downloadServerToolOutputWithRetry/);
+  assert.doesNotMatch(source, /downloadServerToolOutput\(/);
 });
 
 test("PR-0 (structure): the workspace guards the processing lifecycle", () => {
