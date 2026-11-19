@@ -11,6 +11,29 @@ import { Progress } from "@/components/ui/progress";
 import { StatusFeedback } from "@/components/ui/status-feedback";
 import { BrandMark } from "@/components/brand/brand-mark";
 
+/**
+ * Bounded polling for the async document-worker pipeline.
+ * Office timeout is 120s and OCR timeout is 300s (runtimeLimits); the client
+ * must wait beyond the server timeout plus queue wait, but never unbounded.
+ * OCR therefore polls up to 390s and Office up to 210s at 1s intervals.
+ */
+async function waitForServerJob(jobId: string, isOcr: boolean) {
+  const maxAttempts = isOcr ? 390 : 210;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const response = await fetch(`/api/jobs/status/${jobId}`, { cache: "no-store" });
+    const job = await response.json() as { status?: string; result?: { outputFileIds?: string[] }; errorCode?: string; error?: { message?: string } };
+    if (!response.ok) throw new Error(job.errorCode ?? "JOB_STATUS_FAILED");
+    if (job.status === "succeeded") {
+      const outputFileIds = job.result?.outputFileIds ?? [];
+      if (!outputFileIds.length) throw new Error("OUTPUT_MISSING: The worker finished without an output file.");
+      return outputFileIds;
+    }
+    if (["failed", "cancelled", "expired"].includes(job.status ?? "")) throw new Error(`${job.errorCode ?? "PROCESSING_FAILED"}: ${job.error?.message ?? "The worker could not process this document."}`);
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+  throw new Error("PROCESSING_TIMEOUT: The worker did not finish in time.");
+}
+
 export function ServerToolWorkspace({ tool, embedded: _embedded = false }: { tool: ToolDefinition; embedded?: boolean }) {
   void _embedded;
   const { locale } = useLocale();
@@ -22,7 +45,7 @@ export function ServerToolWorkspace({ tool, embedded: _embedded = false }: { too
   const [output, setOutput] = useState<{ url: string; name: string } | null>(null);
   const isOcr = tool.id === "ocr-pdf";
   const isArabic = locale === "ar";
-  const copy = isArabic ? { isolated: "معالجة خادمية معزولة", temporary: "يُعالَج الملف في مساحة مؤقتة ومعزولة، ثم يُحذف مباشرةً بعد إنشاء النتيجة.", upload: "حمّل مستنداً ممسوحاً", uploadOne: "حمّل مستنداً واحداً", drop: "اسحب ملفاً هنا أو اختره", limit: "ملف واحد، حتى 100 ميجابايت", recognition: "لغة التعرّف", searchable: "يضيف OCR طبقة نص قابلة للبحث مع الحفاظ على شكل الصفحات الأصلي.", process: "تتم المعالجة بأمان…", searchableAction: "اجعل المستند قابلاً للبحث", ready: "أصبح المستند المحوّل جاهزاً. لا يحتفظ DIP به.", waiting: "قد تستغرق معالجة الملفات الممسوحة الكبيرة عدة دقائق.", download: "تحميل", remove: "إزالة" } : { isolated: "Isolated server processing", temporary: "The file is processed in a temporary isolated workspace and removed after the result is created.", upload: "Upload a scanned document", uploadOne: "Upload one document", drop: "Drop a file here or browse", limit: "One file, up to 100 MB", recognition: "Recognition language", searchable: "OCR adds a searchable text layer while preserving the original page appearance.", process: "Processing securely…", searchableAction: "Make document searchable", ready: "Your converted document is ready. It is not retained by DIP.", waiting: "Processing may take a few minutes for large scanned files.", download: "Download", remove: "Remove" };
+  const copy = isArabic ? { isolated: "معالجة خادمية معزولة", temporary: "يُعالَج الملف في عامل مستندات معزول ويُخزَّن في تخزين كائني خاص وفق سياسة الاحتفاظ.", upload: "حمّل مستنداً ممسوحاً", uploadOne: "حمّل مستنداً واحداً", drop: "اسحب ملفاً هنا أو اختره", limit: "ملف واحد، حتى 100 ميجابايت", recognition: "لغة التعرّف", searchable: "يضيف OCR طبقة نص قابلة للبحث مع الحفاظ على شكل الصفحات الأصلي.", process: "تتم المعالجة بأمان…", searchableAction: "اجعل المستند قابلاً للبحث", ready: "أصبح المستند المحوّل جاهزاً. يُخزَّن وفق سياسة الاحتفاظ ويمكن تنزيله الآن.", waiting: "قد تستغرق معالجة الملفات الممسوحة الكبيرة عدة دقائق.", download: "تحميل", remove: "إزالة" } : { isolated: "Isolated server processing", temporary: "The file is processed by an isolated document worker and stored in private object storage under the retention policy.", upload: "Upload a scanned document", uploadOne: "Upload one document", drop: "Drop a file here or browse", limit: "One file, up to 100 MB", recognition: "Recognition language", searchable: "OCR adds a searchable text layer while preserving the original page appearance.", process: "Processing securely…", searchableAction: "Make document searchable", ready: "Your converted document is ready. It is stored under the retention policy and can be downloaded now.", waiting: "Processing may take a few minutes for large scanned files.", download: "Download", remove: "Remove" };
   useEffect(() => inputRef.current?.setAttribute("aria-label", isOcr ? copy.upload : copy.uploadOne), [copy.upload, copy.uploadOne, isOcr]);
   const accept = tool.id === "word-to-pdf" ? ".doc,.docx,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document" : tool.id === "excel-to-pdf" ? ".xls,.xlsx,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" : tool.id === "powerpoint-to-pdf" ? ".ppt,.pptx,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation" : isOcr ? ".pdf,.jpg,.jpeg,.png,application/pdf,image/jpeg,image/png" : ".pdf,application/pdf";
 
@@ -35,10 +58,15 @@ export function ServerToolWorkspace({ tool, embedded: _embedded = false }: { too
   const process = async () => {
     if (!file) return;
     window.dispatchEvent(new CustomEvent("dip:analytics", { detail: { name: "tool_started" } })); setStatus("processing"); setMessage(isArabic ? "يجري إرسال المستند إلى محرك المعالجة المعزول…" : "Securely sending the document to the isolated processing engine…");
-    const form = new FormData(); form.set("file", file); if (isOcr) form.set("language", language);
+    const form = new FormData(); form.append("files", file); form.set("options", JSON.stringify(isOcr ? { language } : {}));
     try {
-      const response = await fetch(`/api/tools/${tool.id}`, { method: "POST", body: form });
-      if (!response.ok) { const problem = await response.json().catch(() => null); throw new Error(`${problem?.code ?? "PROCESSING_FAILED"}: ${problem?.message ?? "The document could not be processed."}`); }
+      const queued = await fetch(`/api/jobs/${tool.id}`, { method: "POST", headers: { "Idempotency-Key": crypto.randomUUID(), "X-Correlation-Id": crypto.randomUUID() }, body: form });
+      const accepted = await queued.json() as { jobId?: string; code?: string; message?: string };
+      if (!queued.ok || !accepted.jobId) throw new Error(`${accepted.code ?? "QUEUE_FAILED"}: ${accepted.message ?? "The job could not be queued."}`);
+      setMessage(isArabic ? "تم إدراج المستند في قائمة الانتظار، وتجري المعالجة في عامل المستندات المعزول…" : "Document queued; the isolated document worker is processing it…");
+      const outputFileIds = await waitForServerJob(accepted.jobId, isOcr);
+      const response = await fetch(`/api/files/${outputFileIds[0]}`);
+      if (!response.ok) throw new Error("OUTPUT_DOWNLOAD_FAILED: The output file could not be downloaded.");
       const disposition = response.headers.get("content-disposition") ?? "";
       const name = disposition.match(/filename="?([^";]+)"?/)?.[1] ?? `${file.name}.output`;
       const url = URL.createObjectURL(await response.blob());
