@@ -1,6 +1,6 @@
 import { db } from "@/lib/db";
 import { getStorage, type ObjectStorage } from "@/lib/storage";
-import { retentionPolicy } from "./config";
+import { approvedRetentionDays, currentPlanCode } from "./plan";
 import { logger } from "@/lib/logging";
 import { recordMetric } from "@/lib/observability/metrics";
 import {
@@ -13,6 +13,7 @@ import {
   type RetentionScope,
   type RetentionFileSkipReason,
 } from "./safety";
+import type { PlanCode } from "@/lib/entitlements/policy";
 
 export type CleanupResult = {
   scanned: number;
@@ -39,6 +40,30 @@ const ACTIVE_JOB_STATUSES = ["QUEUED", "RUNNING", "RETRYING"] as const;
 export const EXPIRED_JOB_GRACE_MS = 86_400_000;
 
 type LoadedDocuments = Awaited<ReturnType<typeof loadDocuments>>;
+
+/**
+ * LogContext is a flat record, and nested per-plan maps must not be silently
+ * dropped. Flatten them into explicit scalars so a plan regression is visible
+ * in logs and dashboards.
+ */
+function summaryLogContext(summary: ReturnType<typeof buildRetentionSummary>) {
+  return {
+    policy_version: summary.policyVersion,
+    retention_days_free: summary.retentionDays.FREE,
+    retention_days_pro: summary.retentionDays.PRO,
+    scanned_documents: summary.scannedDocuments,
+    candidate_documents: summary.candidateDocuments,
+    candidate_documents_free: summary.candidateDocumentsByPlan.FREE,
+    candidate_documents_pro: summary.candidateDocumentsByPlan.PRO,
+    candidate_files: summary.candidateFiles,
+    retained_files: summary.retainedFiles,
+    protected_files: summary.protectedFiles,
+    scope_blocked_files: summary.scopeBlockedFiles,
+    missing_object_files: summary.missingObjectFiles,
+    already_deleted_files: summary.alreadyDeletedFiles,
+  };
+}
+
 
 function loadDocuments(now: Date) {
   return db.document.findMany({
@@ -84,6 +109,15 @@ export async function protectedFileIds(): Promise<Set<string>> {
   return protectedIds;
 }
 
+/**
+ * Approved per-plan input retention periods. Each document is evaluated against
+ * its own plan: a PRO document keeps 30 days and is never truncated to the
+ * shorter FREE period.
+ */
+export function retentionDaysByPlan(): Record<PlanCode, number> {
+  return approvedRetentionDays();
+}
+
 function planFromDocuments(options: {
   now: Date;
   scope: RetentionScope;
@@ -92,11 +126,12 @@ function planFromDocuments(options: {
 }): RetentionPlan {
   return planRetention({
     now: options.now,
-    retentionDays: Math.min(...Object.values(retentionPolicy.plans).map((plan) => plan.inputDays)),
+    retentionDays: retentionDaysByPlan(),
     scope: options.scope,
     protectedFileIds: options.protectedIds,
     documents: options.documents.map((document) => ({
       documentId: document.id,
+      plan: currentPlanCode(document.user.subscriptions),
       files: document.files.map((file) => ({
         fileId: file.id,
         createdAt: file.createdAt,
@@ -120,7 +155,7 @@ export async function planRetentionCleanup(input: { now?: Date; scope?: Retentio
   const scope = input.scope ?? configuredRetentionScope(process.env);
   const now = input.now ?? new Date();
   const { plan } = await buildPlan(now, scope);
-  logger.info("retention.scanned", buildRetentionSummary({ plan, expiredJobs: 0 }));
+  logger.info("retention.scanned", summaryLogContext(buildRetentionSummary({ plan, expiredJobs: 0 })));
   return plan;
 }
 
@@ -153,10 +188,11 @@ export async function runRetentionCleanup(input: RetentionCleanupInput = {}): Pr
   // The summary is aggregate-only and shared by both modes, so a dry-run and an
   // apply run report the same candidate counts.
   const summary = buildRetentionSummary({ plan, expiredJobs: 0 });
-  logger.info(dryRun ? "retention.dry_run" : "retention.apply_started", summary);
+  const logContext = summaryLogContext(summary);
+  logger.info(dryRun ? "retention.dry_run" : "retention.apply_started", logContext);
   if (dryRun) {
     recordMetric("cleanup_candidates_total", plan.candidateDocuments, "count", { mode: "dry_run" });
-    logger.info("retention.dry_run_completed", { ...summary, deleted: 0 });
+    logger.info("retention.dry_run_completed", { ...logContext, deleted: 0 });
     return result;
   }
 
@@ -204,6 +240,8 @@ export async function runRetentionCleanup(input: RetentionCleanupInput = {}): Pr
     failures: result.failures,
     blocked_objects: result.blockedObjects,
     policy_version: summary.policyVersion,
+    retention_days_free: summary.retentionDays.FREE,
+    retention_days_pro: summary.retentionDays.PRO,
   });
   return result;
 }

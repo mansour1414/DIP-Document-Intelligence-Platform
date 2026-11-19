@@ -1,4 +1,5 @@
 import { retentionPolicy } from "./config";
+import type { PlanCode } from "@/lib/entitlements/policy";
 
 /**
  * Small, dependency-free retention safety primitives.
@@ -72,11 +73,25 @@ export type RetentionFileFacts = {
   } | null;
 };
 
-export type RetentionDocumentFacts = { documentId: string; files: RetentionFileFacts[] };
+export type RetentionDocumentFacts = {
+  documentId: string;
+  /**
+   * Plan code governing this document's retention period. Resolved from the
+   * user's active subscription before planning; a missing or unknown
+   * subscription falls back to FREE.
+   */
+  plan?: PlanCode;
+  files: RetentionFileFacts[];
+};
 
 export type RetentionPlanInput = {
   now: Date;
-  retentionDays: number;
+  /**
+   * Per-plan retention periods. Each document is evaluated against its own
+   * plan, so a PRO document keeps the full PRO period instead of inheriting a
+   * shorter FREE period.
+   */
+  retentionDays: Record<PlanCode, number>;
   scope: RetentionScope;
   /** File ids referenced by QUEUED/RUNNING/RETRYING jobs or their params. */
   protectedFileIds: ReadonlySet<string>;
@@ -102,6 +117,10 @@ export type PlannedDeletion = {
 
 export type RetentionPlan = {
   deletions: PlannedDeletion[];
+  /** Retention period applied per plan code, included in the audit summary. */
+  retentionDays: Record<PlanCode, number>;
+  /** Candidate documents per plan, so a regression in one tier is visible. */
+  candidatesByPlan: Record<PlanCode, number>;
   /** Counts only. No titles, filenames or object keys are reported. */
   scannedDocuments: number;
   candidateDocuments: number;
@@ -136,10 +155,17 @@ const emptySkipReasons = (): Record<RetentionFileSkipReason, number> => ({
  * metadata update without issuing a second storage call.
  */
 export function planRetention(input: RetentionPlanInput): RetentionPlan {
-  if (!Number.isInteger(input.retentionDays) || input.retentionDays < 1) throw new Error("RETENTION_POLICY_INVALID");
-  const cutoff = input.now.getTime() - input.retentionDays * DAY_MS;
+  // Every plan period must be a positive integer; a bad period is a policy bug,
+  // not something to silently clamp.
+  for (const days of Object.values(input.retentionDays)) {
+    if (!Number.isInteger(days) || days < 1) throw new Error("RETENTION_POLICY_INVALID");
+  }
+  const nowMs = input.now.getTime();
+  const cutoffFor = (code: PlanCode) => nowMs - input.retentionDays[code] * DAY_MS;
   const plan: RetentionPlan = {
     deletions: [],
+    retentionDays: { ...input.retentionDays },
+    candidatesByPlan: { FREE: 0, PRO: 0 },
     scannedDocuments: input.documents.length,
     candidateDocuments: 0,
     candidateFiles: 0,
@@ -157,6 +183,11 @@ export function planRetention(input: RetentionPlanInput): RetentionPlan {
       plan.skippedDocuments += 1;
       continue;
     }
+
+    // The document's own plan decides its cutoff. Defaulting to FREE keeps the
+    // historical behaviour for documents whose subscription cannot be resolved.
+    const planCode: PlanCode = document.plan ?? "FREE";
+    const cutoff = cutoffFor(planCode);
 
     const objects: PlannedDeletion["objects"] = [];
     let alreadyDeleted = 0;
@@ -188,6 +219,7 @@ export function planRetention(input: RetentionPlanInput): RetentionPlan {
     }
 
     plan.candidateDocuments += 1;
+    plan.candidatesByPlan[planCode] += 1;
     plan.candidateFiles += document.files.length;
     plan.alreadyDeletedFiles += alreadyDeleted;
     plan.deletions.push({ documentId: document.documentId, objects, alreadyDeleted, fileCount: document.files.length });
@@ -199,8 +231,11 @@ export function planRetention(input: RetentionPlanInput): RetentionPlan {
 /** Aggregate, content-free summary. Safe to log and safe to return to a scheduler. */
 export type RetentionSummary = {
   policyVersion: string;
+  /** Periods the sweep actually applied, per plan. */
+  retentionDays: Record<PlanCode, number>;
   scannedDocuments: number;
   candidateDocuments: number;
+  candidateDocumentsByPlan: Record<PlanCode, number>;
   candidateFiles: number;
   alreadyDeletedFiles: number;
   retainedFiles: number;
@@ -214,8 +249,10 @@ export type RetentionSummary = {
 export function buildRetentionSummary(input: { plan: RetentionPlan; expiredJobs: number }): RetentionSummary {
   return {
     policyVersion: retentionPolicy.version,
+    retentionDays: input.plan.retentionDays,
     scannedDocuments: input.plan.scannedDocuments,
     candidateDocuments: input.plan.candidateDocuments,
+    candidateDocumentsByPlan: input.plan.candidatesByPlan,
     candidateFiles: input.plan.candidateFiles,
     alreadyDeletedFiles: input.plan.alreadyDeletedFiles,
     retainedFiles: input.plan.retainedFiles,

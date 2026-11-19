@@ -104,13 +104,54 @@ integration("orchestrator to DB, Redis, production worker, S3, Office and biling
 
 integration("retention scheduler deletes expired storage, preserves running inputs and retries idempotently", { timeout: 30_000 }, async () => {
   const { db } = await import("../src/lib/db/index"); const { runRetentionCleanup } = await import("../src/lib/retention/service"); const userId = randomUUID(); const old = new Date("2020-01-01T00:00:00Z");
-  try { await db.user.create({ data: { id: userId, email: `retention-${userId}@example.invalid` } });
-  const expired = await db.document.create({ data: { userId, title: "expired", createdAt: old, files: { create: { originalName: "expired.pdf", mimeType: "application/pdf", size: 1, storageKey: `expired/${userId}`, createdAt: old, storageObject: { create: { provider: "s3", bucket: "test", objectKey: `expired/${userId}`, size: 1, createdAt: old } } } } }, include: { files: true } });
-  const active = await db.document.create({ data: { userId, title: "protected", createdAt: old, files: { create: { originalName: "active.pdf", mimeType: "application/pdf", size: 1, storageKey: `active/${userId}`, createdAt: old, storageObject: { create: { provider: "s3", bucket: "test", objectKey: `active/${userId}`, size: 1, createdAt: old } } } } }, include: { files: true } });
+  // Fixtures live in the bucket the suite actually configures (CI: dip-test), and
+  // the scope is injected explicitly. Scope validation stays fully enforced.
+  const testBucket = process.env.STORAGE_BUCKET ?? "dip-test";
+  const scope = { provider: "s3", bucket: testBucket };
+  const freePlan = await db.planCatalog.findUniqueOrThrow({ where: { code: "FREE" }, select: { id: true } });
+  try { await db.user.create({ data: { id: userId, email: `retention-${userId}@example.invalid`, subscriptions: { create: { planId: freePlan.id, status: "ACTIVE" } } } });
+  const expired = await db.document.create({ data: { userId, title: "expired", createdAt: old, files: { create: { originalName: "expired.pdf", mimeType: "application/pdf", size: 1, storageKey: `expired/${userId}`, createdAt: old, storageObject: { create: { provider: "s3", bucket: testBucket, objectKey: `expired/${userId}`, size: 1, createdAt: old } } } } }, include: { files: true } });
+  const active = await db.document.create({ data: { userId, title: "protected", createdAt: old, files: { create: { originalName: "active.pdf", mimeType: "application/pdf", size: 1, storageKey: `active/${userId}`, createdAt: old, storageObject: { create: { provider: "s3", bucket: testBucket, objectKey: `active/${userId}`, size: 1, createdAt: old } } } } }, include: { files: true } });
   await db.job.create({ data: { toolId: "merge-pdf", idempotencyKey: `protected-${userId}`, requesterId: userId, inputFileId: active.files[0].id, status: "RUNNING" } });
   const deleted: string[] = []; const fakeStorage = { createUploadKey: () => "", put: async () => ({ key: "", bucket: "", contentType: "", size: 0 }), get: async () => new Uint8Array(), head: async () => ({ key: "", bucket: "", contentType: "", size: 0 }), exists: async () => true, deleteObject: async (key: string) => { deleted.push(key); }, close: async () => undefined };
-  const first = await runRetentionCleanup({ now: new Date("2026-09-10T00:00:00Z"), dryRun: false, storage: fakeStorage }); assert.equal(first.deletedDocuments, 1); assert.deepEqual(deleted, [`expired/${userId}`]);
+  const first = await runRetentionCleanup({ now: new Date("2026-09-10T00:00:00Z"), dryRun: false, storage: fakeStorage, scope }); assert.equal(first.deletedDocuments, 1); assert.deepEqual(deleted, [`expired/${userId}`]);
   assert.equal((await db.document.findUniqueOrThrow({ where: { id: expired.id } })).status, "DELETED"); assert.equal((await db.document.findUniqueOrThrow({ where: { id: active.id } })).status, "ACTIVE");
-  const second = await runRetentionCleanup({ now: new Date("2026-09-10T00:00:00Z"), dryRun: false, storage: fakeStorage }); assert.equal(second.deletedDocuments, 0); assert.deepEqual(deleted, [`expired/${userId}`]);
+  const second = await runRetentionCleanup({ now: new Date("2026-09-10T00:00:00Z"), dryRun: false, storage: fakeStorage, scope }); assert.equal(second.deletedDocuments, 0); assert.deepEqual(deleted, [`expired/${userId}`]);
   } finally { await db.$disconnect(); }
+});
+
+integration("retention scheduler keeps a PRO document inside its 30-day period that FREE would delete", { timeout: 30_000 }, async () => {
+  const { db } = await import("../src/lib/db/index"); const { runRetentionCleanup } = await import("../src/lib/retention/service");
+  const testBucket = process.env.STORAGE_BUCKET ?? "dip-test";
+  const scope = { provider: "s3", bucket: testBucket };
+  const freeUserId = randomUUID(); const proUserId = randomUUID();
+  const twentyDaysOld = new Date(Date.now() - 20 * 86_400_000);
+  const expiredKeys: string[] = [];
+  const fakeStorage = { createUploadKey: () => "", put: async () => ({ key: "", bucket: "", contentType: "", size: 0 }), get: async () => new Uint8Array(), head: async () => ({ key: "", bucket: "", contentType: "", size: 0 }), exists: async () => true, deleteObject: async (key: string) => { expiredKeys.push(key); }, close: async () => undefined };
+  const plans = await db.planCatalog.findMany({ where: { code: { in: ["FREE", "PRO"] } }, select: { id: true, code: true } });
+  const planId = (code: string) => plans.find((plan) => plan.code === code)!.id;
+  try {
+    for (const [id, code] of [[freeUserId, "FREE"], [proUserId, "PRO"]] as const) {
+      await db.user.create({ data: { id, email: `retention-plan-${id}@example.invalid`, subscriptions: { create: { planId: planId(code), status: "ACTIVE" } } } });
+    }
+    const seed = (id: string) => db.document.create({ data: { userId: id, title: "aged-20d", createdAt: twentyDaysOld, files: { create: { originalName: "aged.pdf", mimeType: "application/pdf", size: 1, storageKey: `aged/${id}`, createdAt: twentyDaysOld, storageObject: { create: { provider: "s3", bucket: testBucket, objectKey: `aged/${id}`, size: 1, createdAt: twentyDaysOld } } } } }, include: { files: true } });
+    const freeDocument = await seed(freeUserId); const proDocument = await seed(proUserId);
+
+    // Dry-run must report the same plan-aware decision without writing.
+    const preview = await runRetentionCleanup({ dryRun: true, storage: fakeStorage, scope });
+    assert.equal(preview.dryRun, true);
+    assert.equal(preview.candidateDocuments, 1, "only the FREE document is a candidate");
+    assert.equal(expiredKeys.length, 0, "dry-run must not touch storage");
+    assert.equal((await db.document.findUniqueOrThrow({ where: { id: freeDocument.id } })).status, "ACTIVE");
+    assert.equal((await db.document.findUniqueOrThrow({ where: { id: proDocument.id } })).status, "ACTIVE");
+
+    // Apply: 20 days is past FREE (7d) but inside PRO (30d).
+    await runRetentionCleanup({ dryRun: false, storage: fakeStorage, scope });
+    assert.equal(expiredKeys.includes(`aged/${freeUserId}`), true, "FREE document past 7 days is deleted");
+    assert.equal(expiredKeys.includes(`aged/${proUserId}`), false, "PRO document inside 30 days is retained");
+    assert.equal((await db.document.findUniqueOrThrow({ where: { id: freeDocument.id } })).status, "DELETED");
+    assert.equal((await db.document.findUniqueOrThrow({ where: { id: proDocument.id } })).status, "ACTIVE");
+  } finally {
+    await db.$disconnect();
+  }
 });
