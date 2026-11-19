@@ -83,6 +83,8 @@ export type QueueEvidenceProvider = {
   read(jobIds: readonly string[]): Promise<QueueReadResult[]>;
   /** Releases any connection this provider owns. Must be idempotent. */
   close(): Promise<void>;
+  /** Optional aggregate counters, safe to log (no hosts, no credentials). */
+  diagnostics?(): { queues_expected: number; queues_read: number; failed_reads: number };
 };
 
 /**
@@ -101,19 +103,25 @@ export function redisEvidenceProvider(): QueueEvidenceProvider {
         return [];
       },
       close: handle.close,
+      diagnostics: () => ({ queues_expected: QUEUE_NAMES.length, queues_read: 0, failed_reads: 0 }),
     };
   }
   const connection = handle.connection;
   const nowMs = () => Date.now();
+  // Diagnostic only: distinguishes "Redis unreachable" from "every job is
+  // genuinely tracked". Logged as a count, never as a connection string.
+  let lastReadFailures = 0;
   const lookups = QUEUE_NAMES.map((queueName) => createQueueActivityLookup({ redis: connection, queueName, now: nowMs }));
   return {
     async read(jobIds) {
       // Sequential reads keep load on the worker's Redis predictable.
       const results: QueueReadResult[] = [];
       for (const lookup of lookups) results.push(await lookup.read(jobIds));
+      lastReadFailures = results.filter((result) => !result.ok).length;
       return results;
     },
     close: handle.close,
+    diagnostics: () => ({ queues_expected: QUEUE_NAMES.length, queues_read: lookups.length, failed_reads: lastReadFailures }),
   };
 }
 
@@ -138,9 +146,9 @@ async function withQueueEvidence(
     // A provider-level failure is UNKNOWN for the whole batch, never absence.
     return jobs.map((job) => ({ ...job, queue: unknownEvidence("error") }));
   }
-  // Reading zero queues proves nothing about the job, so it cannot be absence.
-  if (reads.length === 0) return jobs.map((job) => ({ ...job, queue: unknownEvidence("error") }));
-  return jobs.map((job) => ({ ...job, queue: resolveEvidence(job.id, reads) }));
+  // Absence requires a complete read of EVERY configured queue. A short result
+  // set means a queue went unread, and an unread queue might have held the job.
+  return jobs.map((job) => ({ ...job, queue: resolveEvidence(job.id, reads, QUEUE_NAMES.length) }));
 }
 
 export type ExpireStalledJobsOptions = {
@@ -157,7 +165,11 @@ export type ExpireStalledJobsOptions = {
 
 export type ExpireStalledJobsResult = { expired: number; plan: JobExpiryPlan };
 
-function expiryLogContext(plan: JobExpiryPlan, mode: "apply" | "plan") {
+function expiryLogContext(
+  plan: JobExpiryPlan,
+  mode: "apply" | "plan",
+  diagnostics?: { queues_expected: number; queues_read: number; failed_reads: number },
+) {
   return {
     scanned: plan.counts.scanned,
     expired: plan.counts.expired,
@@ -170,6 +182,9 @@ function expiryLogContext(plan: JobExpiryPlan, mode: "apply" | "plan") {
     queue_unknown: plan.counts.queueUnknown,
     abandoned_grace_ms: plan.policy.abandonedGraceMs,
     running_silence_ms: plan.policy.runningSilenceMs,
+    // Diagnostics: a queue that could not be read shows up here rather than as
+    // a silent "nothing expired". Counts only — never hosts or credentials.
+    ...(diagnostics ?? {}),
     mode,
   };
 }
@@ -189,7 +204,7 @@ export async function planStalledJobExpiry(options: ExpireStalledJobsOptions = {
     const candidates = await loadCandidates(now);
     const facts = await withQueueEvidence(candidates, provider, options.queueUnavailable ?? provider.unavailable ?? null);
     const plan = planJobExpiry(facts, now);
-    logger.info("jobs.expiry_planned", expiryLogContext(plan, mode));
+    logger.info("jobs.expiry_planned", expiryLogContext(plan, mode, provider.diagnostics?.()));
     return { expired: 0, plan };
   } finally {
     // Always release the connection: a one-shot scheduler process must not leak

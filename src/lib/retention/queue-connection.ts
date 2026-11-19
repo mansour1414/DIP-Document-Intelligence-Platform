@@ -21,6 +21,24 @@ import { logger } from "@/lib/logging";
  * This module therefore refuses to connect at all unless `REDIS_URL` is
  * explicitly configured, uses bounded timeouts and a finite retry strategy, and
  * is always closable so a one-shot process leaks nothing.
+ *
+ * ## Why `lazyConnect` and `enableOfflineQueue: false` are NOT used
+ *
+ * Together they are a trap. `lazyConnect` leaves the client in status `wait`
+ * with no stream, and ioredis rejects *every* command immediately when the
+ * offline queue is disabled and the stream is not writable:
+ *
+ *     Stream isn't writeable and enableOfflineQueue options is false
+ *
+ * Every read would then fail, every job would be `unknown`, and the sweep would
+ * silently never expire anything — a fail-safe but completely inert scheduler.
+ * (This was a real bug in an earlier revision of this PR.)
+ *
+ * Instead the connection starts eagerly like any other ioredis client, so
+ * commands issued before `ready` are queued (the offline queue is left enabled)
+ * and then flushed once connected; a connection that never becomes ready is
+ * bounded by `connectTimeout` plus `maxRetriesPerRequest: 1` and surfaces as a
+ * rejected command, which the caller maps to `unknown`.
  */
 
 export type RetentionRedisHandle = {
@@ -60,10 +78,8 @@ export function openRetentionRedis(): RetentionRedisHandle {
     connectTimeout: CONNECT_TIMEOUT_MS,
     commandTimeout: COMMAND_TIMEOUT_MS,
     maxRetriesPerRequest: 1,
-    enableOfflineQueue: false,
     // A one-shot process gets one attempt; no open-ended reconnect loop.
     retryStrategy: () => null,
-    lazyConnect: true,
     // Keep the event loop free even if teardown is delayed.
     autoResubscribe: false,
     autoResendUnfulfilledCommands: false,

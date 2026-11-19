@@ -108,23 +108,47 @@ export function createQueueActivityLookup(options: {
 }
 
 /**
- * Combine one queue's presence evidence with the *other* queues' completeness.
+ * Combine every queue's evidence into one verdict for a job.
  *
- * Order of precedence: presence wins outright (a queue that knows the job
- * proves it is tracked); then incompleteness; only then absence.
+ * Order of precedence:
+ *   1. **Presence wins outright.** A queue that knows the job proves it is
+ *      tracked, regardless of what the other queues returned.
+ *   2. **Completeness is then required.** Absence may only be concluded when
+ *      every expected queue produced a successful result. A missing result is
+ *      not an empty result: if the caller expected two queues and got one, the
+ *      unread queue might have held the job.
+ *   3. Only then is the job `absent`.
+ *
+ * `expectedReads` exists because "I received fewer results than I asked for" is
+ * otherwise indistinguishable from "I asked for one queue". Defaulting it to
+ * `reads.length` would silently restore the bug for any caller that forgets it,
+ * so the scheduler always passes the expected count explicitly.
  */
 export function resolveEvidence(
   jobId: string,
   reads: readonly QueueReadResult[],
+  expectedReads: number = reads.length,
 ): QueueEvidence {
   for (const read of reads) {
     const presence = read.present.get(jobId);
     if (presence) return { state: "present", ...presence };
   }
-  if (reads.length === 0 || reads.some((read) => !read.ok)) {
+  if (!isCompleteEvidence(reads, expectedReads)) {
     return { state: "unknown", reason: "error" };
   }
   return { state: "absent" };
+}
+
+/**
+ * True only when every expected queue produced a fully successful result.
+ *
+ * A short result set, a zero-length set, or any `ok: false` all mean the batch
+ * is incomplete, and incomplete evidence can never justify absence.
+ */
+export function isCompleteEvidence(reads: readonly QueueReadResult[], expectedReads: number): boolean {
+  if (expectedReads <= 0) return false;
+  if (reads.length < expectedReads) return false;
+  return reads.every((read) => read.ok);
 }
 
 /** Evidence for a sweep that could not reach Redis at all. */

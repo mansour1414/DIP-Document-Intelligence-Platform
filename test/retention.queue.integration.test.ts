@@ -148,15 +148,26 @@ test("a delayed retry is reported present, so it is never expired mid-backoff", 
     assert.equal(state, "delayed", "fixture must reach the delayed retry state");
 
     // The fixture must be genuinely *beyond* the grace window, or the test
-    // proves nothing: a freshly added job has `timestamp = now`, which alone
-    // satisfies the grace check and would mask a missing presence rule.
+    // proves nothing. `lastActivityAt` takes the MAX of every timestamp, so
+    // backdating a single field is not enough — an earlier revision of this
+    // test backdated `timestamp` only, while `finishedOn` (written by
+    // `moveToFinished` at the moment the attempt failed) stayed at "now" and
+    // kept the job inside grace.
     //
-    // Age the stored evidence the way a real long-delayed retry would look: the
-    // hash timestamp moves back while the delayed ZSET entry stays put, so the
-    // job is still genuinely tracked by BullMQ but every timestamp is stale.
+    // A failed attempt writes both `processedOn` (attempt start) and
+    // `finishedOn` (attempt end), so both must move back along with `timestamp`.
+    // The delayed ZSET entry itself is untouched, so BullMQ still genuinely
+    // tracks the retry: the job is present *and* every timestamp is stale.
     const graceMs = abandonedGraceMs();
     const agedMs = Date.now() - graceMs - 6 * HOUR;
-    await connection.hset(`bull:${queueName}:${jobId}`, "timestamp", String(agedMs));
+    const hash = `bull:${queueName}:${jobId}`;
+    await connection.hset(hash, "timestamp", String(agedMs), "processedOn", String(agedMs), "finishedOn", String(agedMs));
+    // Verify against Redis itself, not against our own reader: a fixture that
+    // silently fails to age a field would make this whole test vacuous.
+    const stored = await connection.hgetall(hash);
+    assert.equal(Number(stored.timestamp), agedMs);
+    assert.equal(Number(stored.processedOn), agedMs);
+    assert.equal(Number(stored.finishedOn), agedMs);
 
     const observedAt = new Date();
     const read = await lookup.read([jobId]);

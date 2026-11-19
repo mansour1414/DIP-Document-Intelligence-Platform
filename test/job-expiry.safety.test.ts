@@ -10,7 +10,7 @@ import {
   type JobLifecycleState,
   type QueueEvidence,
 } from "../src/lib/retention/job-expiry";
-import { resolveEvidence, type QueueReadResult } from "../src/lib/retention/queue-activity";
+import { isCompleteEvidence, resolveEvidence, type QueueReadResult } from "../src/lib/retention/queue-activity";
 
 const now = new Date("2026-09-10T12:00:00Z");
 const MINUTE = 60_000;
@@ -320,12 +320,68 @@ test("the scheduler closes the Redis connection on every path", async () => {
 
 test("a provider that reads zero queues yields unknown, never absent", async () => {
   const source = await readFile(new URL("../scripts/cleanup-expired-jobs.ts", import.meta.url), "utf8");
-  // "No queues were read" is not evidence of absence.
-  assert.match(source, /if \(reads\.length === 0\) return jobs\.map\(\(job\) => \(\{ \.\.\.job, queue: unknownEvidence\("error"\) \}\)\);/);
+  // "No queues were read" is not evidence of absence. This is now enforced
+  // inside resolveEvidence via the explicit expected-queue count, which also
+  // covers the subtler case of a short (partial) result set.
+  assert.match(source, /resolveEvidence\(job\.id, reads, QUEUE_NAMES\.length\)/);
+  assert.equal(isCompleteEvidence([], 2), false);
 });
 
 test("an unconfigured queue provider reports unknown, never absent", async () => {
   const source = await readFile(new URL("../scripts/cleanup-expired-jobs.ts", import.meta.url), "utf8");
   assert.match(source, /unavailable: "not_configured"/);
   assert.match(source, /options\.queueUnavailable \?\? provider\.unavailable/);
+});
+
+// ---------------------------------------------------------------------------
+// 3. Incomplete multi-queue evidence must never conclude ABSENT
+// ---------------------------------------------------------------------------
+
+test("a short result set from a two-queue read is unknown, not absent", () => {
+  const oneOfTwo: QueueReadResult[] = [{ present: new Map(), ok: true }];
+  // Asked for two queues, received one: the unread queue might have held the job.
+  assert.deepEqual(oneOfTwo.length < 2, true);
+  assert.equal(isCompleteEvidence(oneOfTwo, 2), false);
+  assert.deepEqual(resolveEvidence("missing", oneOfTwo, 2), { state: "unknown", reason: "error" });
+});
+
+test("both queues read successfully is the only path to absence", () => {
+  const both: QueueReadResult[] = [
+    { present: new Map(), ok: true },
+    { present: new Map(), ok: true },
+  ];
+  assert.equal(isCompleteEvidence(both, 2), true);
+  assert.deepEqual(resolveEvidence("missing", both, 2), { state: "absent" });
+});
+
+test("any single failed queue poisons absence for the whole batch", () => {
+  for (const failing of [0, 1]) {
+    const reads: QueueReadResult[] = [
+      { present: new Map(), ok: failing !== 0 },
+      { present: new Map(), ok: failing !== 1 },
+    ];
+    assert.equal(isCompleteEvidence(reads, 2), false);
+    assert.deepEqual(resolveEvidence("missing", reads, 2), { state: "unknown", reason: "error" });
+  }
+});
+
+test("presence still wins when the other queue failed to read", () => {
+  const reads: QueueReadResult[] = [
+    { present: new Map([["known", { lastActivityMs: now.getTime(), leased: true, activelyProcessing: true }]]), ok: true },
+    { present: new Map(), ok: false },
+  ];
+  const evidence = resolveEvidence("known", reads, 2);
+  assert.equal(evidence.state, "present", "positive evidence must outrank an incomplete sibling read");
+  assert.equal(evidence.state === "present" && evidence.leased, true);
+});
+
+test("zero expected queues can never justify absence", () => {
+  assert.equal(isCompleteEvidence([], 0), false);
+  assert.deepEqual(resolveEvidence("missing", [], 0), { state: "unknown", reason: "error" });
+});
+
+test("the scheduler requires a complete read of every configured queue", async () => {
+  const source = await readFile(new URL("../scripts/cleanup-expired-jobs.ts", import.meta.url), "utf8");
+  assert.match(source, /resolveEvidence\(job\.id, reads, QUEUE_NAMES\.length\)/, "the expected queue count must be passed explicitly");
+  assert.equal(/if \(reads\.length === 0\) return/.test(source), false, "length-zero alone was the old, insufficient check");
 });
