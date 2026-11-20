@@ -458,6 +458,106 @@ test("zero candidates with unreachable Redis is UNAVAILABLE, never healthy", asy
   assert.deepEqual(state.writes, []);
 });
 
+test("a read that throws after a successful PING is INCOMPLETE, never NOT_CHECKED", async () => {
+  const { repository, state } = fakeRepository([]);
+  const throwing = {
+    async read() {
+      throw new Error("READONLY You can't write against a read only replica.");
+    },
+    async probe() {
+      return "VERIFIED" as const;
+    },
+    async close() {},
+  };
+  const report = await runRetentionDryRun({
+    now,
+    env: dryRunEnv,
+    scope,
+    repository,
+    loadCandidates: async () => [staleCandidate],
+    evidence: throwing,
+  });
+
+  // The PING succeeded, so connectivity is real…
+  assert.equal(report.redis.connectivity, "VERIFIED");
+  // …and the queue read was attempted and did not answer: that is a broken read,
+  // not an untried step. Reporting NOT_CHECKED here would hide a Redis outage.
+  assert.notEqual(report.redis.queue_evidence, "NOT_CHECKED", "a thrown read is never an untried read");
+  assert.equal(report.redis.queue_evidence, "INCOMPLETE");
+  assert.equal(report.redis.reads_attempted, 2, "a read that threw was still attempted");
+  assert.equal(report.redis.queues_read, 0);
+  assert.equal(report.redis.failed_reads, 2);
+
+  // Fail-closed: every job is unknown, so nothing may expire.
+  assert.equal(report.queue.queue_unknown, 1);
+  assert.equal(report.queue.planned_expiry, 0, "incomplete evidence must never authorise expiry");
+  assert.equal(report.mutations.metadata_mutations, 0);
+  assert.equal(report.mutations.storage_operations, 0);
+  assert.equal(report.zero_mutations, true);
+  assert.deepEqual(state.writes, [], "no PostgreSQL write may be attempted");
+});
+
+test("a read that throws while the connection is also gone is UNAVAILABLE", async () => {
+  const { repository } = fakeRepository([]);
+  const dead = {
+    async read() {
+      throw new Error("connect ECONNREFUSED");
+    },
+    async probe() {
+      return "UNAVAILABLE" as const;
+    },
+    async close() {},
+  };
+  const report = await runRetentionDryRun({
+    now,
+    env: dryRunEnv,
+    scope,
+    repository,
+    loadCandidates: async () => [staleCandidate],
+    evidence: dead,
+  });
+  assert.equal(report.redis.connectivity, "UNAVAILABLE");
+  assert.equal(report.redis.queue_evidence, "UNAVAILABLE");
+  assert.equal(report.redis.reads_attempted, 2);
+  assert.equal(report.queue.queue_unknown, 1);
+  assert.equal(report.queue.planned_expiry, 0);
+  assert.equal(report.zero_mutations, true);
+});
+
+test("an empty result set despite existing candidates is INCOMPLETE, never NOT_CHECKED", async () => {
+  const { repository, state } = fakeRepository([]);
+  const emptyRead = {
+    async read() {
+      // A provider that answers with nothing at all: indistinguishable from a
+      // queue that could not be read, and it must not be reported as untried.
+      return [];
+    },
+    async probe() {
+      return "VERIFIED" as const;
+    },
+    async close() {},
+  };
+  const report = await runRetentionDryRun({
+    now,
+    env: dryRunEnv,
+    scope,
+    repository,
+    loadCandidates: async () => [staleCandidate],
+    evidence: emptyRead,
+  });
+
+  assert.equal(report.redis.connectivity, "VERIFIED");
+  assert.notEqual(report.redis.queue_evidence, "NOT_CHECKED", "an attempted read is never NOT_CHECKED");
+  assert.equal(report.redis.queue_evidence, "INCOMPLETE");
+  assert.equal(report.redis.reads_attempted, 2);
+  assert.equal(report.redis.queues_read, 0);
+  assert.equal(report.redis.failed_reads, 2);
+  assert.equal(report.queue.queue_unknown, 1);
+  assert.equal(report.queue.planned_expiry, 0);
+  assert.equal(report.zero_mutations, true);
+  assert.deepEqual(state.writes, []);
+});
+
 test("a provider without a probe reports connectivity as NOT_CHECKED, never VERIFIED", async () => {
   const { repository } = fakeRepository([]);
   const noProbe = {

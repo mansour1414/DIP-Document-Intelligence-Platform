@@ -178,30 +178,53 @@ export function redisEvidenceProvider(): QueueEvidenceProvider {
  * Presence anywhere wins; otherwise any incomplete read poisons the batch to
  * `unknown`. Only a fully successful, fully empty read set may conclude absence.
  */
+type QueueEvidenceOutcome = {
+  facts: JobExpiryFacts[];
+  /** Results the provider returned. `null` only when no read was required. */
+  reads: QueueReadResult[] | null;
+  /**
+   * Whether a read was actually started.
+   *
+   * This cannot be inferred from `reads`: a read that threw, and a read that
+   * returned nothing, both leave an empty result set. Conflating either with
+   * "no read was needed" would let a failed read be reported as `NOT_CHECKED`,
+   * i.e. as an untried step rather than as a broken one.
+   */
+  readAttempted: boolean;
+};
+
 async function withQueueEvidence(
   jobs: CandidateRow[],
   provider: QueueEvidenceProvider,
   unavailableReason: Extract<QueueEvidence, { state: "unknown" }>["reason"] | null = null,
-): Promise<{ facts: JobExpiryFacts[]; reads: QueueReadResult[] | null }> {
-  // `null` — not `[]` — says "no read was attempted". Reporting an empty array
-  // here used to be indistinguishable from "every queue answered", which is how
-  // constructed readers came to be counted as completed reads.
-  if (jobs.length === 0) return { facts: [], reads: null };
+): Promise<QueueEvidenceOutcome> {
+  // Nothing to look up: this is the only path that may report NOT_CHECKED.
+  if (jobs.length === 0) return { facts: [], reads: null, readAttempted: false };
   if (unavailableReason) {
-    return { facts: jobs.map((job) => ({ ...job, queue: unknownEvidence(unavailableReason) })), reads: null };
+    return {
+      facts: jobs.map((job) => ({ ...job, queue: unknownEvidence(unavailableReason) })),
+      reads: null,
+      readAttempted: false,
+    };
   }
 
+  const jobIds = jobs.map((job) => job.id);
   let reads: QueueReadResult[];
   try {
-    reads = await provider.read(jobs.map((job) => job.id));
+    reads = await provider.read(jobIds);
   } catch {
-    // A provider-level failure is UNKNOWN for the whole batch, never absence.
-    return { facts: jobs.map((job) => ({ ...job, queue: unknownEvidence("error") })), reads: null };
+    // A provider-level failure is UNKNOWN for the whole batch, never absence,
+    // and the read counts as attempted — it did not answer.
+    return {
+      facts: jobs.map((job) => ({ ...job, queue: unknownEvidence("error") })),
+      reads: [],
+      readAttempted: true,
+    };
   }
   // Absence requires a complete read of EVERY configured queue. A short result
   // set means a queue went unread, and an unread queue might have held the job.
   const facts = jobs.map((job) => ({ ...job, queue: resolveEvidence(job.id, reads, QUEUE_NAMES.length) }));
-  return { facts, reads };
+  return { facts, reads, readAttempted: true };
 }
 
 /**
@@ -215,16 +238,21 @@ async function withQueueEvidence(
 export function queueEvidenceStatus(input: {
   unavailable: string | null;
   connectivity: QueueConnectivity;
-  readsAttempted: number;
+  /** True only when the backend was actually asked to read the queues. */
+  readAttempted: boolean;
   queuesRead: number;
   queuesExpected: number;
   failedReads: number;
 }): QueueEvidenceStatus {
   if (input.unavailable !== null) return "UNAVAILABLE";
+
+  // NOT_CHECKED is reserved for "no read was required". It is never a substitute
+  // for a read that was attempted and did not answer — that is INCOMPLETE, or
+  // UNAVAILABLE when the connection itself is gone.
+  if (!input.readAttempted) return input.connectivity === "UNAVAILABLE" ? "UNAVAILABLE" : "NOT_CHECKED";
+
+  if (input.failedReads === 0 && input.queuesRead >= input.queuesExpected) return "VERIFIED";
   if (input.connectivity === "UNAVAILABLE") return "UNAVAILABLE";
-  if (input.failedReads > 0) return "INCOMPLETE";
-  if (input.readsAttempted === 0) return "NOT_CHECKED";
-  if (input.queuesRead >= input.queuesExpected) return "VERIFIED";
   return "INCOMPLETE";
 }
 
@@ -244,7 +272,11 @@ export type QueueDiagnostics = {
   /** Completeness of this run's queue evidence. Only `VERIFIED` means "fully read". */
   queue_evidence: QueueEvidenceStatus;
   queues_expected: number;
-  /** Queue reads that were actually started. Zero when there were no candidates. */
+  /**
+   * Queues the run asked the backend for. Zero only when no read was required
+   * (no job candidates, or queue evidence is unavailable by configuration).
+   * A read that threw still counts here — it was attempted.
+   */
   reads_attempted: number;
   /** Queue reads that COMPLETED successfully — never "readers constructed". */
   queues_read: number;
@@ -319,13 +351,14 @@ export async function planStalledJobExpiry(options: ExpireStalledJobsOptions = {
           ? await provider.probe().catch(() => "UNAVAILABLE" as const)
           : "NOT_CHECKED";
 
-    const { facts, reads } = await withQueueEvidence(candidates, provider, unavailable);
+    const { facts, reads, readAttempted } = await withQueueEvidence(candidates, provider, unavailable);
     const plan = planJobExpiry(facts, now);
 
-    // Counters are derived from the reads that actually happened. `reads` is
-    // null when none were attempted, which is reported as such.
-    const readsAttempted = reads?.length ?? 0;
-    const queuesRead = reads?.filter((result) => result.ok).length ?? 0;
+    // Counters are derived from the reads that actually happened. A started read
+    // counts as an attempt even when it threw or returned nothing, so a broken
+    // queue shows up as a failure rather than as an untried step.
+    const readsAttempted = readAttempted ? QUEUE_NAMES.length : 0;
+    const queuesRead = Math.min(reads?.filter((result) => result.ok).length ?? 0, QUEUE_NAMES.length);
     const failedReads = readsAttempted - queuesRead;
 
     const queue: QueueDiagnostics = {
@@ -335,7 +368,7 @@ export async function planStalledJobExpiry(options: ExpireStalledJobsOptions = {
       queue_evidence: queueEvidenceStatus({
         unavailable,
         connectivity,
-        readsAttempted,
+        readAttempted,
         queuesRead,
         queuesExpected: QUEUE_NAMES.length,
         failedReads,

@@ -165,8 +165,11 @@ The report separates *reachability* from *completeness*, because they answer dif
 | `NOT_CHECKED` | There were zero job candidates, so no queue read was needed — reachability may still be `VERIFIED`. |
 | `UNAVAILABLE` | No usable connection: unconfigured, or the probe failed. |
 
-`queues_read` counts reads that **completed**, never readers that were constructed. During a quiet window
-expect `queue_evidence: "NOT_CHECKED"` with `reads_attempted: 0`; that is honest, not a success.
+`queues_read` counts reads that **completed**, never readers that were constructed. `reads_attempted`
+counts queue reads that were **started**: a read that threw, timed out or returned nothing still counts
+there, so a broken backend is reported as `INCOMPLETE`/`UNAVAILABLE` rather than as an untried step.
+`NOT_CHECKED` appears only when no read was required. During a quiet window expect
+`queue_evidence: "NOT_CHECKED"` with `reads_attempted: 0`; that is honest, not a success.
 
 ## 4. Run the dry-run
 
@@ -204,6 +207,8 @@ A dry-run is meaningful only when **all** of these hold. Anything else is a find
 - [ ] If `redis.queue_evidence` is `"NOT_CHECKED"` because `redis.candidates_scanned: 0`, the run proves
       reachability only. Record it as *connectivity verified, queue completeness not exercised*, and repeat
       after a window in which at least one job exists if queue completeness must be demonstrated.
+- [ ] A read that was attempted and did not answer must never appear as `"NOT_CHECKED"`: if
+      `redis.candidates_scanned > 0` then `redis.reads_attempted` must be `2`.
 - [ ] `redis.queue_evidence` of `"INCOMPLETE"` or `"UNAVAILABLE"` is a finding: the run is **safe but not
       meaningful**, `queue.queue_unknown` will be non-zero, and zero candidates must not be read as proof
       that nothing needs cleanup.
