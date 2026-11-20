@@ -97,7 +97,7 @@ test("no write is issued for an empty plan", async () => {
 });
 
 test("the sweep timestamp is captured before planning, not after", async () => {
-  const source = await readFile(new URL("../scripts/cleanup-expired-jobs.ts", import.meta.url), "utf8");
+  const source = await readFile(new URL("../src/lib/retention/expiry-sweep.ts", import.meta.url), "utf8");
   const start = source.indexOf("export async function expireStalledJobs");
   const end = source.indexOf("/**", start + 10);
   const body = source.slice(start, end);
@@ -115,7 +115,7 @@ test("the sweep timestamp is captured before planning, not after", async () => {
 });
 
 test("the guarded write is unreachable from the dry-run path", async () => {
-  const source = await readFile(new URL("../scripts/cleanup-expired-jobs.ts", import.meta.url), "utf8");
+  const source = await readFile(new URL("../src/lib/retention/expiry-sweep.ts", import.meta.url), "utf8");
   const planFn = source.slice(source.indexOf("export async function planStalledJobExpiry"), source.indexOf("export async function expireStalledJobs"));
   for (const write of ["updateMany", "applyExpiryPlan", "create(", "delete("]) {
     assert.equal(planFn.includes(write), false, `planning must not call ${write}`);

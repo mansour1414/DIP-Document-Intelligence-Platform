@@ -20,6 +20,7 @@
     "db:studio": "prisma studio",
     "worker:documents": "tsx workers/document-worker.ts",
     "jobs:cleanup": "tsx scripts/cleanup-expired-jobs.ts",
+    "retention:dry-run": "tsx scripts/retention-dry-run.ts",
     "docker:up": "docker compose -f docker/docker-compose.yml up -d",
     "docker:down": "docker compose -f docker/docker-compose.yml down",
     "prepare": "husky"

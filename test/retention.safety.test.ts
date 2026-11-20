@@ -58,8 +58,25 @@ test("dry-run is strictly read-only: the service never writes, calls storage or 
   const destructiveIndex = source.indexOf("for (const deletion of plan.deletions)");
   assert.ok(dryRunIndex > 0 && destructiveIndex > dryRunIndex, "dry-run must return before the delete loop");
   const beforeReturn = source.slice(0, dryRunIndex);
-  for (const write of ["deleteObject(", "storageObject.update", "document.update", "job.update", "job.updateMany", "$transaction"]) {
+  for (const write of [
+    "deleteObject(",
+    "storageObject.update",
+    "document.update",
+    "job.update",
+    "job.updateMany",
+    "$transaction",
+    // The repository port is the only write path; it must not be reachable, and
+    // the object store must not even be resolved, before the early return.
+    "markStorageObjectDeleted(",
+    "markDocumentDeleted(",
+    "getStorage(",
+  ]) {
     assert.equal(beforeReturn.includes(write), false, `dry-run path must not contain ${write}`);
+  }
+  // ... and every write stays strictly after it.
+  const applyOnly = source.slice(dryRunIndex);
+  for (const write of ["markStorageObjectDeleted(", "markDocumentDeleted(", "deleteObject("]) {
+    assert.ok(applyOnly.includes(write), `apply path must still contain ${write}`);
   }
   // All storage deletes stay inside the apply path.
   const countDeleteCalls = (source.match(/storage\.deleteObject\(/g) ?? []).length;
@@ -232,16 +249,16 @@ test("a storage failure leaves the document ACTIVE for a retry", async () => {
   const source = await readFile(new URL("../src/lib/retention/service.ts", import.meta.url), "utf8");
   // Partial failure must skip the document tombstone, and failures are counted.
   assert.match(source, /catch \(error\) \{[\s\S]*?complete = false;[\s\S]*?result\.failures \+= 1;/);
-  assert.match(source, /if \(!complete\) continue;\s*\n\s*await db\.document\.update/);
+  assert.match(source, /if \(!complete\) continue;\s*\n\s*await markDocumentDeleted\(/);
   // A scope mismatch is blocked, never retried as a delete.
   assert.match(source, /if \(decision !== "match"\) \{[\s\S]*?result\.blockedObjects \+= 1;/);
 });
 
 test("active work is protected by job status regardless of job age", async () => {
-  const source = await readFile(new URL("../src/lib/retention/service.ts", import.meta.url), "utf8");
+  const source = await readFile(new URL("../src/lib/retention/repository.ts", import.meta.url), "utf8");
   // The protection query takes no lower age bound: a live RUNNING job must keep
   // protecting its inputs even if a separate operator complains it is old.
-  const protection = source.slice(source.indexOf("export async function protectedFileIds"), source.indexOf("function planFromDocuments"));
+  const protection = source.slice(source.indexOf("async function loadProtectedFileIds"), source.indexOf("export const prismaRetentionRepository"));
   assert.equal(protection.includes("createdAt:"), false);
   // Statuses are shared with the expiring sweep, so assert the single source.
   const statuses = source.match(/const ACTIVE_JOB_STATUSES = \[([^\]]+)\] as const;/);
