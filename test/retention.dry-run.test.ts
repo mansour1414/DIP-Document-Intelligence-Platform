@@ -285,6 +285,9 @@ test("an unconfigured queue reports unknown evidence and plans no expiry", async
 
   assert.equal(report.redis.redis_configured, false);
   assert.equal(report.redis.unavailable, "not_configured");
+  assert.equal(report.redis.connectivity, "UNAVAILABLE");
+  assert.equal(report.redis.queue_evidence, "UNAVAILABLE");
+  assert.equal(report.redis.reads_attempted, 0, "nothing was configured, so nothing was read");
   assert.equal(report.queue.queue_unknown, 1, "the candidate's liveness is unknown, not absent");
   assert.equal(report.queue.planned_expiry, 0, "unknown evidence must never authorise expiry");
   assert.equal(report.mutations.jobs_expired_applied, 0);
@@ -297,6 +300,9 @@ test("an unreachable queue is also unknown, never expiry", async () => {
     unavailable: "error" as const,
     async read() {
       throw new Error("connection refused");
+    },
+    async probe() {
+      return "UNAVAILABLE" as const;
     },
     async close() {},
   };
@@ -323,7 +329,9 @@ test("a complete empty queue read is the only way absence is concluded (still no
       ];
     },
     async close() {},
-    diagnostics: () => ({ queues_expected: 2, queues_read: 2, failed_reads: 0 }),
+    async probe() {
+      return "VERIFIED" as const;
+    },
   };
   const report = await runRetentionDryRun({
     now,
@@ -334,12 +342,146 @@ test("a complete empty queue read is the only way absence is concluded (still no
     evidence: bothQueuesEmpty,
   });
   assert.equal(report.redis.redis_configured, true);
+  assert.equal(report.redis.connectivity, "VERIFIED");
+  assert.equal(report.redis.queue_evidence, "VERIFIED");
+  assert.equal(report.redis.reads_attempted, 2);
   assert.equal(report.redis.queues_read, 2);
   assert.equal(report.redis.failed_reads, 0);
   assert.equal(report.queue.queue_unknown, 0);
   // The plan may now identify a stale job, but a dry-run still applies nothing.
   assert.equal(report.queue.planned_expiry, 1);
   assert.equal(report.mutations.jobs_expired_applied, 0);
+  assert.equal(report.mutations.metadata_mutations, 0);
+});
+
+test("a partial read is INCOMPLETE and never reported as verified", async () => {
+  const { repository } = fakeRepository([]);
+  const partial = {
+    async read() {
+      // Two queues expected; one answered. The second could have held the job.
+      return [
+        { present: new Map(), ok: true },
+        { present: new Map(), ok: false },
+      ];
+    },
+    async probe() {
+      return "VERIFIED" as const;
+    },
+    async close() {},
+  };
+  const report = await runRetentionDryRun({
+    now,
+    env: dryRunEnv,
+    scope,
+    repository,
+    loadCandidates: async () => [staleCandidate],
+    evidence: partial,
+  });
+  assert.equal(report.redis.connectivity, "VERIFIED");
+  assert.equal(report.redis.queue_evidence, "INCOMPLETE", "a failed read must never read as complete");
+  assert.equal(report.redis.reads_attempted, 2);
+  assert.equal(report.redis.queues_read, 1);
+  assert.equal(report.redis.failed_reads, 1);
+  assert.equal(report.queue.queue_unknown, 1);
+  assert.equal(report.queue.planned_expiry, 0);
+});
+
+test("zero candidates with healthy Redis reports NOT_CHECKED evidence, not a fake success", async () => {
+  const { repository, state } = fakeRepository([]);
+  let readCalls = 0;
+  const healthy = {
+    async read() {
+      readCalls += 1;
+      return [
+        { present: new Map(), ok: true },
+        { present: new Map(), ok: true },
+      ];
+    },
+    async probe() {
+      return "VERIFIED" as const;
+    },
+    async close() {},
+  };
+  const report = await runRetentionDryRun({
+    now,
+    env: dryRunEnv,
+    scope,
+    repository,
+    loadCandidates: async () => [],
+    evidence: healthy,
+  });
+
+  // The connection is reachable…
+  assert.equal(report.redis.connectivity, "VERIFIED");
+  // …but no queue was actually read, so completeness is explicitly not claimed.
+  assert.equal(report.redis.queue_evidence, "NOT_CHECKED");
+  assert.equal(report.redis.reads_attempted, 0);
+  assert.equal(report.redis.queues_read, 0, "constructed readers are not completed reads");
+  assert.equal(readCalls, 0, "a run with no candidates must not open queue reads");
+  assert.equal(report.redis.candidates_scanned, 0);
+  assert.equal(report.redis.queues_expected, 2);
+  assert.equal(report.queue.queue_unknown, 0);
+  assert.equal(report.mutations.metadata_mutations, 0);
+  assert.equal(report.mutations.storage_operations, 0);
+  assert.deepEqual(state.writes, [], "no write path may be reached");
+});
+
+test("zero candidates with unreachable Redis is UNAVAILABLE, never healthy", async () => {
+  const { repository, state } = fakeRepository([]);
+  const unreachable = {
+    async read() {
+      throw new Error("must not be called: there is nothing to read");
+    },
+    async probe() {
+      return "UNAVAILABLE" as const;
+    },
+    async close() {},
+  };
+  const report = await runRetentionDryRun({
+    now,
+    env: dryRunEnv,
+    scope,
+    repository,
+    loadCandidates: async () => [],
+    evidence: unreachable,
+  });
+
+  // This is the regression the previous revision had: two readers were
+  // constructed, so the run reported queues_read: 2 and looked healthy while
+  // Redis was unreachable.
+  assert.equal(report.redis.connectivity, "UNAVAILABLE");
+  assert.equal(report.redis.queue_evidence, "UNAVAILABLE");
+  assert.equal(report.redis.reads_attempted, 0);
+  assert.equal(report.redis.queues_read, 0);
+  assert.equal(report.redis.failed_reads, 0);
+  assert.equal(report.zero_mutations, true);
+  assert.deepEqual(state.writes, []);
+});
+
+test("a provider without a probe reports connectivity as NOT_CHECKED, never VERIFIED", async () => {
+  const { repository } = fakeRepository([]);
+  const noProbe = {
+    async read() {
+      return [
+        { present: new Map(), ok: true },
+        { present: new Map(), ok: true },
+      ];
+    },
+    async close() {},
+  };
+  const report = await runRetentionDryRun({
+    now,
+    env: dryRunEnv,
+    scope,
+    repository,
+    loadCandidates: async () => [staleCandidate],
+    evidence: noProbe,
+  });
+  // Completing every read still proves the queues were read…
+  assert.equal(report.redis.queue_evidence, "VERIFIED");
+  // …but reachability was never independently measured, so it is not claimed.
+  assert.equal(report.redis.connectivity, "NOT_CHECKED");
+  assert.equal(report.redis.queues_read, 2);
   assert.equal(report.mutations.metadata_mutations, 0);
 });
 
@@ -350,7 +492,9 @@ test("a partially read queue poisons the batch to unknown", async () => {
       return [{ present: new Map(), ok: true }];
     },
     async close() {},
-    diagnostics: () => ({ queues_expected: 2, queues_read: 1, failed_reads: 0 }),
+    async probe() {
+      return "VERIFIED" as const;
+    },
   };
   const report = await runRetentionDryRun({
     now,

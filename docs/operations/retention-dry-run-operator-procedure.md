@@ -89,25 +89,84 @@ ORDER BY tablename, cmd;
 If 2.1–2.5 do not match the expectations above, **stop**: the credential is not the least-privilege one the
 runbook requires, and a dry-run would produce evidence that does not describe the apply path.
 
-## 3. Pre-flight: connectivity (no secrets printed)
+## 3. Pre-flight: connectivity (read-only, no secrets printed)
+
+**Rule for every command in this section:** nothing here may write, and no credential may appear in a
+command line. A URL passed as an argument is visible in `ps`/process listings, in shell history and in
+terminal scrollback; use environment variables or a credentials file instead.
+
+### 3.1 Database reachability and identity
+
+Prefer the discrete `PG*` variables over `psql "$DATABASE_URL"`, so the password never enters `argv`:
 
 ```bash
-# 3.1 Database reachability and identity. `psql` prints the role, never the URL.
-psql "$DATABASE_URL" -Atc "select current_user, current_database(), version();"
-
-# 3.2 The retention query path works under RLS with this role (counts only).
-psql "$DATABASE_URL" -Atc "select count(*) from documents where status = 'ACTIVE';"
-psql "$DATABASE_URL" -Atc "select count(*) from jobs where status in ('QUEUED','RUNNING','RETRYING');"
-
-# 3.3 Redis, if configured. A read-only principal must be able to read and not write.
-redis-cli -u "$REDIS_URL" PING
-redis-cli -u "$REDIS_URL" --scan --pattern 'bull:dip.document-processing.v1:*' | head -n 5
-redis-cli -u "$REDIS_URL" SET dip:retention:probe 1   # must be denied by a read-only ACL
+# The values come from the secret manager, never from this document.
+# PGPASSWORD=<scheduler password>  PGHOST/PGPORT/PGUSER/PGDATABASE=<scope values>
+psql -X -A -t -c "select current_user, current_database();"
 ```
 
+`psql` prints the role and the database, never the credential. If your environment only provides a single
+URL, `psql -X -A -t "$DATABASE_URL" -c …` is acceptable for an interactive session but leaks the password to
+the process table; do not use it in anything recorded, scripted or shared.
+
+### 3.2 The retention query path works under RLS with this role (counts only)
+
+```bash
+psql -X -A -t -c "select count(*) from documents where status = 'ACTIVE';"
+psql -X -A -t -c "select count(*) from jobs where status in ('QUEUED','RUNNING','RETRYING');"
+```
+
+### 3.3 Redis, if configured — non-mutating only
+
+```bash
+# Authentication is supplied by environment, not by an argument:
+#   REDISCLI_AUTH=<read-only password>  redis-cli -h <host> -p <port> --user <read-only user>
+redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" --user "$REDIS_USER" PING
+redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" --user "$REDIS_USER" ACL WHOAMI
+```
+
+What these establish: `PING` proves a bounded round trip reaches Redis (this is exactly the probe the sweep
+performs, so a green `PING` is what `redis.connectivity: "VERIFIED"` will mean); `ACL WHOAMI` proves which
+principal is in use, without printing a credential.
+
+**Deliberately absent — do not add these to a production procedure:**
+
+- `SET`, `DEL`, `FLUSH*`, `EXPIRE`, `EVAL`, `FUNCTION LOAD` or any other write: a "probe" that writes is a
+  production mutation, and it is the one operation that turns a connectivity check into an incident when an
+  ACL is misconfigured.
+- `SCAN`/`KEYS` output pasted into a ticket: live job keys are tenant work items. The sweep never prints a
+  key, and neither should the operator.
+- `SET …` (or any write) as an **ACL-denial test**: denial must be proven in isolated test infrastructure,
+  never against production. In an isolated environment only, `ACL DRYRUN <user> SET probe 1` (Redis 7.0+)
+  evaluates permissions without executing the command; it is still not a production command.
+- `redis-cli -u "$REDIS_URL"`: the URL carries the password into `argv`.
+
+If a read-only principal cannot run `PING`, the sweep reports `redis.connectivity: "UNAVAILABLE"` rather
+than claiming health. `PING` is not a data command; grant it (`+ping`) instead of weakening the procedure.
+
 Two-queue coverage matters: the sweep reads `bull:dip.document-processing.v1:*` **and**
-`bull:dip.ai-processing.v1:*`. If the Redis principal cannot read both, evidence is `unknown` for every
-candidate and the run, while safe, is not meaningful.
+`bull:dip.ai-processing.v1:*`. If the Redis principal cannot read both, evidence is `INCOMPLETE` or
+`UNAVAILABLE` and the run, while safe, is not meaningful.
+
+### 3.4 What the sweep will report about its own evidence
+
+The report separates *reachability* from *completeness*, because they answer different questions:
+
+| `redis.connectivity` | Meaning |
+| --- | --- |
+| `VERIFIED` | A bounded `PING` round trip succeeded. |
+| `UNAVAILABLE` | Unconfigured, unreachable, or the probe was denied/timed out. |
+| `NOT_CHECKED` | The provider has no probe (test seam only). |
+
+| `redis.queue_evidence` | Meaning |
+| --- | --- |
+| `VERIFIED` | Every configured queue (2) was read to completion in this run. |
+| `INCOMPLETE` | A queue read failed, or fewer queues answered than expected. |
+| `NOT_CHECKED` | There were zero job candidates, so no queue read was needed — reachability may still be `VERIFIED`. |
+| `UNAVAILABLE` | No usable connection: unconfigured, or the probe failed. |
+
+`queues_read` counts reads that **completed**, never readers that were constructed. During a quiet window
+expect `queue_evidence: "NOT_CHECKED"` with `reads_attempted: 0`; that is honest, not a success.
 
 ## 4. Run the dry-run
 
@@ -139,12 +198,19 @@ A dry-run is meaningful only when **all** of these hold. Anything else is a find
 - [ ] `policy_version: 2026-09-provisional-v2`, `retention_days: { free: 7, pro: 30 }` (unchanged periods).
 
 ### B. Redis evidence completeness
-- [ ] `redis.redis_configured: true`.
-- [ ] `redis.queues_expected: 2`, `redis.queues_read: 2`, `redis.failed_reads: 0`.
+- [ ] `redis.redis_configured: true` and `redis.connectivity: "VERIFIED"`.
+- [ ] `redis.queue_evidence` is `"VERIFIED"` — i.e. `redis.queues_expected: 2`, `redis.reads_attempted: 2`,
+      `redis.queues_read: 2`, `redis.failed_reads: 0`.
+- [ ] If `redis.queue_evidence` is `"NOT_CHECKED"` because `redis.candidates_scanned: 0`, the run proves
+      reachability only. Record it as *connectivity verified, queue completeness not exercised*, and repeat
+      after a window in which at least one job exists if queue completeness must be demonstrated.
+- [ ] `redis.queue_evidence` of `"INCOMPLETE"` or `"UNAVAILABLE"` is a finding: the run is **safe but not
+      meaningful**, `queue.queue_unknown` will be non-zero, and zero candidates must not be read as proof
+      that nothing needs cleanup.
 - [ ] `queue.queue_unknown: 0`.
 - [ ] `queue.planned_expiry: 0` on a healthy fleet (any non-zero value must be explainable job-by-job).
-- [ ] If `redis_configured` is `false`: the run is **safe but not meaningful** — record it as `queue evidence
-      unknown` and do not treat zero candidates as evidence that nothing needs cleanup.
+- [ ] If `redis_configured` is `false`: record the run as `queue evidence unknown`; it establishes document
+      retention candidates only.
 
 ### C. Retention candidates
 - [ ] `candidates.scanned_documents` equals an independent `select count(*) from documents where status='ACTIVE'`.
@@ -184,9 +250,35 @@ Stop and treat the run as failed if any of the following appears:
 - `jobs.expired_cleanup` in the logs.
 - `scope_blocked_documents > 0` with no explanation.
 - `current_user` is anything other than `dip_retention`.
+- `redis.connectivity: "UNAVAILABLE"` when a Redis principal was supposed to be provisioned.
+- The activation gate was bypassed (a run whose log does not contain `RETENTION_DRY_RUN_ACTIVATED=true`).
 - The process exceeds the job timeout without emitting `retention.dry_run_summary`.
 
-## 7. What this procedure does **not** establish
+## 7. Activating the scheduled workflow (documented; **not executed** by this PR)
+
+The scheduled workflow is **inactive by default** and merging code does not activate it. Two independent
+things must be true before a production-connected run can happen:
+
+1. **The cron is disabled in the workflow file.** During preparation the `schedule:` trigger is commented
+   out, so no automatic run exists at all. Re-enabling it is a reviewed change, not a variable edit.
+2. **The owner-activation variable is absent.** The job's first step requires the repository variable
+   `RETENTION_DRY_RUN_ENABLED` to equal `true`; anything else (including "not created") fails the job before
+   checkout and before any credential is injected. No variable is created by this PR.
+
+Activation sequence — performed **only** by the owner, after CR-005 is approved:
+
+- [ ] Record approval in `docs/cr-005-retention-dry-run-execution.md` (the approval block is intentionally blank).
+- [ ] Confirm §2 (identity/privileges) and §3 (connectivity) pass from the chosen execution location.
+- [ ] Create repository variable `RETENTION_DRY_RUN_ENABLED=true` (a *variable*, never a secret; it carries no value).
+- [ ] For a manually triggered run: **Actions → Retention Dry-Run → Run workflow** — nothing is dispatched automatically.
+- [ ] For a scheduled run: merge a reviewed change that re-enables the `schedule:` block.
+- [ ] After the first run, confirm the log contains `RETENTION_DRY_RUN_ACTIVATED=true` and a
+      `retention.dry_run_summary` with `zero_mutations: true`.
+
+Deactivation is the reverse and takes effect immediately: delete or set `RETENTION_DRY_RUN_ENABLED` to any
+value other than `true`. The workflow then fails closed at step one.
+
+## 8. What this procedure does **not** establish
 
 Completing it proves the dry-run is safe, complete and interpretable. It does **not**:
 

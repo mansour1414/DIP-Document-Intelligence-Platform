@@ -54,12 +54,24 @@ Established by the pull request that accompanies this CR, without touching produ
    the hermetic tests and the runtime self-check (`RETENTION_DRY_RUN_MUTATED`).
 3. Apply is unchanged and still fail-closed: storage-scope blocking, storage-first ordering, per-object
    scope proof, failure counting and the "leave the document ACTIVE for retry" rule all remain.
-4. Missing or unreachable Redis produces `unknown` queue evidence, which can never authorise expiry, and is
-   reported as such (`redis_configured`, `queues_expected`, `queues_read`, `failed_reads`, `queue_unknown`).
+4. Missing or unreachable Redis produces `unknown` queue evidence, which can never authorise expiry.
+   Reachability (`redis.connectivity`) and completeness (`redis.queue_evidence`) are reported separately:
+   `queues_read` counts reads that actually completed, so an unreachable backend with zero job candidates is
+   reported `UNAVAILABLE`, not as a healthy empty queue, and a run with no candidates reports
+   `NOT_CHECKED` rather than claiming verified completeness.
 5. A dedicated dry-run-only entrypoint exists (`npm run retention:dry-run`). It rejects `RETENTION_APPLY=1`
    and every apply-shaped argument, and has no destructive mode.
 6. The scheduled workflow cannot enter apply mode: it refuses any non-dry-run `RETENTION_APPLY` value,
    never passes the switch to the run step, and runs with `permissions: contents: read`.
+7. The workflow holds no S3 credential at all: `RETENTION_STORAGE_ENDPOINT`, `RETENTION_STORAGE_ACCESS_KEY`
+   and `RETENTION_STORAGE_SECRET_KEY` do not appear anywhere in the file, in any step, so they cannot leak
+   into a log, an artifact or a child process. Only `RETENTION_DATABASE_URL` and `RETENTION_STORAGE_BUCKET`
+   are injected.
+8. Automatic scheduling is disabled during preparation (the `schedule:` trigger is commented out) and the
+   job's first step requires the repository variable `RETENTION_DRY_RUN_ENABLED=true`. With the variable
+   absent — the current state — the job fails before checkout and before any credential is injected, even if
+   every database secret is already provisioned. Activation is a separate owner-approved step (see the
+   operator procedure §7); no variable, secret or environment is created by this change.
 
 Operational readiness is **not** established by any of the above. See §6.
 
@@ -76,9 +88,12 @@ Before this option may be used for a production-connected dry-run:
 - **Credential delivery**: `dip_retention` and a read-only Redis principal are injected from the existing
   secret manager at container start; no credential enters GitHub.
 - **Log capture**: aggregate diagnostics are shipped to the private log store so evidence is retained.
-- **Note**: the worker image sets `NODE_ENV=production`, which makes `readEnvironment()` require
-  `REDIS_URL` and `NEXT_PUBLIC_APP_URL`. Both are already present in the worker environment; verify this
-  explicitly for the scheduler container rather than assuming it.
+- **Note**: the dry-run path does not call `readEnvironment()`. It reads `REDIS_URL` directly (a missing
+  value degrades to `unknown` evidence instead of throwing, in every `NODE_ENV`) and reads the database URL
+  from `DATABASE_URL`. `NEXT_PUBLIC_APP_URL` is an *application* contract variable and is not consulted by a
+  read-only sweep; it remains relevant only to the apply path (`createS3Storage()`), which this CR does not
+  authorise. Verify `DATABASE_URL` (and `REDIS_URL`, for meaningful queue evidence) in the scheduler
+  container rather than assuming them.
 
 ## 5. Conditions attached to Option B (GitHub-hosted Actions runner)
 

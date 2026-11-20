@@ -82,6 +82,30 @@ async function loadCandidates(now: Date): Promise<CandidateRow[]> {
   return [...queueLike, ...running];
 }
 
+/**
+ * Reachability of the queue backend, established independently of any job read.
+ *
+ * `NOT_CHECKED` exists because a provider may legitimately not support a probe;
+ * it is never used to claim health. Only `VERIFIED` means a bounded round trip
+ * actually reached Redis.
+ */
+export type QueueConnectivity = "VERIFIED" | "UNAVAILABLE" | "NOT_CHECKED";
+
+/**
+ * How complete this run's queue evidence is.
+ *
+ *   - `VERIFIED`     every configured queue was read to completion.
+ *   - `INCOMPLETE`   a read failed, or fewer queues answered than expected.
+ *   - `NOT_CHECKED`  no job candidates existed, so no queue read was needed.
+ *                    Reachability may still be `VERIFIED`; the *evidence* is not.
+ *   - `UNAVAILABLE`  no usable connection: unconfigured, or the probe failed.
+ *
+ * `VERIFIED` is the only value that may be read as "the queues were fully
+ * consulted". `NOT_CHECKED` in particular must never be reported as healthy
+ * simply because readers were constructed.
+ */
+export type QueueEvidenceStatus = "VERIFIED" | "INCOMPLETE" | "NOT_CHECKED" | "UNAVAILABLE";
+
 export type QueueEvidenceProvider = {
   /**
    * Set when the provider cannot read at all (e.g. `REDIS_URL` is not
@@ -90,10 +114,16 @@ export type QueueEvidenceProvider = {
   unavailable?: Extract<QueueEvidence, { state: "unknown" }>["reason"];
   /** Reads every configured queue, returning one result per queue. */
   read(jobIds: readonly string[]): Promise<QueueReadResult[]>;
+  /**
+   * Bounded, strictly non-mutating reachability check (`PING`).
+   *
+   * Optional so a test seam can omit it; when omitted the run reports
+   * `connectivity: "NOT_CHECKED"` rather than inferring health from the mere
+   * existence of a provider.
+   */
+  probe?(): Promise<QueueConnectivity>;
   /** Releases any connection this provider owns. Must be idempotent. */
   close(): Promise<void>;
-  /** Optional aggregate counters, safe to log (no hosts, no credentials). */
-  diagnostics?(): { queues_expected: number; queues_read: number; failed_reads: number };
 };
 
 /**
@@ -111,26 +141,34 @@ export function redisEvidenceProvider(): QueueEvidenceProvider {
       async read() {
         return [];
       },
+      // Nothing was configured to probe: report honestly instead of "healthy".
+      async probe() {
+        return "UNAVAILABLE";
+      },
       close: handle.close,
-      diagnostics: () => ({ queues_expected: QUEUE_NAMES.length, queues_read: 0, failed_reads: 0 }),
     };
   }
   const connection = handle.connection;
   const nowMs = () => Date.now();
-  // Diagnostic only: distinguishes "Redis unreachable" from "every job is
-  // genuinely tracked". Logged as a count, never as a connection string.
-  let lastReadFailures = 0;
   const lookups = QUEUE_NAMES.map((queueName) => createQueueActivityLookup({ redis: connection, queueName, now: nowMs }));
   return {
     async read(jobIds) {
       // Sequential reads keep load on the worker's Redis predictable.
       const results: QueueReadResult[] = [];
       for (const lookup of lookups) results.push(await lookup.read(jobIds));
-      lastReadFailures = results.filter((result) => !result.ok).length;
       return results;
     },
+    async probe() {
+      // PING is a pure round trip: no key is created, read or deleted, so this
+      // is safe against a production Redis even with a read-only ACL. A denial
+      // or timeout reports UNAVAILABLE — never a claimed success.
+      try {
+        return (await connection.ping()) === "PONG" ? "VERIFIED" : "UNAVAILABLE";
+      } catch {
+        return "UNAVAILABLE";
+      }
+    },
     close: handle.close,
-    diagnostics: () => ({ queues_expected: QUEUE_NAMES.length, queues_read: lookups.length, failed_reads: lastReadFailures }),
   };
 }
 
@@ -144,20 +182,50 @@ async function withQueueEvidence(
   jobs: CandidateRow[],
   provider: QueueEvidenceProvider,
   unavailableReason: Extract<QueueEvidence, { state: "unknown" }>["reason"] | null = null,
-): Promise<JobExpiryFacts[]> {
-  if (jobs.length === 0) return [];
-  if (unavailableReason) return jobs.map((job) => ({ ...job, queue: unknownEvidence(unavailableReason) }));
+): Promise<{ facts: JobExpiryFacts[]; reads: QueueReadResult[] | null }> {
+  // `null` — not `[]` — says "no read was attempted". Reporting an empty array
+  // here used to be indistinguishable from "every queue answered", which is how
+  // constructed readers came to be counted as completed reads.
+  if (jobs.length === 0) return { facts: [], reads: null };
+  if (unavailableReason) {
+    return { facts: jobs.map((job) => ({ ...job, queue: unknownEvidence(unavailableReason) })), reads: null };
+  }
 
   let reads: QueueReadResult[];
   try {
     reads = await provider.read(jobs.map((job) => job.id));
   } catch {
     // A provider-level failure is UNKNOWN for the whole batch, never absence.
-    return jobs.map((job) => ({ ...job, queue: unknownEvidence("error") }));
+    return { facts: jobs.map((job) => ({ ...job, queue: unknownEvidence("error") })), reads: null };
   }
   // Absence requires a complete read of EVERY configured queue. A short result
   // set means a queue went unread, and an unread queue might have held the job.
-  return jobs.map((job) => ({ ...job, queue: resolveEvidence(job.id, reads, QUEUE_NAMES.length) }));
+  const facts = jobs.map((job) => ({ ...job, queue: resolveEvidence(job.id, reads, QUEUE_NAMES.length) }));
+  return { facts, reads };
+}
+
+/**
+ * Derive the evidence status from what actually happened.
+ *
+ * Counters come from the returned `QueueReadResult[]`, never from the number of
+ * readers that were constructed: a lookup object that was never asked to read
+ * anything is not evidence, and an unreachable backend with zero candidates must
+ * not look healthy merely because there was nothing to read.
+ */
+export function queueEvidenceStatus(input: {
+  unavailable: string | null;
+  connectivity: QueueConnectivity;
+  readsAttempted: number;
+  queuesRead: number;
+  queuesExpected: number;
+  failedReads: number;
+}): QueueEvidenceStatus {
+  if (input.unavailable !== null) return "UNAVAILABLE";
+  if (input.connectivity === "UNAVAILABLE") return "UNAVAILABLE";
+  if (input.failedReads > 0) return "INCOMPLETE";
+  if (input.readsAttempted === 0) return "NOT_CHECKED";
+  if (input.queuesRead >= input.queuesExpected) return "VERIFIED";
+  return "INCOMPLETE";
 }
 
 /**
@@ -171,7 +239,14 @@ async function withQueueEvidence(
 export type QueueDiagnostics = {
   redis_configured: boolean;
   unavailable: "not_configured" | "unavailable" | "error" | null;
+  /** Reachability of the queue backend, established by a bounded PING probe. */
+  connectivity: QueueConnectivity;
+  /** Completeness of this run's queue evidence. Only `VERIFIED` means "fully read". */
+  queue_evidence: QueueEvidenceStatus;
   queues_expected: number;
+  /** Queue reads that were actually started. Zero when there were no candidates. */
+  reads_attempted: number;
+  /** Queue reads that COMPLETED successfully — never "readers constructed". */
   queues_read: number;
   failed_reads: number;
   candidates_scanned: number;
@@ -199,7 +274,7 @@ export type ExpireStalledJobsResult = { expired: number; plan: JobExpiryPlan; qu
 function expiryLogContext(
   plan: JobExpiryPlan,
   mode: "apply" | "plan",
-  diagnostics?: { queues_expected: number; queues_read: number; failed_reads: number },
+  diagnostics?: Pick<QueueDiagnostics, "queues_expected" | "reads_attempted" | "queues_read" | "failed_reads" | "connectivity" | "queue_evidence">,
 ) {
   return {
     scanned: plan.counts.scanned,
@@ -234,18 +309,44 @@ export async function planStalledJobExpiry(options: ExpireStalledJobsOptions = {
   try {
     const candidates = await (options.loadCandidates ?? loadCandidates)(now);
     const unavailable = options.queueUnavailable ?? provider.unavailable ?? null;
-    const facts = await withQueueEvidence(candidates, provider, unavailable);
+
+    // Probe reachability first, so an unreachable backend is visible even when
+    // there are no candidates and therefore nothing to read.
+    const connectivity: QueueConnectivity =
+      unavailable !== null
+        ? "UNAVAILABLE"
+        : provider.probe
+          ? await provider.probe().catch(() => "UNAVAILABLE" as const)
+          : "NOT_CHECKED";
+
+    const { facts, reads } = await withQueueEvidence(candidates, provider, unavailable);
     const plan = planJobExpiry(facts, now);
-    const counts = provider.diagnostics?.() ?? { queues_expected: QUEUE_NAMES.length, queues_read: 0, failed_reads: 0 };
+
+    // Counters are derived from the reads that actually happened. `reads` is
+    // null when none were attempted, which is reported as such.
+    const readsAttempted = reads?.length ?? 0;
+    const queuesRead = reads?.filter((result) => result.ok).length ?? 0;
+    const failedReads = readsAttempted - queuesRead;
+
     const queue: QueueDiagnostics = {
       redis_configured: unavailable === null,
       unavailable,
-      queues_expected: counts.queues_expected,
-      queues_read: counts.queues_read,
-      failed_reads: counts.failed_reads,
+      connectivity,
+      queue_evidence: queueEvidenceStatus({
+        unavailable,
+        connectivity,
+        readsAttempted,
+        queuesRead,
+        queuesExpected: QUEUE_NAMES.length,
+        failedReads,
+      }),
+      queues_expected: QUEUE_NAMES.length,
+      reads_attempted: readsAttempted,
+      queues_read: queuesRead,
+      failed_reads: failedReads,
       candidates_scanned: plan.counts.scanned,
     };
-    logger.info("jobs.expiry_planned", expiryLogContext(plan, mode, counts));
+    logger.info("jobs.expiry_planned", expiryLogContext(plan, mode, queue));
     return { expired: 0, plan, queue };
   } finally {
     // Always release the connection: a one-shot scheduler process must not leak

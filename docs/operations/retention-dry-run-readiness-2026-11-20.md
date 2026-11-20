@@ -9,6 +9,10 @@
 > wiring, an apply-only S3 credential demanded by a read-only path, no dry-run-only entrypoint) are
 > implemented in the pull request that adds `docs/cr-005-retention-dry-run-execution.md`; the
 > *operational-readiness* blockers (V1, V5, V6 and the unknown list) are unchanged and remain open.
+> Findings F4 (an apply-only S3 credential demanded by a read-only path) and F6 (`readEnvironment()`
+> throwing in production when `REDIS_URL` is absent) are both resolved: the dry-run reads `REDIS_URL`
+> directly and constructs no storage client, so the statements below describing the old behaviour are
+> history, not current behaviour.
 > The proposed change request is **CR-005**; `CR-004` is unrelated and already assigned.
 
 **Status:** read-only audit artifact. It records findings and a proposed plan only. Nothing in it has been provisioned, enabled, dispatched, deployed, committed or merged. Nothing in it changes an approved policy or architecture.
@@ -55,7 +59,7 @@ Each item is a statement that follows directly from the code or from read-only G
 | F3 | The scheduler **requires** five environment variables before it touches Prisma or storage, and fails with `RETENTION_CONFIGURATION_MISSING:<names>` — names only, never values. | `src/lib/retention/safety.ts:19-31`, `scripts/cleanup-expired-jobs.ts:256-258, 281-292` |
 | F4 | Three of those five are object-storage credentials, but **the dry-run never calls the object store**. `runRetentionCleanup` still constructs the storage client (`getStorage()`) *before* branching on `dryRun`. | `service.ts:174`; `src/lib/storage/index.ts:22-26, 54` |
 | F5 | **`REDIS_URL` is not supplied by the workflow.** With it absent, `openRetentionRedis()` returns `connection: null`, logs `retention.redis_not_configured`, and every job candidate becomes `unknown`. `unknown` can never authorise expiry. | `.github/workflows/retention.yml:52-61`; `src/lib/retention/queue-connection.ts:63-74`; `src/lib/retention/job-expiry.ts:157-186` |
-| F6 | The graceful "degrade to unknown" behaviour of F5 only exists while `NODE_ENV` is **not** `production`. `readEnvironment()` throws in production if `DATABASE_URL`, `REDIS_URL` or `NEXT_PUBLIC_APP_URL` is missing, and it is called from both `openRetentionRedis()` and `createS3Storage()`. So adding `NODE_ENV=production` to the workflow without wiring `REDIS_URL` and `NEXT_PUBLIC_APP_URL` converts a degraded dry-run into a hard failure. | `src/lib/env.ts:1-10`; `queue-connection.ts:64`; `storage/index.ts:23`; `retention.yml` (no `NODE_ENV`, no `REDIS_URL`, no `NEXT_PUBLIC_APP_URL`) |
+| F6 | The graceful "degrade to unknown" behaviour of F5 only exists while `NODE_ENV` is **not** `production`. `readEnvironment()` throws in production if `DATABASE_URL`, `REDIS_URL` or `NEXT_PUBLIC_APP_URL` is missing, and it is called from both `openRetentionRedis()` and `createS3Storage()`. So adding `NODE_ENV=production` to the workflow without wiring `REDIS_URL` and `NEXT_PUBLIC_APP_URL` converts a degraded dry-run into a hard failure. | `src/lib/env.ts:1-10`; `queue-connection.ts:64`; `storage/index.ts:23`; `retention.yml` (no `NODE_ENV`, no `REDIS_URL`, no `NEXT_PUBLIC_APP_URL`) — **resolved since**: see banner |
 | F7 | `expired_jobs` in `retention.scheduler_result` is the **planned** count, not an applied count — in dry-run *and* in apply. It must not be read as "rows mutated". | `scripts/cleanup-expired-jobs.ts:262-278` |
 | F8 | `candidate_documents = candidate_documents_free + candidate_documents_pro` and `scanned_documents = candidate_documents + skipped_documents` are structural invariants of `planRetention`. | `src/lib/retention/safety.ts:181-226` |
 | F9 | `retained_files`, `protected_files`, `missing_object_files` and `scope_blocked_files` are incremented **once per skipped document**, not per file, despite the names. `candidate_files` *is* per file. Any acceptance threshold must read these four as document counts. | `safety.ts:211-218` vs `:223` |

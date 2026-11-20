@@ -143,7 +143,13 @@ export function reportLogContext(report: RetentionDryRunReport) {
     retention_days_pro: report.retention_days.pro,
     redis_configured: report.redis.redis_configured,
     redis_unavailable: report.redis.unavailable ?? "none",
+    // Reachability and evidence completeness are reported separately on purpose:
+    // a reachable Redis with no candidates is NOT a verified queue read, and an
+    // unreachable one must never be mistaken for a healthy empty queue.
+    redis_connectivity: report.redis.connectivity,
+    queue_evidence: report.redis.queue_evidence,
     queues_expected: report.redis.queues_expected,
+    reads_attempted: report.redis.reads_attempted,
     queues_read: report.redis.queues_read,
     failed_reads: report.redis.failed_reads,
     job_candidates_scanned: report.redis.candidates_scanned,

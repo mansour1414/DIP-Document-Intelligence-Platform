@@ -1,11 +1,29 @@
 name: Retention Dry-Run
 
-# Preparation-phase workflow: it can only ever run a read-only dry-run.
+# Preparation-phase workflow: read-only, dry-run only, and INACTIVE by default.
+#
+# Merging this file does NOT authorise production connectivity. Two independent
+# gates must both open before a single production-connected run can happen:
+#
+#   1. Owner activation: repository variable RETENTION_DRY_RUN_ENABLED must be the
+#      exact string "true". It does not exist yet, so the job stops at its first
+#      step — before checkout, before any credential is injected, before any
+#      socket is opened — even if every database secret is already provisioned.
+#   2. The run step itself: `npm run retention:dry-run` refuses apply and has no
+#      destructive mode at all.
+#
 # Apply is not reachable from this file (see docs/cr-005-retention-dry-run-execution.md).
+# Activation is a separate, owner-approved operational change; it is documented
+# in docs/operations/retention-dry-run-operator-procedure.md §7 and must not be
+# performed as part of a code merge.
 
 on:
-  schedule:
-    - cron: "17 2 * * *"
+  # Automatic scheduling is DISABLED during preparation. Re-enabling the cron
+  # below is part of the activation procedure (owner-approved, separate change),
+  # never a side effect of merging code:
+  #
+  # schedule:
+  #   - cron: "17 2 * * *"
   workflow_dispatch:
 
 # A sweep must never overlap another sweep.
@@ -22,6 +40,23 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
+      - name: Require owner activation
+        # Fail-closed operational gate, deliberately the FIRST step: no credential
+        # is injected and no dependency is contacted unless the owner has
+        # activated this workflow. Absent, empty or any value other than "true"
+        # fails the job.
+        shell: bash
+        env:
+          RETENTION_DRY_RUN_ENABLED: ${{ vars.RETENTION_DRY_RUN_ENABLED }}
+        run: |
+          if [ "$RETENTION_DRY_RUN_ENABLED" != "true" ]; then
+            echo "RETENTION_DRY_RUN_ACTIVATED=false"
+            echo "Retention dry-run is not activated for this repository; nothing was contacted."
+            echo "Activation requires owner approval recorded against CR-005 and the repository variable RETENTION_DRY_RUN_ENABLED=true."
+            echo "See docs/operations/retention-dry-run-operator-procedure.md section 7."
+            exit 1
+          fi
+          echo "RETENTION_DRY_RUN_ACTIVATED=true"
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
         with:
@@ -52,22 +87,16 @@ jobs:
       - name: Validate dry-run configuration
         shell: bash
         env:
+          # Exactly the read-only subset. No storage endpoint and no key pair is
+          # injected anywhere in this workflow: a dry-run never constructs an
+          # object-storage client, so those values must not be able to leak into
+          # the job in the first place.
           RETENTION_DATABASE_URL: ${{ secrets.RETENTION_DATABASE_URL }}
-          RETENTION_STORAGE_ENDPOINT: ${{ secrets.RETENTION_STORAGE_ENDPOINT }}
           RETENTION_STORAGE_BUCKET: ${{ secrets.RETENTION_STORAGE_BUCKET }}
-          RETENTION_STORAGE_ACCESS_KEY: ${{ secrets.RETENTION_STORAGE_ACCESS_KEY }}
-          RETENTION_STORAGE_SECRET_KEY: ${{ secrets.RETENTION_STORAGE_SECRET_KEY }}
         run: |
-          # The inventory is informational: it tells an operator which values exist
-          # without printing any of them. Only the two dry-run prerequisites are
-          # enforced. A dry-run never constructs a storage client, so an S3 key
-          # pair is deliberately NOT required here and is never passed to the run.
           failed=0
-          for name in RETENTION_DATABASE_URL RETENTION_STORAGE_ENDPOINT RETENTION_STORAGE_BUCKET RETENTION_STORAGE_ACCESS_KEY RETENTION_STORAGE_SECRET_KEY; do
-            if test -n "${!name}"; then echo "${name}_PRESENT=true"; else echo "${name}_PRESENT=false"; fi
-          done
           for name in RETENTION_DATABASE_URL RETENTION_STORAGE_BUCKET; do
-            if test -z "${!name}"; then echo "${name}_REQUIRED=true"; failed=1; fi
+            if test -n "${!name}"; then echo "${name}_PRESENT=true"; else echo "${name}_PRESENT=false"; failed=1; fi
           done
           test "$failed" = 0 || { echo "Retention configuration error: required dry-run credential(s) are missing."; exit 1; }
       - name: Run retention dry-run

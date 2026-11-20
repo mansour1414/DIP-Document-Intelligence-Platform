@@ -26,9 +26,10 @@ scheduler.
 **Security**
 - Reuses the allowlisted egress path already granted to workers (DB, Redis, object storage). No new exposure.
 - No public log surface; the report is aggregate-only by construction.
-- `NODE_ENV=production` is already set in the worker image, so `readEnvironment()` requires `REDIS_URL` and
-  `NEXT_PUBLIC_APP_URL` — both present in the worker environment, but confirm them for the scheduler container
-  rather than assuming.
+- The dry-run path does not call `readEnvironment()`: it reads `REDIS_URL` directly (absent ⇒ `unknown`
+  evidence, never a throw, in every `NODE_ENV`) and takes the database URL from `DATABASE_URL`.
+  `NEXT_PUBLIC_APP_URL` is an application-contract variable and is not consulted by a read-only sweep;
+  confirm `DATABASE_URL` and `REDIS_URL` in the scheduler container rather than assuming them.
 
 **Cost** — marginal: roughly one minute of existing CPU per day, plus log retention.
 
@@ -40,9 +41,10 @@ adapter the workers already use. The one genuine blocker is the missing script c
 
 **Verification required before use**
 - [ ] A scheduler trigger exists and can run a one-shot container.
-- [ ] The scheduler container's environment includes `REDIS_URL` and `NEXT_PUBLIC_APP_URL`.
+- [ ] The scheduler container's environment includes `DATABASE_URL` and `REDIS_URL`.
 - [ ] Redis read-only principal can read `bull:dip.document-processing.v1:*` and `bull:dip.ai-processing.v1:*`
-      and is denied writes.
+      and is denied writes. Denial is proven in isolated test infrastructure only — never with a write
+      against production.
 - [ ] The report lands in the private log store with a timestamp and operator identity.
 
 ---
@@ -52,7 +54,9 @@ adapter the workers already use. The one genuine blocker is the missing script c
 The workflow already in the repository, hardened for read-only operation.
 
 **Shape**
-1. `.github/workflows/retention.yml` runs on `ubuntu-latest` on a daily schedule and on dispatch.
+1. `.github/workflows/retention.yml` runs on `ubuntu-latest`. During preparation the daily `schedule:`
+   trigger is commented out and the job's first step requires `RETENTION_DRY_RUN_ENABLED=true`, so nothing
+   runs automatically and a dispatch without that variable fails before checkout.
 2. It refuses any non-dry-run `RETENTION_APPLY` value, never passes the switch to the run step, runs
    `npm run retention:dry-run`, and uses `permissions: contents: read`.
 3. Credentials: repository secrets `RETENTION_DATABASE_URL` and `RETENTION_STORAGE_BUCKET` (the storage key
