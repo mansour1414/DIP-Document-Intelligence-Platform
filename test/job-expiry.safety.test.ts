@@ -286,7 +286,7 @@ test("an entirely unknown batch expires nothing", () => {
 // ---------------------------------------------------------------------------
 
 test("the scheduler never writes job state while planning", async () => {
-  const source = await readFile(new URL("../scripts/cleanup-expired-jobs.ts", import.meta.url), "utf8");
+  const source = await readFile(new URL("../src/lib/retention/expiry-sweep.ts", import.meta.url), "utf8");
   const planFn = source.slice(source.indexOf("export async function planStalledJobExpiry"), source.indexOf("export async function expireStalledJobs"));
   for (const write of ["updateMany", "update(", "create(", "delete(", "applyExpiryPlan"]) {
     assert.equal(planFn.includes(write), false, `planning must not call ${write}`);
@@ -301,25 +301,26 @@ test("the scheduler never writes job state while planning", async () => {
 });
 
 test("dry-run reports candidates without terminating them", async () => {
+  // This gate lives in the process entrypoint; the sweep itself was extracted.
   const source = await readFile(new URL("../scripts/cleanup-expired-jobs.ts", import.meta.url), "utf8");
   assert.match(source, /const expiredJobs = apply\s*\n?\s*\? await expireStalledJobs\(\{ mode: "apply" \}\)/);
   assert.match(source, /planStalledJobExpiry\(\{ mode: "plan" \}\)\)\.plan\.counts\.expired/);
 });
 
 test("expiry no longer selects jobs by createdAt age alone", async () => {
-  const source = await readFile(new URL("../scripts/cleanup-expired-jobs.ts", import.meta.url), "utf8");
+  const source = await readFile(new URL("../src/lib/retention/expiry-sweep.ts", import.meta.url), "utf8");
   assert.equal(/status: \{ in: \["QUEUED", "RETRYING", "RUNNING"\] \}, createdAt: \{ lt: cutoff \}/.test(source), false);
   assert.match(source, /status: "RUNNING"[\s\S]*?startedAt: \{ lt: silenceFloor \}/);
 });
 
 test("the scheduler closes the Redis connection on every path", async () => {
-  const source = await readFile(new URL("../scripts/cleanup-expired-jobs.ts", import.meta.url), "utf8");
+  const source = await readFile(new URL("../src/lib/retention/expiry-sweep.ts", import.meta.url), "utf8");
   assert.match(source, /finally \{[\s\S]*?await provider\.close\(\)/);
   assert.match(source, /if \(ownsProvider\) await provider\.close\(\)/);
 });
 
 test("a provider that reads zero queues yields unknown, never absent", async () => {
-  const source = await readFile(new URL("../scripts/cleanup-expired-jobs.ts", import.meta.url), "utf8");
+  const source = await readFile(new URL("../src/lib/retention/expiry-sweep.ts", import.meta.url), "utf8");
   // "No queues were read" is not evidence of absence. This is now enforced
   // inside resolveEvidence via the explicit expected-queue count, which also
   // covers the subtler case of a short (partial) result set.
@@ -328,7 +329,7 @@ test("a provider that reads zero queues yields unknown, never absent", async () 
 });
 
 test("an unconfigured queue provider reports unknown, never absent", async () => {
-  const source = await readFile(new URL("../scripts/cleanup-expired-jobs.ts", import.meta.url), "utf8");
+  const source = await readFile(new URL("../src/lib/retention/expiry-sweep.ts", import.meta.url), "utf8");
   assert.match(source, /unavailable: "not_configured"/);
   assert.match(source, /options\.queueUnavailable \?\? provider\.unavailable/);
 });
@@ -381,7 +382,7 @@ test("zero expected queues can never justify absence", () => {
 });
 
 test("the scheduler requires a complete read of every configured queue", async () => {
-  const source = await readFile(new URL("../scripts/cleanup-expired-jobs.ts", import.meta.url), "utf8");
+  const source = await readFile(new URL("../src/lib/retention/expiry-sweep.ts", import.meta.url), "utf8");
   assert.match(source, /resolveEvidence\(job\.id, reads, QUEUE_NAMES\.length\)/, "the expected queue count must be passed explicitly");
   assert.equal(/if \(reads\.length === 0\) return/.test(source), false, "length-zero alone was the old, insufficient check");
 });

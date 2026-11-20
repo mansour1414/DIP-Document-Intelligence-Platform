@@ -1,4 +1,3 @@
-import { db } from "@/lib/db";
 import { getStorage, type ObjectStorage } from "@/lib/storage";
 import { approvedRetentionDays, currentPlanCode } from "./plan";
 import { logger } from "@/lib/logging";
@@ -13,6 +12,7 @@ import {
   type RetentionScope,
   type RetentionFileSkipReason,
 } from "./safety";
+import { prismaRetentionRepository, type RetentionDocumentRow, type RetentionRepository } from "./repository";
 import type { PlanCode } from "@/lib/entitlements/policy";
 
 export type CleanupResult = {
@@ -24,22 +24,41 @@ export type CleanupResult = {
   failures: number;
   blockedObjects: number;
   dryRun: boolean;
+  /** Object-store calls issued. Always 0 in a dry-run; proven by test. */
+  storageOperations: number;
+  /** PostgreSQL rows written (object tombstones + document tombstones). Always 0 in a dry-run. */
+  metadataMutations: number;
 };
 
 export type RetentionCleanupInput = {
   now?: Date;
   /** Defaults to dry-run: retention is only destructive when explicitly applied. */
   dryRun?: boolean;
+  /** Apply-only. A dry-run must never be handed an object store, and never resolves one. */
   storage?: ObjectStorage;
+  /**
+   * Apply-only storage factory, used when `storage` is omitted.
+   *
+   * Exists so a dry-run can be proven independent of S3 client construction: an
+   * injected factory that throws must never be reached.
+   */
+  resolveStorage?: () => ObjectStorage;
   /** Configured storage scope; resolved from STORAGE_BUCKET when omitted. */
   scope?: RetentionScope;
+  /** Data-access port. Defaults to the Prisma implementation. */
+  repository?: RetentionRepository;
 };
 
-const ACTIVE_JOB_STATUSES = ["QUEUED", "RUNNING", "RETRYING"] as const;
 /** Grace window before an abandoned job counts as terminal work. */
 export const EXPIRED_JOB_GRACE_MS = 86_400_000;
 
-type LoadedDocuments = Awaited<ReturnType<typeof loadDocuments>>;
+/**
+ * Files referenced by live jobs. Re-exported for callers that need the same
+ * protection set the sweep uses; the query itself lives in `repository.ts`.
+ */
+export async function protectedFileIds(repository: RetentionRepository = prismaRetentionRepository): Promise<Set<string>> {
+  return repository.loadProtectedFileIds();
+}
 
 /**
  * LogContext is a flat record, and nested per-plan maps must not be silently
@@ -64,51 +83,6 @@ function summaryLogContext(summary: ReturnType<typeof buildRetentionSummary>) {
   };
 }
 
-
-function loadDocuments(now: Date) {
-  return db.document.findMany({
-    where: { status: "ACTIVE" },
-    include: {
-      files: { include: { storageObject: true }, orderBy: { createdAt: "asc" } },
-      user: {
-        include: {
-          subscriptions: {
-            where: {
-              status: { in: ["ACTIVE", "TRIALING"] },
-              startsAt: { lte: now },
-              OR: [{ currentPeriodEnd: null }, { currentPeriodEnd: { gt: now } }],
-            },
-            include: { plan: true },
-            orderBy: { createdAt: "desc" },
-            take: 1,
-          },
-        },
-      },
-    },
-  });
-}
-
-/**
- * Files referenced by live jobs must never be deleted. Jobs are read without a
- * lower age bound: a stale QUEUED/RUNNING/RETRYING row still represents work
- * that has not reached a terminal state, so expiring it in the same sweep must
- * not also release its inputs for deletion.
- */
-export async function protectedFileIds(): Promise<Set<string>> {
-  const activeJobs = await db.job.findMany({
-    where: { status: { in: [...ACTIVE_JOB_STATUSES] } },
-    select: { inputFileId: true, outputFileId: true, params: true },
-  });
-  const protectedIds = new Set<string>();
-  for (const job of activeJobs) {
-    if (job.inputFileId) protectedIds.add(job.inputFileId);
-    if (job.outputFileId) protectedIds.add(job.outputFileId);
-    const ids = (job.params as { inputFileIds?: unknown })?.inputFileIds;
-    if (Array.isArray(ids)) for (const id of ids) if (typeof id === "string") protectedIds.add(id);
-  }
-  return protectedIds;
-}
-
 /**
  * Approved per-plan input retention periods. Each document is evaluated against
  * its own plan: a PRO document keeps 30 days and is never truncated to the
@@ -122,7 +96,7 @@ function planFromDocuments(options: {
   now: Date;
   scope: RetentionScope;
   protectedIds: ReadonlySet<string>;
-  documents: LoadedDocuments;
+  documents: ReadonlyArray<RetentionDocumentRow>;
 }): RetentionPlan {
   return planRetention({
     now: options.now,
@@ -141,9 +115,9 @@ function planFromDocuments(options: {
   });
 }
 
-async function buildPlan(now: Date, scope: RetentionScope) {
-  const documents = await loadDocuments(now);
-  const plan = planFromDocuments({ now, scope, protectedIds: await protectedFileIds(), documents });
+async function buildPlan(now: Date, scope: RetentionScope, repository: RetentionRepository) {
+  const documents = await repository.loadActiveDocuments(now);
+  const plan = planFromDocuments({ now, scope, protectedIds: await repository.loadProtectedFileIds(), documents });
   return { plan, documents };
 }
 
@@ -151,10 +125,12 @@ async function buildPlan(now: Date, scope: RetentionScope) {
  * Plan a retention sweep. Strictly read-only: no document, file, storage object
  * or job row is written, and the object store is never called.
  */
-export async function planRetentionCleanup(input: { now?: Date; scope?: RetentionScope } = {}): Promise<RetentionPlan> {
+export async function planRetentionCleanup(
+  input: { now?: Date; scope?: RetentionScope; repository?: RetentionRepository } = {},
+): Promise<RetentionPlan> {
   const scope = input.scope ?? configuredRetentionScope(process.env);
   const now = input.now ?? new Date();
-  const { plan } = await buildPlan(now, scope);
+  const { plan } = await buildPlan(now, scope, input.repository ?? prismaRetentionRepository);
   logger.info("retention.scanned", summaryLogContext(buildRetentionSummary({ plan, expiredJobs: 0 })));
   return plan;
 }
@@ -163,17 +139,35 @@ export async function planRetentionCleanup(input: { now?: Date; scope?: Retentio
  * Run the retention sweep.
  *
  * `dryRun` is the default. A dry-run only reads and reports aggregate counts: it
- * never expires jobs, tombstones documents or deletes objects. Apply mode
- * deletes storage first, then tombstones metadata, and refuses any object whose
- * provider/bucket does not match the configured storage scope.
+ * never expires jobs, tombstones documents or deletes objects, and it never
+ * constructs the object-storage client — so it needs no S3 write/delete
+ * credential. Storage-scope validation stays fully enforced because it compares
+ * the `provider`/`bucket` recorded in PostgreSQL metadata against the configured
+ * scope, without contacting the object store.
+ *
+ * Apply mode resolves the object store, deletes storage first, then tombstones
+ * metadata, and refuses any object whose provider/bucket does not match the
+ * configured storage scope.
  */
 export async function runRetentionCleanup(input: RetentionCleanupInput = {}): Promise<CleanupResult> {
+  return (await runRetentionSweep(input)).result;
+}
+
+/**
+ * The sweep itself, returning both the plan and the outcome.
+ *
+ * A dry-run needs the full plan for its aggregate diagnostics (per-plan
+ * candidates and skip reasons); re-running the document query to obtain them
+ * would double the cost of the most expensive read in the system. The plan is
+ * never logged — only its aggregate counts are.
+ */
+export async function runRetentionSweep(input: RetentionCleanupInput = {}): Promise<{ plan: RetentionPlan; result: CleanupResult }> {
   const now = input.now ?? new Date();
   const dryRun = input.dryRun ?? true;
   const scope = input.scope ?? configuredRetentionScope(process.env);
-  const storage = input.storage ?? getStorage();
+  const repository = input.repository ?? prismaRetentionRepository;
 
-  const { plan, documents } = await buildPlan(now, scope);
+  const { plan, documents } = await buildPlan(now, scope, repository);
   const result: CleanupResult = {
     scanned: plan.scannedDocuments,
     candidateDocuments: plan.candidateDocuments,
@@ -183,6 +177,8 @@ export async function runRetentionCleanup(input: RetentionCleanupInput = {}): Pr
     failures: 0,
     blockedObjects: 0,
     dryRun,
+    storageOperations: 0,
+    metadataMutations: 0,
   };
 
   // The summary is aggregate-only and shared by both modes, so a dry-run and an
@@ -191,10 +187,27 @@ export async function runRetentionCleanup(input: RetentionCleanupInput = {}): Pr
   const logContext = summaryLogContext(summary);
   logger.info(dryRun ? "retention.dry_run" : "retention.apply_started", logContext);
   if (dryRun) {
+    // Strictly read-only: no object store, no metadata write, no job expiry.
     recordMetric("cleanup_candidates_total", plan.candidateDocuments, "count", { mode: "dry_run" });
-    logger.info("retention.dry_run_completed", { ...logContext, deleted: 0 });
-    return result;
+    logger.info("retention.dry_run_completed", {
+      ...logContext,
+      deleted: 0,
+      storage_operations: 0,
+      metadata_mutations: 0,
+    });
+    return { plan, result };
   }
+
+  // Apply only. Prove the write path exists before touching the object store, so
+  // a read-only repository fails closed without deleting objects whose tombstone
+  // could never be recorded — that would leave the next sweep blind.
+  const markStorageObjectDeleted = repository.markStorageObjectDeleted?.bind(repository);
+  const markDocumentDeleted = repository.markDocumentDeleted?.bind(repository);
+  if (!markStorageObjectDeleted || !markDocumentDeleted) throw new Error("RETENTION_REPOSITORY_READ_ONLY");
+
+  // Resolve the object store here, never earlier: a dry-run must not even
+  // construct an S3 client, and therefore needs no S3 credential.
+  const storage = input.storage ?? (input.resolveStorage ?? getStorage)();
 
   const objectById = new Map<string, { provider: string; bucket: string; objectKey: string; deletedAt: Date | null }>();
   for (const document of documents) {
@@ -218,8 +231,10 @@ export async function runRetentionCleanup(input: RetentionCleanupInput = {}): Pr
         continue;
       }
       try {
+        result.storageOperations += 1;
         await storage.deleteObject(object.objectKey);
-        await db.storageObject.update({ where: { id: object.storageObjectId }, data: { deletedAt: now } });
+        await markStorageObjectDeleted(object.storageObjectId, now);
+        result.metadataMutations += 1;
         result.deletedObjects += 1;
       } catch (error) {
         complete = false;
@@ -229,7 +244,8 @@ export async function runRetentionCleanup(input: RetentionCleanupInput = {}): Pr
       }
     }
     if (!complete) continue;
-    await db.document.update({ where: { id: deletion.documentId }, data: { status: "DELETED" } });
+    await markDocumentDeleted(deletion.documentId);
+    result.metadataMutations += 1;
     result.deletedDocuments += 1;
   }
 
@@ -239,11 +255,13 @@ export async function runRetentionCleanup(input: RetentionCleanupInput = {}): Pr
     deleted_documents: result.deletedDocuments,
     failures: result.failures,
     blocked_objects: result.blockedObjects,
+    storage_operations: result.storageOperations,
+    metadata_mutations: result.metadataMutations,
     policy_version: summary.policyVersion,
     retention_days_free: summary.retentionDays.FREE,
     retention_days_pro: summary.retentionDays.PRO,
   });
-  return result;
+  return { plan, result };
 }
 
 export { parseRetentionApply };

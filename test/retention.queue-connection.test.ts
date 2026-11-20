@@ -68,7 +68,7 @@ function stripComments(source: string): string {
 }
 
 test("the source never falls back to an implicit localhost Redis URL", async () => {
-  for (const path of ["../src/lib/retention/queue-connection.ts", "../scripts/cleanup-expired-jobs.ts"]) {
+  for (const path of ["../src/lib/retention/queue-connection.ts", "../src/lib/retention/expiry-sweep.ts"]) {
     const code = stripComments(await readFile(new URL(path, import.meta.url), "utf8"));
     // The shared queue module does this; the retention path must not.
     assert.equal(/redis:\/\/localhost:6379/.test(code), false, `${path} must not hard-code localhost`);
@@ -115,7 +115,7 @@ test("closing twice is safe and leaves no open socket", async () => {
 });
 
 test("the planner releases its provider even when planning throws", async () => {
-  const source = await readFile(new URL("../scripts/cleanup-expired-jobs.ts", import.meta.url), "utf8");
+  const source = await readFile(new URL("../src/lib/retention/expiry-sweep.ts", import.meta.url), "utf8");
   const planFn = source.slice(source.indexOf("export async function planStalledJobExpiry"), source.indexOf("export async function expireStalledJobs"));
   assert.match(planFn, /try \{/, "planning body must be guarded");
   assert.match(planFn, /finally \{/, "cleanup must be unconditional");

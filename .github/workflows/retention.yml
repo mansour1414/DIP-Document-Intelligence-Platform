@@ -1,18 +1,24 @@
-name: Retention Cleanup
+name: Retention Dry-Run
+
+# Preparation-phase workflow: it can only ever run a read-only dry-run.
+# Apply is not reachable from this file (see docs/cr-005-retention-dry-run-execution.md).
 
 on:
   schedule:
     - cron: "17 2 * * *"
   workflow_dispatch:
 
-# A sweep must never overlap another sweep: concurrent apply runs could issue
-# duplicate deletes and race on the same metadata rows.
+# A sweep must never overlap another sweep.
 concurrency:
   group: retention-cleanup
   cancel-in-progress: false
 
+# Least privilege: checkout and a read-only sweep only. No write scopes needed.
+permissions:
+  contents: read
+
 jobs:
-  cleanup:
+  dry-run:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -23,7 +29,27 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npx prisma generate
-      - name: Validate retention configuration
+      - name: Refuse apply mode during dry-run preparation
+        shell: bash
+        env:
+          RETENTION_APPLY: ${{ vars.RETENTION_APPLY }}
+        run: |
+          # Destructive retention is disabled while the dry-run is being prepared.
+          # This check is the outer layer: the entrypoint itself
+          # (`npm run retention:dry-run`) also aborts when RETENTION_APPLY=1, and
+          # the run step below is never given the variable at all.
+          case "$RETENTION_APPLY" in
+            ""|0)
+              echo "RETENTION_APPLY_ENABLED=false"
+              echo "RETENTION_MODE=dry_run"
+              ;;
+            *)
+              echo "Retention apply is disabled during dry-run preparation."
+              echo "RETENTION_APPLY is set to a non-dry-run value; unset it (or set it to 0) and re-run."
+              exit 1
+              ;;
+          esac
+      - name: Validate dry-run configuration
         shell: bash
         env:
           RETENTION_DATABASE_URL: ${{ secrets.RETENTION_DATABASE_URL }}
@@ -32,30 +58,24 @@ jobs:
           RETENTION_STORAGE_ACCESS_KEY: ${{ secrets.RETENTION_STORAGE_ACCESS_KEY }}
           RETENTION_STORAGE_SECRET_KEY: ${{ secrets.RETENTION_STORAGE_SECRET_KEY }}
         run: |
-          # Credentials are mandatory: without them the scheduler cannot read or
-          # verify anything, so a missing credential always fails closed.
+          # The inventory is informational: it tells an operator which values exist
+          # without printing any of them. Only the two dry-run prerequisites are
+          # enforced. A dry-run never constructs a storage client, so an S3 key
+          # pair is deliberately NOT required here and is never passed to the run.
           failed=0
           for name in RETENTION_DATABASE_URL RETENTION_STORAGE_ENDPOINT RETENTION_STORAGE_BUCKET RETENTION_STORAGE_ACCESS_KEY RETENTION_STORAGE_SECRET_KEY; do
-            if test -n "${!name}"; then echo "${name}_PRESENT=true"; else echo "${name}_PRESENT=false"; failed=1; fi
+            if test -n "${!name}"; then echo "${name}_PRESENT=true"; else echo "${name}_PRESENT=false"; fi
           done
-          test "$failed" = 0 || { echo "Retention configuration error: required credential(s) are missing."; exit 1; }
-          # RETENTION_APPLY is a mode switch, not a prerequisite. Unset (or any
-          # value other than 1) selects the read-only dry-run, which is safe and
-          # expected to succeed. Applying deletions requires the explicit "1".
-          if test "${{ vars.RETENTION_APPLY }}" = "1"; then
-            echo "RETENTION_APPLY_ENABLED=true"
-            echo "RETENTION_MODE=apply"
-          else
-            echo "RETENTION_APPLY_ENABLED=false"
-            echo "RETENTION_MODE=dry_run"
-          fi
-      - run: npm run jobs:cleanup
+          for name in RETENTION_DATABASE_URL RETENTION_STORAGE_BUCKET; do
+            if test -z "${!name}"; then echo "${name}_REQUIRED=true"; failed=1; fi
+          done
+          test "$failed" = 0 || { echo "Retention configuration error: required dry-run credential(s) are missing."; exit 1; }
+      - name: Run retention dry-run
+        # No RETENTION_APPLY here on purpose: the entrypoint refuses apply, and the
+        # variable is not needed to select a mode.
+        run: npm run retention:dry-run
         env:
           DATABASE_URL: ${{ secrets.RETENTION_DATABASE_URL }}
-          STORAGE_ENDPOINT: ${{ secrets.RETENTION_STORAGE_ENDPOINT }}
+          # Storage-scope validation reads provider/bucket from database metadata;
+          # no endpoint and no key are required for a read-only sweep.
           STORAGE_BUCKET: ${{ secrets.RETENTION_STORAGE_BUCKET }}
-          STORAGE_ACCESS_KEY: ${{ secrets.RETENTION_STORAGE_ACCESS_KEY }}
-          STORAGE_SECRET_KEY: ${{ secrets.RETENTION_STORAGE_SECRET_KEY }}
-          STORAGE_REGION: ${{ vars.RETENTION_STORAGE_REGION }}
-          # Unset or anything other than "1" resolves to a read-only dry-run.
-          RETENTION_APPLY: ${{ vars.RETENTION_APPLY }}

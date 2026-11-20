@@ -1,5 +1,4 @@
 import Redis from "ioredis";
-import { readEnvironment } from "@/lib/env";
 import { logger } from "@/lib/logging";
 
 /**
@@ -61,7 +60,15 @@ const COMMAND_TIMEOUT_MS = 2_000;
  * (never as absence).
  */
 export function openRetentionRedis(): RetentionRedisHandle {
-  const url = readEnvironment().redisUrl;
+  // Read the variable directly instead of through `readEnvironment()`.
+  //
+  // `readEnvironment()` enforces the *application's* production contract and
+  // throws when `REDIS_URL` is absent. A one-shot sweep must not inherit that:
+  // a missing queue credential is a known, reportable condition that degrades
+  // queue evidence to `unknown` (which can never authorise expiry), not a crash
+  // that hides the retention candidate counts the run exists to produce. This
+  // keeps "missing" and "unreachable" behaviour identical in every NODE_ENV.
+  const url = process.env.REDIS_URL;
   if (!url || url.trim() === "") {
     // Fail closed on evidence, not on the sweep: the dry-run still reports the
     // candidates it can establish from the database alone.

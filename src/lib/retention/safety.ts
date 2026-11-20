@@ -15,7 +15,15 @@ import type { PlanCode } from "@/lib/entitlements/policy";
 
 const DAY_MS = 86_400_000;
 
-/** Variables that must be configured before the scheduler may run at all. */
+/**
+ * Variables that must be configured before a sweep may **delete** anything.
+ *
+ * Apply constructs the object-storage client, so it needs the endpoint and a
+ * key pair. A dry-run must not inherit that requirement: it never constructs the
+ * client and never issues a storage call (see `service.ts`), so forcing it to
+ * hold S3 write credentials would widen the blast radius of a read-only run for
+ * no operational benefit.
+ */
 export const RETENTION_REQUIRED_CREDENTIALS = [
   "DATABASE_URL",
   "STORAGE_ENDPOINT",
@@ -26,9 +34,37 @@ export const RETENTION_REQUIRED_CREDENTIALS = [
 
 export type RetentionCredential = (typeof RETENTION_REQUIRED_CREDENTIALS)[number];
 
-/** NAMES only. Never include values, so the result is safe to log and report. */
-export function missingRetentionCredentials(env: Record<string, string | undefined>): RetentionCredential[] {
-  return RETENTION_REQUIRED_CREDENTIALS.filter((name) => !env[name]?.trim());
+/** Sweep modes. `dry_run` is read-only by construction; `apply` may delete. */
+export type RetentionMode = "dry_run" | "apply";
+
+/**
+ * Variables a **dry-run** must have: a database to read and the configured
+ * storage scope to compare stored metadata against.
+ *
+ * `STORAGE_BUCKET` stays mandatory because candidate selection is only
+ * trustworthy when every object is provably inside one explicit bucket. That
+ * check reads `provider`/`bucket` from PostgreSQL metadata and never contacts the
+ * object store, which is why the endpoint and keys are not needed.
+ */
+export const RETENTION_DRY_RUN_REQUIRED_CREDENTIALS = ["DATABASE_URL", "STORAGE_BUCKET"] as const;
+
+/** The exact credential set a given mode requires. Apply is unchanged. */
+export function requiredRetentionCredentials(mode: RetentionMode): readonly RetentionCredential[] {
+  return mode === "apply" ? RETENTION_REQUIRED_CREDENTIALS : RETENTION_DRY_RUN_REQUIRED_CREDENTIALS;
+}
+
+/**
+ * NAMES only. Never include values, so the result is safe to log and report.
+ *
+ * Defaults to `apply` (the strictest set) so a caller that forgets to state its
+ * mode cannot accidentally run a destructive sweep with a half-configured
+ * environment.
+ */
+export function missingRetentionCredentials(
+  env: Record<string, string | undefined>,
+  mode: RetentionMode = "apply",
+): RetentionCredential[] {
+  return requiredRetentionCredentials(mode).filter((name) => !env[name]?.trim());
 }
 
 /**
@@ -37,6 +73,20 @@ export function missingRetentionCredentials(env: Record<string, string | undefin
  */
 export function parseRetentionApply(value: string | undefined): boolean {
   return value === "1";
+}
+
+/**
+ * Refuse to run a dry-run entrypoint while the environment asks for apply.
+ *
+ * This is deliberately stricter than `parseRetentionApply`: the dry-run
+ * entrypoint must not "ignore" an apply request, it must abort loudly. Silently
+ * continuing would let an operator believe deletions ran (or believe they were
+ * blocked) based on an ambiguous configuration.
+ */
+export function assertDryRunAllowed(env: Record<string, string | undefined>): void {
+  if (parseRetentionApply(env.RETENTION_APPLY)) {
+    throw new Error("RETENTION_APPLY_FORBIDDEN_IN_DRY_RUN");
+  }
 }
 
 // The `s3` provider id is fixed by the storage adapter: every S3-compatible
