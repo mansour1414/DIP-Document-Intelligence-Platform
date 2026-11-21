@@ -1,0 +1,134 @@
+name: G1-A 03B Candidate Evidence
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/g1a03b-candidate-evidence.yml
+      - scripts/experiments/Dockerfile.structural-grayscale-g1a03-candidate
+      - scripts/experiments/build-structural-grayscale-g1a03-candidate.sh
+      - scripts/experiments/collect-structural-grayscale-g1a02-evidence.py
+      - scripts/experiments/collect-structural-grayscale-g1a03-notices.py
+      - scripts/experiments/collect-node-inventory-g1a03b.mjs
+      - scripts/experiments/verify-structural-grayscale-g1a03b-evidence.py
+      - scripts/experiments/structural-grayscale-stage3b.requirements.txt
+      - docs/evidence/g1a02/g1a02-python-native-inventory.json
+      - package.json
+      - package-lock.json
+      - Dockerfile.worker
+
+permissions:
+  contents: read
+
+jobs:
+  candidate-evidence:
+    name: Isolated candidate evidence only
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      G1A03_NODE_IMAGE: docker.io/library/node:22.20.0-bookworm-slim@sha256:b21fe589dfbe5cc39365d0544b9be3f1f33f55f3c86c87a76ff65a02f8f5848e
+      SYFT_VERSION: 1.52.0
+      SYFT_LINUX_AMD64_SHA256: caeedb81fb0491615f1ebd1761e4145d41ee86dd2cc7bf80669f9f5ad9d6133d
+      GRYPE_VERSION: 0.119.0
+      GRYPE_LINUX_AMD64_SHA256: 3fa2dc4b924621ab65404cf08d0b8438d896d80ab949c9d5a4ca283c36004c9b
+      G1A03_EVIDENCE_DIR: ${{ github.workspace }}/output/g1a03b-candidate
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Verify immutable base image at the trusted registry boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$G1A03_NODE_IMAGE" in
+            docker.io/library/node:*@sha256:*) ;;
+            *) echo "Base reference is not the approved immutable Docker Hub reference" >&2; exit 2 ;;
+          esac
+          docker pull "$G1A03_NODE_IMAGE"
+          docker image inspect "$G1A03_NODE_IMAGE" --format '{{json .RepoDigests}}' > base-image-repo-digests.json
+          grep -Fq "${G1A03_NODE_IMAGE#*@}" base-image-repo-digests.json
+
+      - name: Install checksum-pinned Syft and Grype
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/anchore-tools" "$HOME/.local/bin"
+          curl --fail --location --silent --show-error \
+            "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_linux_amd64.tar.gz" \
+            --output "$RUNNER_TEMP/anchore-tools/syft.tar.gz"
+          echo "${SYFT_LINUX_AMD64_SHA256}  $RUNNER_TEMP/anchore-tools/syft.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/anchore-tools/syft.tar.gz" -C "$HOME/.local/bin" syft
+          curl --fail --location --silent --show-error \
+            "https://github.com/anchore/grype/releases/download/v${GRYPE_VERSION}/grype_${GRYPE_VERSION}_linux_amd64.tar.gz" \
+            --output "$RUNNER_TEMP/anchore-tools/grype.tar.gz"
+          echo "${GRYPE_LINUX_AMD64_SHA256}  $RUNNER_TEMP/anchore-tools/grype.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/anchore-tools/grype.tar.gz" -C "$HOME/.local/bin" grype
+          syft version
+          grype version
+
+      - name: Materialize and verify the reviewed wheel set
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir .g1a03-wheelhouse
+          python -m pip download --only-binary=:all: --dest .g1a03-wheelhouse \
+            --requirement scripts/experiments/structural-grayscale-stage3b.requirements.txt
+          python scripts/experiments/collect-structural-grayscale-g1a02-evidence.py \
+            --wheel-dir .g1a03-wheelhouse --package-lock package-lock.json \
+            --output-dir "$RUNNER_TEMP/g1a03b-wheel-verification"
+          test "$(find .g1a03-wheelhouse -maxdepth 1 -type f -name '*.whl' | wc -l)" -eq 9
+
+      - name: Install Node tree for notice evidence only
+        run: npm ci --ignore-scripts
+
+      - name: Build isolated candidate and collect image evidence
+        shell: bash
+        run: sh scripts/experiments/build-structural-grayscale-g1a03-candidate.sh
+
+      - name: Collect Python and Node notices
+        shell: bash
+        run: |
+          python scripts/experiments/collect-structural-grayscale-g1a03-notices.py \
+            --wheel-dir .g1a03-wheelhouse --package-lock package-lock.json \
+            --node-modules node_modules --output-dir "$G1A03_EVIDENCE_DIR/notices"
+
+      - name: Record CI boundary and tool provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp base-image-repo-digests.json "$G1A03_EVIDENCE_DIR/"
+          cat >"$G1A03_EVIDENCE_DIR/ci-boundary.json" <<'JSON'
+          {
+            "scope": "G1-A/03B isolated candidate evidence only",
+            "grayscale_engine_present": false,
+            "production_worker_evidence": false,
+            "registry_push_performed": false,
+            "independent_registry_pull_performed": false,
+            "registry_oci_digest_status": "NOT VERIFIED",
+            "licensing_gate": "OPEN — NOT APPROVED"
+          }
+          JSON
+          printf '%s\n' "syft ${SYFT_VERSION} ${SYFT_LINUX_AMD64_SHA256}" \
+            "grype ${GRYPE_VERSION} ${GRYPE_LINUX_AMD64_SHA256}" \
+            >"$G1A03_EVIDENCE_DIR/scanner-tool-provenance.txt"
+          find "$G1A03_EVIDENCE_DIR" -type f -print0 | sort -z | xargs -0 sha256sum \
+            >"$G1A03_EVIDENCE_DIR/artifact-files.sha256"
+
+      - name: Upload candidate evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: g1a03b-candidate-evidence-${{ github.sha }}
+          path: ${{ env.G1A03_EVIDENCE_DIR }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Assert no registry publication occurred
+        shell: bash
+        run: |
+          test "$(cat "$G1A03_EVIDENCE_DIR/registry-digest-status.txt")" = \
+            "registry digest NOT VERIFIED: local image has no RepoDigest"
+          test "$(jq -r '.registry_oci_digest_status' "$G1A03_EVIDENCE_DIR/reconciliation.json")" = "NOT VERIFIED"
