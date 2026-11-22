@@ -7,7 +7,7 @@ import { logger } from "@/lib/logging";
 import { enforceJobCreation } from "@/lib/usage/enforcement";
 import { measure, recordMetric } from "@/lib/observability/metrics";
 import { withTenant, withTenantScope } from "@/lib/db/tenant";
-import { buildStorageObjectConnectOrCreate } from "@/lib/storage/metadata";
+import { buildStorageObjectConnectOrCreate, isAuthorizedFileStorageAccess } from "@/lib/storage/metadata";
 import { requireCleanUpload } from "@/lib/malware";
 import { validateToolOptions } from "@/lib/tools/options";
 import { deletePhase1Secret, enforceUnlockRateLimit, phase1SecretToolIds, putPhase1Secret, type Phase1SecretPayload, type Phase1SecretPurpose } from "@/lib/secrets/phase1";
@@ -73,23 +73,39 @@ export async function createToolJobFromFiles(input: { userId: string; toolId: st
         where: {
           id: { in: input.fileIds },
           document: { userId: input.userId, organizationId: null, status: "ACTIVE" },
+          storageObjectId: { not: null },
           NOT: { storageKey: { startsWith: "ephemeral/" } },
-          OR: [
-            { storageObjectId: null },
-            {
-              storageObject: {
-                ownerUserId: input.userId,
-                organizationId: null,
-                apiClientId: null,
-                deletedAt: null,
-              },
-            },
-          ],
+          storageObject: {
+            ownerUserId: input.userId,
+            organizationId: null,
+            apiClientId: null,
+            deletedAt: null,
+          },
         },
-        select: { id: true, size: true, pageCount: true, mimeType: true },
+        select: {
+          id: true,
+          size: true,
+          pageCount: true,
+          mimeType: true,
+          storageKey: true,
+          storageObjectId: true,
+          storageObject: {
+            select: {
+              ownerUserId: true,
+              organizationId: true,
+              apiClientId: true,
+              provider: true,
+              bucket: true,
+              objectKey: true,
+              deletedAt: true,
+            },
+          },
+        },
       }),
   );
-  if (files.length !== input.fileIds.length) throw Object.assign(new Error("WORKFLOW_ARTIFACT_UNAUTHORIZED"), { code: "WORKFLOW_ARTIFACT_UNAUTHORIZED" });
+  if (files.length !== input.fileIds.length || files.some((file) => !isAuthorizedFileStorageAccess(file, { userId: input.userId }))) {
+    throw Object.assign(new Error("WORKFLOW_ARTIFACT_UNAUTHORIZED"), { code: "WORKFLOW_ARTIFACT_UNAUTHORIZED" });
+  }
   if (input.fileIds.length < minimumFilesFor(input.toolId) || input.fileIds.length > tool.limits.maxFiles) throw new Error("INPUT_FILE_COUNT_INVALID");
   if (files.some((file) => !tool.mime.input.includes(file.mimeType))) throw Object.assign(new Error("WORKFLOW_MIME_INCOMPATIBLE"), { code: "WORKFLOW_MIME_INCOMPATIBLE" });
   const monetization = await enforceJobCreation({ userId: input.userId, toolId: tool.toolId, idempotencyKey: input.idempotencyKey, correlationId: input.correlationId, options, files: files.map((file) => ({ size: Number(file.size), pageCount: file.pageCount ?? undefined })) });

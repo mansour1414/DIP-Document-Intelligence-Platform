@@ -8,6 +8,7 @@ import { db } from "@/lib/db";
 import { withApiTenant, withTenantScope } from "@/lib/db/tenant";
 import { createToolJob } from "@/lib/jobs/orchestrator";
 import { getStorage, type ObjectStorage } from "@/lib/storage";
+import { isAuthorizedFileStorageAccess } from "@/lib/storage/metadata";
 import { getPublicTool } from "./tools";
 import { PublicApiError } from "./errors";
 import { deletePhase1Secret, phase1SecretsFromForm, type Phase1SecretPayload } from "@/lib/secrets/phase1";
@@ -60,31 +61,47 @@ export async function getPublicJobResult(principal: ApiPrincipal, jobId: string,
   const job = await scopedResult(principal, jobId, client);
   const result = job.result as { outputFileIds?: string[] } | null;
   if (!result?.outputFileIds) return { kind: "json" as const, data: job.result };
+  const scope = { userId: principal.executionUserId, organizationId: principal.organizationId, apiClientId: principal.apiClientId };
   const files = await withTenantScope(
-    { userId: principal.executionUserId, organizationId: principal.organizationId, apiClientId: principal.apiClientId },
+    scope,
     (tx) =>
       tx.file.findMany({
         where: {
           id: { in: result.outputFileIds },
           document: { userId: principal.executionUserId, organizationId: principal.organizationId, status: "ACTIVE" },
+          storageObjectId: { not: null },
           NOT: { storageKey: { startsWith: "ephemeral/" } },
-          OR: [
-            { storageObjectId: null },
-            {
-              storageObject: {
-                ownerUserId: principal.executionUserId,
-                organizationId: principal.organizationId,
-                apiClientId: principal.apiClientId,
-                deletedAt: null,
-              },
-            },
-          ],
+          storageObject: {
+            ownerUserId: principal.executionUserId,
+            organizationId: principal.organizationId,
+            apiClientId: principal.apiClientId,
+            deletedAt: null,
+          },
         },
-        select: { id: true, originalName: true, mimeType: true, size: true },
+        select: {
+          id: true,
+          originalName: true,
+          mimeType: true,
+          size: true,
+          storageKey: true,
+          storageObjectId: true,
+          storageObject: {
+            select: {
+              ownerUserId: true,
+              organizationId: true,
+              apiClientId: true,
+              provider: true,
+              bucket: true,
+              objectKey: true,
+              deletedAt: true,
+            },
+          },
+        },
       }),
     client,
   );
-  return { kind: "files" as const, files: files.map((file) => ({ id: file.id, name: file.originalName, mimeType: file.mimeType, bytes: Number(file.size), downloadUrl: `/v1/jobs/${jobId}/result/${file.id}` })) };
+  const authorizedFiles = files.filter((file) => isAuthorizedFileStorageAccess(file, scope));
+  return { kind: "files" as const, files: authorizedFiles.map((file) => ({ id: file.id, name: file.originalName, mimeType: file.mimeType, bytes: Number(file.size), downloadUrl: `/v1/jobs/${jobId}/result/${file.id}` })) };
 }
 export async function downloadPublicJobResult(principal: ApiPrincipal, jobId: string, fileId: string, deps: { client?: PrismaClient; storage?: ObjectStorage } = {}) {
   const client = deps.client ?? db;
@@ -92,30 +109,48 @@ export async function downloadPublicJobResult(principal: ApiPrincipal, jobId: st
   const job = await scopedResult(principal, jobId, client);
   const ids = ((job.result as { outputFileIds?: string[] } | null)?.outputFileIds ?? []);
   if (!ids.includes(fileId)) throw new PublicApiError("NOT_FOUND", "The result file was not found.", 404);
+  const scope = { userId: principal.executionUserId, organizationId: principal.organizationId, apiClientId: principal.apiClientId };
   const file = await withTenantScope(
-    { userId: principal.executionUserId, organizationId: principal.organizationId, apiClientId: principal.apiClientId },
+    scope,
     (tx) =>
       tx.file.findFirst({
         where: {
           id: fileId,
           document: { userId: principal.executionUserId, organizationId: principal.organizationId, status: "ACTIVE" },
+          storageObjectId: { not: null },
           NOT: { storageKey: { startsWith: "ephemeral/" } },
-          OR: [
-            { storageObjectId: null },
-            {
-              storageObject: {
-                ownerUserId: principal.executionUserId,
-                organizationId: principal.organizationId,
-                apiClientId: principal.apiClientId,
-                deletedAt: null,
-              },
-            },
-          ],
+          storageObject: {
+            ownerUserId: principal.executionUserId,
+            organizationId: principal.organizationId,
+            apiClientId: principal.apiClientId,
+            deletedAt: null,
+          },
         },
-        select: { originalName: true, mimeType: true, storageKey: true },
+        select: {
+          originalName: true,
+          mimeType: true,
+          storageKey: true,
+          storageObjectId: true,
+          storageObject: {
+            select: {
+              ownerUserId: true,
+              organizationId: true,
+              apiClientId: true,
+              provider: true,
+              bucket: true,
+              objectKey: true,
+              deletedAt: true,
+            },
+          },
+        },
       }),
     client,
   );
-  if (!file) throw new PublicApiError("NOT_FOUND", "The result file was not found.", 404);
-  return { ...file, bytes: await storage.get(file.storageKey) };
+  if (!isAuthorizedFileStorageAccess(file, scope)) throw new PublicApiError("NOT_FOUND", "The result file was not found.", 404);
+  return {
+    originalName: file!.originalName,
+    mimeType: file!.mimeType,
+    storageKey: file!.storageKey,
+    bytes: await storage.get(file!.storageKey),
+  };
 }

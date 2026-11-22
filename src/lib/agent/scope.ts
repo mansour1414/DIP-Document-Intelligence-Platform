@@ -1,4 +1,5 @@
 import { withTenant } from "@/lib/db/tenant";
+import { isAuthorizedFileStorageAccess } from "@/lib/storage/metadata";
 import { AgentError } from "./errors";
 import type { AgentRequest, ResolvedAgentFile, ResolvedAgentScope } from "./types";
 
@@ -12,28 +13,44 @@ const databaseLookup: AgentFileLookup = (userId, fileIds) =>
           where: {
             id: { in: [...fileIds] },
             document: { userId, organizationId: null, status: "ACTIVE" },
+            storageObjectId: { not: null },
             NOT: { storageKey: { startsWith: "ephemeral/" } },
-            OR: [
-              { storageObjectId: null },
-              {
-                storageObject: {
-                  ownerUserId: userId,
-                  organizationId: null,
-                  apiClientId: null,
-                  deletedAt: null,
-                },
-              },
-            ],
+            storageObject: {
+              ownerUserId: userId,
+              organizationId: null,
+              apiClientId: null,
+              deletedAt: null,
+            },
           },
-          select: { id: true, mimeType: true, size: true, pageCount: true },
+          select: {
+            id: true,
+            mimeType: true,
+            size: true,
+            pageCount: true,
+            storageKey: true,
+            storageObjectId: true,
+            storageObject: {
+              select: {
+                ownerUserId: true,
+                organizationId: true,
+                apiClientId: true,
+                provider: true,
+                bucket: true,
+                objectKey: true,
+                deletedAt: true,
+              },
+            },
+          },
         })
         .then((files) =>
-          files.map((file) => ({
-            id: file.id,
-            mimeType: file.mimeType,
-            size: Number(file.size),
-            ...(file.pageCount === null ? {} : { pageCount: file.pageCount }),
-          })),
+          files
+            .filter((file) => isAuthorizedFileStorageAccess(file, { userId }))
+            .map((file) => ({
+              id: file.id,
+              mimeType: file.mimeType,
+              size: Number(file.size),
+              ...(file.pageCount === null ? {} : { pageCount: file.pageCount }),
+            })),
         ),
   );
 

@@ -204,10 +204,30 @@ async function fixture() {
   const user = randomUUID(); const jobId = randomUUID(); const inputIds: string[] = [];
   for (let index = 0; index < 2; index += 1) {
     const id = randomUUID();
+    const storageObjectId = randomUUID();
     const key = `input/${user}/${id}.pdf`;
     const bytes = await pdfBytes();
     inputs.set(key, bytes);
-    db.state.files.push({ id, documentId: randomUUID(), storageKey: key, mimeType: "application/pdf", originalName: `in-${index}.pdf`, size: BigInt(bytes.byteLength), pageCount: 1 });
+    db.state.files.push({
+      id,
+      documentId: randomUUID(),
+      storageObjectId,
+      storageObject: {
+        id: storageObjectId,
+        ownerUserId: user,
+        organizationId: null,
+        apiClientId: null,
+        provider: "s3",
+        bucket: "dip-test",
+        objectKey: key,
+        deletedAt: null,
+      },
+      storageKey: key,
+      mimeType: "application/pdf",
+      originalName: `in-${index}.pdf`,
+      size: BigInt(bytes.byteLength),
+      pageCount: 1,
+    });
     inputIds.push(id);
   }
   db.state.jobs.set(jobId, { id: jobId, toolId: "merge-pdf", status: "QUEUED", requesterId: user, organizationId: null, correlationId: randomUUID(), params: { inputFileIds: inputIds, options: {} }, startedAt: null, outputFileId: null, errorCode: null, result: null, completedAt: null });

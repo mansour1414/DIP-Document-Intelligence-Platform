@@ -36,9 +36,12 @@ test("N1-A corrective migration preserves all 12 historical migrations and adds 
   ]);
 });
 
-test("N1-A migration enforces migration-owner preflight, mixed API-client fail-closed checks, composite FK, and orphan preservation", () => {
+test("N1-A migration enforces migration-owner preflight, storage-key coordinate preflight/constraints, mixed API-client fail-closed checks, composite FK, and orphan preservation", () => {
   assert.match(sql, /IF current_user IN \('dip_app', 'dip_retention'\) THEN\s+RAISE EXCEPTION 'MIGRATION_ROLE_INVALID/);
   assert.match(sql, /ALTER TABLE "storage_objects"\s+ADD COLUMN "owner_user_id" UUID,\s+ADD COLUMN "organization_id" UUID,\s+ADD COLUMN "api_client_id" UUID;/);
+  assert.match(sql, /FILE_STORAGE_OBJECT_REQUIRED_CONFLICT/);
+  assert.match(sql, /FILE_EPHEMERAL_STORAGE_OBJECT_CONFLICT/);
+  assert.match(sql, /FILE_STORAGE_KEY_MISMATCH_CONFLICT/);
   assert.match(sql, /STORAGE_OBJECT_TENANT_CONFLICT/);
   assert.match(sql, /COUNT\(DISTINCT d\."organization_id"\) = 1 AND BOOL_OR\(d\."organization_id" IS NULL\)/);
   assert.match(sql, /BOOL_OR\(has_api_job AND has_non_api_job\)/);
@@ -47,7 +50,14 @@ test("N1-A migration enforces migration-owner preflight, mixed API-client fail-c
   assert.match(sql, /j\."result"->'outputFileIds'/);
   assert.match(sql, /STORAGE_OBJECT_API_CLIENT_CONFLICT/);
   assert.doesNotMatch(sql, /DELETE\s+FROM\s+"?storage_objects"?/i, "backfill must never silently delete orphaned storage_objects");
+  assert.doesNotMatch(sql, /DELETE\s+FROM\s+"?files"?/i, "preflight must never silently delete files rows");
 
+  assert.match(sql, /CONSTRAINT "files_ephemeral_or_storage_object_check" CHECK/);
+  assert.match(sql, /FILE_STORAGE_OBJECT_REQUIRED/);
+  assert.match(sql, /FILE_STORAGE_KEY_MISMATCH/);
+  assert.match(sql, /FILE_STORAGE_COORDINATES_IMMUTABLE/);
+  assert.match(sql, /CREATE TRIGGER files_storage_object_tenant_guard\s+BEFORE INSERT OR UPDATE ON "files"/);
+  assert.match(sql, /so\."object_key" = "files"\."storage_key"/);
   assert.match(sql, /CONSTRAINT "storage_objects_tenant_scope_check" CHECK/);
   assert.match(sql, /CONSTRAINT "storage_objects_owner_user_id_fkey"\s+FOREIGN KEY \("owner_user_id"\) REFERENCES "users"\("id"\)\s+ON DELETE RESTRICT ON UPDATE CASCADE/);
   assert.match(sql, /CONSTRAINT "storage_objects_organization_id_fkey"\s+FOREIGN KEY \("organization_id"\) REFERENCES "organizations"\("id"\)\s+ON DELETE RESTRICT ON UPDATE CASCADE/);

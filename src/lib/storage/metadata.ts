@@ -44,7 +44,7 @@ export const storageObjectMetadataSelect = {
 export type FileStorageAccessCandidate = Readonly<{
   storageKey: string;
   storageObjectId?: string | null;
-  document: Readonly<{
+  document?: Readonly<{
     userId: string;
     organizationId?: string | null;
     status?: string | null;
@@ -53,15 +53,24 @@ export type FileStorageAccessCandidate = Readonly<{
     ownerUserId?: string | null;
     organizationId?: string | null;
     apiClientId?: string | null;
+    provider?: string | null;
+    bucket?: string | null;
+    objectKey?: string | null;
     deletedAt?: Date | null;
   }> | null;
+}>;
+
+export type ExpectedStorageCoordinates = Readonly<{
+  provider?: string;
+  bucket?: string;
 }>;
 
 export function isAuthorizedFileStorageAccess(
   file: FileStorageAccessCandidate | null | undefined,
   principal: TenantExecutionScope,
+  expectedCoordinates?: ExpectedStorageCoordinates,
 ): boolean {
-  if (!file || !file.storageKey || file.storageKey.startsWith("ephemeral/")) {
+  if (!file || !file.storageKey.trim() || file.storageKey.startsWith("ephemeral/")) {
     return false;
   }
 
@@ -82,23 +91,37 @@ export function isAuthorizedFileStorageAccess(
     }
   }
 
-  if ((file.storageObjectId ?? null) !== null) {
-    const so = file.storageObject;
-    if (!so) {
-      return false;
-    }
-    if (so.deletedAt !== null && so.deletedAt !== undefined) {
-      return false;
-    }
-    if (so.ownerUserId !== scope.userId) {
-      return false;
-    }
-    if ((so.organizationId ?? null) !== scope.organizationId) {
-      return false;
-    }
-    if ((so.apiClientId ?? null) !== scope.apiClientId) {
-      return false;
-    }
+  if ((file.storageObjectId ?? null) === null) {
+    return false;
+  }
+
+  const so = file.storageObject;
+  if (!so) {
+    return false;
+  }
+  if (so.deletedAt !== null && so.deletedAt !== undefined) {
+    return false;
+  }
+  if (so.ownerUserId !== scope.userId) {
+    return false;
+  }
+  if ((so.organizationId ?? null) !== scope.organizationId) {
+    return false;
+  }
+  if ((so.apiClientId ?? null) !== scope.apiClientId) {
+    return false;
+  }
+  if (!so.provider?.trim() || !so.bucket?.trim()) {
+    return false;
+  }
+  if (so.objectKey !== file.storageKey) {
+    return false;
+  }
+  if (expectedCoordinates?.provider && so.provider !== expectedCoordinates.provider) {
+    return false;
+  }
+  if (expectedCoordinates?.bucket && so.bucket !== expectedCoordinates.bucket) {
+    return false;
   }
 
   return true;

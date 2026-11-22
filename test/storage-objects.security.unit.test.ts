@@ -443,8 +443,14 @@ class SimulatedTenantDatabase {
                   }
                 }
 
+                const rawStorageKey = String(data.storageKey);
+
                 // Trigger: enforce_file_storage_object_tenant_match
-                if (storageObjectId !== null) {
+                if (storageObjectId === null) {
+                  if (!rawStorageKey.startsWith("ephemeral/") || rawStorageKey.length <= "ephemeral/".length) {
+                    throw Object.assign(new Error("FILE_STORAGE_OBJECT_REQUIRED"), { code: "23514" });
+                  }
+                } else {
                   const obj = this.storageObjects.get(storageObjectId);
                   if (!obj) throw Object.assign(new Error("FILE_STORAGE_OBJECT_NOT_FOUND"), { code: "23503" });
                   if (
@@ -458,13 +464,19 @@ class SimulatedTenantDatabase {
                   if (obj.apiClientId !== ctxApiClientId) {
                     throw Object.assign(new Error("STORAGE_OBJECT_API_CLIENT_MISMATCH"), { code: "42501" });
                   }
+                  if (obj.deletedAt !== null) {
+                    throw Object.assign(new Error("FILE_STORAGE_OBJECT_DELETED"), { code: "23514" });
+                  }
+                  if (!rawStorageKey.trim() || rawStorageKey.startsWith("ephemeral/") || rawStorageKey !== obj.objectKey) {
+                    throw Object.assign(new Error("FILE_STORAGE_KEY_MISMATCH"), { code: "23514" });
+                  }
                 }
 
                 const file: SimFile = {
                   id: (data.id as string | undefined) ?? randomUUID(),
                   documentId,
                   storageObjectId,
-                  storageKey: String(data.storageKey),
+                  storageKey: rawStorageKey,
                   originalName: String(data.originalName),
                   mimeType: String(data.mimeType),
                   size: BigInt(data.size as bigint | number),
@@ -477,9 +489,11 @@ class SimulatedTenantDatabase {
               findMany: async ({
                 where = {},
                 include,
+                select,
               }: {
                 where?: Record<string, unknown>;
                 include?: { document?: boolean; storageObject?: boolean };
+                select?: { document?: unknown; storageObject?: unknown };
               }) => {
                 const matchClause = (file: SimFile, doc: SimDocument, clause: Record<string, unknown>): boolean => {
                   if (clause.id && typeof clause.id === "object" && "in" in (clause.id as object)) {
@@ -494,8 +508,13 @@ class SimulatedTenantDatabase {
                     if (typeof sk.startsWith === "string" && !file.storageKey.startsWith(sk.startsWith)) return false;
                   }
 
-                  if ("storageObjectId" in clause && file.storageObjectId !== clause.storageObjectId) {
-                    return false;
+                  if ("storageObjectId" in clause) {
+                    const soFilter = clause.storageObjectId;
+                    if (soFilter && typeof soFilter === "object" && "not" in (soFilter as object)) {
+                      if (file.storageObjectId === (soFilter as { not: string | null }).not) return false;
+                    } else if (file.storageObjectId !== soFilter) {
+                      return false;
+                    }
                   }
 
                   if (clause.document && typeof clause.document === "object") {
@@ -545,22 +564,35 @@ class SimulatedTenantDatabase {
                     (doc.organizationId !== null && o === doc.organizationId && this.isOrgMember(doc.organizationId, u));
                   if (!docVisible) return false;
                   // Restrictive files_storage_object_rls_guard TO dip_app
-                  if (role === "dip_app" && file.storageObjectId !== null) {
-                    const so = this.storageObjects.get(file.storageObjectId);
-                    if (!so || !this.canSelectStorageObject(role, guc, so)) return false;
+                  if (role === "dip_app") {
+                    if (file.storageObjectId === null) {
+                      if (!file.storageKey.startsWith("ephemeral/") || file.storageKey.length <= "ephemeral/".length) {
+                        return false;
+                      }
+                    } else {
+                      if (file.storageKey.startsWith("ephemeral/")) return false;
+                      const so = this.storageObjects.get(file.storageObjectId);
+                      if (!so || so.objectKey !== file.storageKey || !this.canSelectStorageObject(role, guc, so)) {
+                        return false;
+                      }
+                    }
                   }
                   return matchClause(file, doc, where);
                 });
 
                 return matches.map((file) => ({
                   ...file,
-                  ...(include?.document ? { document: this.documents.get(file.documentId)! } : {}),
-                  ...(include?.storageObject
+                  ...(include?.document || select?.document ? { document: this.documents.get(file.documentId)! } : {}),
+                  ...(include?.storageObject || select?.storageObject
                     ? { storageObject: file.storageObjectId ? this.storageObjects.get(file.storageObjectId) ?? null : null }
                     : {}),
                 }));
               },
-              findFirst: async (args: { where?: Record<string, unknown> }) => {
+              findFirst: async (args: {
+                where?: Record<string, unknown>;
+                include?: { document?: boolean; storageObject?: boolean };
+                select?: { document?: unknown; storageObject?: unknown };
+              }) => {
                 const rows = await tx.file.findMany(args);
                 return rows[0] ?? null;
               },
@@ -1396,10 +1428,51 @@ test("18. File.storageKey access guard and fail-closed RLS gate runner enforce s
   assert.equal(
     isAuthorizedFileStorageAccess(
       {
+        storageKey: `input/${userA}/unlinked-non-ephemeral.pdf`,
+        storageObjectId: null,
+        document: { userId: userA, organizationId: null, status: "ACTIVE" },
+      },
+      { userId: userA },
+    ),
+    false,
+    "non-ephemeral File with storageObjectId=null must never be authorized for object storage reads",
+  );
+  assert.equal(
+    isAuthorizedFileStorageAccess(
+      {
+        storageKey: `api/${orgA}/${clientA2}/victim.pdf`,
+        storageObjectId: randomUUID(),
+        document: { userId: userA, organizationId: orgA, status: "ACTIVE" },
+        storageObject: {
+          ownerUserId: userA,
+          organizationId: orgA,
+          apiClientId: clientA1,
+          provider: "s3",
+          bucket: "dip-test",
+          objectKey: `api/${orgA}/${clientA1}/own.pdf`,
+          deletedAt: null,
+        },
+      },
+      { userId: userA, organizationId: orgA, apiClientId: clientA1 },
+    ),
+    false,
+    "forged File.storageKey differing from StorageObject.objectKey must be rejected",
+  );
+  assert.equal(
+    isAuthorizedFileStorageAccess(
+      {
         storageKey: `api/${orgA}/${clientA1}/doc.pdf`,
         storageObjectId: randomUUID(),
         document: { userId: userA, organizationId: orgA, status: "ACTIVE" },
-        storageObject: { ownerUserId: userA, organizationId: orgA, apiClientId: clientA1, deletedAt: null },
+        storageObject: {
+          ownerUserId: userA,
+          organizationId: orgA,
+          apiClientId: clientA1,
+          provider: "s3",
+          bucket: "dip-test",
+          objectKey: `api/${orgA}/${clientA1}/doc.pdf`,
+          deletedAt: null,
+        },
       },
       { userId: userA, organizationId: orgA, apiClientId: clientA2 },
     ),
@@ -1411,7 +1484,15 @@ test("18. File.storageKey access guard and fail-closed RLS gate runner enforce s
         storageKey: `api/${orgA}/${clientA1}/doc.pdf`,
         storageObjectId: randomUUID(),
         document: { userId: userA, organizationId: orgA, status: "ACTIVE" },
-        storageObject: { ownerUserId: userA, organizationId: orgA, apiClientId: clientA1, deletedAt: new Date() },
+        storageObject: {
+          ownerUserId: userA,
+          organizationId: orgA,
+          apiClientId: clientA1,
+          provider: "s3",
+          bucket: "dip-test",
+          objectKey: `api/${orgA}/${clientA1}/doc.pdf`,
+          deletedAt: new Date(),
+        },
       },
       { userId: userA, organizationId: orgA, apiClientId: clientA1 },
     ),
@@ -1423,7 +1504,36 @@ test("18. File.storageKey access guard and fail-closed RLS gate runner enforce s
         storageKey: `api/${orgA}/${clientA1}/doc.pdf`,
         storageObjectId: randomUUID(),
         document: { userId: userA, organizationId: orgA, status: "ACTIVE" },
-        storageObject: { ownerUserId: userA, organizationId: orgA, apiClientId: clientA1, deletedAt: null },
+        storageObject: {
+          ownerUserId: userA,
+          organizationId: orgA,
+          apiClientId: clientA1,
+          provider: "s3",
+          bucket: "dip-test",
+          objectKey: `api/${orgA}/${clientA1}/doc.pdf`,
+          deletedAt: null,
+        },
+      },
+      { userId: userA, organizationId: orgA, apiClientId: clientA1 },
+      { provider: "s3", bucket: "other-bucket" },
+    ),
+    false,
+  );
+  assert.equal(
+    isAuthorizedFileStorageAccess(
+      {
+        storageKey: `api/${orgA}/${clientA1}/doc.pdf`,
+        storageObjectId: randomUUID(),
+        document: { userId: userA, organizationId: orgA, status: "ACTIVE" },
+        storageObject: {
+          ownerUserId: userA,
+          organizationId: orgA,
+          apiClientId: clientA1,
+          provider: "s3",
+          bucket: "dip-test",
+          objectKey: `api/${orgA}/${clientA1}/doc.pdf`,
+          deletedAt: null,
+        },
       },
       { userId: userA, organizationId: orgA, apiClientId: clientA1 },
     ),
@@ -1631,4 +1741,203 @@ test("19. Real generated PrismaClient validates checked FileCreateInput + buildS
   } finally {
     await realPrisma.$disconnect();
   }
+});
+
+test("21. Storage key coordinate integrity: unlinked non-ephemeral files and forged File.storageKey values fail closed across DB triggers/RLS and all storage.get consumers while preserving ephemeral job history", async () => {
+  const { sim, userA, userB, orgA, clientA1 } = seedMultiTenantWorld();
+  const appClient = sim.clientForRole("dip_app");
+
+  // 1. Legitimate ephemeral job-history File (storageObjectId = null, storageKey = ephemeral/*) succeeds,
+  //    stays tenant-scoped, and is never downloadable via findOutputFileForUser.
+  const ephemeralHistory = await withTenant(
+    { userId: userA },
+    async (tx) => {
+      const doc = await tx.document.create({ data: { userId: userA, title: "browser-history" } });
+      return tx.file.create({
+        data: {
+          document: { connect: { id: doc.id } },
+          originalName: "browser-history.pdf",
+          mimeType: "application/pdf",
+          size: BigInt(1024),
+          storageKey: `ephemeral/${randomUUID()}-browser-history.pdf`,
+        },
+      });
+    },
+    appClient,
+  );
+  assert.equal(ephemeralHistory.storageObjectId, null);
+  assert.equal(await findOutputFileForUser(userA, ephemeralHistory.id, appClient), null);
+
+  // 2. Unlinked non-ephemeral File creation is rejected at DB trigger boundary.
+  await assert.rejects(
+    () =>
+      withTenant(
+        { userId: userA },
+        async (tx) => {
+          const doc = await tx.document.create({ data: { userId: userA, title: "unlinked-doc" } });
+          return tx.file.create({
+            data: {
+              document: { connect: { id: doc.id } },
+              originalName: "unlinked.pdf",
+              mimeType: "application/pdf",
+              size: BigInt(512),
+              storageKey: `input/${userB}/victim.pdf`,
+            },
+          });
+        },
+        appClient,
+      ),
+    /FILE_STORAGE_OBJECT_REQUIRED/,
+  );
+
+  // 3. Forged File.storageKey linked to attacker's own StorageObject is rejected at DB trigger boundary.
+  const ownAuthorizedFile = await withTenant(
+    { userId: userA },
+    async (tx) => {
+      const doc = await tx.document.create({ data: { userId: userA, title: "own-doc" } });
+      return tx.file.create({
+        data: {
+          document: { connect: { id: doc.id } },
+          originalName: "own.pdf",
+          mimeType: "application/pdf",
+          size: BigInt(512),
+          storageKey: `input/${userA}/own.pdf`,
+          storageObject: buildStorageObjectConnectOrCreate(
+            { userId: userA },
+            { bucket: "dip-test", objectKey: `input/${userA}/own.pdf`, size: 512 },
+          ),
+        },
+      });
+    },
+    appClient,
+  );
+
+  await assert.rejects(
+    () =>
+      withTenant(
+        { userId: userA },
+        async (tx) => {
+          const doc = await tx.document.create({ data: { userId: userA, title: "forged-doc" } });
+          return tx.file.create({
+            data: {
+              document: { connect: { id: doc.id } },
+              originalName: "forged.pdf",
+              mimeType: "application/pdf",
+              size: BigInt(512),
+              storageKey: `input/${userB}/victim.pdf`,
+              storageObject: { connect: { id: ownAuthorizedFile.storageObjectId! } },
+            },
+          });
+        },
+        appClient,
+      ),
+    /FILE_STORAGE_KEY_MISMATCH/,
+  );
+
+  // 4. Defense in depth: even if raw store state were corrupted out-of-band (unlinked non-ephemeral row or
+  //    forged storageKey != objectKey), findOutputFileForUser, getPublicJobResult, downloadPublicJobResult,
+  //    and processDocumentJob ALL fail closed with zero storage.get invocations.
+  let storageReads = 0;
+  const guardedStorage: ObjectStorage = {
+    createUploadKey: () => "",
+    put: async (): Promise<StoredObject> => ({ key: "", bucket: "dip-test", contentType: "application/pdf", size: 0 }),
+    get: async () => {
+      storageReads += 1;
+      return new Uint8Array();
+    },
+    head: async () => undefined,
+    exists: async () => true,
+    deleteObject: async () => {},
+    close: async () => {},
+  };
+  const cleanScanner: MalwareScanner = {
+    scan: async () => ({ result: "CLEAN", engine: "stub", engineVersion: "1", signatureVersion: "1", scannedAt: new Date() }),
+  };
+
+  // Tamper personal file to forged victim key and unlinked state in sequence:
+  sim.files.get(ownAuthorizedFile.id)!.storageKey = `input/${userB}/victim.pdf`;
+  assert.equal(await findOutputFileForUser(userA, ownAuthorizedFile.id, appClient), null);
+
+  const forgedJobId = randomUUID();
+  sim.jobs.set(forgedJobId, {
+    id: forgedJobId,
+    toolId: "compress-pdf",
+    requesterId: userA,
+    organizationId: null,
+    apiClientId: null,
+    status: "QUEUED",
+    params: { inputFileIds: [ownAuthorizedFile.id], options: {} },
+    result: null,
+    outputFileId: null,
+    correlationId: randomUUID(),
+    startedAt: null,
+    completedAt: null,
+    errorCode: null,
+  });
+  await assert.rejects(
+    () =>
+      processDocumentJob(
+        { jobId: forgedJobId, toolId: "compress-pdf", idempotencyKey: `forged-${forgedJobId}`, correlationId: randomUUID(), userId: userA },
+        { client: appClient, storage: guardedStorage, scanner: cleanScanner },
+      ),
+    /Input file is missing/,
+  );
+
+  sim.files.get(ownAuthorizedFile.id)!.storageObjectId = null;
+  assert.equal(await findOutputFileForUser(userA, ownAuthorizedFile.id, appClient), null);
+
+  const apiFile = await withTenantScope(
+    { userId: userA, organizationId: orgA, apiClientId: clientA1 },
+    async (tx) => {
+      const doc = await tx.document.create({ data: { userId: userA, organizationId: orgA, title: "api-tamper" } });
+      return tx.file.create({
+        data: {
+          document: { connect: { id: doc.id } },
+          originalName: "api.pdf",
+          mimeType: "application/pdf",
+          size: BigInt(256),
+          storageKey: `api/${orgA}/${clientA1}/legit.pdf`,
+          storageObject: buildStorageObjectConnectOrCreate(
+            { userId: userA, organizationId: orgA, apiClientId: clientA1 },
+            { bucket: "dip-test", objectKey: `api/${orgA}/${clientA1}/legit.pdf`, size: 256 },
+          ),
+        },
+      });
+    },
+    appClient,
+  );
+  const apiJobId = randomUUID();
+  sim.jobs.set(apiJobId, {
+    id: apiJobId,
+    toolId: "compress-pdf",
+    requesterId: userA,
+    organizationId: orgA,
+    apiClientId: clientA1,
+    status: "SUCCEEDED",
+    params: {},
+    result: { outputFileIds: [apiFile.id] },
+    outputFileId: apiFile.id,
+    correlationId: null,
+    startedAt: new Date(),
+    completedAt: new Date(),
+    errorCode: null,
+  });
+  const principalA1: ApiPrincipal = {
+    kind: "api_key",
+    apiKeyId: randomUUID(),
+    apiClientId: clientA1,
+    organizationId: orgA,
+    executionUserId: userA,
+    scopes: ["*"],
+  };
+
+  sim.files.get(apiFile.id)!.storageKey = `api/${orgA}/other-client/secret.pdf`;
+  const tamperedResult = await getPublicJobResult(principalA1, apiJobId, appClient);
+  assert.equal(tamperedResult.kind, "files");
+  assert.equal(tamperedResult.files.length, 0);
+  await assert.rejects(
+    () => downloadPublicJobResult(principalA1, apiJobId, apiFile.id, { client: appClient, storage: guardedStorage }),
+    /NOT_FOUND|result file was not found/,
+  );
+  assert.equal(storageReads, 0, "storage.get must never be invoked for unlinked or forged File.storageKey rows");
 });

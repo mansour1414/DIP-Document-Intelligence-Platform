@@ -57,33 +57,54 @@
 
 ### 3.1 Summary of Schema, Constraint, Trigger & RLS Controls
 Implemented in forward-only migration `prisma/migrations/20261121120000_n1a_storage_objects_tenant_isolation/migration.sql`:
-1. **Preflight Role & Attribution Safety**:
+1. **Preflight Role, Coordinate Integrity & Attribution Safety (Fail-Closed, Non-Destructive)**:
    - Rejects execution as `dip_app` or `dip_retention` (`MIGRATION_ROLE_INVALID`) so `SECURITY DEFINER` routines are always owned by the schema migration owner.
+   - Fails closed without deleting or silently reassigning data if any existing non-ephemeral `files` row has `storage_object_id IS NULL` (`FILE_STORAGE_OBJECT_REQUIRED_CONFLICT`), if any `ephemeral/*` or blank `files.storage_key` links to a physical `storage_objects` row (`FILE_EPHEMERAL_STORAGE_OBJECT_CONFLICT`), or if `files.storage_key IS DISTINCT FROM storage_objects.object_key` (`FILE_STORAGE_KEY_MISMATCH_CONFLICT`).
    - Fails closed on any multi-user/multi-org link (`STORAGE_OBJECT_TENANT_CONFLICT`) or mixed/conflicting API-client attribution (`STORAGE_OBJECT_API_CLIENT_CONFLICT`, including mixed `NULL` vs non-`NULL` `jobs.api_client_id` and multi-file JSONB `params->'inputFileIds'` / `result->'outputFileIds'` links).
 2. **Columns**: Nullable `owner_user_id UUID`, `organization_id UUID`, `api_client_id UUID` on `storage_objects`.
 3. **Constraints & Composite FK**:
+   - `files_ephemeral_or_storage_object_check`: Every row in `files` is EITHER an ephemeral browser job-history placeholder (`storage_object_id IS NULL AND storage_key LIKE 'ephemeral/%' AND char_length(storage_key) > 10`) OR a physical file backed by a `StorageObject` (`storage_object_id IS NOT NULL AND btrim(storage_key) <> '' AND storage_key NOT LIKE 'ephemeral/%'`).
    - `storage_objects_tenant_scope_check`: Either all three columns are `NULL` (quarantined historical unlinked orphan) OR `owner_user_id IS NOT NULL AND (api_client_id IS NULL OR organization_id IS NOT NULL)`.
    - `storage_objects_owner_user_id_fkey`: `FOREIGN KEY (owner_user_id) REFERENCES users(id) ON DELETE RESTRICT ON UPDATE CASCADE`.
    - `storage_objects_organization_id_fkey`: `FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE RESTRICT ON UPDATE CASCADE`.
    - `storage_objects_api_client_organization_fkey`: Composite `FOREIGN KEY (api_client_id, organization_id) REFERENCES api_clients(id, organization_id) ON DELETE RESTRICT ON UPDATE CASCADE`.
 4. **Immutability & Cross-Table Triggers (`SECURITY DEFINER`, `SET search_path = pg_catalog, public`)**:
    - `storage_objects_immutability_guard`: Blocks mutating `(provider, bucket, object_key)` and blocks reassigning `(owner_user_id, organization_id, api_client_id)` once attributed.
-   - `files_storage_object_tenant_guard`: Blocks linking any `File` to an unattributed (`owner_user_id IS NULL`) `StorageObject`, a differently owned `(owner_user_id, organization_id)` `StorageObject` (`STORAGE_OBJECT_TENANT_MISMATCH`), or a `StorageObject` whose `api_client_id` is distinct from `app.current_api_client_id` (`STORAGE_OBJECT_API_CLIENT_MISMATCH` — preventing API Client B from cross-linking API Client A's `StorageObject` even when sharing the same organization and execution user).
+   - `files_storage_object_tenant_guard` (`BEFORE INSERT OR UPDATE ON "files"`): Rejects non-ephemeral `files` with `storage_object_id IS NULL` (`FILE_STORAGE_OBJECT_REQUIRED`), blocks linking any `File` to an unattributed (`owner_user_id IS NULL`) or differently owned `(owner_user_id, organization_id)` `StorageObject` (`STORAGE_OBJECT_TENANT_MISMATCH`), blocks linking to a `StorageObject` whose `api_client_id` is distinct from `app.current_api_client_id` (`STORAGE_OBJECT_API_CLIENT_MISMATCH`), forbids mutating `(document_id, storage_object_id, storage_key)` on `UPDATE` (`FILE_STORAGE_COORDINATES_IMMUTABLE`), blocks linking tombstoned objects on `INSERT` (`FILE_STORAGE_OBJECT_DELETED`), and enforces exact coordinate equality `NEW.storage_key = storage_objects.object_key` (`FILE_STORAGE_KEY_MISMATCH`).
    - `documents_storage_object_tenant_guard`: Blocks mutating `documents.(user_id, organization_id)` while linked to `storage_objects` of another tenant.
    - Trigger functions revoke `EXECUTE` from `PUBLIC`, `dip_app`, and `dip_retention`; `app_api_client_matches_tenant` binds arguments to the active session GUCs (anti-oracle), revokes `PUBLIC` and `dip_retention`, and grants `EXECUTE` solely to `dip_app`.
 5. **RLS & `FORCE ROW LEVEL SECURITY` + Least-Privilege Grants**:
    - `ENABLE ROW LEVEL SECURITY` + `FORCE ROW LEVEL SECURITY` on `storage_objects`.
    - All 7 runtime tenant policies on `storage_objects` are explicitly scoped **`TO dip_app`** (never `PUBLIC`), with `storage_objects_org_member_{select,update}` requiring `"api_client_id" IS NOT DISTINCT FROM NULLIF(current_setting('app.current_api_client_id', true), '')::uuid`.
-   - `files_storage_object_rls_guard` (`AS RESTRICTIVE FOR ALL TO dip_app` on `files`) guarantees `dip_app` can never `SELECT`, `INSERT`, or `UPDATE` a `File` (or read `File.storage_key`) whose linked `StorageObject` is outside the caller's active user/org/API-client RLS scope.
+   - `files_storage_object_rls_guard` (`AS RESTRICTIVE FOR ALL TO dip_app` on `files`) guarantees `dip_app` can only access `files` rows that are either `ephemeral/*` (`storage_object_id IS NULL`) OR linked to a `StorageObject` visible in the caller's active RLS scope whose `object_key` equals `files.storage_key` (`so."object_key" = "files"."storage_key"`), and all application/worker `File.storageKey` consumers (`isAuthorizedFileStorageAccess`, `findOutputFileForUser`, `getPublicJobResult`, `downloadPublicJobResult`, `processDocumentJob`, `processAiJob`, `createToolJobFromFiles`, `startWorkflowRun`, `databaseLookup`, `finalize`) reject `storageObjectId = null` and require `file.storageObject.objectKey === file.storageKey`.
    - Dedicated retention policies are scoped **`TO dip_retention`**.
    - `dip_app`: `SELECT, INSERT` + column-scoped `UPDATE (region, checksum, deleted_at)` (no `DELETE`).
    - `dip_retention`: `SELECT` + column-scoped `UPDATE (deleted_at)` (no `INSERT`, `DELETE`, or other column updates).
 
-### 3.2 Staged Production Rollout Runbook (Not Executed in N1-A)
-1. **Stage 0 — Pre-Deployment Read-Only Audit (Maintenance Check)**:
+### 3.2 Staged Production Rollout Runbook & Non-Destructive Remediation Strategy (Not Executed in N1-A)
+1. **Stage 0 — Pre-Deployment Read-Only Audit & Safe Remediation (Maintenance Check)**:
    Run as read-only admin against target database *before* scheduling deployment:
    ```sql
-   -- Must return 0 rows; any row indicates a historical cross-tenant link requiring manual incident triage.
+   -- 1) Non-ephemeral files missing storage_object_id (must return 0 rows; otherwise migration raises FILE_STORAGE_OBJECT_REQUIRED_CONFLICT):
+   SELECT f.id, f.document_id, d.user_id, d.organization_id, f.storage_key, f.size, f.checksum
+   FROM files f
+   JOIN documents d ON d.id = f.document_id
+   WHERE f.storage_object_id IS NULL
+     AND (f.storage_key IS NULL OR f.storage_key NOT LIKE 'ephemeral/%' OR char_length(f.storage_key) <= 10);
+
+   -- 2) Ephemeral or blank files linked to a physical storage_object (must return 0 rows; otherwise FILE_EPHEMERAL_STORAGE_OBJECT_CONFLICT):
+   SELECT f.id, f.storage_object_id, f.storage_key
+   FROM files f
+   WHERE f.storage_object_id IS NOT NULL
+     AND (f.storage_key IS NULL OR btrim(f.storage_key) = '' OR f.storage_key LIKE 'ephemeral/%');
+
+   -- 3) Coordinate mismatch between files.storage_key and storage_objects.object_key (must return 0 rows; otherwise FILE_STORAGE_KEY_MISMATCH_CONFLICT):
+   SELECT f.id AS file_id, f.storage_key, so.id AS storage_object_id, so.object_key
+   FROM files f
+   JOIN storage_objects so ON so.id = f.storage_object_id
+   WHERE f.storage_key IS DISTINCT FROM so.object_key;
+
+   -- 4) Multi-tenant link conflict (must return 0 rows; otherwise STORAGE_OBJECT_TENANT_CONFLICT):
    SELECT so.id, COUNT(DISTINCT d.user_id) AS users, COUNT(DISTINCT d.organization_id) AS orgs
    FROM storage_objects so
    JOIN files f ON f.storage_object_id = so.id
@@ -93,11 +114,14 @@ Implemented in forward-only migration `prisma/migrations/20261121120000_n1a_stor
        OR COUNT(DISTINCT d.organization_id) > 1
        OR (COUNT(DISTINCT d.organization_id) = 1 AND BOOL_OR(d.organization_id IS NULL));
 
-   -- Count historical unlinked orphan rows that will remain quarantined (owner_user_id IS NULL).
+   -- 5) Count historical unlinked orphan rows that will remain quarantined (owner_user_id IS NULL):
    SELECT COUNT(*) AS unlinked_orphans
    FROM storage_objects so
    WHERE NOT EXISTS (SELECT 1 FROM files f WHERE f.storage_object_id = so.id);
    ```
+   - **Safe Non-Destructive Remediation Strategy (if Query 1, 2, or 3 returns rows — NEVER delete or silently reassign data)**:
+     - **Missing `storage_object_id` on verified physical files (Query 1)**: First verify via `HEAD` against the configured bucket (`STORAGE_BUCKET`) that each `f.storage_key` exists and its prefix/job lineage unambiguously belongs to `(d.user_id, d.organization_id)`. Only for verified unambiguous rows, run an explicit pre-migration transaction inserting/matching `storage_objects (id, provider, bucket, object_key, size, checksum, created_at)` where `object_key = f.storage_key` and linking `files.storage_object_id = so.id` **only when no conflicting tenant claims `object_key`**. Any row whose object does not exist in S3 or whose ownership is ambiguous must be held for manual incident review (never auto-deleted or linked across tenants).
+     - **Mismatched `files.storage_key <> storage_objects.object_key` or `ephemeral/*` with `storage_object_id` (Queries 2 & 3)**: Treat as a security/integrity anomaly — halt migration, preserve all rows and S3 objects as forensic evidence, verify ground-truth object keys from `tool_executions` / upload audit logs and S3 `HEAD` metadata, and apply an explicit, reviewed, single-row operator fix before retrying `prisma migrate deploy`.
 2. **Stage 1 — Brief Drain / Coordinated Deploy**:
    - Pause document/AI queue intake briefly (or drain active in-flight commits for <30s) because once RLS is enabled on `storage_objects`, old app/worker instances that omit `owner_user_id` on `INSERT` will rightly be rejected by RLS (`42501`).
    - Deploy updated web + worker image (containing `withTenantScope` and `buildStorageObjectConnectOrCreate`) together with `npx prisma migrate deploy` and `psql --set=ON_ERROR_STOP=1 -f prisma/bootstrap/dip_app.sql`.
@@ -143,5 +167,6 @@ Implemented in forward-only migration `prisma/migrations/20261121120000_n1a_stor
 | 16 | RLS, `FORCE`, `TO dip_app`, and `SECURITY DEFINER` ACLs verified | Catalog & SQL assertions | PASS (simulated `forceRls` toggle) | `pg_class`, `pg_policies`, `pg_proc` catalog checks (**NOT VERIFIED locally; enforced in CI `rls-security` PG18**) |
 | 17 | API Client B cannot cross-link or read API Client A's `StorageObject`/`File` when sharing org + execution user | `STORAGE_OBJECT_API_CLIENT_MISMATCH` + `files_storage_object_rls_guard` | PASS | Explicit negative suite implemented (**NOT VERIFIED locally; enforced in CI `rls-security` PG18**) |
 | 18 | Fail-closed PostgreSQL 18 RLS gate forbids skips and external DBs | `.github/workflows/ci.yml` `postgres:18-alpine` assertions | PASS (`validateIsolatedRlsGateEnv`, `evaluateRlsTestCounts`) | Enforced by `scripts/run-rls-security-gate.mjs` (`DIP_REQUIRE_PG18=1`) |
+| 19 | Unlinked non-ephemeral `File` (`storageObjectId = null`) and forged `File.storageKey <> StorageObject.objectKey` fail closed at DB & app boundaries while `ephemeral/*` job history remains preserved | `files_ephemeral_or_storage_object_check` + `FILE_STORAGE_OBJECT_REQUIRED` + `FILE_STORAGE_KEY_MISMATCH` + `so.object_key = files.storage_key` | PASS (Test 18 & Test 21 across `metadata.ts`, `access.ts`, `public-api/jobs.ts`, `document-pipeline.ts`) | Explicit PG18 positive + negative suite in `test/storage-objects.rls.integration.test.mjs` (**enforced in CI `rls-security` PG18**) |
 
 > **Explicit Gate Honesty Statement**: Local verification in this sandbox confirmed static SQL contracts, TypeScript compilation, ESLint, and synthetic/unit security tests. Native Prisma `schema-engine` validation (`prisma validate`) is **`NOT VERIFIED` locally** because `binaries.prisma.sh` is outside the sandbox network allowlist, and **real PostgreSQL 18 RLS execution is `NOT VERIFIED` locally** because no local PostgreSQL 18 runtime or Docker daemon is installed in this sandbox (external/Neon databases remain strictly untouched). Both gates are enforced in GitHub Actions CI (`npx prisma generate` + `npx prisma migrate deploy` and the isolated `postgres:18-alpine` `rls-security` job requiring `server_version_num >= 180000` and 0 skipped tests).

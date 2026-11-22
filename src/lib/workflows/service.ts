@@ -3,6 +3,7 @@ import type { Prisma } from "@prisma/client";
 import { withTenant } from "@/lib/db/tenant";
 import { resolvePlan } from "@/lib/entitlements/service";
 import { createToolJobFromFiles } from "@/lib/jobs/orchestrator";
+import { isAuthorizedFileStorageAccess } from "@/lib/storage/metadata";
 import { logger } from "@/lib/logging";
 import { recordMetric } from "@/lib/observability/metrics";
 import type { WorkflowDefinition, WorkflowNode } from "./types";
@@ -33,26 +34,40 @@ export async function startWorkflowRun(userId: string, workflowId: string, input
   const owned = await withTenant(
     { userId },
     (tx) =>
-      tx.file.count({
+      tx.file.findMany({
         where: {
           id: { in: ids },
           document: { userId, organizationId: null, status: "ACTIVE" },
+          storageObjectId: { not: null },
           NOT: { storageKey: { startsWith: "ephemeral/" } },
-          OR: [
-            { storageObjectId: null },
-            {
-              storageObject: {
-                ownerUserId: userId,
-                organizationId: null,
-                apiClientId: null,
-                deletedAt: null,
-              },
+          storageObject: {
+            ownerUserId: userId,
+            organizationId: null,
+            apiClientId: null,
+            deletedAt: null,
+          },
+        },
+        select: {
+          id: true,
+          storageKey: true,
+          storageObjectId: true,
+          storageObject: {
+            select: {
+              ownerUserId: true,
+              organizationId: true,
+              apiClientId: true,
+              provider: true,
+              bucket: true,
+              objectKey: true,
+              deletedAt: true,
             },
-          ],
+          },
         },
       }),
   );
-  if (!ids.length || owned !== ids.length) throw Object.assign(new Error("WORKFLOW_ARTIFACT_UNAUTHORIZED"), { code: "WORKFLOW_ARTIFACT_UNAUTHORIZED" });
+  if (!ids.length || owned.length !== ids.length || owned.some((file) => !isAuthorizedFileStorageAccess(file, { userId }))) {
+    throw Object.assign(new Error("WORKFLOW_ARTIFACT_UNAUTHORIZED"), { code: "WORKFLOW_ARTIFACT_UNAUTHORIZED" });
+  }
   const run = await withTenant({ userId }, (tx) => tx.workflowRun.create({ data: { ownerId: userId, workflowVersionId: workflow.currentVersion!.id, status: "QUEUED", inputs, correlationId } }));
   recordMetric("workflow_runs_total", 1, "count", { status: "queued" }); await advanceWorkflowRun(run.id, userId); return run;
 }

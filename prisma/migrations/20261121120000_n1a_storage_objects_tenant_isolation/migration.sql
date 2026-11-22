@@ -32,10 +32,51 @@ ALTER TABLE "storage_objects"
   ADD COLUMN "organization_id" UUID,
   ADD COLUMN "api_client_id" UUID;
 
--- 3. Fail closed if any existing storage_objects row has conflicting user, organization,
+-- 3. Fail closed if any existing files or storage_objects row violates coordinate integrity
+-- (missing storage_object_id on non-ephemeral files, storage_object_id attached to ephemeral/*,
+-- or files.storage_key != storage_objects.object_key) or has conflicting user, organization,
 -- or mixed/conflicting API-client attribution across any linked files or jobs (including multi-file JSONB arrays).
+-- Never delete or silently reassign existing rows; require explicit operator remediation first.
 DO $$
 BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM "files" f
+    WHERE f."storage_object_id" IS NULL
+      AND (
+        f."storage_key" IS NULL
+        OR f."storage_key" NOT LIKE 'ephemeral/%'
+        OR pg_catalog.char_length(f."storage_key") <= pg_catalog.char_length('ephemeral/')
+      )
+  ) THEN
+    RAISE EXCEPTION 'FILE_STORAGE_OBJECT_REQUIRED_CONFLICT: non-ephemeral files row is missing storage_object_id; run explicit preflight backfill before applying migration'
+      USING ERRCODE = '23514';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM "files" f
+    WHERE f."storage_object_id" IS NOT NULL
+      AND (
+        f."storage_key" IS NULL
+        OR pg_catalog.btrim(f."storage_key") = ''
+        OR f."storage_key" LIKE 'ephemeral/%'
+      )
+  ) THEN
+    RAISE EXCEPTION 'FILE_EPHEMERAL_STORAGE_OBJECT_CONFLICT: ephemeral or blank files.storage_key cannot link to a physical storage_objects row'
+      USING ERRCODE = '23514';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM "files" f
+    JOIN "storage_objects" so ON so."id" = f."storage_object_id"
+    WHERE f."storage_key" IS DISTINCT FROM so."object_key"
+  ) THEN
+    RAISE EXCEPTION 'FILE_STORAGE_KEY_MISMATCH_CONFLICT: files.storage_key does not match linked storage_objects.object_key; remediate mismatched rows before applying migration'
+      USING ERRCODE = '23514';
+  END IF;
+
   IF EXISTS (
     SELECT 1
     FROM "storage_objects" so
@@ -131,7 +172,21 @@ FROM resolved_ownership ro
 WHERE so."id" = ro.storage_object_id
   AND so."owner_user_id" IS NULL;
 
--- 5. Enforce ownership invariants, referential integrity, composite API-client binding, and lookup indexes.
+-- 5. Enforce ownership invariants, file coordinate integrity, referential integrity, composite API-client binding, and lookup indexes.
+ALTER TABLE "files"
+  ADD CONSTRAINT "files_ephemeral_or_storage_object_check" CHECK (
+    (
+      "storage_object_id" IS NULL
+      AND "storage_key" LIKE 'ephemeral/%'
+      AND char_length("storage_key") > 10
+    )
+    OR (
+      "storage_object_id" IS NOT NULL
+      AND btrim("storage_key") <> ''
+      AND "storage_key" NOT LIKE 'ephemeral/%'
+    )
+  );
+
 ALTER TABLE "storage_objects"
   ADD CONSTRAINT "storage_objects_tenant_scope_check" CHECK (
     ("owner_user_id" IS NULL AND "organization_id" IS NULL AND "api_client_id" IS NULL)
@@ -247,9 +302,28 @@ DECLARE
   v_obj_owner_user_id uuid;
   v_obj_org_id uuid;
   v_obj_api_client_id uuid;
+  v_obj_object_key text;
+  v_obj_deleted_at timestamp(3);
   v_ctx_api_client_id uuid;
 BEGIN
   IF NEW."storage_object_id" IS NULL THEN
+    IF NEW."storage_key" IS NULL
+       OR NEW."storage_key" NOT LIKE 'ephemeral/%'
+       OR pg_catalog.char_length(NEW."storage_key") <= pg_catalog.char_length('ephemeral/') THEN
+      RAISE EXCEPTION 'FILE_STORAGE_OBJECT_REQUIRED: non-ephemeral files must reference an authorized storage_object'
+        USING ERRCODE = '23514';
+    END IF;
+
+    IF TG_OP = 'UPDATE'
+       AND (
+         NEW."storage_key" IS DISTINCT FROM OLD."storage_key"
+         OR NEW."document_id" IS DISTINCT FROM OLD."document_id"
+         OR NEW."storage_object_id" IS DISTINCT FROM OLD."storage_object_id"
+       ) THEN
+      RAISE EXCEPTION 'FILE_STORAGE_COORDINATES_IMMUTABLE: file document_id, storage_object_id, and storage_key are immutable'
+        USING ERRCODE = '23514';
+    END IF;
+
     RETURN NEW;
   END IF;
 
@@ -263,8 +337,8 @@ BEGIN
       USING ERRCODE = '23503';
   END IF;
 
-  SELECT so."owner_user_id", so."organization_id", so."api_client_id"
-    INTO v_obj_owner_user_id, v_obj_org_id, v_obj_api_client_id
+  SELECT so."owner_user_id", so."organization_id", so."api_client_id", so."object_key", so."deleted_at"
+    INTO v_obj_owner_user_id, v_obj_org_id, v_obj_api_client_id, v_obj_object_key, v_obj_deleted_at
     FROM public."storage_objects" so
    WHERE so."id" = NEW."storage_object_id";
 
@@ -286,6 +360,29 @@ BEGIN
       USING ERRCODE = '42501';
   END IF;
 
+  IF TG_OP = 'UPDATE'
+     AND (
+       NEW."storage_key" IS DISTINCT FROM OLD."storage_key"
+       OR NEW."document_id" IS DISTINCT FROM OLD."document_id"
+       OR NEW."storage_object_id" IS DISTINCT FROM OLD."storage_object_id"
+     ) THEN
+    RAISE EXCEPTION 'FILE_STORAGE_COORDINATES_IMMUTABLE: file document_id, storage_object_id, and storage_key are immutable'
+      USING ERRCODE = '23514';
+  END IF;
+
+  IF TG_OP = 'INSERT' AND v_obj_deleted_at IS NOT NULL THEN
+    RAISE EXCEPTION 'FILE_STORAGE_OBJECT_DELETED: cannot link file to a tombstoned storage_object'
+      USING ERRCODE = '23514';
+  END IF;
+
+  IF NEW."storage_key" IS NULL
+     OR pg_catalog.btrim(NEW."storage_key") = ''
+     OR NEW."storage_key" LIKE 'ephemeral/%'
+     OR NEW."storage_key" IS DISTINCT FROM v_obj_object_key THEN
+    RAISE EXCEPTION 'FILE_STORAGE_KEY_MISMATCH: file storage_key does not match linked storage_object object_key'
+      USING ERRCODE = '23514';
+  END IF;
+
   RETURN NEW;
 END
 $$;
@@ -293,7 +390,7 @@ $$;
 REVOKE ALL ON FUNCTION enforce_file_storage_object_tenant_match() FROM PUBLIC, dip_app, dip_retention;
 
 CREATE TRIGGER files_storage_object_tenant_guard
-  BEFORE INSERT OR UPDATE OF "document_id", "storage_object_id" ON "files"
+  BEFORE INSERT OR UPDATE ON "files"
   FOR EACH ROW
   EXECUTE FUNCTION enforce_file_storage_object_tenant_match();
 
@@ -462,25 +559,44 @@ CREATE POLICY storage_objects_api_client_update ON "storage_objects"
   );
 
 -- Restrictive cross-table policy on files so dip_app can never SELECT, INSERT, or UPDATE a File
--- (including reading File.storage_key) when its linked StorageObject is inaccessible in the active scope.
+-- (including reading File.storage_key) when its linked StorageObject is inaccessible in the active scope,
+-- when a non-ephemeral File is missing storage_object_id, or when File.storage_key != StorageObject.object_key.
 CREATE POLICY files_storage_object_rls_guard ON "files"
   AS RESTRICTIVE
   FOR ALL
   TO dip_app
   USING (
-    "storage_object_id" IS NULL
-    OR EXISTS (
-      SELECT 1
-      FROM "storage_objects" so
-      WHERE so."id" = "files"."storage_object_id"
+    (
+      "storage_object_id" IS NULL
+      AND "storage_key" LIKE 'ephemeral/%'
+      AND char_length("storage_key") > 10
+    )
+    OR (
+      "storage_object_id" IS NOT NULL
+      AND "storage_key" NOT LIKE 'ephemeral/%'
+      AND EXISTS (
+        SELECT 1
+        FROM "storage_objects" so
+        WHERE so."id" = "files"."storage_object_id"
+          AND so."object_key" = "files"."storage_key"
+      )
     )
   )
   WITH CHECK (
-    "storage_object_id" IS NULL
-    OR EXISTS (
-      SELECT 1
-      FROM "storage_objects" so
-      WHERE so."id" = "files"."storage_object_id"
+    (
+      "storage_object_id" IS NULL
+      AND "storage_key" LIKE 'ephemeral/%'
+      AND char_length("storage_key") > 10
+    )
+    OR (
+      "storage_object_id" IS NOT NULL
+      AND "storage_key" NOT LIKE 'ephemeral/%'
+      AND EXISTS (
+        SELECT 1
+        FROM "storage_objects" so
+        WHERE so."id" = "files"."storage_object_id"
+          AND so."object_key" = "files"."storage_key"
+      )
     )
   );
 

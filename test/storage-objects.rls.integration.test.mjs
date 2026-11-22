@@ -5,6 +5,7 @@ import { PrismaPg } from "@prisma/adapter-pg";
 import { Prisma, PrismaClient } from "@prisma/client";
 import pg from "pg";
 import { withTenantScope } from "../src/lib/db/tenant.ts";
+import { findOutputFileForUser } from "../src/lib/jobs/access.ts";
 import { buildStorageObjectConnectOrCreate } from "../src/lib/storage/metadata.ts";
 
 const runtimeUrl = process.env.DIP_RLS_TEST_DATABASE_URL;
@@ -109,6 +110,15 @@ integration("N1-A storage_objects enforces real PostgreSQL RLS, FORCE RLS, API-c
     const filesGuardPolicy = policyCatalog.rows.find((p) => p.policyname === "files_storage_object_rls_guard");
     assert.ok(filesGuardPolicy, "files_storage_object_rls_guard policy must exist");
     assert.equal(filesGuardPolicy.permissive, "RESTRICTIVE");
+
+    const fileCheckConstraint = await owner.query(
+      `SELECT conname
+         FROM pg_constraint
+        WHERE conrelid = 'public.files'::regclass
+          AND contype = 'c'
+          AND conname = 'files_ephemeral_or_storage_object_check'`,
+    );
+    assert.equal(fileCheckConstraint.rowCount, 1, "files_ephemeral_or_storage_object_check constraint must exist on public.files");
 
     const fnCatalog = await owner.query(
       `SELECT p.proname,
@@ -632,6 +642,190 @@ integration("N1-A storage_objects enforces real PostgreSQL RLS, FORCE RLS, API-c
         api_client_id: clientA1,
       },
     ]);
+
+    // STORAGE KEY INTEGRITY & EPHEMERAL JOB-HISTORY SUITE (PostgreSQL 18 kernel + real Prisma):
+    // 1. Unlinked non-ephemeral File (storage_object_id = NULL, storage_key not ephemeral/*) is rejected
+    //    for both dip_app and table owner.
+    await assert.rejects(
+      () =>
+        inScope(runtime, { userId: userA }, (c) =>
+          c.query(
+            "INSERT INTO files(id,document_id,storage_object_id,storage_key,mime_type,original_name,size,created_at) VALUES($1,$2,NULL,$3,'application/pdf','unlinked.pdf',128,now())",
+            [crypto.randomUUID(), docA, `input/${userB}/b.pdf`],
+          ),
+        ),
+      /FILE_STORAGE_OBJECT_REQUIRED|files_ephemeral_or_storage_object_check/i,
+    );
+    await assert.rejects(
+      () =>
+        owner.query(
+          "INSERT INTO files(id,document_id,storage_object_id,storage_key,mime_type,original_name,size,created_at) VALUES($1,$2,NULL,$3,'application/pdf','owner-unlinked.pdf',128,now())",
+          [crypto.randomUUID(), docA, `input/${userB}/b.pdf`],
+        ),
+      /FILE_STORAGE_OBJECT_REQUIRED|files_ephemeral_or_storage_object_check/i,
+    );
+    await assert.rejects(
+      () =>
+        withTenantScope(
+          { userId: userA },
+          (tx) =>
+            tx.file.create({
+              data: {
+                document: { connect: { id: docA } },
+                storageKey: `input/${userB}/b.pdf`,
+                mimeType: "application/pdf",
+                originalName: "prisma-unlinked.pdf",
+                size: BigInt(128),
+              },
+              select: { id: true },
+            }),
+          prismaRuntime,
+        ),
+      (error) => {
+        assert.equal(
+          error instanceof Prisma.PrismaClientValidationError || error?.name === "PrismaClientValidationError",
+          false,
+          `Must not fail due to malformed Prisma input: ${error?.message ?? String(error)}`,
+        );
+        assert.match(String(error?.message ?? error), /FILE_STORAGE_OBJECT_REQUIRED|files_ephemeral_or_storage_object_check/i);
+        return true;
+      },
+    );
+
+    // 2. Forged File.storageKey linked to attacker's own authorized StorageObject is rejected
+    //    across personal scope, same-org/same-execution-user API-client scope, and real Prisma.
+    await assert.rejects(
+      () =>
+        inScope(runtime, { userId: userA }, (c) =>
+          c.query(
+            "INSERT INTO files(id,document_id,storage_object_id,storage_key,mime_type,original_name,size,created_at) VALUES($1,$2,$3,$4,'application/pdf','forged-personal.pdf',100,now())",
+            [crypto.randomUUID(), docA, personalObjA, `input/${userB}/b.pdf`],
+          ),
+        ),
+      /FILE_STORAGE_KEY_MISMATCH|row-level security/i,
+    );
+    await assert.rejects(
+      () =>
+        inScope(runtime, { userId: userA, organizationId: orgA, apiClientId: clientA2 }, (c) =>
+          c.query(
+            "INSERT INTO files(id,document_id,storage_object_id,storage_key,mime_type,original_name,size,created_at) VALUES($1,$2,$3,$4,'application/pdf','forged-api.pdf',410,now())",
+            [crypto.randomUUID(), docOrgApiA2, apiObjA2, `api/${orgA}/${clientA1}/doc.pdf`],
+          ),
+        ),
+      /FILE_STORAGE_KEY_MISMATCH|row-level security/i,
+    );
+    await assert.rejects(
+      () =>
+        withTenantScope(
+          { userId: userA },
+          (tx) =>
+            tx.file.create({
+              data: {
+                document: { connect: { id: docA } },
+                storageKey: `input/${userB}/b.pdf`,
+                mimeType: "application/pdf",
+                originalName: "prisma-forged.pdf",
+                size: BigInt(100),
+                storageObject: { connect: { id: personalObjA } },
+              },
+              select: { id: true },
+            }),
+          prismaRuntime,
+        ),
+      (error) => {
+        assert.equal(
+          error instanceof Prisma.PrismaClientValidationError || error?.name === "PrismaClientValidationError",
+          false,
+          `Must not fail due to malformed Prisma input: ${error?.message ?? String(error)}`,
+        );
+        assert.match(String(error?.message ?? error), /FILE_STORAGE_KEY_MISMATCH|row-level security/i);
+        return true;
+      },
+    );
+
+    // 3. Ephemeral storage_key cannot be paired with a non-null storage_object_id, and bare 'ephemeral/' is rejected.
+    await assert.rejects(
+      () =>
+        inScope(runtime, { userId: userA }, (c) =>
+          c.query(
+            "INSERT INTO files(id,document_id,storage_object_id,storage_key,mime_type,original_name,size,created_at) VALUES($1,$2,$3,'ephemeral/forged-link.pdf','application/pdf','bad-ephemeral.pdf',64,now())",
+            [crypto.randomUUID(), docA, personalObjA],
+          ),
+        ),
+      /FILE_STORAGE_KEY_MISMATCH|files_ephemeral_or_storage_object_check/i,
+    );
+    await assert.rejects(
+      () =>
+        inScope(runtime, { userId: userA }, (c) =>
+          c.query(
+            "INSERT INTO files(id,document_id,storage_object_id,storage_key,mime_type,original_name,size,created_at) VALUES($1,$2,NULL,'ephemeral/','application/pdf','empty-ephemeral.pdf',64,now())",
+            [crypto.randomUUID(), docA],
+          ),
+        ),
+      /FILE_STORAGE_OBJECT_REQUIRED|files_ephemeral_or_storage_object_check/i,
+    );
+
+    // 4. Post-insert mutation of File.storage_key or unlinking storage_object_id on an existing File is rejected,
+    //    while legitimate metadata updates (e.g. created_at for retention tests) remain permitted.
+    await assert.rejects(
+      () =>
+        inScope(runtime, { userId: userA }, (c) =>
+          c.query("UPDATE files SET storage_key = $1 WHERE id = $2", [`input/${userB}/b.pdf`, createdPersonal1.id]),
+        ),
+      /FILE_STORAGE_COORDINATES_IMMUTABLE|FILE_STORAGE_KEY_MISMATCH|row-level security/i,
+    );
+    await assert.rejects(
+      () =>
+        inScope(runtime, { userId: userA }, (c) =>
+          c.query("UPDATE files SET storage_object_id = NULL WHERE id = $1", [createdPersonal1.id]),
+        ),
+      /FILE_STORAGE_OBJECT_REQUIRED|FILE_STORAGE_COORDINATES_IMMUTABLE|files_ephemeral_or_storage_object_check/i,
+    );
+    assert.equal(
+      (
+        await inScope(runtime, { userId: userA }, (c) =>
+          c.query("UPDATE files SET created_at = created_at WHERE id = $1", [createdPersonal1.id]),
+        )
+      ).rowCount,
+      1,
+    );
+    assert.equal(
+      (await findOutputFileForUser(userA, createdPersonal1.id, prismaRuntime))?.storageKey,
+      prismaPersonalKey,
+    );
+
+    // 5. Legitimate browser job-history ephemeral/* File (storage_object_id = NULL) succeeds for its tenant,
+    //    stays invisible to other tenants, and is never returned by physical output download helpers.
+    const ephemeralHistoryKey = `ephemeral/${crypto.randomUUID()}-browser-history.pdf`;
+    const ephemeralFile = await withTenantScope(
+      { userId: userA },
+      (tx) =>
+        tx.file.create({
+          data: {
+            document: { connect: { id: docA } },
+            storageKey: ephemeralHistoryKey,
+            mimeType: "application/pdf",
+            originalName: "browser-history.pdf",
+            size: BigInt(2048),
+          },
+          select: { id: true, storageKey: true, storageObjectId: true },
+        }),
+      prismaRuntime,
+    );
+    assert.equal(ephemeralFile.storageObjectId, null);
+    assert.equal(
+      (await inScope(runtime, { userId: userA }, (c) => c.query("SELECT id FROM files WHERE id = $1", [ephemeralFile.id]))).rowCount,
+      1,
+    );
+    assert.equal(
+      (await inScope(runtime, { userId: userB }, (c) => c.query("SELECT id FROM files WHERE id = $1", [ephemeralFile.id]))).rowCount,
+      0,
+    );
+    assert.equal(
+      await findOutputFileForUser(userA, ephemeralFile.id, prismaRuntime),
+      null,
+      "ephemeral job-history file must never be exposed for physical object download",
+    );
 
     // Immutability & column grants: dip_app cannot DELETE or mutate coordinates/ownership.
     await assert.rejects(() => inScope(runtime, { userId: userA }, (c) => c.query("DELETE FROM storage_objects WHERE id=$1", [personalObjA])), /permission denied/i);
