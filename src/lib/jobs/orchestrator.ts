@@ -6,7 +6,8 @@ import { validateUpload } from "@/lib/uploads/validation";
 import { logger } from "@/lib/logging";
 import { enforceJobCreation } from "@/lib/usage/enforcement";
 import { measure, recordMetric } from "@/lib/observability/metrics";
-import { withTenant } from "@/lib/db/tenant";
+import { withTenant, withTenantScope } from "@/lib/db/tenant";
+import { buildStorageObjectConnectOrCreate, isAuthorizedFileStorageAccess } from "@/lib/storage/metadata";
 import { requireCleanUpload } from "@/lib/malware";
 import { validateToolOptions } from "@/lib/tools/options";
 import { deletePhase1Secret, enforceUnlockRateLimit, phase1SecretToolIds, putPhase1Secret, type Phase1SecretPayload, type Phase1SecretPurpose } from "@/lib/secrets/phase1";
@@ -21,7 +22,8 @@ export async function createToolJob(input: { userId: string; toolId: string; upl
   if (input.uploads.length < minimumFiles || input.uploads.length > tool.limits.maxFiles) throw new Error("INPUT_FILE_COUNT_INVALID");
   if (input.uploads.reduce((total, upload) => total + upload.bytes.byteLength, 0) > tool.limits.maxBytes) throw new Error("TOTAL_SIZE_LIMIT_EXCEEDED");
   const correlationId = input.correlationId ?? randomUUID();
-  const existing = await measure("db_job_idempotency_query", { tool_id: tool.toolId }, () => withTenant({ userId: input.userId }, (tx) => tx.job.findUnique({ where: { toolId_idempotencyKey: { toolId: tool.toolId, idempotencyKey: input.idempotencyKey } }, select: { id: true, status: true } })));
+  const executionScope = { userId: input.userId, organizationId: input.organizationId, apiClientId: input.apiClientId };
+  const existing = await measure("db_job_idempotency_query", { tool_id: tool.toolId }, () => withTenantScope(executionScope, (tx) => tx.job.findUnique({ where: { toolId_idempotencyKey: { toolId: tool.toolId, idempotencyKey: input.idempotencyKey } }, select: { id: true, status: true } })));
   if (existing) return { ...existing, reused: true };
   if (phase1SecretToolIds.has(tool.toolId) !== Boolean(input.secrets)) throw Object.assign(new Error("Secure secret input does not match this tool."), { code: "SECRET_INPUT_INVALID" });
   if (tool.toolId === "unlock-pdf") await enforceUnlockRateLimit(input.userId);
@@ -38,9 +40,9 @@ export async function createToolJob(input: { userId: string; toolId: string; upl
     for (const item of prepared) { const key = storage.createUploadKey({ userId: input.userId, filename: item.upload.filename }); const object = await storage.put({ key, bytes: item.upload.bytes, contentType: item.validation.mimeType, checksum: item.validation.checksum }); stored.push({ key: object.key, bucket: object.bucket, upload: item.upload, validation: item.validation }); }
     const jobId = randomUUID();
     if (input.secrets) secretRef = await putPhase1Secret({ tenantId: input.userId, jobId, purpose: tool.toolId as Phase1SecretPurpose, payload: input.secrets });
-    const job = await withTenant({ userId: input.userId }, async (tx) => {
+    const job = await withTenantScope(executionScope, async (tx) => {
       const document = await tx.document.create({ data: { userId: input.userId, organizationId: input.organizationId, title: `${tool.name} input` } });
-      const files = await Promise.all(stored.map(async (item) => { const file = await tx.file.create({ data: { document: { connect: { id: document.id } }, originalName: item.upload.filename.slice(0, 255), mimeType: item.validation.mimeType, size: BigInt(item.upload.bytes.byteLength), storageKey: item.key, checksum: item.validation.checksum, pageCount: item.validation.pageCount, storageObject: { connectOrCreate: { where: { provider_bucket_objectKey: { provider: "s3", bucket: item.bucket, objectKey: item.key } }, create: { provider: "s3", bucket: item.bucket, objectKey: item.key, size: BigInt(item.upload.bytes.byteLength), checksum: item.validation.checksum } } } } }); await tx.fileVersion.create({ data: { fileId: file.id, ownerId: input.userId, version: 1, storageKey: item.key, checksum: item.validation.checksum } }); return file; }));
+      const files = await Promise.all(stored.map(async (item) => { const file = await tx.file.create({ data: { document: { connect: { id: document.id } }, originalName: item.upload.filename.slice(0, 255), mimeType: item.validation.mimeType, size: BigInt(item.upload.bytes.byteLength), storageKey: item.key, checksum: item.validation.checksum, pageCount: item.validation.pageCount, storageObject: buildStorageObjectConnectOrCreate(executionScope, { provider: "s3", bucket: item.bucket, objectKey: item.key, size: BigInt(item.upload.bytes.byteLength), checksum: item.validation.checksum }) } }); await tx.fileVersion.create({ data: { fileId: file.id, ownerId: input.userId, version: 1, storageKey: item.key, checksum: item.validation.checksum } }); return file; }));
       return tx.job.create({ data: { id: jobId, toolId: tool.toolId, idempotencyKey: input.idempotencyKey, requesterId: input.userId, organizationId: input.organizationId, apiClientId: input.apiClientId, inputFileId: files[0].id, status: "QUEUED", params: { inputFileIds: files.map((file) => file.id), options, ...(secretRef ? { secretRef } : {}) }, correlationId, steps: { create: { name: tool.toolId, idempotencyKey: `${input.idempotencyKey}:${tool.toolId}`, status: "QUEUED", correlationId } } }, select: { id: true, status: true } });
     });
     const queuedJob = { jobId: job.id, toolId: tool.toolId, idempotencyKey: input.idempotencyKey, correlationId, userId: input.userId };
@@ -64,8 +66,46 @@ export async function createToolJobFromFiles(input: { userId: string; toolId: st
   const options = validateToolOptions(tool.toolId, input.options ?? {});
   const existing = await withTenant({ userId: input.userId }, (tx) => tx.job.findUnique({ where: { toolId_idempotencyKey: { toolId: tool.toolId, idempotencyKey: input.idempotencyKey } }, select: { id: true, status: true } }));
   if (existing) return { ...existing, reused: true };
-  const files = await withTenant({ userId: input.userId }, (tx) => tx.file.findMany({ where: { id: { in: input.fileIds }, document: { userId: input.userId } }, select: { id: true, size: true, pageCount: true, mimeType: true } }));
-  if (files.length !== input.fileIds.length) throw Object.assign(new Error("WORKFLOW_ARTIFACT_UNAUTHORIZED"), { code: "WORKFLOW_ARTIFACT_UNAUTHORIZED" });
+  const files = await withTenant(
+    { userId: input.userId },
+    (tx) =>
+      tx.file.findMany({
+        where: {
+          id: { in: input.fileIds },
+          document: { userId: input.userId, organizationId: null, status: "ACTIVE" },
+          storageObjectId: { not: null },
+          NOT: { storageKey: { startsWith: "ephemeral/" } },
+          storageObject: {
+            ownerUserId: input.userId,
+            organizationId: null,
+            apiClientId: null,
+            deletedAt: null,
+          },
+        },
+        select: {
+          id: true,
+          size: true,
+          pageCount: true,
+          mimeType: true,
+          storageKey: true,
+          storageObjectId: true,
+          storageObject: {
+            select: {
+              ownerUserId: true,
+              organizationId: true,
+              apiClientId: true,
+              provider: true,
+              bucket: true,
+              objectKey: true,
+              deletedAt: true,
+            },
+          },
+        },
+      }),
+  );
+  if (files.length !== input.fileIds.length || files.some((file) => !isAuthorizedFileStorageAccess(file, { userId: input.userId }))) {
+    throw Object.assign(new Error("WORKFLOW_ARTIFACT_UNAUTHORIZED"), { code: "WORKFLOW_ARTIFACT_UNAUTHORIZED" });
+  }
   if (input.fileIds.length < minimumFilesFor(input.toolId) || input.fileIds.length > tool.limits.maxFiles) throw new Error("INPUT_FILE_COUNT_INVALID");
   if (files.some((file) => !tool.mime.input.includes(file.mimeType))) throw Object.assign(new Error("WORKFLOW_MIME_INCOMPATIBLE"), { code: "WORKFLOW_MIME_INCOMPATIBLE" });
   const monetization = await enforceJobCreation({ userId: input.userId, toolId: tool.toolId, idempotencyKey: input.idempotencyKey, correlationId: input.correlationId, options, files: files.map((file) => ({ size: Number(file.size), pageCount: file.pageCount ?? undefined })) });

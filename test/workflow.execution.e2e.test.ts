@@ -34,7 +34,7 @@ integration("Phase 7 executes a real multi-step workflow with retry, failure, ca
       const key = `input/${userId}/${prefix}-${index}.pdf`;
       const checksum = createHash("sha256").update(bytes).digest("base64");
       if (store) { await storage.put({ key, bytes, contentType: "application/pdf", checksum }); objectKeys.add(key); }
-      const storageObject = await owner.storageObject.create({ data: { provider: "s3", bucket: process.env.STORAGE_BUCKET!, objectKey: key, size: BigInt(bytes.byteLength), checksum } });
+      const storageObject = await owner.storageObject.create({ data: { ownerUserId: userId, provider: "s3", bucket: process.env.STORAGE_BUCKET!, objectKey: key, size: BigInt(bytes.byteLength), checksum } });
       const file = await owner.file.create({ data: { documentId: document.id, originalName: `${prefix}-${index}.pdf`, mimeType: "application/pdf", size: BigInt(bytes.byteLength), storageKey: key, storageObjectId: storageObject.id, checksum, pageCount: 1 } });
       await owner.fileVersion.create({ data: { fileId: file.id, ownerId: userId, version: 1, storageKey: key, checksum } });
       ids.push(file.id);

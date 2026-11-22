@@ -6,6 +6,7 @@ import { runtimeLimits } from "@/lib/runtime/config";
 import { resolvePlan } from "@/lib/entitlements/service";
 import { planCanUseTool } from "@/lib/entitlements/policy";
 import { withTenant } from "@/lib/db/tenant";
+import { isAuthorizedFileStorageAccess } from "@/lib/storage/metadata";
 import { toolRegistry, workerToolIds } from "@/lib/tools/registry";
 import { MAX_WORKFLOW_NODES, assertValidWorkflow } from "@/lib/workflows/validator";
 import { startWorkflowRun, cancelWorkflowRun } from "@/lib/workflows/service";
@@ -105,7 +106,8 @@ async function finalize(userId: string, run: { id: string; correlationId: string
   if (run.workflowRun.status === "CANCELLED") { await withTenant({ userId }, (tx) => tx.agentRun.update({ where: { id: run.id }, data: { status: "CANCELLED", completedAt: new Date() } })); await audit(userId, "agent.execution.failed", { userId, correlationId: run.correlationId, reasonCode: "CANCELLED" }, run.id); return getAgentRun(userId, run.id); }
   const frozen = run.currentPlanVersion?.frozenPlan as unknown as FrozenAgentPlan; assertFrozenAgentPlan(frozen);
   const outputs = run.workflowRun.jobs.flatMap((job) => { const result = job.result as { outputFileIds?: string[] } | null; return result?.outputFileIds ?? []; });
-  const files = await withTenant({ userId }, (tx) => tx.file.findMany({ where: { id: { in: outputs }, document: { userId } }, select: { id: true, mimeType: true } }));
+  const rawFiles = await withTenant({ userId }, (tx) => tx.file.findMany({ where: { id: { in: outputs }, document: { userId, organizationId: null, status: "ACTIVE" }, storageObjectId: { not: null }, NOT: { storageKey: { startsWith: "ephemeral/" } }, storageObject: { ownerUserId: userId, organizationId: null, apiClientId: null, deletedAt: null } }, select: { id: true, mimeType: true, storageKey: true, storageObjectId: true, storageObject: { select: { ownerUserId: true, organizationId: true, apiClientId: true, provider: true, bucket: true, objectKey: true, deletedAt: true } } } }));
+  const files = rawFiles.filter((file) => isAuthorizedFileStorageAccess(file, { userId }));
   const complete = run.workflowRun.status === "SUCCEEDED" && run.workflowRun.jobs.every((job) => job.status === "SUCCEEDED" && job.result) && files.length === outputs.length;
   const verification = complete ? createVerificationResult({ expectedOutputs: frozen.draft.steps.map((step) => ({ stepId: step.stepId, mimeTypes: toolRegistry[step.toolId].mime.output })), actualOutputs: run.workflowRun.jobs.map((job) => { const ids = (job.result as { outputFileIds?: string[] } | null)?.outputFileIds ?? []; return { stepId: job.workflowNodeId!, fileIds: ids, mimeTypes: toolRegistry[job.toolId].aiFlag ? ["application/json"] : files.filter((file) => ids.includes(file.id)).map((file) => file.mimeType) }; }), artifactValidation: "PASSED", schemaValidation: "PASSED", mimeValidation: "PASSED", reasons: [] }) : verificationFailure([{ code: "AGENT_WORKFLOW_FAILED", message: "Workflow execution or artifact verification failed." }]);
   const evidence = createExecutionEvidence(frozen, { correlationId: run.correlationId, workflowRunId: run.workflowRun.id, jobIds: run.workflowRun.jobs.map((j) => j.id), jobStepIds: run.workflowRun.jobs.flatMap((j) => j.steps.map((s) => s.id)), toolExecutionIds: run.workflowRun.jobs.flatMap((j) => j.toolExecutions.map((e) => e.id)), outputFileIds: outputs, verification });

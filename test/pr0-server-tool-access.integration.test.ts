@@ -45,14 +45,18 @@ integrationTest("PR-0 (database): job and output reads are scoped to the owning 
     await owner.query(`DELETE FROM file_versions WHERE file_id IN (SELECT id FROM files WHERE document_id IN (SELECT id FROM documents WHERE user_id = ANY($1::uuid[])))`, [users]);
     await owner.query(`DELETE FROM files WHERE document_id IN (SELECT id FROM documents WHERE user_id = ANY($1::uuid[]))`, [users]);
     await owner.query(`DELETE FROM documents WHERE user_id = ANY($1::uuid[])`, [users]);
+    await owner.query(`DELETE FROM storage_objects WHERE owner_user_id = ANY($1::uuid[])`, [users]);
     await owner.query(`DELETE FROM users WHERE id = ANY($1::uuid[])`, [users]);
   };
 
   const seed = async (suffix: "A" | "B") => {
     const user = ids[`user${suffix}`];
+    const storageObject = randomUUID();
+    const storageKey = `pr0/${ids[`file${suffix}`]}`;
     await owner.query(`INSERT INTO users (id,email,status,created_at,updated_at) VALUES ($1,$2,'ACTIVE',now(),now())`, [user, `pr0-access-${user}@example.invalid`]);
     await owner.query(`INSERT INTO documents (id,user_id,title,status,created_at,updated_at) VALUES ($1,$2,$3,'ACTIVE',now(),now())`, [ids[`document${suffix}`], user, `PR-0 ${suffix}`]);
-    await owner.query(`INSERT INTO files (id,document_id,original_name,mime_type,size,storage_key,version,created_at) VALUES ($1,$2,$3,'application/pdf',1,$4,1,now())`, [ids[`file${suffix}`], ids[`document${suffix}`], `pr0-${suffix}.pdf`, `pr0/${ids[`file${suffix}`]}`]);
+    await owner.query(`INSERT INTO storage_objects (id,owner_user_id,provider,bucket,object_key,size,created_at) VALUES ($1,$2,'s3','dip-rls',$3,1,now())`, [storageObject, user, storageKey]);
+    await owner.query(`INSERT INTO files (id,document_id,storage_object_id,original_name,mime_type,size,storage_key,version,created_at) VALUES ($1,$2,$3,$4,'application/pdf',1,$5,1,now())`, [ids[`file${suffix}`], ids[`document${suffix}`], storageObject, `pr0-${suffix}.pdf`, storageKey]);
     await owner.query(`INSERT INTO jobs (id,tool_id,idempotency_key,requester_id,status,params,result,created_at,updated_at) VALUES ($1,'ocr-pdf',$2,$3,'SUCCEEDED','{}',$4::jsonb,now(),now())`, [ids[`job${suffix}`], `pr0-${ids[`job${suffix}`]}`, user, JSON.stringify({ outputFileIds: [ids[`file${suffix}`]] })]);
     await owner.query(`INSERT INTO job_steps (id,job_id,name,status,created_at,updated_at) VALUES ($1,$2,'run','SUCCEEDED',now(),now())`, [randomUUID(), ids[`job${suffix}`]]);
   };

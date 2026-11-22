@@ -37,6 +37,7 @@ integrationTest("dip_app pooled RLS isolates tenants and fails closed", async ()
     await owner.query(`DELETE FROM file_versions WHERE owner_id = ANY($1::uuid[])`, [users]);
     await owner.query(`DELETE FROM files WHERE document_id IN (SELECT id FROM documents WHERE user_id = ANY($1::uuid[]))`, [users]);
     await owner.query(`DELETE FROM documents WHERE user_id = ANY($1::uuid[])`, [users]);
+    await owner.query(`DELETE FROM storage_objects WHERE owner_user_id = ANY($1::uuid[])`, [users]);
     await owner.query(`DELETE FROM users WHERE id = ANY($1::uuid[])`, [users]);
   };
 
@@ -47,6 +48,7 @@ integrationTest("dip_app pooled RLS isolates tenants and fails closed", async ()
     await owner.query(`DELETE FROM file_versions WHERE owner_id IN (${taggedUsers})`);
     await owner.query(`DELETE FROM files WHERE document_id IN (SELECT id FROM documents WHERE user_id IN (${taggedUsers}))`);
     await owner.query(`DELETE FROM documents WHERE user_id IN (${taggedUsers})`);
+    await owner.query(`DELETE FROM storage_objects WHERE owner_user_id IN (${taggedUsers})`);
     await owner.query(`DELETE FROM users WHERE email LIKE 'rls-%@example.invalid'`);
   };
 
@@ -55,9 +57,12 @@ integrationTest("dip_app pooled RLS isolates tenants and fails closed", async ()
     const document = ids[`document${suffix}`];
     const file = ids[`file${suffix}`];
     const job = ids[`job${suffix}`];
+    const storageObject = crypto.randomUUID();
+    const storageKey = `rls/${file}`;
     await owner.query(`INSERT INTO users (id,email,status,created_at,updated_at) VALUES ($1,$2,'ACTIVE',now(),now())`, [user, `rls-${user}@example.invalid`]);
     await owner.query(`INSERT INTO documents (id,user_id,title,status,created_at,updated_at) VALUES ($1,$2,$3,'ACTIVE',now(),now())`, [document, user, `Tenant ${suffix}`]);
-    await owner.query(`INSERT INTO files (id,document_id,original_name,mime_type,size,storage_key,version,created_at) VALUES ($1,$2,$3,'application/pdf',1,$4,1,now())`, [file, document, `${suffix}.pdf`, `rls/${file}`]);
+    await owner.query(`INSERT INTO storage_objects (id,owner_user_id,provider,bucket,object_key,size,created_at) VALUES ($1,$2,'s3','dip-rls',$3,1,now())`, [storageObject, user, storageKey]);
+    await owner.query(`INSERT INTO files (id,document_id,storage_object_id,original_name,mime_type,size,storage_key,version,created_at) VALUES ($1,$2,$3,$4,'application/pdf',1,$5,1,now())`, [file, document, storageObject, `${suffix}.pdf`, storageKey]);
     await owner.query(`INSERT INTO file_versions (id,file_id,owner_id,version,storage_key,created_at) VALUES ($1,$2,$3,1,$4,now())`, [ids[`version${suffix}`], file, user, `rls/version/${file}`]);
     await owner.query(`INSERT INTO jobs (id,tool_id,idempotency_key,requester_id,status,params,created_at,updated_at) VALUES ($1,'rls-test',$2,$3,'QUEUED','{}',now(),now())`, [job, `rls-${job}`, user]);
     await owner.query(`INSERT INTO job_steps (id,job_id,name,status,created_at,updated_at) VALUES ($1,$2,'run','QUEUED',now(),now())`, [ids[`step${suffix}`], job]);

@@ -1,6 +1,7 @@
 import type { PrismaClient } from "@prisma/client";
 import { db } from "@/lib/db";
 import { withTenant } from "@/lib/db/tenant";
+import { isAuthorizedFileStorageAccess } from "@/lib/storage/metadata";
 
 /**
  * Tenant-scoped read helpers shared by the job status and output download
@@ -32,6 +33,52 @@ export function findJobForUser(userId: string, jobId: string, client: PrismaClie
   return withTenant({ userId }, (tx) => tx.job.findFirst({ where: { id: jobId, requesterId: userId }, select: jobStatusSelect }), client);
 }
 
-export function findOutputFileForUser(userId: string, fileId: string, client: PrismaClient = db) {
-  return withTenant({ userId }, (tx) => tx.file.findFirst({ where: { id: fileId, document: { userId } }, select: outputFileSelect }), client);
+export async function findOutputFileForUser(userId: string, fileId: string, client: PrismaClient = db) {
+  const file = await withTenant(
+    { userId },
+    (tx) =>
+      tx.file.findFirst({
+        where: {
+          id: fileId,
+          document: { userId },
+          AND: [
+            { document: { organizationId: null, status: "ACTIVE" } },
+            { storageObjectId: { not: null } },
+            { NOT: { storageKey: { startsWith: "ephemeral/" } } },
+            {
+              storageObject: {
+                ownerUserId: userId,
+                organizationId: null,
+                apiClientId: null,
+                deletedAt: null,
+              },
+            },
+          ],
+        },
+        select: {
+          ...outputFileSelect,
+          storageObjectId: true,
+          storageObject: {
+            select: {
+              ownerUserId: true,
+              organizationId: true,
+              apiClientId: true,
+              provider: true,
+              bucket: true,
+              objectKey: true,
+              deletedAt: true,
+            },
+          },
+        },
+      }),
+    client,
+  );
+  if (!isAuthorizedFileStorageAccess(file, { userId })) {
+    return null;
+  }
+  return {
+    originalName: file!.originalName,
+    mimeType: file!.mimeType,
+    storageKey: file!.storageKey,
+  };
 }

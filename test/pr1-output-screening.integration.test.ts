@@ -93,10 +93,13 @@ integrationTest("PR-1 (integration): generated outputs are screened before stora
     await owner.query(`INSERT INTO documents (id,user_id,title,status,created_at,updated_at) VALUES ($1,$2,'PR-1 input','ACTIVE',now(),now())`, [document, user]);
     for (let index = 0; index < inputCount; index += 1) {
       const inputFile = randomUUID();
+      const inputStorageObject = randomUUID();
       const inputBytes = await pdfBytes(pages);
       const inputKey = `input/${user}/${inputFile}-${index}.pdf`;
+      const bucketName = process.env.STORAGE_BUCKET ?? "dip-test";
       await bucket.put({ key: inputKey, bytes: inputBytes, contentType: "application/pdf" });
-      await owner.query(`INSERT INTO files (id,document_id,original_name,mime_type,size,storage_key,version,created_at) VALUES ($1,$2,$3,'application/pdf',$4,$5,1,now())`, [inputFile, document, `in-${index}.pdf`, inputBytes.byteLength, inputKey]);
+      await owner.query(`INSERT INTO storage_objects (id,owner_user_id,provider,bucket,object_key,size,created_at) VALUES ($1,$2,'s3',$3,$4,$5,now())`, [inputStorageObject, user, bucketName, inputKey, inputBytes.byteLength]);
+      await owner.query(`INSERT INTO files (id,document_id,storage_object_id,original_name,mime_type,size,storage_key,version,created_at) VALUES ($1,$2,$3,$4,'application/pdf',$5,$6,1,now())`, [inputFile, document, inputStorageObject, `in-${index}.pdf`, inputBytes.byteLength, inputKey]);
       inputFiles.push(inputFile); inputKeys.push(inputKey);
     }
     await owner.query(`INSERT INTO jobs (id,tool_id,idempotency_key,requester_id,status,params,correlation_id,created_at,updated_at) VALUES ($1,$2,$3,$4,'QUEUED',$5::jsonb,$6,now(),now())`, [job, toolId, `pr1-${job}`, user, JSON.stringify({ inputFileIds: inputFiles, options: {} }), randomUUID()]);
@@ -110,6 +113,7 @@ integrationTest("PR-1 (integration): generated outputs are screened before stora
     await owner.query(`DELETE FROM file_versions WHERE file_id IN (SELECT id FROM files WHERE document_id IN (SELECT id FROM documents WHERE user_id = $1))`, [fixture.user]);
     await owner.query(`DELETE FROM files WHERE document_id IN (SELECT id FROM documents WHERE user_id = $1)`, [fixture.user]);
     await owner.query(`DELETE FROM documents WHERE user_id = $1`, [fixture.user]);
+    await owner.query(`DELETE FROM storage_objects WHERE owner_user_id = $1`, [fixture.user]);
     await owner.query(`DELETE FROM users WHERE id = $1`, [fixture.user]);
     for (const key of [...fixture.inputKeys, ...extraKeys]) await bucket.deleteObject(key).catch(() => undefined);
   };

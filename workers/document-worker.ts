@@ -9,7 +9,8 @@ import { runtimeLimits, timeoutFor } from "@/lib/runtime/config";
 import { withTimeout } from "@/lib/runtime/timeout";
 import { recordMetric } from "@/lib/observability/metrics";
 import { captureOperationalError } from "@/lib/observability/errors";
-import { withTenant } from "@/lib/db/tenant";
+import { withTenant, withTenantScope } from "@/lib/db/tenant";
+import { isAuthorizedFileStorageAccess } from "@/lib/storage/metadata";
 import { isUnrecoverableAiQueueError, toAiQueueError } from "@/lib/ai/gateway/retry";
 import { isUnrecoverableQueueError, toDocumentQueueError } from "@/lib/jobs/queue-errors";
 import { processDocumentJob } from "@/lib/jobs/document-pipeline";
@@ -58,13 +59,14 @@ export async function processAiJob(message: QueuedJob, attemptNumber = 1) {
   if (job.status === "CANCELLED" || job.status === "EXPIRED") return;
   const step = job.steps.find((item) => item.name === job.toolId); const started = Date.now();
   try {
-    if (!job.requesterId) throw Object.assign(new Error("AI jobs require a requester"), { code: "AI_REQUESTER_REQUIRED" });
+    if (!job.requesterId || job.requesterId !== message.userId) throw Object.assign(new Error("AI jobs require a requester"), { code: "AI_REQUESTER_REQUIRED" });
+    const aiExecutionScope = { userId: job.requesterId, organizationId: job.organizationId, apiClientId: job.apiClientId };
     await tenant((tx) => tx.job.update({ where: { id: job.id }, data: { status: "RUNNING", startedAt: job.startedAt ?? new Date(), error: undefined, errorCode: null } }));
     if (step) await tenant((tx) => tx.jobStep.update({ where: { id: step.id }, data: { status: "RUNNING", startedAt: step.startedAt ?? new Date(), error: undefined, errorCode: null } }));
     const params = job.params as { inputFileIds?: string[]; options?: Record<string, unknown> }; const ids = params.inputFileIds ?? [];
     if (ids.length !== 1) throw Object.assign(new Error("AI jobs require exactly one scoped document"), { code: "DOCUMENT_SCOPE_VIOLATION" });
-    const file = await tenant((tx) => tx.file.findUnique({ where: { id: ids[0] }, include: { document: true } }));
-    if (!file || file.document.userId !== job.requesterId || file.mimeType !== "application/pdf") throw Object.assign(new Error("The input is outside the document scope"), { code: "DOCUMENT_SCOPE_VIOLATION" });
+    const file = await withTenantScope(aiExecutionScope, (tx) => tx.file.findUnique({ where: { id: ids[0] }, include: { document: true, storageObject: true } }));
+    if (!file || !isAuthorizedFileStorageAccess(file, aiExecutionScope) || file.mimeType !== "application/pdf") throw Object.assign(new Error("The input is outside the document scope"), { code: "DOCUMENT_SCOPE_VIOLATION" });
     const requestedDocumentId = params.options?.documentId;
     if (requestedDocumentId !== undefined && requestedDocumentId !== file.documentId) throw Object.assign(new Error("The requested document does not match the job input"), { code: "DOCUMENT_SCOPE_VIOLATION" });
     const pages = await extractPdfTextServer(await getStorage().get(file.storageKey));
