@@ -3,24 +3,86 @@
 
 BEGIN;
 
--- 1. Preflight role safety: migrations must run as the schema owner, never as runtime or retention roles,
--- so SECURITY DEFINER functions are owned by the privileged migration owner rather than dip_app/dip_retention.
+-- 1. Read-only, fail-closed role preflight (PostgreSQL 18 non-superuser compatible, e.g. Neon neondb_owner):
+--    - Never provisions or mutates cluster roles inside a schema migration.
+--    - Rejects execution as dip_app or dip_retention so SECURITY DEFINER functions are owned by the schema owner.
+--    - Verifies dip_app and dip_retention already exist with exact least-privilege attributes
+--      (LOGIN, NOSUPERUSER, NOBYPASSRLS, NOINHERIT, NOCREATEDB, NOCREATEROLE, NOREPLICATION)
+--      and zero unsafe role memberships (e.g. neon_superuser, pg_read_all_data, pg_write_all_data).
 DO $$
+DECLARE
+  v_target_role text;
+  v_rolcanlogin boolean;
+  v_rolsuper boolean;
+  v_rolbypassrls boolean;
+  v_rolinherit boolean;
+  v_rolcreatedb boolean;
+  v_rolcreaterole boolean;
+  v_rolreplication boolean;
+  v_bad_attrs text[];
+  v_memberships text;
 BEGIN
   IF current_user IN ('dip_app', 'dip_retention') THEN
     RAISE EXCEPTION 'MIGRATION_ROLE_INVALID: N1-A migration must not execute as runtime or retention role (%).', current_user
       USING ERRCODE = '42501';
   END IF;
 
-  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'dip_app') THEN
-    CREATE ROLE dip_app LOGIN NOINHERIT NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
-  END IF;
-  ALTER ROLE dip_app NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOINHERIT;
+  FOREACH v_target_role IN ARRAY ARRAY['dip_app', 'dip_retention'] LOOP
+    SELECT
+      r.rolcanlogin,
+      r.rolsuper,
+      r.rolbypassrls,
+      r.rolinherit,
+      r.rolcreatedb,
+      r.rolcreaterole,
+      r.rolreplication
+    INTO
+      v_rolcanlogin,
+      v_rolsuper,
+      v_rolbypassrls,
+      v_rolinherit,
+      v_rolcreatedb,
+      v_rolcreaterole,
+      v_rolreplication
+    FROM pg_catalog.pg_roles r
+    WHERE r.rolname = v_target_role;
 
-  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'dip_retention') THEN
-    CREATE ROLE dip_retention LOGIN NOINHERIT NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
-  END IF;
-  ALTER ROLE dip_retention NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOINHERIT;
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'ROLE_PREFLIGHT_MISSING: required database role "%" does not exist; provision least-privilege roles via prisma/bootstrap/roles.sql before running migrations',
+        v_target_role
+        USING ERRCODE = '42501';
+    END IF;
+
+    v_bad_attrs := ARRAY[]::text[];
+    IF NOT v_rolcanlogin THEN v_bad_attrs := array_append(v_bad_attrs, 'rolcanlogin=false (expected LOGIN)'); END IF;
+    IF v_rolsuper THEN v_bad_attrs := array_append(v_bad_attrs, 'rolsuper=true (expected NOSUPERUSER)'); END IF;
+    IF v_rolbypassrls THEN v_bad_attrs := array_append(v_bad_attrs, 'rolbypassrls=true (expected NOBYPASSRLS)'); END IF;
+    IF v_rolinherit THEN v_bad_attrs := array_append(v_bad_attrs, 'rolinherit=true (expected NOINHERIT)'); END IF;
+    IF v_rolcreatedb THEN v_bad_attrs := array_append(v_bad_attrs, 'rolcreatedb=true (expected NOCREATEDB)'); END IF;
+    IF v_rolcreaterole THEN v_bad_attrs := array_append(v_bad_attrs, 'rolcreaterole=true (expected NOCREATEROLE)'); END IF;
+    IF v_rolreplication THEN v_bad_attrs := array_append(v_bad_attrs, 'rolreplication=true (expected NOREPLICATION)'); END IF;
+
+    IF coalesce(array_length(v_bad_attrs, 1), 0) > 0 THEN
+      RAISE EXCEPTION 'ROLE_PREFLIGHT_INVALID: role "%" violates least-privilege attributes [%]; remediate via privileged role bootstrap before running migrations',
+        v_target_role,
+        array_to_string(v_bad_attrs, ', ')
+        USING ERRCODE = '42501';
+    END IF;
+
+    SELECT string_agg(granted_role.rolname, ', ' ORDER BY granted_role.rolname)
+      INTO v_memberships
+      FROM pg_catalog.pg_auth_members membership
+      JOIN pg_catalog.pg_roles member_role ON member_role.oid = membership.member
+      JOIN pg_catalog.pg_roles granted_role ON granted_role.oid = membership.roleid
+     WHERE member_role.rolname = v_target_role;
+
+    IF v_memberships IS NOT NULL THEN
+      RAISE EXCEPTION 'ROLE_PREFLIGHT_MEMBERSHIP_INVALID: role "%" has unsafe role memberships [%]; runtime and retention roles must be standalone least-privilege roles',
+        v_target_role,
+        v_memberships
+        USING ERRCODE = '42501';
+    END IF;
+  END LOOP;
 END
 $$;
 

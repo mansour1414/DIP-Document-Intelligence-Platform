@@ -7,11 +7,13 @@ const migrationPath = new URL(
   import.meta.url,
 );
 const sql = readFileSync(migrationPath, "utf8");
+const rolesBootstrap = readFileSync(new URL("../prisma/bootstrap/roles.sql", import.meta.url), "utf8");
 const runtimeGrants = readFileSync(new URL("../prisma/bootstrap/dip_app.sql", import.meta.url), "utf8");
 const schema = readFileSync(new URL("../prisma/schema.prisma", import.meta.url), "utf8");
 const ci = readFileSync(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8");
 const doc = readFileSync(new URL("../docs/n1a-storage-objects-tenant-isolation.md", import.meta.url), "utf8");
 const rlsIntegration = readFileSync(new URL("./storage-objects.rls.integration.test.mjs", import.meta.url), "utf8");
+const neonRoleCompatTest = readFileSync(new URL("./neon-role-compatibility.rls.integration.test.mjs", import.meta.url), "utf8");
 
 test("N1-A corrective migration preserves all 12 historical migrations and adds one forward-only migration", () => {
   const dirs = readdirSync(new URL("../prisma/migrations", import.meta.url), { withFileTypes: true })
@@ -144,6 +146,8 @@ test("CI defines an isolated fail-closed PostgreSQL 18 RLS security gate and doc
   assert.doesNotMatch(ci, /neon\.tech/i);
 
   assert.doesNotMatch(doc, /DISABLE ROW LEVEL SECURITY/i);
+  assert.match(doc, /`ENABLE ROW LEVEL SECURITY` without `FORCE ROW LEVEL SECURITY`/);
+  assert.match(doc, /separate future security hardening decision requiring explicit owner review/i);
   assert.doesNotMatch(
     rlsIntegration,
     /tx\.file\.create\(\{\s*data:\s*\{[^}]*\bdocumentId\s*:/,
@@ -151,4 +155,45 @@ test("CI defines an isolated fail-closed PostgreSQL 18 RLS security gate and doc
   );
   assert.match(rlsIntegration, /document:\s*\{\s*connect:\s*\{\s*id:\s*docA\s*\}\s*\}/);
   assert.match(rlsIntegration, /document:\s*\{\s*connect:\s*\{\s*id:\s*docOrgApiA1\s*\}\s*\}/);
+});
+
+test("N1-A migration and roles.sql enforce PostgreSQL 18 non-superuser role compatibility without CREATE ROLE or ALTER ROLE in schema DDL", () => {
+  assert.doesNotMatch(
+    sql,
+    /\bCREATE\s+ROLE\b|\bALTER\s+ROLE\b/i,
+    "Schema migration must never create or alter cluster roles so non-superuser migration owners (e.g. Neon neondb_owner) succeed on PG18",
+  );
+
+  const preflightEndIdx = sql.indexOf('ALTER TABLE "storage_objects"');
+  assert.ok(preflightEndIdx > 0);
+  const preflightBlock = sql.slice(0, preflightEndIdx);
+
+  assert.match(preflightBlock, /FOREACH v_target_role IN ARRAY ARRAY\['dip_app', 'dip_retention'\]/);
+  assert.match(preflightBlock, /FROM pg_catalog\.pg_roles r/);
+  assert.match(preflightBlock, /ROLE_PREFLIGHT_MISSING/);
+  assert.match(preflightBlock, /rolcanlogin=false \(expected LOGIN\)/);
+  assert.match(preflightBlock, /rolsuper=true \(expected NOSUPERUSER\)/);
+  assert.match(preflightBlock, /rolbypassrls=true \(expected NOBYPASSRLS\)/);
+  assert.match(preflightBlock, /rolinherit=true \(expected NOINHERIT\)/);
+  assert.match(preflightBlock, /rolcreatedb=true \(expected NOCREATEDB\)/);
+  assert.match(preflightBlock, /rolcreaterole=true \(expected NOCREATEROLE\)/);
+  assert.match(preflightBlock, /rolreplication=true \(expected NOREPLICATION\)/);
+  assert.match(preflightBlock, /ROLE_PREFLIGHT_INVALID/);
+  assert.match(preflightBlock, /FROM pg_catalog\.pg_auth_members membership/);
+  assert.match(preflightBlock, /ROLE_PREFLIGHT_MEMBERSHIP_INVALID/);
+
+  assert.match(rolesBootstrap, /ROLE_BOOTSTRAP_CALLER_INVALID/);
+  assert.match(rolesBootstrap, /ROLE_BOOTSTRAP_PRIVILEGE_REQUIRED/);
+  assert.match(rolesBootstrap, /IF v_caller_is_super AND \(/);
+  assert.match(rolesBootstrap, /ROLE_PREFLIGHT_INVALID/);
+  assert.match(rolesBootstrap, /ROLE_PREFLIGHT_MEMBERSHIP_INVALID/);
+
+  assert.match(
+    ci,
+    /CREATE ROLE dip_nonsuper_owner LOGIN PASSWORD '[^']+' NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION NOINHERIT;/,
+  );
+  assert.match(ci, /Verify non-superuser PostgreSQL 18 role preflight, migrate deploy, and grant reconciliation/);
+  assert.match(ci, /DIP_PG18_ADMIN_URL: postgresql:\/\/postgres:postgres@localhost:5432\/postgres/);
+  assert.match(neonRoleCompatTest, /\["migrate", "deploy"\]/);
+  assert.match(neonRoleCompatTest, /ROLE_PREFLIGHT_MEMBERSHIP_INVALID/);
 });

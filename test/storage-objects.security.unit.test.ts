@@ -29,7 +29,11 @@ import {
   updateStorageObjectMetadataForOrganization,
   updateStorageObjectMetadataForUser,
 } from "@/lib/storage/metadata";
-import { evaluateRlsTestCounts, validateIsolatedRlsGateEnv } from "../scripts/run-rls-security-gate.mjs";
+import {
+  evaluateRlsTestCounts,
+  REQUIRED_RLS_TEST_FILES,
+  validateIsolatedRlsGateEnv,
+} from "../scripts/run-rls-security-gate.mjs";
 
 /**
  * NOTE ON EVIDENCE BOUNDARIES (Phase 4):
@@ -1667,9 +1671,25 @@ test("18. File.storageKey access guard and fail-closed RLS gate runner enforce s
     DIP_RLS_TEST_OWNER_URL: "postgresql://postgres:postgres@localhost:5432/dip_rls_pg18",
     DIP_RLS_TEST_DATABASE_URL: "postgresql://dip_app:dip_rls_pg18_runtime@localhost:5432/dip_rls_pg18",
     DIP_RETENTION_TEST_DATABASE_URL: "postgresql://dip_retention:dip_rls_pg18_retention@localhost:5432/dip_rls_pg18",
+    DIP_PG18_ADMIN_URL: "postgresql://postgres:postgres@localhost:5432/postgres",
     DIP_REQUIRE_PG18: "1",
   });
   assert.equal(validEnv.requirePg18, true);
+  assert.equal(validEnv.adminUrl, "postgresql://postgres:postgres@localhost:5432/postgres");
+  assert.throws(
+    () =>
+      validateIsolatedRlsGateEnv({
+        DIP_RLS_TEST_OWNER_URL: "postgresql://postgres:postgres@localhost:5432/dip_rls_pg18",
+        DIP_RLS_TEST_DATABASE_URL: "postgresql://dip_app:pass@localhost:5432/dip_rls_pg18",
+        DIP_RETENTION_TEST_DATABASE_URL: "postgresql://dip_retention:pass@localhost:5432/dip_rls_pg18",
+        DIP_PG18_ADMIN_URL: "postgresql://placeholder@ep-example.neon.tech/postgres",
+      }),
+    /RLS_GATE_FORBIDDEN_HOST/,
+  );
+  assert.ok(
+    REQUIRED_RLS_TEST_FILES.includes("test/neon-role-compatibility.rls.integration.test.mjs"),
+    "PostgreSQL 18 RLS security gate must enforce non-superuser Neon role compatibility test with 0 skips",
+  );
 
   assert.throws(() => evaluateRlsTestCounts({ passed: 8, failed: 0, skipped: 1 }), /RLS_GATE_SKIPPED_FORBIDDEN/);
   assert.throws(() => evaluateRlsTestCounts({ passed: 8, failed: 1, skipped: 0 }), /RLS_GATE_TEST_FAILURE/);

@@ -14,9 +14,31 @@ export const REQUIRED_RLS_TEST_FILES = Object.freeze([
   "test/retention.rls.integration.test.mjs",
   "test/feature-flags.permissions.integration.test.mjs",
   "test/pr0-server-tool-access.integration.test.ts",
+  "test/neon-role-compatibility.rls.integration.test.mjs",
 ]);
 
 const ALLOWED_DISPOSABLE_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]", "postgres"]);
+
+function assertDisposablePostgresUrl(name, raw) {
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error(`RLS_GATE_ENV_INVALID: ${name} is not a valid PostgreSQL connection URL.`);
+  }
+  if (parsed.protocol !== "postgres:" && parsed.protocol !== "postgresql:") {
+    throw new Error(`RLS_GATE_ENV_INVALID: ${name} must use postgres:// or postgresql:// protocol.`);
+  }
+  const host = parsed.hostname.toLowerCase();
+  if (host.includes("neon.tech") || host.includes("supabase.co") || host.includes("amazonaws.com")) {
+    throw new Error(`RLS_GATE_FORBIDDEN_HOST: ${name} points to non-disposable external host (${host}).`);
+  }
+  if (!ALLOWED_DISPOSABLE_HOSTS.has(host)) {
+    throw new Error(
+      `RLS_GATE_FORBIDDEN_HOST: ${name} must target an isolated disposable local/container host, got (${host}).`,
+    );
+  }
+}
 
 /**
  * @param {Record<string, string | undefined>} [env]
@@ -33,30 +55,19 @@ export function validateIsolatedRlsGateEnv(env = process.env) {
     if (!raw) {
       throw new Error(`RLS_GATE_ENV_MISSING: ${name} is required; refusing to skip RLS security gate.`);
     }
-    let parsed;
-    try {
-      parsed = new URL(raw);
-    } catch {
-      throw new Error(`RLS_GATE_ENV_INVALID: ${name} is not a valid PostgreSQL connection URL.`);
-    }
-    if (parsed.protocol !== "postgres:" && parsed.protocol !== "postgresql:") {
-      throw new Error(`RLS_GATE_ENV_INVALID: ${name} must use postgres:// or postgresql:// protocol.`);
-    }
-    const host = parsed.hostname.toLowerCase();
-    if (host.includes("neon.tech") || host.includes("supabase.co") || host.includes("amazonaws.com")) {
-      throw new Error(`RLS_GATE_FORBIDDEN_HOST: ${name} points to non-disposable external host (${host}).`);
-    }
-    if (!ALLOWED_DISPOSABLE_HOSTS.has(host)) {
-      throw new Error(
-        `RLS_GATE_FORBIDDEN_HOST: ${name} must target an isolated disposable local/container host, got (${host}).`,
-      );
-    }
+    assertDisposablePostgresUrl(name, raw);
+  }
+
+  const adminUrl = env.DIP_PG18_ADMIN_URL?.trim() || null;
+  if (adminUrl) {
+    assertDisposablePostgresUrl("DIP_PG18_ADMIN_URL", adminUrl);
   }
 
   return {
     ownerUrl: env.DIP_RLS_TEST_OWNER_URL.trim(),
     runtimeUrl: env.DIP_RLS_TEST_DATABASE_URL.trim(),
     retentionUrl: env.DIP_RETENTION_TEST_DATABASE_URL.trim(),
+    adminUrl,
     requirePg18: env.DIP_REQUIRE_PG18 === "1",
   };
 }
@@ -116,6 +127,11 @@ async function verifyDatabasePosture({ ownerUrl, requirePg18 }) {
 
 export async function runRlsSecurityGate(env = process.env) {
   const config = validateIsolatedRlsGateEnv(env);
+  if (config.requirePg18 && !config.adminUrl) {
+    throw new Error(
+      "RLS_GATE_ENV_MISSING: DIP_PG18_ADMIN_URL is required when DIP_REQUIRE_PG18=1 to verify non-superuser PostgreSQL 18 role compatibility.",
+    );
+  }
   await verifyDatabasePosture(config);
 
   const files = REQUIRED_RLS_TEST_FILES.map((relPath) => resolve(process.cwd(), relPath));
