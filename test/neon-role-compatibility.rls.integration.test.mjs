@@ -273,9 +273,8 @@ test(
           const histSql = readFileSync(new URL(`../prisma/migrations/${dir}/migration.sql`, import.meta.url), "utf8");
           await negOwner.query(histSql);
         }
-        await negOwner.query(runtimeGrantsSql);
 
-        async function assertN1aColumnsAbsent() {
+        async function assertPreN1aSchemaUnchanged() {
           const cols = await negOwner.query(
             `SELECT column_name
                FROM information_schema.columns
@@ -284,7 +283,28 @@ test(
                 AND column_name IN ('owner_user_id', 'organization_id', 'api_client_id')`,
           );
           assert.equal(cols.rowCount, 0, "Failed preflight must roll back cleanly before altering storage_objects");
+
+          const rlsState = await negOwner.query(
+            `SELECT c.relrowsecurity, c.relforcerowsecurity
+               FROM pg_catalog.pg_class c
+               JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = 'public' AND c.relname = 'storage_objects'`,
+          );
+          assert.deepEqual(rlsState.rows[0], {
+            relrowsecurity: false,
+            relforcerowsecurity: false,
+          });
+
+          const fnState = await negOwner.query(
+            `SELECT 1
+               FROM pg_catalog.pg_proc p
+               JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+              WHERE n.nspname = 'public' AND p.proname = 'app_api_client_matches_tenant'`,
+          );
+          assert.equal(fnState.rowCount, 0, "N1-A helper function must not exist before N1-A preflight succeeds");
         }
+
+        await assertPreN1aSchemaUnchanged();
 
         async function expectOwnerMigrationFailure(pattern) {
           await assert.rejects(
@@ -326,6 +346,7 @@ test(
           } finally {
             await roleClient.end();
           }
+          await assertPreN1aSchemaUnchanged();
         }
 
         // 4b. Missing dip_app and missing dip_retention fail closed in both migration.sql and non-superuser roles.sql.
@@ -343,6 +364,7 @@ test(
           } finally {
             await adminClient.query(`ALTER ROLE ${tempName} RENAME TO ${targetRole}`);
           }
+          await assertPreN1aSchemaUnchanged();
         }
 
         // 4c. Every elevated or malformed attribute on dip_app / dip_retention fails closed.
@@ -366,6 +388,7 @@ test(
           } finally {
             await restoreCanonicalRuntimeRoles();
           }
+          await assertPreN1aSchemaUnchanged();
         }
 
         // 4d. Unsafe role memberships (e.g. Neon's neon_superuser or pg_read_all_data) fail closed.
@@ -383,6 +406,7 @@ test(
         } finally {
           await restoreCanonicalRuntimeRoles();
         }
+        await assertPreN1aSchemaUnchanged();
 
         await adminClient.query("GRANT pg_read_all_data TO dip_retention");
         try {
@@ -396,10 +420,12 @@ test(
         }
 
         // Confirm zero schema mutation leaked across any negative preflight failure.
-        await assertN1aColumnsAbsent();
+        await assertPreN1aSchemaUnchanged();
 
-        // Once clean least-privilege roles are restored, N1-A migration succeeds under non-superuser owner.
+        // Once clean least-privilege roles are restored, N1-A migration and post-migration
+        // runtime grant reconciliation succeed under the non-superuser owner.
         await negOwner.query(n1aMigrationSql);
+        await negOwner.query(runtimeGrantsSql);
 
         const colsAfter = await negOwner.query(
           `SELECT column_name
@@ -413,6 +439,17 @@ test(
           colsAfter.rows.map((r) => r.column_name),
           ["api_client_id", "organization_id", "owner_user_id"],
         );
+
+        const rlsAfter = await negOwner.query(
+          `SELECT c.relrowsecurity, c.relforcerowsecurity
+             FROM pg_catalog.pg_class c
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = 'public' AND c.relname = 'storage_objects'`,
+        );
+        assert.deepEqual(rlsAfter.rows[0], {
+          relrowsecurity: true,
+          relforcerowsecurity: true,
+        });
       } finally {
         await negOwner.end();
       }
