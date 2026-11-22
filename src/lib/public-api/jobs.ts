@@ -1,11 +1,13 @@
+import type { PrismaClient } from "@prisma/client";
 import { createHash } from "node:crypto";
 import type { ApiPrincipal } from "@/lib/api-platform/auth";
 import { bindIdempotencyResource, claimApiIdempotency } from "@/lib/api-platform/idempotency";
 import { creditCost } from "@/lib/billing/credit-policy";
 import { writeBusinessAudit } from "@/lib/business/audit";
-import { withApiTenant, withTenant } from "@/lib/db/tenant";
+import { db } from "@/lib/db";
+import { withApiTenant, withTenantScope } from "@/lib/db/tenant";
 import { createToolJob } from "@/lib/jobs/orchestrator";
-import { getStorage } from "@/lib/storage";
+import { getStorage, type ObjectStorage } from "@/lib/storage";
 import { getPublicTool } from "./tools";
 import { PublicApiError } from "./errors";
 import { deletePhase1Secret, phase1SecretsFromForm, type Phase1SecretPayload } from "@/lib/secrets/phase1";
@@ -51,8 +53,65 @@ export async function cancelPublicJob(principal: ApiPrincipal, jobId: string) {
   await deletePhase1Secret(cancelled.secretRef).catch(() => undefined); return cancelled.result;
 }
 
-async function scopedResult(principal: ApiPrincipal, jobId: string) {
-  const job = await withApiTenant(principal, (tx) => tx.job.findFirst({ where: { id: jobId, organizationId: principal.organizationId, apiClientId: principal.apiClientId, status: "SUCCEEDED" }, select: { id: true, toolId: true, result: true } })); if (!job) throw new PublicApiError("NOT_FOUND", "A completed result was not found.", 404); return job;
+async function scopedResult(principal: ApiPrincipal, jobId: string, client: PrismaClient = db) {
+  const job = await withApiTenant(principal, (tx) => tx.job.findFirst({ where: { id: jobId, organizationId: principal.organizationId, apiClientId: principal.apiClientId, status: "SUCCEEDED" }, select: { id: true, toolId: true, result: true } }), client); if (!job) throw new PublicApiError("NOT_FOUND", "A completed result was not found.", 404); return job;
 }
-export async function getPublicJobResult(principal: ApiPrincipal, jobId: string) { const job = await scopedResult(principal, jobId); const result = job.result as { outputFileIds?: string[] } | null; if (!result?.outputFileIds) return { kind: "json" as const, data: job.result }; const files = await withTenant({ userId: principal.executionUserId }, (tx) => tx.file.findMany({ where: { id: { in: result.outputFileIds }, document: { organizationId: principal.organizationId } }, select: { id: true, originalName: true, mimeType: true, size: true } })); return { kind: "files" as const, files: files.map((file) => ({ id: file.id, name: file.originalName, mimeType: file.mimeType, bytes: Number(file.size), downloadUrl: `/v1/jobs/${jobId}/result/${file.id}` })) }; }
-export async function downloadPublicJobResult(principal: ApiPrincipal, jobId: string, fileId: string) { const job = await scopedResult(principal, jobId); const ids = ((job.result as { outputFileIds?: string[] } | null)?.outputFileIds ?? []); if (!ids.includes(fileId)) throw new PublicApiError("NOT_FOUND", "The result file was not found.", 404); const file = await withTenant({ userId: principal.executionUserId }, (tx) => tx.file.findFirst({ where: { id: fileId, document: { organizationId: principal.organizationId } }, select: { originalName: true, mimeType: true, storageKey: true } })); if (!file) throw new PublicApiError("NOT_FOUND", "The result file was not found.", 404); return { ...file, bytes: await getStorage().get(file.storageKey) }; }
+export async function getPublicJobResult(principal: ApiPrincipal, jobId: string, client: PrismaClient = db) {
+  const job = await scopedResult(principal, jobId, client);
+  const result = job.result as { outputFileIds?: string[] } | null;
+  if (!result?.outputFileIds) return { kind: "json" as const, data: job.result };
+  const files = await withTenantScope(
+    { userId: principal.executionUserId, organizationId: principal.organizationId, apiClientId: principal.apiClientId },
+    (tx) =>
+      tx.file.findMany({
+        where: {
+          id: { in: result.outputFileIds },
+          document: { organizationId: principal.organizationId, status: "ACTIVE" },
+          OR: [
+            { storageObjectId: null },
+            {
+              storageObject: {
+                organizationId: principal.organizationId,
+                apiClientId: principal.apiClientId,
+                deletedAt: null,
+              },
+            },
+          ],
+        },
+        select: { id: true, originalName: true, mimeType: true, size: true },
+      }),
+    client,
+  );
+  return { kind: "files" as const, files: files.map((file) => ({ id: file.id, name: file.originalName, mimeType: file.mimeType, bytes: Number(file.size), downloadUrl: `/v1/jobs/${jobId}/result/${file.id}` })) };
+}
+export async function downloadPublicJobResult(principal: ApiPrincipal, jobId: string, fileId: string, deps: { client?: PrismaClient; storage?: ObjectStorage } = {}) {
+  const client = deps.client ?? db;
+  const storage = deps.storage ?? getStorage();
+  const job = await scopedResult(principal, jobId, client);
+  const ids = ((job.result as { outputFileIds?: string[] } | null)?.outputFileIds ?? []);
+  if (!ids.includes(fileId)) throw new PublicApiError("NOT_FOUND", "The result file was not found.", 404);
+  const file = await withTenantScope(
+    { userId: principal.executionUserId, organizationId: principal.organizationId, apiClientId: principal.apiClientId },
+    (tx) =>
+      tx.file.findFirst({
+        where: {
+          id: fileId,
+          document: { organizationId: principal.organizationId, status: "ACTIVE" },
+          OR: [
+            { storageObjectId: null },
+            {
+              storageObject: {
+                organizationId: principal.organizationId,
+                apiClientId: principal.apiClientId,
+                deletedAt: null,
+              },
+            },
+          ],
+        },
+        select: { originalName: true, mimeType: true, storageKey: true },
+      }),
+    client,
+  );
+  if (!file) throw new PublicApiError("NOT_FOUND", "The result file was not found.", 404);
+  return { ...file, bytes: await storage.get(file.storageKey) };
+}

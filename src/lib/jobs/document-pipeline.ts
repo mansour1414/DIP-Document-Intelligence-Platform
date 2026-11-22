@@ -10,7 +10,8 @@ import { validateWorkerOutputs } from "@/lib/outputs/validation";
 import { OutputCommitSupersededError, discardStoredObjects, screenAndStoreWorkerOutputs } from "@/lib/outputs/screening";
 import { recordMetric } from "@/lib/observability/metrics";
 import { configuredCostRates, estimateJobCost } from "@/lib/cost/model";
-import { withTenant } from "@/lib/db/tenant";
+import { withTenant, withTenantScope } from "@/lib/db/tenant";
+import { buildStorageObjectConnectOrCreate } from "@/lib/storage/metadata";
 import type { QueuedJob } from "@/lib/queue";
 import { validateToolOptions } from "@/lib/tools/options";
 import { deletePhase1Secret, takePhase1Secret, type Phase1SecretPurpose } from "@/lib/secrets/phase1";
@@ -53,6 +54,9 @@ export async function processDocumentJob(message: QueuedJob, deps: DocumentPipel
   const tenant = <T>(operation: Parameters<typeof withTenant<T>>[1]) => withTenant({ userId: message.userId! }, operation, deps.client);
   const job = await tenant((tx) => tx.job.findUnique({ where: { id: message.jobId }, include: { steps: true } }));
   if (!job) throw new Error("JOB_NOT_FOUND");
+  if (!job.requesterId) throw Object.assign(new Error("Worker job requires a persisted requester identity"), { code: "TENANT_CONTEXT_REQUIRED" });
+  const jobExecutionScope = { userId: job.requesterId, organizationId: job.organizationId, apiClientId: job.apiClientId };
+  const scopedTenant = <T>(operation: Parameters<typeof withTenantScope<T>>[1]) => withTenantScope(jobExecutionScope, operation, deps.client);
   const attemptId = deps.attemptId ?? randomUUID();
   const context = { job_id: job.id, correlation_id: job.correlationId ?? message.correlationId, tool_id: job.toolId, attempt_id: attemptId };
   const rawParams = job.params as { inputFileIds?: string[]; options?: Record<string, unknown>; secretRef?: string };
@@ -77,7 +81,7 @@ export async function processDocumentJob(message: QueuedJob, deps: DocumentPipel
     if (step) await tenant((tx) => tx.jobStep.updateMany({ where: { id: step.id, status: { notIn: [...CLOSED_JOB_STATES] } }, data: { status: "RUNNING", startedAt: new Date() } }));
     const params = rawParams; const ids = params.inputFileIds;
     if (!ids?.length) throw Object.assign(new Error("Unsupported job payload"), { code: "INVALID_JOB_INPUT" });
-    const files = await tenant((tx) => tx.file.findMany({ where: { id: { in: ids } }, include: { document: true } }));
+    const files = await scopedTenant((tx) => tx.file.findMany({ where: { id: { in: ids } }, include: { document: true } }));
     if (files.length !== ids.length) throw Object.assign(new Error("Input file is missing"), { code: "INPUT_NOT_FOUND" });
     const inputById = new Map(files.map((file) => [file.id, file]));
     const storage = deps.storage ?? getStorage();
@@ -100,11 +104,11 @@ export async function processDocumentJob(message: QueuedJob, deps: DocumentPipel
     // status can exist for a batch that was not explicitly declared clean.
     const { stored: storedOutputs } = await screenAndStoreWorkerOutputs(outputs, { job, storage, scanner: deps.scanner, attemptId });
     try {
-      await tenant(async (tx) => {
+      await scopedTenant(async (tx) => {
         const current = await tx.job.findUniqueOrThrow({ where: { id: job.id }, select: { outputFileId: true } });
         if (current.outputFileId) throw new OutputCommitSupersededError();
-        const outputDocument = await tx.document.create({ data: { userId: job.requesterId!, organizationId: job.organizationId, title: `${job.toolId} output` } }); const outputFileIds: string[] = [];
-        for (const item of storedOutputs) { const outputFile = await tx.file.create({ data: { document: { connect: { id: outputDocument.id } }, originalName: item.output.name, mimeType: item.output.mimeType, size: BigInt(item.output.bytes.byteLength), storageKey: item.object.key, checksum: item.checksum, storageObject: { connectOrCreate: { where: { provider_bucket_objectKey: { provider: "s3", bucket: item.object.bucket, objectKey: item.object.key } }, create: { provider: "s3", bucket: item.object.bucket, objectKey: item.object.key, size: BigInt(item.output.bytes.byteLength), checksum: item.checksum } } } } }); await tx.fileVersion.create({ data: { fileId: outputFile.id, ownerId: job.requesterId!, version: 1, storageKey: item.object.key, checksum: item.checksum } }); outputFileIds.push(outputFile.id); }
+        const outputDocument = await tx.document.create({ data: { userId: jobExecutionScope.userId, organizationId: jobExecutionScope.organizationId, title: `${job.toolId} output` } }); const outputFileIds: string[] = [];
+        for (const item of storedOutputs) { const outputFile = await tx.file.create({ data: { document: { connect: { id: outputDocument.id } }, originalName: item.output.name, mimeType: item.output.mimeType, size: BigInt(item.output.bytes.byteLength), storageKey: item.object.key, checksum: item.checksum, storageObject: buildStorageObjectConnectOrCreate(jobExecutionScope, { provider: "s3", bucket: item.object.bucket, objectKey: item.object.key, size: BigInt(item.output.bytes.byteLength), checksum: item.checksum }) } }); await tx.fileVersion.create({ data: { fileId: outputFile.id, ownerId: jobExecutionScope.userId, version: 1, storageKey: item.object.key, checksum: item.checksum } }); outputFileIds.push(outputFile.id); }
         // The commit itself is the compare-and-set. Under READ COMMITTED a second
         // attempt blocks on this row, re-evaluates `outputFileId IS NULL` after the
         // winner commits, matches nothing, and rolls its own rows back — so exactly
@@ -123,7 +127,7 @@ export async function processDocumentJob(message: QueuedJob, deps: DocumentPipel
       const keys = storedOutputs.map((item) => item.object.key);
       let referenced: Set<string> | undefined;
       try {
-        referenced = new Set((await tenant((tx) => tx.file.findMany({ where: { storageKey: { in: keys } }, select: { storageKey: true } }))).map((row) => row.storageKey));
+        referenced = new Set((await scopedTenant((tx) => tx.file.findMany({ where: { storageKey: { in: keys } }, select: { storageKey: true } }))).map((row) => row.storageKey));
       } catch {
         logger.error("worker.output_cleanup_unverified", { error_code: "OWNERSHIP_UNKNOWN" });
       }

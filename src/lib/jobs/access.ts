@@ -33,5 +33,32 @@ export function findJobForUser(userId: string, jobId: string, client: PrismaClie
 }
 
 export function findOutputFileForUser(userId: string, fileId: string, client: PrismaClient = db) {
-  return withTenant({ userId }, (tx) => tx.file.findFirst({ where: { id: fileId, document: { userId } }, select: outputFileSelect }), client);
+  return withTenant(
+    { userId },
+    (tx) =>
+      tx.file.findFirst({
+        where: {
+          id: fileId,
+          document: { userId },
+          AND: [
+            { document: { organizationId: null, status: "ACTIVE" } },
+            {
+              OR: [
+                { storageObjectId: null },
+                {
+                  storageObject: {
+                    ownerUserId: userId,
+                    organizationId: null,
+                    apiClientId: null,
+                    deletedAt: null,
+                  },
+                },
+              ],
+            },
+          ],
+        },
+        select: outputFileSelect,
+      }),
+    client,
+  );
 }

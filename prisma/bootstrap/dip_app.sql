@@ -75,7 +75,15 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON
   ,api_idempotency_records
 TO dip_app;
 
-GRANT SELECT, INSERT, UPDATE ON storage_objects TO dip_app;
+GRANT SELECT, INSERT ON storage_objects TO dip_app;
+GRANT UPDATE (region, checksum, deleted_at) ON storage_objects TO dip_app;
+GRANT EXECUTE ON FUNCTION
+  app_is_org_member(uuid, uuid),
+  app_has_org_role(uuid, uuid, "MemberRole"[]),
+  create_organization_with_owner(uuid, text, text),
+  api_key_auth_candidate(text),
+  app_api_client_matches_tenant(uuid, uuid, uuid, boolean)
+TO dip_app;
 GRANT INSERT ON audit_logs TO dip_app;
 GRANT INSERT ON security_events TO dip_app;
 GRANT SELECT, INSERT ON api_usage TO dip_app;

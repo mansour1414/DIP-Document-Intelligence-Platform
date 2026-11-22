@@ -39,6 +39,7 @@ model User {
   workflowRuns      WorkflowRun[]
   agentRuns         AgentRun[]
   createdApiClients ApiClient[]      @relation("ApiClientCreator")
+  storageObjects    StorageObject[]
 
   @@index([status])
   @@map("users")
@@ -62,6 +63,7 @@ model Organization {
   apiIdempotencyRecords ApiIdempotencyRecord[]
   apiUsage              ApiUsage[]
   jobs                  Job[]
+  storageObjects        StorageObject[]
 
   @@map("organizations")
 }
@@ -143,6 +145,7 @@ model ApiClient {
   idempotencyRecords ApiIdempotencyRecord[]
   jobs               Job[]
   apiUsage           ApiUsage[]
+  storageObjects     StorageObject[]
 
   @@unique([organizationId, name])
   @@index([organizationId, status])
@@ -264,18 +267,28 @@ model FileVersion {
 }
 
 model StorageObject {
-  id        String    @id @default(uuid()) @db.Uuid
-  provider  String    @db.VarChar(50)
-  bucket    String    @db.VarChar(255)
-  objectKey String    @map("object_key") @db.VarChar(500)
-  region    String?   @db.VarChar(100)
-  size      BigInt
-  checksum  String?   @db.VarChar(64)
-  createdAt DateTime  @default(now()) @map("created_at")
-  deletedAt DateTime? @map("deleted_at")
-  files     File[]
+  id             String        @id @default(uuid()) @db.Uuid
+  ownerUserId    String?       @map("owner_user_id") @db.Uuid
+  organizationId String?       @map("organization_id") @db.Uuid
+  apiClientId    String?       @map("api_client_id") @db.Uuid
+  provider       String        @db.VarChar(50)
+  bucket         String        @db.VarChar(255)
+  objectKey      String        @map("object_key") @db.VarChar(500)
+  region         String?       @db.VarChar(100)
+  size           BigInt
+  checksum       String?       @db.VarChar(64)
+  createdAt      DateTime      @default(now()) @map("created_at")
+  deletedAt      DateTime?     @map("deleted_at")
+
+  ownerUser    User?         @relation(fields: [ownerUserId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  organization Organization? @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  apiClient    ApiClient?    @relation(fields: [apiClientId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  files        File[]
 
   @@unique([provider, bucket, objectKey])
+  @@index([ownerUserId])
+  @@index([organizationId])
+  @@index([apiClientId, organizationId])
   @@map("storage_objects")
 }
 

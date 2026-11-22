@@ -110,6 +110,7 @@ integrationTest("PR-1 (integration): generated outputs are screened before stora
     await owner.query(`DELETE FROM file_versions WHERE file_id IN (SELECT id FROM files WHERE document_id IN (SELECT id FROM documents WHERE user_id = $1))`, [fixture.user]);
     await owner.query(`DELETE FROM files WHERE document_id IN (SELECT id FROM documents WHERE user_id = $1)`, [fixture.user]);
     await owner.query(`DELETE FROM documents WHERE user_id = $1`, [fixture.user]);
+    await owner.query(`DELETE FROM storage_objects WHERE owner_user_id = $1`, [fixture.user]);
     await owner.query(`DELETE FROM users WHERE id = $1`, [fixture.user]);
     for (const key of [...fixture.inputKeys, ...extraKeys]) await bucket.deleteObject(key).catch(() => undefined);
   };
