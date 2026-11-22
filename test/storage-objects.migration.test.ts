@@ -11,6 +11,7 @@ const runtimeGrants = readFileSync(new URL("../prisma/bootstrap/dip_app.sql", im
 const schema = readFileSync(new URL("../prisma/schema.prisma", import.meta.url), "utf8");
 const ci = readFileSync(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8");
 const doc = readFileSync(new URL("../docs/n1a-storage-objects-tenant-isolation.md", import.meta.url), "utf8");
+const rlsIntegration = readFileSync(new URL("./storage-objects.rls.integration.test.mjs", import.meta.url), "utf8");
 
 test("N1-A corrective migration preserves all 12 historical migrations and adds one forward-only migration", () => {
   const dirs = readdirSync(new URL("../prisma/migrations", import.meta.url), { withFileTypes: true })
@@ -128,4 +129,11 @@ test("CI defines an isolated fail-closed PostgreSQL 18 RLS security gate and doc
   assert.doesNotMatch(ci, /neon\.tech/i);
 
   assert.doesNotMatch(doc, /DISABLE ROW LEVEL SECURITY/i);
+  assert.doesNotMatch(
+    rlsIntegration,
+    /tx\.file\.create\(\{\s*data:\s*\{[^}]*\bdocumentId\s*:/,
+    "RLS integration Prisma file.create calls must use checked relation document: { connect: { id } } when passing nested storageObject",
+  );
+  assert.match(rlsIntegration, /document:\s*\{\s*connect:\s*\{\s*id:\s*docA\s*\}\s*\}/);
+  assert.match(rlsIntegration, /document:\s*\{\s*connect:\s*\{\s*id:\s*docOrgApiA1\s*\}\s*\}/);
 });

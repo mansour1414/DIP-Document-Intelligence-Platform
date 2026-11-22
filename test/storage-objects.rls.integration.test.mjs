@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import test from "node:test";
 import { PrismaPg } from "@prisma/adapter-pg";
-import { PrismaClient } from "@prisma/client";
+import { Prisma, PrismaClient } from "@prisma/client";
 import pg from "pg";
 import { withTenantScope } from "../src/lib/db/tenant.ts";
 import { buildStorageObjectConnectOrCreate } from "../src/lib/storage/metadata.ts";
@@ -394,7 +394,26 @@ integration("N1-A storage_objects enforces real PostgreSQL RLS, FORCE RLS, API-c
       /duplicate key value violates unique constraint/,
     );
 
-    // REAL PRISMA connectOrCreate VERIFICATION AGAINST POSTGRESQL dip_app:
+    // REAL PRISMA connectOrCreate & connect VERIFICATION AGAINST POSTGRESQL dip_app:
+    const assertExpectedPrismaDbRejection = (expectedCodes) => (error) => {
+      assert.equal(
+        error instanceof Prisma.PrismaClientValidationError || error?.name === "PrismaClientValidationError",
+        false,
+        `Must not fail due to malformed Prisma input: ${error?.message ?? String(error)}`,
+      );
+      assert.equal(
+        error instanceof Prisma.PrismaClientKnownRequestError,
+        true,
+        `Expected PrismaClientKnownRequestError, received ${error?.constructor?.name ?? typeof error}: ${error?.message ?? String(error)}`,
+      );
+      assert.equal(
+        expectedCodes.includes(error.code),
+        true,
+        `Expected Prisma error code in [${expectedCodes.join(", ")}], got ${error.code}: ${error.message}`,
+      );
+      return true;
+    };
+
     // (a) Same personal tenant connectOrCreate reuses existing StorageObject cleanly.
     const prismaPersonalKey = `prisma-connect/${userA}/${crypto.randomUUID()}.pdf`;
     const createdPersonal1 = await withTenantScope(
@@ -402,7 +421,7 @@ integration("N1-A storage_objects enforces real PostgreSQL RLS, FORCE RLS, API-c
       (tx) =>
         tx.file.create({
           data: {
-            documentId: docA,
+            document: { connect: { id: docA } },
             storageKey: prismaPersonalKey,
             mimeType: "application/pdf",
             originalName: "p1.pdf",
@@ -421,7 +440,7 @@ integration("N1-A storage_objects enforces real PostgreSQL RLS, FORCE RLS, API-c
       (tx) =>
         tx.file.create({
           data: {
-            documentId: docA,
+            document: { connect: { id: docA } },
             storageKey: prismaPersonalKey,
             mimeType: "application/pdf",
             originalName: "p1-copy.pdf",
@@ -438,36 +457,80 @@ integration("N1-A storage_objects enforces real PostgreSQL RLS, FORCE RLS, API-c
     assert.ok(createdPersonal1.storageObjectId);
     assert.equal(createdPersonal1.storageObjectId, createdPersonal2.storageObjectId);
 
-    // (b) Cross-user Prisma connectOrCreate on colliding (provider, bucket, object_key) fails closed!
-    await assert.rejects(() =>
-      withTenantScope(
-        { userId: userB },
-        (tx) =>
-          tx.file.create({
-            data: {
-              documentId: docB,
-              storageKey: prismaPersonalKey,
-              mimeType: "application/pdf",
-              originalName: "hijack-prisma.pdf",
-              size: BigInt(512),
-              storageObject: buildStorageObjectConnectOrCreate(
-                { userId: userB },
-                { bucket: "dip-rls", objectKey: prismaPersonalKey, size: 512 },
-              ),
-            },
-          }),
-        prismaRuntime,
-      ),
+    // (b) Cross-user Prisma connectOrCreate on colliding (provider, bucket, object_key) fails closed on uniqueness/RLS (P2002),
+    // and direct nested connect by StorageObject ID fails closed on RLS non-visibility (P2025)!
+    await assert.rejects(
+      () =>
+        withTenantScope(
+          { userId: userB },
+          (tx) =>
+            tx.file.create({
+              data: {
+                document: { connect: { id: docB } },
+                storageKey: prismaPersonalKey,
+                mimeType: "application/pdf",
+                originalName: "hijack-prisma.pdf",
+                size: BigInt(512),
+                storageObject: buildStorageObjectConnectOrCreate(
+                  { userId: userB },
+                  { bucket: "dip-rls", objectKey: prismaPersonalKey, size: 512 },
+                ),
+              },
+              select: { id: true, storageObjectId: true },
+            }),
+          prismaRuntime,
+        ),
+      assertExpectedPrismaDbRejection(["P2002"]),
     );
 
-    // (c) Same-org, same-execution-user cross-API-client Prisma connectOrCreate fails closed!
+    await assert.rejects(
+      () =>
+        withTenantScope(
+          { userId: userB },
+          (tx) =>
+            tx.file.create({
+              data: {
+                document: { connect: { id: docB } },
+                storageKey: `prisma-connect/${userB}/hijack-direct.pdf`,
+                mimeType: "application/pdf",
+                originalName: "hijack-direct.pdf",
+                size: BigInt(512),
+                storageObject: { connect: { id: createdPersonal1.storageObjectId } },
+              },
+              select: { id: true, storageObjectId: true },
+            }),
+          prismaRuntime,
+        ),
+      assertExpectedPrismaDbRejection(["P2025"]),
+    );
+
+    // Verify no cross-tenant File or StorageObject rows/links were created on docB or prismaPersonalKey.
+    const docBFilesAfterCollision = await owner.query(
+      "SELECT id, storage_object_id FROM files WHERE document_id = $1",
+      [docB],
+    );
+    assert.equal(docBFilesAfterCollision.rowCount, 0);
+    const personalKeyObjects = await owner.query(
+      "SELECT id, owner_user_id, organization_id, api_client_id FROM storage_objects WHERE provider = 's3' AND bucket = 'dip-rls' AND object_key = $1",
+      [prismaPersonalKey],
+    );
+    assert.deepEqual(personalKeyObjects.rows, [
+      {
+        id: createdPersonal1.storageObjectId,
+        owner_user_id: userA,
+        organization_id: null,
+        api_client_id: null,
+      },
+    ]);
+
+    // (c) Same-org, same-execution-user cross-API-client Prisma connectOrCreate & connect fail closed!
     const prismaApiKey = `prisma-api/${orgA}/${clientA1}/${crypto.randomUUID()}.pdf`;
     const createdApiFile = await withTenantScope(
       { userId: userA, organizationId: orgA, apiClientId: clientA1 },
       (tx) =>
         tx.file.create({
           data: {
-            documentId: docOrgApiA1,
+            document: { connect: { id: docOrgApiA1 } },
             storageKey: prismaApiKey,
             mimeType: "application/pdf",
             originalName: "api-a1.pdf",
@@ -483,26 +546,92 @@ integration("N1-A storage_objects enforces real PostgreSQL RLS, FORCE RLS, API-c
     );
     assert.ok(createdApiFile.storageObjectId);
 
-    await assert.rejects(() =>
-      withTenantScope(
-        { userId: userA, organizationId: orgA, apiClientId: clientA2 },
-        (tx) =>
-          tx.file.create({
-            data: {
-              documentId: docOrgApiA2,
-              storageKey: prismaApiKey,
-              mimeType: "application/pdf",
-              originalName: "api-a2-collide.pdf",
-              size: BigInt(768),
-              storageObject: buildStorageObjectConnectOrCreate(
-                { userId: userA, organizationId: orgA, apiClientId: clientA2 },
-                { bucket: "dip-rls", objectKey: prismaApiKey, size: 768 },
-              ),
-            },
-          }),
-        prismaRuntime,
-      ),
+    // Same-API-client repeat connectOrCreate reuses createdApiFile.storageObjectId cleanly.
+    const reusedApiFile = await withTenantScope(
+      { userId: userA, organizationId: orgA, apiClientId: clientA1 },
+      (tx) =>
+        tx.file.create({
+          data: {
+            document: { connect: { id: docOrgApiA1 } },
+            storageKey: prismaApiKey,
+            mimeType: "application/pdf",
+            originalName: "api-a1-copy.pdf",
+            size: BigInt(768),
+            storageObject: buildStorageObjectConnectOrCreate(
+              { userId: userA, organizationId: orgA, apiClientId: clientA1 },
+              { bucket: "dip-rls", objectKey: prismaApiKey, size: 768 },
+            ),
+          },
+          select: { id: true, storageObjectId: true },
+        }),
+      prismaRuntime,
     );
+    assert.equal(reusedApiFile.storageObjectId, createdApiFile.storageObjectId);
+
+    await assert.rejects(
+      () =>
+        withTenantScope(
+          { userId: userA, organizationId: orgA, apiClientId: clientA2 },
+          (tx) =>
+            tx.file.create({
+              data: {
+                document: { connect: { id: docOrgApiA2 } },
+                storageKey: prismaApiKey,
+                mimeType: "application/pdf",
+                originalName: "api-a2-collide.pdf",
+                size: BigInt(768),
+                storageObject: buildStorageObjectConnectOrCreate(
+                  { userId: userA, organizationId: orgA, apiClientId: clientA2 },
+                  { bucket: "dip-rls", objectKey: prismaApiKey, size: 768 },
+                ),
+              },
+              select: { id: true, storageObjectId: true },
+            }),
+          prismaRuntime,
+        ),
+      assertExpectedPrismaDbRejection(["P2002"]),
+    );
+
+    await assert.rejects(
+      () =>
+        withTenantScope(
+          { userId: userA, organizationId: orgA, apiClientId: clientA2 },
+          (tx) =>
+            tx.file.create({
+              data: {
+                document: { connect: { id: docOrgApiA2 } },
+                storageKey: `prisma-api/${orgA}/${clientA2}/direct-hijack.pdf`,
+                mimeType: "application/pdf",
+                originalName: "api-a2-direct.pdf",
+                size: BigInt(768),
+                storageObject: { connect: { id: createdApiFile.storageObjectId } },
+              },
+              select: { id: true, storageObjectId: true },
+            }),
+          prismaRuntime,
+        ),
+      assertExpectedPrismaDbRejection(["P2025"]),
+    );
+
+    // Verify clientA2 created zero cross-client File links on docOrgApiA2 (only its earlier legitimate fileApiA2 exists)
+    // and createdApiFile.storageObjectId remains attributed solely to clientA1.
+    const docOrgApiA2Files = await owner.query(
+      "SELECT id, storage_object_id FROM files WHERE document_id = $1",
+      [docOrgApiA2],
+    );
+    assert.deepEqual(docOrgApiA2Files.rows, [{ id: fileApiA2, storage_object_id: apiObjA2 }]);
+    const apiKeyObjects = await owner.query(
+      "SELECT id, owner_user_id, organization_id, api_client_id FROM storage_objects WHERE provider = 's3' AND bucket = 'dip-rls' AND object_key = $1",
+      [prismaApiKey],
+    );
+    assert.deepEqual(apiKeyObjects.rows, [
+      {
+        id: createdApiFile.storageObjectId,
+        owner_user_id: userA,
+        organization_id: orgA,
+        api_client_id: clientA1,
+      },
+    ]);
 
     // Immutability & column grants: dip_app cannot DELETE or mutate coordinates/ownership.
     await assert.rejects(() => inScope(runtime, { userId: userA }, (c) => c.query("DELETE FROM storage_objects WHERE id=$1", [personalObjA])), /permission denied/i);
@@ -514,9 +643,20 @@ integration("N1-A storage_objects enforces real PostgreSQL RLS, FORCE RLS, API-c
     // Retention role can SELECT across tenants/orphans and UPDATE only deleted_at.
     const retentionSeeAll = await retention.query(
       "SELECT id FROM storage_objects WHERE id = ANY($1::uuid[])",
-      [[orphanObj, personalObjA, personalObjB, orgObjA, apiObjA1, apiObjA2]],
+      [
+        [
+          orphanObj,
+          personalObjA,
+          personalObjB,
+          orgObjA,
+          apiObjA1,
+          apiObjA2,
+          createdPersonal1.storageObjectId,
+          createdApiFile.storageObjectId,
+        ],
+      ],
     );
-    assert.equal(retentionSeeAll.rowCount, 6);
+    assert.equal(retentionSeeAll.rowCount, 8);
     assert.equal(
       (await retention.query("UPDATE storage_objects SET deleted_at = now() WHERE id = $1", [orphanObj])).rowCount,
       1,

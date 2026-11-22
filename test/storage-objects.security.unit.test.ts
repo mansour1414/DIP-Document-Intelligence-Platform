@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
-import type { PrismaClient } from "@prisma/client";
+import { PrismaPg } from "@prisma/adapter-pg";
+import { Prisma, PrismaClient as RuntimePrismaClient, type PrismaClient } from "@prisma/client";
 import { PDFDocument } from "pdf-lib";
+import pg from "pg";
 import type { ApiPrincipal } from "@/lib/api-platform/auth";
 import {
   assertValidTenantExecutionScope,
@@ -1451,4 +1453,182 @@ test("18. File.storageKey access guard and fail-closed RLS gate runner enforce s
   assert.throws(() => evaluateRlsTestCounts({ passed: 8, failed: 1, skipped: 0 }), /RLS_GATE_TEST_FAILURE/);
   assert.throws(() => evaluateRlsTestCounts({ passed: 0, failed: 0, skipped: 0 }), /RLS_GATE_EMPTY_SUITE/);
   assert.doesNotThrow(() => evaluateRlsTestCounts({ passed: 9, failed: 0, skipped: 0 }));
+});
+
+test("19. Real generated PrismaClient validates checked FileCreateInput + buildStorageObjectConnectOrCreate and surfaces P2002/P2025 rather than PrismaClientValidationError", async () => {
+  const userA = randomUUID();
+  const userB = randomUUID();
+  const orgA = randomUUID();
+  const clientA1 = randomUUID();
+  const clientA2 = randomUUID();
+  const docA = randomUUID();
+  const docB = randomUUID();
+  const docApi = randomUUID();
+  const soPersonalId = randomUUID();
+  const soApiId = randomUUID();
+  const createdFileId = randomUUID();
+
+  let simulateDuplicateInsert = false;
+
+  class ContractPool extends pg.Pool {
+    override async connect(): Promise<pg.PoolClient> {
+      let aborted = false;
+      return {
+        on: () => {},
+        removeListener: () => {},
+        query: async (sqlOrObj: string | { text: string; rowMode?: string }) => {
+          const text = typeof sqlOrObj === "string" ? sqlOrObj : sqlOrObj.text;
+          const asArray = typeof sqlOrObj === "object" && sqlOrObj.rowMode === "array";
+          const wrap = (rows: Array<Record<string, unknown>>, fields: Array<{ name: string; dataTypeID: number }>) => ({
+            rows: asArray ? rows.map((r) => fields.map((f) => r[f.name])) : rows,
+            rowCount: rows.length,
+            fields,
+          });
+          if (text === "BEGIN" || text === "COMMIT" || text === "ROLLBACK") {
+            if (text === "ROLLBACK") aborted = false;
+            return wrap([], []);
+          }
+          if (aborted) {
+            throw Object.assign(new Error("current transaction is aborted"), { code: "25P02", severity: "ERROR" });
+          }
+          if (text.includes('INSERT INTO "public"."storage_objects"')) {
+            if (simulateDuplicateInsert) {
+              aborted = true;
+              throw Object.assign(
+                new Error('duplicate key value violates unique constraint "storage_objects_provider_bucket_object_key_key"'),
+                { code: "23505", severity: "ERROR", constraint: "storage_objects_provider_bucket_object_key_key" },
+              );
+            }
+            const nextId = text.includes("prisma-api") ? soApiId : soPersonalId;
+            return wrap([{ id: nextId }], [{ name: "id", dataTypeID: 2950 }]);
+          }
+          if (text.includes('INSERT INTO "public"."files"')) {
+            return wrap(
+              [{ id: createdFileId, storage_object_id: soPersonalId }],
+              [
+                { name: "id", dataTypeID: 2950 },
+                { name: "storage_object_id", dataTypeID: 2950 },
+              ],
+            );
+          }
+          if (text.includes('FROM "public"."files"')) {
+            return wrap(
+              [{ id: createdFileId, storage_object_id: soPersonalId }],
+              [
+                { name: "id", dataTypeID: 2950 },
+                { name: "storage_object_id", dataTypeID: 2950 },
+              ],
+            );
+          }
+          if (text.includes('FROM "public"."documents"')) {
+            return wrap([{ id: docA }], [{ name: "id", dataTypeID: 2950 }]);
+          }
+          return wrap([], []);
+        },
+        release: () => {},
+      } as unknown as pg.PoolClient;
+    }
+    override async end(): Promise<void> {}
+  }
+
+  const realPrisma = new RuntimePrismaClient({ adapter: new PrismaPg(new ContractPool()) });
+  try {
+    const okPersonal = await withTenantScope(
+      { userId: userA },
+      (tx) =>
+        tx.file.create({
+          data: {
+            document: { connect: { id: docA } },
+            storageKey: `prisma-connect/${userA}/ok.pdf`,
+            mimeType: "application/pdf",
+            originalName: "ok.pdf",
+            size: BigInt(512),
+            storageObject: buildStorageObjectConnectOrCreate(
+              { userId: userA },
+              { bucket: "dip-rls", objectKey: `prisma-connect/${userA}/ok.pdf`, size: 512 },
+            ),
+          },
+          select: { id: true, storageObjectId: true },
+        }),
+      realPrisma,
+    );
+    assert.equal(okPersonal.storageObjectId, soPersonalId);
+
+    const okApi = await withTenantScope(
+      { userId: userA, organizationId: orgA, apiClientId: clientA1 },
+      (tx) =>
+        tx.file.create({
+          data: {
+            document: { connect: { id: docApi } },
+            storageKey: `prisma-api/${orgA}/${clientA1}/ok.pdf`,
+            mimeType: "application/pdf",
+            originalName: "api-ok.pdf",
+            size: BigInt(768),
+            storageObject: buildStorageObjectConnectOrCreate(
+              { userId: userA, organizationId: orgA, apiClientId: clientA1 },
+              { bucket: "dip-rls", objectKey: `prisma-api/${orgA}/${clientA1}/ok.pdf`, size: 768 },
+            ),
+          },
+          select: { id: true, storageObjectId: true },
+        }),
+      realPrisma,
+    );
+    assert.ok(okApi.id);
+
+    simulateDuplicateInsert = true;
+    await assert.rejects(
+      () =>
+        withTenantScope(
+          { userId: userB },
+          (tx) =>
+            tx.file.create({
+              data: {
+                document: { connect: { id: docB } },
+                storageKey: `prisma-connect/${userA}/ok.pdf`,
+                mimeType: "application/pdf",
+                originalName: "collide.pdf",
+                size: BigInt(512),
+                storageObject: buildStorageObjectConnectOrCreate(
+                  { userId: userB },
+                  { bucket: "dip-rls", objectKey: `prisma-connect/${userA}/ok.pdf`, size: 512 },
+                ),
+              },
+              select: { id: true, storageObjectId: true },
+            }),
+          realPrisma,
+        ),
+      (err: unknown) => {
+        assert.equal(err instanceof Prisma.PrismaClientValidationError, false);
+        assert.equal(err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002", true);
+        return true;
+      },
+    );
+
+    await assert.rejects(
+      () =>
+        withTenantScope(
+          { userId: userA, organizationId: orgA, apiClientId: clientA2 },
+          (tx) =>
+            tx.file.create({
+              data: {
+                document: { connect: { id: docApi } },
+                storageKey: `prisma-api/${orgA}/${clientA2}/direct.pdf`,
+                mimeType: "application/pdf",
+                originalName: "direct.pdf",
+                size: BigInt(768),
+                storageObject: { connect: { id: soApiId } },
+              },
+              select: { id: true, storageObjectId: true },
+            }),
+          realPrisma,
+        ),
+      (err: unknown) => {
+        assert.equal(err instanceof Prisma.PrismaClientValidationError, false);
+        assert.equal(err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2025", true);
+        return true;
+      },
+    );
+  } finally {
+    await realPrisma.$disconnect();
+  }
 });
