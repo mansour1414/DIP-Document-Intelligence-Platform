@@ -142,9 +142,9 @@ jobs:
             ALTER ROLE dip_app PASSWORD 'dip_rls_pg18_runtime';
             ALTER ROLE dip_retention PASSWORD 'dip_rls_pg18_retention';
             CREATE ROLE dip_nonsuper_owner LOGIN PASSWORD 'dip_rls_pg18_nonsuper_owner' NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION NOINHERIT;
-            CREATE DATABASE dip_rls_nonsuper_pg18 OWNER dip_nonsuper_owner;
-            GRANT CONNECT, TEMP ON DATABASE dip_rls_nonsuper_pg18 TO dip_nonsuper_owner, dip_app, dip_retention;
           "
+          psql "$DATABASE_URL" --set=ON_ERROR_STOP=1 --command="CREATE DATABASE dip_rls_nonsuper_pg18 OWNER dip_nonsuper_owner"
+          psql "$DATABASE_URL" --set=ON_ERROR_STOP=1 --command="GRANT CONNECT, TEMP ON DATABASE dip_rls_nonsuper_pg18 TO dip_nonsuper_owner, dip_app, dip_retention"
           psql "postgresql://postgres:postgres@localhost:5432/dip_rls_nonsuper_pg18" --set=ON_ERROR_STOP=1 --command="
             ALTER SCHEMA public OWNER TO dip_nonsuper_owner;
             GRANT ALL ON SCHEMA public TO dip_nonsuper_owner;

@@ -192,6 +192,10 @@ test("N1-A migration and roles.sql enforce PostgreSQL 18 non-superuser role comp
     ci,
     /CREATE ROLE dip_nonsuper_owner LOGIN PASSWORD '[^']+' NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION NOINHERIT;/,
   );
+  assert.match(
+    ci,
+    /psql "\$DATABASE_URL" --set=ON_ERROR_STOP=1 --command="CREATE DATABASE dip_rls_nonsuper_pg18 OWNER dip_nonsuper_owner"/,
+  );
   assert.match(ci, /Verify non-superuser PostgreSQL 18 role preflight, migrate deploy, and grant reconciliation/);
   assert.match(ci, /DIP_PG18_ADMIN_URL: postgresql:\/\/postgres:postgres@localhost:5432\/postgres/);
   assert.match(neonRoleCompatTest, /\["migrate", "deploy"\]/);
