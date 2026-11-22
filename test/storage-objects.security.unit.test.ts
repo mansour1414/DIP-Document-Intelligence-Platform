@@ -17,6 +17,7 @@ import { findOutputFileForUser } from "@/lib/jobs/access";
 import { processDocumentJob } from "@/lib/jobs/document-pipeline";
 import type { MalwareScanner } from "@/lib/malware";
 import { downloadPublicJobResult, getPublicJobResult } from "@/lib/public-api/jobs";
+import { runRetentionCleanup } from "@/lib/retention/service";
 import type { ObjectStorage, StoredObject } from "@/lib/storage";
 import {
   buildStorageObjectConnectOrCreate,
@@ -80,6 +81,7 @@ type SimFile = {
   size: bigint;
   checksum: string | null;
   pageCount: number | null;
+  createdAt: Date;
 };
 
 type SimJob = {
@@ -482,9 +484,119 @@ class SimulatedTenantDatabase {
                   size: BigInt(data.size as bigint | number),
                   checksum: (data.checksum as string | null | undefined) ?? null,
                   pageCount: (data.pageCount as number | null | undefined) ?? null,
+                  createdAt: data.createdAt instanceof Date ? data.createdAt : new Date(),
                 };
                 this.files.set(file.id, file);
                 return file;
+              },
+              update: async ({
+                where,
+                data,
+              }: {
+                where: { id: string };
+                data: Record<string, unknown>;
+              }) => {
+                if (role === "dip_retention") {
+                  throw Object.assign(new Error("permission denied for table files"), { code: "42501" });
+                }
+                const oldRow = this.files.get(where.id);
+                if (!oldRow) {
+                  throw new Prisma.PrismaClientKnownRequestError("Record to update not found.", {
+                    code: "P2025",
+                    clientVersion: "7.0.0",
+                  });
+                }
+                if (role === "dip_app") {
+                  const doc = this.documents.get(oldRow.documentId);
+                  const u = guc.userId || null;
+                  const o = guc.organizationId || null;
+                  const docVisible =
+                    Boolean(doc) &&
+                    ((doc!.organizationId === null && u === doc!.userId) ||
+                      (doc!.organizationId !== null && o === doc!.organizationId && this.isOrgMember(doc!.organizationId, u)));
+                  if (!docVisible) {
+                    throw new Prisma.PrismaClientKnownRequestError("Record to update not found.", {
+                      code: "P2025",
+                      clientVersion: "7.0.0",
+                    });
+                  }
+                  if (oldRow.storageObjectId === null) {
+                    if (!oldRow.storageKey.startsWith("ephemeral/") || oldRow.storageKey.length <= "ephemeral/".length) {
+                      throw new Prisma.PrismaClientKnownRequestError("Record to update not found.", {
+                        code: "P2025",
+                        clientVersion: "7.0.0",
+                      });
+                    }
+                  } else {
+                    const so = this.storageObjects.get(oldRow.storageObjectId);
+                    if (!so || so.objectKey !== oldRow.storageKey || !this.canSelectStorageObject(role, guc, so)) {
+                      throw new Prisma.PrismaClientKnownRequestError("Record to update not found.", {
+                        code: "P2025",
+                        clientVersion: "7.0.0",
+                      });
+                    }
+                  }
+                }
+
+                const nextDocumentId = "documentId" in data ? String(data.documentId) : oldRow.documentId;
+                const nextStorageObjectId =
+                  "storageObjectId" in data ? ((data.storageObjectId as string | null) ?? null) : oldRow.storageObjectId;
+                const nextStorageKey = "storageKey" in data ? String(data.storageKey) : oldRow.storageKey;
+
+                // Trigger: enforce_file_storage_object_tenant_match (BEFORE UPDATE ON "files")
+                if (nextStorageObjectId === null) {
+                  if (!nextStorageKey.startsWith("ephemeral/") || nextStorageKey.length <= "ephemeral/".length) {
+                    throw Object.assign(new Error("FILE_STORAGE_OBJECT_REQUIRED"), { code: "23514" });
+                  }
+                  if (
+                    nextStorageKey !== oldRow.storageKey ||
+                    nextDocumentId !== oldRow.documentId ||
+                    nextStorageObjectId !== oldRow.storageObjectId
+                  ) {
+                    throw Object.assign(new Error("FILE_STORAGE_COORDINATES_IMMUTABLE"), { code: "23514" });
+                  }
+                } else {
+                  const parentDoc = this.documents.get(nextDocumentId);
+                  if (!parentDoc) throw Object.assign(new Error("FILE_DOCUMENT_NOT_FOUND"), { code: "23503" });
+                  const obj = this.storageObjects.get(nextStorageObjectId);
+                  if (!obj) throw Object.assign(new Error("FILE_STORAGE_OBJECT_NOT_FOUND"), { code: "23503" });
+                  if (
+                    obj.ownerUserId === null ||
+                    obj.ownerUserId !== parentDoc.userId ||
+                    obj.organizationId !== parentDoc.organizationId
+                  ) {
+                    throw Object.assign(new Error("STORAGE_OBJECT_TENANT_MISMATCH"), { code: "42501" });
+                  }
+                  if (nextStorageObjectId !== oldRow.storageObjectId) {
+                    const ctxApiClientId = guc.apiClientId || null;
+                    if (obj.apiClientId !== ctxApiClientId) {
+                      throw Object.assign(new Error("STORAGE_OBJECT_API_CLIENT_MISMATCH"), { code: "42501" });
+                    }
+                  }
+                  if (
+                    nextStorageKey !== oldRow.storageKey ||
+                    nextDocumentId !== oldRow.documentId ||
+                    nextStorageObjectId !== oldRow.storageObjectId
+                  ) {
+                    throw Object.assign(new Error("FILE_STORAGE_COORDINATES_IMMUTABLE"), { code: "23514" });
+                  }
+                  if (!nextStorageKey.trim() || nextStorageKey.startsWith("ephemeral/") || nextStorageKey !== obj.objectKey) {
+                    throw Object.assign(new Error("FILE_STORAGE_KEY_MISMATCH"), { code: "23514" });
+                  }
+                }
+
+                const updated: SimFile = {
+                  ...oldRow,
+                  documentId: nextDocumentId,
+                  storageObjectId: nextStorageObjectId,
+                  storageKey: nextStorageKey,
+                  originalName: "originalName" in data ? String(data.originalName) : oldRow.originalName,
+                  checksum: "checksum" in data ? ((data.checksum as string | null) ?? null) : oldRow.checksum,
+                  pageCount: "pageCount" in data ? ((data.pageCount as number | null) ?? null) : oldRow.pageCount,
+                  createdAt: data.createdAt instanceof Date ? data.createdAt : oldRow.createdAt,
+                };
+                this.files.set(updated.id, updated);
+                return updated;
               },
               findMany: async ({
                 where = {},
@@ -1940,4 +2052,146 @@ test("21. Storage key coordinate integrity: unlinked non-ephemeral files and for
     /NOT_FOUND|result file was not found/,
   );
   assert.equal(storageReads, 0, "storage.get must never be invoked for unlinked or forged File.storageKey rows");
+});
+
+test("22. Public API retention compatibility regression: owner metadata-only File update succeeds without API-client GUC and retention cleanup expires/deletes cleanly, while coordinate mutations and unauthorized dip_app updates fail closed", async () => {
+  const { sim, userA, orgA, clientA1, clientA2 } = seedMultiTenantWorld();
+  const appClient = sim.clientForRole("dip_app");
+  const ownerClient = sim.clientForRole("table_owner");
+  const retentionClient = sim.clientForRole("dip_retention");
+
+  const apiKey = `input/${userA}/${randomUUID()}-expiry.pdf`;
+  const apiFile = await withTenantScope(
+    { userId: userA, organizationId: orgA, apiClientId: clientA1 },
+    async (tx) => {
+      const doc = await tx.document.create({ data: { userId: userA, organizationId: orgA, title: "public-api-expiry" } });
+      return tx.file.create({
+        data: {
+          document: { connect: { id: doc.id } },
+          originalName: "expiry.pdf",
+          mimeType: "application/pdf",
+          size: BigInt(512),
+          storageKey: apiKey,
+          storageObject: buildStorageObjectConnectOrCreate(
+            { userId: userA, organizationId: orgA, apiClientId: clientA1 },
+            { provider: "s3", bucket: "dip-release-b", objectKey: apiKey, size: 512 },
+          ),
+        },
+      });
+    },
+    appClient,
+  );
+
+  // 1. Exact Public API HTTP E2E fixture aging pattern: table_owner updates File.createdAt
+  //    WITHOUT setting any app.current_api_client_id GUC.
+  const old = new Date("2020-01-01T00:00:00.000Z");
+  const aged = await ownerClient.$transaction((tx) =>
+    tx.file.update({ where: { id: apiFile.id }, data: { createdAt: old } }),
+  );
+  assert.equal(aged.createdAt.toISOString(), old.toISOString());
+  assert.equal(aged.storageObjectId, apiFile.storageObjectId);
+  assert.equal(aged.storageKey, apiKey);
+
+  // 2. Rival API client (clientA2), non-API org session, and personal session under dip_app
+  //    still fail closed on metadata-only File.update under restrictive RLS.
+  await assert.rejects(
+    () =>
+      withTenantScope(
+        { userId: userA, organizationId: orgA, apiClientId: clientA2 },
+        (tx) => tx.file.update({ where: { id: apiFile.id }, data: { originalName: "tampered.pdf" } }),
+        appClient,
+      ),
+    /P2025|not found/i,
+  );
+  await assert.rejects(
+    () =>
+      withTenant(
+        { userId: userA },
+        (tx) => tx.file.update({ where: { id: apiFile.id }, data: { originalName: "tampered.pdf" } }),
+        appClient,
+      ),
+    /P2025|not found/i,
+  );
+  await assert.rejects(
+    () => retentionClient.$transaction((tx) => tx.file.update({ where: { id: apiFile.id }, data: { createdAt: old } })),
+    /permission denied/i,
+  );
+
+  // 3. Coordinate mutations and forged storageKey changes STILL fail closed for both table_owner and clientA1.
+  await assert.rejects(
+    () =>
+      ownerClient.$transaction((tx) =>
+        tx.file.update({ where: { id: apiFile.id }, data: { storageKey: `api/${orgA}/${clientA2}/forged.pdf` } }),
+      ),
+    /FILE_STORAGE_COORDINATES_IMMUTABLE/,
+  );
+  await assert.rejects(
+    () =>
+      withTenantScope(
+        { userId: userA, organizationId: orgA, apiClientId: clientA1 },
+        (tx) => tx.file.update({ where: { id: apiFile.id }, data: { storageKey: `api/${orgA}/${clientA2}/forged.pdf` } }),
+        appClient,
+      ),
+    /FILE_STORAGE_COORDINATES_IMMUTABLE/,
+  );
+  await assert.rejects(
+    () => ownerClient.$transaction((tx) => tx.file.update({ where: { id: apiFile.id }, data: { storageObjectId: null } })),
+    /FILE_STORAGE_OBJECT_REQUIRED/,
+  );
+
+  // 4. Retention cleanup deletes the aged API-client S3 object and tombstones StorageObject.deletedAt via dip_retention.
+  const deletedKeys: string[] = [];
+  const fakeStorage: ObjectStorage = {
+    createUploadKey: () => "",
+    put: async (): Promise<StoredObject> => ({ key: "", bucket: "dip-release-b", contentType: "application/pdf", size: 0 }),
+    get: async () => new Uint8Array(),
+    head: async () => undefined,
+    exists: async () => false,
+    deleteObject: async (key: string) => {
+      deletedKeys.push(key);
+    },
+    close: async () => {},
+  };
+  const cleanupOutcome = await runRetentionCleanup({
+    now: new Date("2026-11-21T00:00:00.000Z"),
+    dryRun: false,
+    scope: { provider: "s3", bucket: "dip-release-b" },
+    storage: fakeStorage,
+    repository: {
+      loadActiveDocuments: async () => {
+        const storedRows = await retentionClient.$transaction((tx) => tx.storageObject.findMany());
+        const storedById = new Map(storedRows.map((row) => [row.id, row]));
+        const currentFile = sim.files.get(apiFile.id)!;
+        const currentDoc = sim.documents.get(apiFile.documentId)!;
+        return currentDoc.status === "ACTIVE"
+          ? [
+              {
+                id: currentDoc.id,
+                user: { subscriptions: [{ plan: { code: "FREE" } }] },
+                files: [
+                  {
+                    id: currentFile.id,
+                    createdAt: currentFile.createdAt,
+                    storageObject: currentFile.storageObjectId ? storedById.get(currentFile.storageObjectId) ?? null : null,
+                  },
+                ],
+              },
+            ]
+          : [];
+      },
+      loadProtectedFileIds: async () => new Set<string>(),
+      markStorageObjectDeleted: async (storageObjectId, deletedAt) => {
+        await retentionClient.$transaction((tx) =>
+          tx.storageObject.updateMany({ where: { id: storageObjectId }, data: { deletedAt } }),
+        );
+      },
+      markDocumentDeleted: async (documentId) => {
+        sim.documents.get(documentId)!.status = "DELETED";
+      },
+    },
+  });
+  assert.equal(cleanupOutcome.deletedObjects, 1);
+  assert.equal(cleanupOutcome.deletedDocuments, 1);
+  assert.deepEqual(deletedKeys, [apiKey]);
+  assert.notEqual(sim.storageObjects.get(apiFile.storageObjectId!)?.deletedAt, null);
 });

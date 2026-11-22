@@ -354,10 +354,13 @@ BEGIN
       USING ERRCODE = '42501';
   END IF;
 
-  v_ctx_api_client_id := NULLIF(pg_catalog.current_setting('app.current_api_client_id', true), '')::uuid;
-  IF v_obj_api_client_id IS DISTINCT FROM v_ctx_api_client_id THEN
-    RAISE EXCEPTION 'STORAGE_OBJECT_API_CLIENT_MISMATCH: file session api_client_id does not match storage_object api_client_id'
-      USING ERRCODE = '42501';
+  IF TG_OP = 'INSERT'
+     OR NEW."storage_object_id" IS DISTINCT FROM OLD."storage_object_id" THEN
+    v_ctx_api_client_id := NULLIF(pg_catalog.current_setting('app.current_api_client_id', true), '')::uuid;
+    IF v_obj_api_client_id IS DISTINCT FROM v_ctx_api_client_id THEN
+      RAISE EXCEPTION 'STORAGE_OBJECT_API_CLIENT_MISMATCH: file session api_client_id does not match storage_object api_client_id'
+        USING ERRCODE = '42501';
+    END IF;
   END IF;
 
   IF TG_OP = 'UPDATE'

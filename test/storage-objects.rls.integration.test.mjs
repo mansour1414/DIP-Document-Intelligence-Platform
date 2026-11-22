@@ -794,6 +794,80 @@ integration("N1-A storage_objects enforces real PostgreSQL RLS, FORCE RLS, API-c
       prismaPersonalKey,
     );
 
+    // 4b. PUBLIC API RETENTION COMPATIBILITY REGRESSION (PostgreSQL 18):
+    //     Database owner can perform a legitimate metadata-only UPDATE (e.g. aging created_at in Public API E2E)
+    //     on an API-client-owned File WITHOUT any fake app.current_api_client_id GUC, while:
+    //     - dip_app sessions outside clientA1's active API-client RLS scope still update 0 rows, and
+    //     - any coordinate mutation (document_id, storage_object_id, storage_key) or forged storage_key
+    //       still fails closed for both database owner and clientA1.
+    const agedTimestamp = "2020-01-01T00:00:00.000Z";
+    const ownerAgedApiFile = await owner.query(
+      "UPDATE files SET created_at = $1::timestamp WHERE id = $2 RETURNING id, document_id, storage_object_id, storage_key",
+      [agedTimestamp, fileApiA1],
+    );
+    assert.equal(ownerAgedApiFile.rowCount, 1, "owner metadata-only UPDATE on API-client-owned File must succeed without API-client GUC");
+    assert.deepEqual(ownerAgedApiFile.rows[0], {
+      id: fileApiA1,
+      document_id: docOrgApiA1,
+      storage_object_id: apiObjA1,
+      storage_key: `api/${orgA}/${clientA1}/doc.pdf`,
+    });
+
+    // dip_app sessions outside clientA1 (clientA2 in same orgA+userA, non-API orgA+userA, personal userA, unscoped)
+    // still CANNOT perform metadata-only UPDATE on clientA1's File due to restrictive files_storage_object_rls_guard.
+    for (const unauthorizedGucs of [
+      { userId: userA, organizationId: orgA, apiClientId: clientA2 },
+      { userId: userA, organizationId: orgA },
+      { userId: userA },
+      {},
+    ]) {
+      assert.equal(
+        (
+          await inScope(runtime, unauthorizedGucs, (c) =>
+            c.query("UPDATE files SET original_name = 'tampered.pdf' WHERE id = $1", [fileApiA1]),
+          )
+        ).rowCount,
+        0,
+      );
+    }
+    assert.equal(
+      (await owner.query("SELECT original_name FROM files WHERE id = $1", [fileApiA1])).rows[0].original_name,
+      "a1.pdf",
+    );
+
+    // Coordinate mutations and forged storage_key changes on an API-client-owned File still fail closed
+    // for BOTH database owner (no GUC) and the owning API client session itself!
+    await assert.rejects(
+      () =>
+        owner.query("UPDATE files SET storage_key = $1 WHERE id = $2", [
+          `api/${orgA}/${clientA2}/doc.pdf`,
+          fileApiA1,
+        ]),
+      /FILE_STORAGE_COORDINATES_IMMUTABLE/,
+    );
+    await assert.rejects(
+      () =>
+        inScope(runtime, { userId: userA, organizationId: orgA, apiClientId: clientA1 }, (c) =>
+          c.query("UPDATE files SET storage_key = $1 WHERE id = $2", [
+            `api/${orgA}/${clientA2}/doc.pdf`,
+            fileApiA1,
+          ]),
+        ),
+      /FILE_STORAGE_COORDINATES_IMMUTABLE/,
+    );
+    await assert.rejects(
+      () => owner.query("UPDATE files SET document_id = $1 WHERE id = $2", [docOrgApiA2, fileApiA1]),
+      /FILE_STORAGE_COORDINATES_IMMUTABLE/,
+    );
+    await assert.rejects(
+      () => owner.query("UPDATE files SET storage_object_id = NULL WHERE id = $1", [fileApiA1]),
+      /FILE_STORAGE_OBJECT_REQUIRED/,
+    );
+    await assert.rejects(
+      () => owner.query("UPDATE files SET storage_object_id = $1 WHERE id = $2", [apiObjA2, fileApiA1]),
+      /STORAGE_OBJECT_API_CLIENT_MISMATCH|FILE_STORAGE_COORDINATES_IMMUTABLE/,
+    );
+
     // 5. Legitimate browser job-history ephemeral/* File (storage_object_id = NULL) succeeds for its tenant,
     //    stays invisible to other tenants, and is never returned by physical output download helpers.
     const ephemeralHistoryKey = `ephemeral/${crypto.randomUUID()}-browser-history.pdf`;

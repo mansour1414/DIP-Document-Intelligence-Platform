@@ -56,6 +56,11 @@ test("N1-A migration enforces migration-owner preflight, storage-key coordinate 
   assert.match(sql, /FILE_STORAGE_OBJECT_REQUIRED/);
   assert.match(sql, /FILE_STORAGE_KEY_MISMATCH/);
   assert.match(sql, /FILE_STORAGE_COORDINATES_IMMUTABLE/);
+  assert.match(
+    sql,
+    /IF TG_OP = 'INSERT'\s+OR NEW\."storage_object_id" IS DISTINCT FROM OLD\."storage_object_id" THEN\s+v_ctx_api_client_id := NULLIF\(pg_catalog\.current_setting\('app\.current_api_client_id', true\), ''\)::uuid;/,
+    "session api_client_id binding must apply on INSERT and storage_object_id link changes without breaking metadata-only owner UPDATEs",
+  );
   assert.match(sql, /CREATE TRIGGER files_storage_object_tenant_guard\s+BEFORE INSERT OR UPDATE ON "files"/);
   assert.match(sql, /so\."object_key" = "files"\."storage_key"/);
   assert.match(sql, /CONSTRAINT "storage_objects_tenant_scope_check" CHECK/);
