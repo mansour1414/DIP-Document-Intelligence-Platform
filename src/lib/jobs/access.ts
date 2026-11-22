@@ -42,6 +42,7 @@ export function findOutputFileForUser(userId: string, fileId: string, client: Pr
           document: { userId },
           AND: [
             { document: { organizationId: null, status: "ACTIVE" } },
+            { NOT: { storageKey: { startsWith: "ephemeral/" } } },
             {
               OR: [
                 { storageObjectId: null },

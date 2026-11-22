@@ -11,7 +11,7 @@ import { OutputCommitSupersededError, discardStoredObjects, screenAndStoreWorker
 import { recordMetric } from "@/lib/observability/metrics";
 import { configuredCostRates, estimateJobCost } from "@/lib/cost/model";
 import { withTenant, withTenantScope } from "@/lib/db/tenant";
-import { buildStorageObjectConnectOrCreate } from "@/lib/storage/metadata";
+import { buildStorageObjectConnectOrCreate, isAuthorizedFileStorageAccess } from "@/lib/storage/metadata";
 import type { QueuedJob } from "@/lib/queue";
 import { validateToolOptions } from "@/lib/tools/options";
 import { deletePhase1Secret, takePhase1Secret, type Phase1SecretPurpose } from "@/lib/secrets/phase1";
@@ -54,7 +54,7 @@ export async function processDocumentJob(message: QueuedJob, deps: DocumentPipel
   const tenant = <T>(operation: Parameters<typeof withTenant<T>>[1]) => withTenant({ userId: message.userId! }, operation, deps.client);
   const job = await tenant((tx) => tx.job.findUnique({ where: { id: message.jobId }, include: { steps: true } }));
   if (!job) throw new Error("JOB_NOT_FOUND");
-  if (!job.requesterId) throw Object.assign(new Error("Worker job requires a persisted requester identity"), { code: "TENANT_CONTEXT_REQUIRED" });
+  if (!job.requesterId || job.requesterId !== message.userId) throw Object.assign(new Error("Worker job requires a persisted requester identity"), { code: "TENANT_CONTEXT_REQUIRED" });
   const jobExecutionScope = { userId: job.requesterId, organizationId: job.organizationId, apiClientId: job.apiClientId };
   const scopedTenant = <T>(operation: Parameters<typeof withTenantScope<T>>[1]) => withTenantScope(jobExecutionScope, operation, deps.client);
   const attemptId = deps.attemptId ?? randomUUID();
@@ -81,8 +81,10 @@ export async function processDocumentJob(message: QueuedJob, deps: DocumentPipel
     if (step) await tenant((tx) => tx.jobStep.updateMany({ where: { id: step.id, status: { notIn: [...CLOSED_JOB_STATES] } }, data: { status: "RUNNING", startedAt: new Date() } }));
     const params = rawParams; const ids = params.inputFileIds;
     if (!ids?.length) throw Object.assign(new Error("Unsupported job payload"), { code: "INVALID_JOB_INPUT" });
-    const files = await scopedTenant((tx) => tx.file.findMany({ where: { id: { in: ids } }, include: { document: true } }));
-    if (files.length !== ids.length) throw Object.assign(new Error("Input file is missing"), { code: "INPUT_NOT_FOUND" });
+    const files = await scopedTenant((tx) => tx.file.findMany({ where: { id: { in: ids } }, include: { document: true, storageObject: true } }));
+    if (files.length !== ids.length || files.some((file) => !isAuthorizedFileStorageAccess(file, jobExecutionScope))) {
+      throw Object.assign(new Error("Input file is missing"), { code: "INPUT_NOT_FOUND" });
+    }
     const inputById = new Map(files.map((file) => [file.id, file]));
     const storage = deps.storage ?? getStorage();
     const bytes = await Promise.all(ids.map((id) => storage.get(inputById.get(id)!.storageKey))); const options: Record<string, unknown> = { ...validateToolOptions(job.toolId, params.options ?? {}), inputMimeTypes: ids.map((id) => inputById.get(id)!.mimeType) };

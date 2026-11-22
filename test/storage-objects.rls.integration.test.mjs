@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import test from "node:test";
+import { PrismaPg } from "@prisma/adapter-pg";
+import { PrismaClient } from "@prisma/client";
 import pg from "pg";
+import { withTenantScope } from "../src/lib/db/tenant.ts";
+import { buildStorageObjectConnectOrCreate } from "../src/lib/storage/metadata.ts";
 
 const runtimeUrl = process.env.DIP_RLS_TEST_DATABASE_URL;
 const ownerUrl = process.env.DIP_RLS_TEST_OWNER_URL;
@@ -27,10 +31,14 @@ async function inScope(pool, gucs, fn) {
   }
 }
 
-integration("N1-A storage_objects enforces real PostgreSQL RLS, FORCE RLS, triggers, composite FK, orphan quarantine, and retention least privilege", async () => {
+integration("N1-A storage_objects enforces real PostgreSQL RLS, FORCE RLS, API-client cross-link triggers, Prisma connectOrCreate, SECURITY DEFINER hardening, and retention least privilege", async () => {
   const owner = new pg.Pool({ connectionString: ownerUrl, max: 2 });
   const runtime = new pg.Pool({ connectionString: runtimeUrl, max: 4 });
   const retention = new pg.Pool({ connectionString: retentionUrl, max: 2 });
+  const prismaRuntime = new PrismaClient({
+    adapter: new PrismaPg({ connectionString: runtimeUrl }),
+    log: ["error"],
+  });
 
   const userA = crypto.randomUUID();
   const userA2 = crypto.randomUUID();
@@ -42,18 +50,25 @@ integration("N1-A storage_objects enforces real PostgreSQL RLS, FORCE RLS, trigg
   const clientB1 = crypto.randomUUID();
   const docA = crypto.randomUUID();
   const docB = crypto.randomUUID();
+  const docOrgApiA1 = crypto.randomUUID();
+  const docOrgApiA2 = crypto.randomUUID();
   const orphanObj = crypto.randomUUID();
   const personalObjA = crypto.randomUUID();
   const personalObjB = crypto.randomUUID();
   const orgObjA = crypto.randomUUID();
   const apiObjA1 = crypto.randomUUID();
+  const apiObjA2 = crypto.randomUUID();
+  const fileApiA1 = crypto.randomUUID();
+  const fileApiA2 = crypto.randomUUID();
+
+  const allDocIds = [docA, docB, docOrgApiA1, docOrgApiA2];
 
   const cleanup = async () => {
-    await owner.query("DELETE FROM files WHERE document_id = ANY($1::uuid[])", [[docA, docB]]);
-    await owner.query("DELETE FROM documents WHERE id = ANY($1::uuid[])", [[docA, docB]]);
+    await owner.query("DELETE FROM files WHERE document_id = ANY($1::uuid[])", [allDocIds]);
+    await owner.query("DELETE FROM documents WHERE id = ANY($1::uuid[])", [allDocIds]);
     await owner.query(
       "DELETE FROM storage_objects WHERE id = ANY($1::uuid[]) OR owner_user_id = ANY($2::uuid[])",
-      [[orphanObj, personalObjA, personalObjB, orgObjA, apiObjA1], [userA, userA2, userB]],
+      [[orphanObj, personalObjA, personalObjB, orgObjA, apiObjA1, apiObjA2], [userA, userA2, userB]],
     );
     await owner.query("DELETE FROM api_clients WHERE id = ANY($1::uuid[])", [[clientA1, clientA2, clientB1]]);
     await owner.query("DELETE FROM memberships WHERE organization_id = ANY($1::uuid[])", [[orgA, orgB]]);
@@ -62,7 +77,7 @@ integration("N1-A storage_objects enforces real PostgreSQL RLS, FORCE RLS, trigg
   };
 
   try {
-    // 16. Verify pg_class RLS + FORCE RLS and non-bypass runtime/retention roles.
+    // Catalog audit: pg_class RLS + FORCE RLS, role posture, explicit policy roles, and SECURITY DEFINER privileges.
     const rlsCatalog = await owner.query(
       "SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE oid = 'public.storage_objects'::regclass",
     );
@@ -75,6 +90,62 @@ integration("N1-A storage_objects enforces real PostgreSQL RLS, FORCE RLS, trigg
       { rolname: "dip_app", rolsuper: false, rolbypassrls: false },
       { rolname: "dip_retention", rolsuper: false, rolbypassrls: false },
     ]);
+
+    const policyCatalog = await owner.query(
+      `SELECT tablename, policyname, permissive, roles::text[] AS roles
+         FROM pg_policies
+        WHERE schemaname = 'public'
+          AND (tablename = 'storage_objects' OR policyname = 'files_storage_object_rls_guard')
+        ORDER BY tablename, policyname`,
+    );
+    for (const pol of policyCatalog.rows) {
+      assert.ok(!pol.roles.includes("public"), `Policy ${pol.policyname} must not target PUBLIC`);
+      if (pol.policyname.includes("retention")) {
+        assert.deepEqual(pol.roles, ["dip_retention"]);
+      } else {
+        assert.deepEqual(pol.roles, ["dip_app"]);
+      }
+    }
+    const filesGuardPolicy = policyCatalog.rows.find((p) => p.policyname === "files_storage_object_rls_guard");
+    assert.ok(filesGuardPolicy, "files_storage_object_rls_guard policy must exist");
+    assert.equal(filesGuardPolicy.permissive, "RESTRICTIVE");
+
+    const fnCatalog = await owner.query(
+      `SELECT p.proname,
+              pg_get_userbyid(p.proowner) AS owner_role,
+              p.prosecdef,
+              p.proconfig,
+              has_function_privilege('public', p.oid, 'EXECUTE') AS public_exec,
+              has_function_privilege('dip_app', p.oid, 'EXECUTE') AS dip_app_exec,
+              has_function_privilege('dip_retention', p.oid, 'EXECUTE') AS dip_retention_exec
+         FROM pg_proc p
+         JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname = 'public'
+          AND p.proname IN (
+            'app_api_client_matches_tenant',
+            'enforce_storage_object_immutability',
+            'enforce_file_storage_object_tenant_match',
+            'enforce_document_storage_object_tenant_match'
+          )
+        ORDER BY p.proname`,
+    );
+    assert.equal(fnCatalog.rowCount, 4);
+    for (const fn of fnCatalog.rows) {
+      assert.equal(fn.prosecdef, true, `${fn.proname} must be SECURITY DEFINER`);
+      assert.notEqual(fn.owner_role, "dip_app");
+      assert.notEqual(fn.owner_role, "dip_retention");
+      assert.ok(
+        Array.isArray(fn.proconfig) && fn.proconfig.includes("search_path=pg_catalog, public"),
+        `${fn.proname} must pin search_path=pg_catalog, public`,
+      );
+      assert.equal(fn.public_exec, false, `${fn.proname} must revoke PUBLIC EXECUTE`);
+      assert.equal(fn.dip_retention_exec, false, `${fn.proname} must revoke dip_retention EXECUTE`);
+      if (fn.proname === "app_api_client_matches_tenant") {
+        assert.equal(fn.dip_app_exec, true);
+      } else {
+        assert.equal(fn.dip_app_exec, false, `${fn.proname} trigger function must revoke dip_app EXECUTE`);
+      }
+    }
 
     for (const u of [userA, userA2, userB]) {
       await owner.query("INSERT INTO users(id,email,status,created_at,updated_at) VALUES($1,$2,'ACTIVE',now(),now())", [
@@ -92,13 +163,14 @@ integration("N1-A storage_objects enforces real PostgreSQL RLS, FORCE RLS, trigg
       "INSERT INTO memberships(id,user_id,organization_id,role,created_at,updated_at) VALUES($1,$2,$3,'OWNER',now(),now()),($4,$5,$3,'MEMBER',now(),now()),($6,$7,$8,'OWNER',now(),now())",
       [crypto.randomUUID(), userA, orgA, crypto.randomUUID(), userA2, crypto.randomUUID(), userB, orgB],
     );
+    // Note: clientA1 and clientA2 intentionally share BOTH orgA AND created_by_user_id = userA (Blocker 2 scenario).
     await owner.query(
       "INSERT INTO api_clients(id,organization_id,created_by_user_id,name,status,created_at,updated_at) VALUES($1,$2,$3,'A1','ACTIVE',now(),now()),($4,$2,$3,'A2','ACTIVE',now(),now()),($5,$6,$7,'B1','ACTIVE',now(),now())",
       [clientA1, orgA, userA, clientA2, clientB1, orgB, userB],
     );
     await owner.query(
-      "INSERT INTO documents(id,user_id,title,status,created_at,updated_at) VALUES($1,$2,'Doc A','ACTIVE',now(),now()),($3,$4,'Doc B','ACTIVE',now(),now())",
-      [docA, userA, docB, userB],
+      "INSERT INTO documents(id,user_id,organization_id,title,status,created_at,updated_at) VALUES($1,$2,NULL,'Doc A','ACTIVE',now(),now()),($3,$4,NULL,'Doc B','ACTIVE',now(),now()),($5,$2,$6,'Doc Org API A1','ACTIVE',now(),now()),($7,$2,$6,'Doc Org API A2','ACTIVE',now(),now())",
+      [docA, userA, docB, userB, docOrgApiA1, orgA, docOrgApiA2],
     );
 
     // Seed an unlinked historical orphan row (NULL ownership).
@@ -107,7 +179,7 @@ integration("N1-A storage_objects enforces real PostgreSQL RLS, FORCE RLS, trigg
       [orphanObj, `orphan/${orphanObj}.pdf`],
     );
 
-    // 5. Missing/empty tenant context fails closed.
+    // Missing/empty tenant context fails closed.
     assert.equal((await runtime.query("SELECT id FROM storage_objects")).rowCount, 0);
     await assert.rejects(
       () =>
@@ -118,7 +190,7 @@ integration("N1-A storage_objects enforces real PostgreSQL RLS, FORCE RLS, trigg
       /row-level security/i,
     );
 
-    // 1-4 & 6. Personal user-owned INSERT, SELECT, cross-tenant isolation, and unauthorized INSERT rejection.
+    // Personal user-owned INSERT, SELECT, cross-tenant isolation, and unauthorized INSERT rejection.
     await inScope(runtime, { userId: userA }, (c) =>
       c.query(
         "INSERT INTO storage_objects(id,owner_user_id,provider,bucket,object_key,size,checksum) VALUES($1,$2,'s3','dip-rls',$3,100,'sha-a')",
@@ -153,7 +225,7 @@ integration("N1-A storage_objects enforces real PostgreSQL RLS, FORCE RLS, trigg
       /row-level security/i,
     );
 
-    // 7-8. Organization & API-client isolation + composite FK enforcement.
+    // Organization & API-client isolation + composite FK enforcement.
     await inScope(runtime, { userId: userA, organizationId: orgA }, (c) =>
       c.query(
         "INSERT INTO storage_objects(id,owner_user_id,organization_id,provider,bucket,object_key,size) VALUES($1,$2,$3,'s3','dip-rls',$4,300)",
@@ -175,6 +247,13 @@ integration("N1-A storage_objects enforces real PostgreSQL RLS, FORCE RLS, trigg
         [apiObjA1, userA, orgA, clientA1, `api/${orgA}/${clientA1}/doc.pdf`],
       ),
     );
+    await inScope(runtime, { userId: userA, organizationId: orgA, apiClientId: clientA2 }, (c) =>
+      c.query(
+        "INSERT INTO storage_objects(id,owner_user_id,organization_id,api_client_id,provider,bucket,object_key,size) VALUES($1,$2,$3,$4,'s3','dip-rls',$5,410)",
+        [apiObjA2, userA, orgA, clientA2, `api/${orgA}/${clientA2}/doc.pdf`],
+      ),
+    );
+
     assert.equal(
       (await inScope(runtime, { organizationId: orgA, apiClientId: clientA1 }, (c) => c.query("SELECT id FROM storage_objects WHERE id=$1", [apiObjA1]))).rowCount,
       1,
@@ -183,9 +262,94 @@ integration("N1-A storage_objects enforces real PostgreSQL RLS, FORCE RLS, trigg
       (await inScope(runtime, { organizationId: orgA, apiClientId: clientA2 }, (c) => c.query("SELECT id FROM storage_objects WHERE id=$1", [apiObjA1]))).rowCount,
       0,
     );
+    // Non-API org session for userA cannot see API-client-scoped storage_objects either.
+    assert.equal(
+      (await inScope(runtime, { userId: userA, organizationId: orgA }, (c) => c.query("SELECT id FROM storage_objects WHERE id=$1", [apiObjA1]))).rowCount,
+      0,
+    );
     assert.equal(
       (await inScope(runtime, { organizationId: orgB, apiClientId: clientB1 }, (c) => c.query("SELECT id FROM storage_objects WHERE id=$1", [apiObjA1]))).rowCount,
       0,
+    );
+
+    // Anti-oracle check: app_api_client_matches_tenant returns false when GUC context does not match probed client/org.
+    const oracleProbeWrongClient = await inScope(
+      runtime,
+      { userId: userA, organizationId: orgA, apiClientId: clientA2 },
+      (c) => c.query("SELECT app_api_client_matches_tenant($1, $2, $3, false) AS ok", [orgA, clientA1, userA]),
+    );
+    assert.equal(oracleProbeWrongClient.rows[0].ok, false);
+
+    // BLOCKER 2 EXPLICIT NEGATIVE SUITE:
+    // clientA1 and clientA2 share BOTH orgA and execution user userA.
+    // 1. clientA1 creates its legitimate File linked to apiObjA1.
+    await inScope(runtime, { userId: userA, organizationId: orgA, apiClientId: clientA1 }, (c) =>
+      c.query(
+        "INSERT INTO files(id,document_id,storage_object_id,storage_key,mime_type,original_name,size,created_at) VALUES($1,$2,$3,$4,'application/pdf','a1.pdf',400,now())",
+        [fileApiA1, docOrgApiA1, apiObjA1, `api/${orgA}/${clientA1}/doc.pdf`],
+      ),
+    );
+    await inScope(runtime, { userId: userA, organizationId: orgA, apiClientId: clientA2 }, (c) =>
+      c.query(
+        "INSERT INTO files(id,document_id,storage_object_id,storage_key,mime_type,original_name,size,created_at) VALUES($1,$2,$3,$4,'application/pdf','a2.pdf',410,now())",
+        [fileApiA2, docOrgApiA2, apiObjA2, `api/${orgA}/${clientA2}/doc.pdf`],
+      ),
+    );
+
+    // 2. clientA2 CANNOT SELECT clientA1's files row (including storage_key), despite sharing userA and orgA.
+    assert.equal(
+      (
+        await inScope(runtime, { userId: userA, organizationId: orgA, apiClientId: clientA2 }, (c) =>
+          c.query("SELECT id, storage_key FROM files WHERE id = $1", [fileApiA1]),
+        )
+      ).rowCount,
+      0,
+    );
+    // Personal userA session and non-API org session also CANNOT SELECT clientA1's files row.
+    assert.equal(
+      (await inScope(runtime, { userId: userA }, (c) => c.query("SELECT id, storage_key FROM files WHERE id = $1", [fileApiA1]))).rowCount,
+      0,
+    );
+    assert.equal(
+      (
+        await inScope(runtime, { userId: userA, organizationId: orgA }, (c) =>
+          c.query("SELECT id, storage_key FROM files WHERE id = $1", [fileApiA1]),
+        )
+      ).rowCount,
+      0,
+    );
+
+    // 3. clientA2 CANNOT INSERT a File referencing clientA1's StorageObject (apiObjA1), even with same orgA + userA!
+    await assert.rejects(
+      () =>
+        inScope(runtime, { userId: userA, organizationId: orgA, apiClientId: clientA2 }, (c) =>
+          c.query(
+            "INSERT INTO files(id,document_id,storage_object_id,storage_key,mime_type,original_name,size,created_at) VALUES($1,$2,$3,'cross-api.pdf','application/pdf','x.pdf',400,now())",
+            [crypto.randomUUID(), docOrgApiA2, apiObjA1],
+          ),
+        ),
+      /STORAGE_OBJECT_API_CLIENT_MISMATCH|row-level security/i,
+    );
+
+    // 4. clientA2 CANNOT UPDATE its own File to reference clientA1's StorageObject (apiObjA1).
+    await assert.rejects(
+      () =>
+        inScope(runtime, { userId: userA, organizationId: orgA, apiClientId: clientA2 }, (c) =>
+          c.query("UPDATE files SET storage_object_id = $1 WHERE id = $2", [apiObjA1, fileApiA2]),
+        ),
+      /STORAGE_OBJECT_API_CLIENT_MISMATCH|row-level security/i,
+    );
+
+    // 5. Non-API org session for userA CANNOT INSERT a File referencing clientA1's StorageObject (apiObjA1).
+    await assert.rejects(
+      () =>
+        inScope(runtime, { userId: userA, organizationId: orgA }, (c) =>
+          c.query(
+            "INSERT INTO files(id,document_id,storage_object_id,storage_key,mime_type,original_name,size,created_at) VALUES($1,$2,$3,'org-to-api.pdf','application/pdf','o2a.pdf',400,now())",
+            [crypto.randomUUID(), docOrgApiA2, apiObjA1],
+          ),
+        ),
+      /STORAGE_OBJECT_API_CLIENT_MISMATCH|row-level security/i,
     );
 
     // Composite FK prevents mismatched (api_client_id, organization_id) even as owner.
@@ -198,7 +362,7 @@ integration("N1-A storage_objects enforces real PostgreSQL RLS, FORCE RLS, trigg
       /storage_objects_api_client_organization_fkey/,
     );
 
-    // 12 & 13. Cross-tenant File -> StorageObject link and orphan link are rejected by trigger; object-key collision fails closed.
+    // Cross-tenant File -> StorageObject link and orphan link are rejected by trigger; object-key collision fails closed.
     await assert.rejects(
       () =>
         inScope(runtime, { userId: userB }, (c) =>
@@ -230,6 +394,116 @@ integration("N1-A storage_objects enforces real PostgreSQL RLS, FORCE RLS, trigg
       /duplicate key value violates unique constraint/,
     );
 
+    // REAL PRISMA connectOrCreate VERIFICATION AGAINST POSTGRESQL dip_app:
+    // (a) Same personal tenant connectOrCreate reuses existing StorageObject cleanly.
+    const prismaPersonalKey = `prisma-connect/${userA}/${crypto.randomUUID()}.pdf`;
+    const createdPersonal1 = await withTenantScope(
+      { userId: userA },
+      (tx) =>
+        tx.file.create({
+          data: {
+            documentId: docA,
+            storageKey: prismaPersonalKey,
+            mimeType: "application/pdf",
+            originalName: "p1.pdf",
+            size: BigInt(512),
+            storageObject: buildStorageObjectConnectOrCreate(
+              { userId: userA },
+              { bucket: "dip-rls", objectKey: prismaPersonalKey, size: 512, checksum: "sha-p1" },
+            ),
+          },
+          select: { id: true, storageObjectId: true },
+        }),
+      prismaRuntime,
+    );
+    const createdPersonal2 = await withTenantScope(
+      { userId: userA },
+      (tx) =>
+        tx.file.create({
+          data: {
+            documentId: docA,
+            storageKey: prismaPersonalKey,
+            mimeType: "application/pdf",
+            originalName: "p1-copy.pdf",
+            size: BigInt(512),
+            storageObject: buildStorageObjectConnectOrCreate(
+              { userId: userA },
+              { bucket: "dip-rls", objectKey: prismaPersonalKey, size: 512, checksum: "sha-p1" },
+            ),
+          },
+          select: { id: true, storageObjectId: true },
+        }),
+      prismaRuntime,
+    );
+    assert.ok(createdPersonal1.storageObjectId);
+    assert.equal(createdPersonal1.storageObjectId, createdPersonal2.storageObjectId);
+
+    // (b) Cross-user Prisma connectOrCreate on colliding (provider, bucket, object_key) fails closed!
+    await assert.rejects(() =>
+      withTenantScope(
+        { userId: userB },
+        (tx) =>
+          tx.file.create({
+            data: {
+              documentId: docB,
+              storageKey: prismaPersonalKey,
+              mimeType: "application/pdf",
+              originalName: "hijack-prisma.pdf",
+              size: BigInt(512),
+              storageObject: buildStorageObjectConnectOrCreate(
+                { userId: userB },
+                { bucket: "dip-rls", objectKey: prismaPersonalKey, size: 512 },
+              ),
+            },
+          }),
+        prismaRuntime,
+      ),
+    );
+
+    // (c) Same-org, same-execution-user cross-API-client Prisma connectOrCreate fails closed!
+    const prismaApiKey = `prisma-api/${orgA}/${clientA1}/${crypto.randomUUID()}.pdf`;
+    const createdApiFile = await withTenantScope(
+      { userId: userA, organizationId: orgA, apiClientId: clientA1 },
+      (tx) =>
+        tx.file.create({
+          data: {
+            documentId: docOrgApiA1,
+            storageKey: prismaApiKey,
+            mimeType: "application/pdf",
+            originalName: "api-a1.pdf",
+            size: BigInt(768),
+            storageObject: buildStorageObjectConnectOrCreate(
+              { userId: userA, organizationId: orgA, apiClientId: clientA1 },
+              { bucket: "dip-rls", objectKey: prismaApiKey, size: 768 },
+            ),
+          },
+          select: { id: true, storageObjectId: true },
+        }),
+      prismaRuntime,
+    );
+    assert.ok(createdApiFile.storageObjectId);
+
+    await assert.rejects(() =>
+      withTenantScope(
+        { userId: userA, organizationId: orgA, apiClientId: clientA2 },
+        (tx) =>
+          tx.file.create({
+            data: {
+              documentId: docOrgApiA2,
+              storageKey: prismaApiKey,
+              mimeType: "application/pdf",
+              originalName: "api-a2-collide.pdf",
+              size: BigInt(768),
+              storageObject: buildStorageObjectConnectOrCreate(
+                { userId: userA, organizationId: orgA, apiClientId: clientA2 },
+                { bucket: "dip-rls", objectKey: prismaApiKey, size: 768 },
+              ),
+            },
+          }),
+        prismaRuntime,
+      ),
+    );
+
     // Immutability & column grants: dip_app cannot DELETE or mutate coordinates/ownership.
     await assert.rejects(() => inScope(runtime, { userId: userA }, (c) => c.query("DELETE FROM storage_objects WHERE id=$1", [personalObjA])), /permission denied/i);
     await assert.rejects(
@@ -237,12 +511,12 @@ integration("N1-A storage_objects enforces real PostgreSQL RLS, FORCE RLS, trigg
       /permission denied|STORAGE_OBJECT_COORDINATES_IMMUTABLE/i,
     );
 
-    // 15. Retention role can SELECT across tenants/orphans and UPDATE only deleted_at.
+    // Retention role can SELECT across tenants/orphans and UPDATE only deleted_at.
     const retentionSeeAll = await retention.query(
       "SELECT id FROM storage_objects WHERE id = ANY($1::uuid[])",
-      [[orphanObj, personalObjA, personalObjB, orgObjA, apiObjA1]],
+      [[orphanObj, personalObjA, personalObjB, orgObjA, apiObjA1, apiObjA2]],
     );
-    assert.equal(retentionSeeAll.rowCount, 5);
+    assert.equal(retentionSeeAll.rowCount, 6);
     assert.equal(
       (await retention.query("UPDATE storage_objects SET deleted_at = now() WHERE id = $1", [orphanObj])).rowCount,
       1,
@@ -258,7 +532,10 @@ integration("N1-A storage_objects enforces real PostgreSQL RLS, FORCE RLS, trigg
       /permission denied/i,
     );
   } finally {
-    await cleanup();
-    await Promise.all([runtime.end(), retention.end(), owner.end()]);
+    await cleanup().catch(() => undefined);
+    await prismaRuntime.$disconnect().catch(() => undefined);
+    await retention.end();
+    await runtime.end();
+    await owner.end();
   }
 });

@@ -77,6 +77,14 @@ TO dip_app;
 
 GRANT SELECT, INSERT ON storage_objects TO dip_app;
 GRANT UPDATE (region, checksum, deleted_at) ON storage_objects TO dip_app;
+REVOKE ALL ON FUNCTION
+  app_api_client_matches_tenant(uuid, uuid, uuid, boolean)
+FROM PUBLIC, dip_retention;
+REVOKE ALL ON FUNCTION
+  enforce_storage_object_immutability(),
+  enforce_file_storage_object_tenant_match(),
+  enforce_document_storage_object_tenant_match()
+FROM PUBLIC, dip_app, dip_retention;
 GRANT EXECUTE ON FUNCTION
   app_is_org_member(uuid, uuid),
   app_has_org_role(uuid, uuid, "MemberRole"[]),

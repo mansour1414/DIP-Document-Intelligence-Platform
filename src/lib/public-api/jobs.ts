@@ -66,11 +66,13 @@ export async function getPublicJobResult(principal: ApiPrincipal, jobId: string,
       tx.file.findMany({
         where: {
           id: { in: result.outputFileIds },
-          document: { organizationId: principal.organizationId, status: "ACTIVE" },
+          document: { userId: principal.executionUserId, organizationId: principal.organizationId, status: "ACTIVE" },
+          NOT: { storageKey: { startsWith: "ephemeral/" } },
           OR: [
             { storageObjectId: null },
             {
               storageObject: {
+                ownerUserId: principal.executionUserId,
                 organizationId: principal.organizationId,
                 apiClientId: principal.apiClientId,
                 deletedAt: null,
@@ -96,11 +98,13 @@ export async function downloadPublicJobResult(principal: ApiPrincipal, jobId: st
       tx.file.findFirst({
         where: {
           id: fileId,
-          document: { organizationId: principal.organizationId, status: "ACTIVE" },
+          document: { userId: principal.executionUserId, organizationId: principal.organizationId, status: "ACTIVE" },
+          NOT: { storageKey: { startsWith: "ephemeral/" } },
           OR: [
             { storageObjectId: null },
             {
               storageObject: {
+                ownerUserId: principal.executionUserId,
                 organizationId: principal.organizationId,
                 apiClientId: principal.apiClientId,
                 deletedAt: null,

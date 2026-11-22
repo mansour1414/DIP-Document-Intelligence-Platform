@@ -66,7 +66,29 @@ export async function createToolJobFromFiles(input: { userId: string; toolId: st
   const options = validateToolOptions(tool.toolId, input.options ?? {});
   const existing = await withTenant({ userId: input.userId }, (tx) => tx.job.findUnique({ where: { toolId_idempotencyKey: { toolId: tool.toolId, idempotencyKey: input.idempotencyKey } }, select: { id: true, status: true } }));
   if (existing) return { ...existing, reused: true };
-  const files = await withTenant({ userId: input.userId }, (tx) => tx.file.findMany({ where: { id: { in: input.fileIds }, document: { userId: input.userId } }, select: { id: true, size: true, pageCount: true, mimeType: true } }));
+  const files = await withTenant(
+    { userId: input.userId },
+    (tx) =>
+      tx.file.findMany({
+        where: {
+          id: { in: input.fileIds },
+          document: { userId: input.userId, organizationId: null, status: "ACTIVE" },
+          NOT: { storageKey: { startsWith: "ephemeral/" } },
+          OR: [
+            { storageObjectId: null },
+            {
+              storageObject: {
+                ownerUserId: input.userId,
+                organizationId: null,
+                apiClientId: null,
+                deletedAt: null,
+              },
+            },
+          ],
+        },
+        select: { id: true, size: true, pageCount: true, mimeType: true },
+      }),
+  );
   if (files.length !== input.fileIds.length) throw Object.assign(new Error("WORKFLOW_ARTIFACT_UNAUTHORIZED"), { code: "WORKFLOW_ARTIFACT_UNAUTHORIZED" });
   if (input.fileIds.length < minimumFilesFor(input.toolId) || input.fileIds.length > tool.limits.maxFiles) throw new Error("INPUT_FILE_COUNT_INVALID");
   if (files.some((file) => !tool.mime.input.includes(file.mimeType))) throw Object.assign(new Error("WORKFLOW_MIME_INCOMPATIBLE"), { code: "WORKFLOW_MIME_INCOMPATIBLE" });

@@ -110,6 +110,56 @@ jobs:
           DIP_RLS_TEST_DATABASE_URL: postgresql://dip_app:dip_test_runtime@localhost:5432/dip_test
           DIP_RETENTION_TEST_DATABASE_URL: postgresql://dip_retention:dip_test_retention@localhost:5432/dip_test
 
+  rls-security:
+    name: RLS Security (PostgreSQL 18)
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_DB: dip_rls_pg18
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d dip_rls_pg18"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx prisma generate
+      - name: Bootstrap database roles
+        run: psql "$DATABASE_URL" --set=ON_ERROR_STOP=1 --file=prisma/bootstrap/roles.sql
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dip_rls_pg18
+      - name: Replay migrations on PostgreSQL 18
+        run: npx prisma migrate deploy
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dip_rls_pg18
+      - name: Reconcile runtime grants
+        run: psql "$DATABASE_URL" --set=ON_ERROR_STOP=1 --file=prisma/bootstrap/dip_app.sql
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dip_rls_pg18
+      - name: Configure ephemeral runtime and retention roles
+        run: psql "$DATABASE_URL" --set=ON_ERROR_STOP=1 --command="ALTER ROLE dip_app PASSWORD 'dip_rls_pg18_runtime'; ALTER ROLE dip_retention PASSWORD 'dip_rls_pg18_retention'"
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dip_rls_pg18
+      - name: Run fail-closed PostgreSQL 18 RLS security gate
+        run: npm run test:rls
+        env:
+          DIP_REQUIRE_PG18: "1"
+          DATABASE_URL: postgresql://dip_app:dip_rls_pg18_runtime@localhost:5432/dip_rls_pg18
+          DIP_RLS_TEST_OWNER_URL: postgresql://postgres:postgres@localhost:5432/dip_rls_pg18
+          DIP_RLS_TEST_DATABASE_URL: postgresql://dip_app:dip_rls_pg18_runtime@localhost:5432/dip_rls_pg18
+          DIP_RETENTION_TEST_DATABASE_URL: postgresql://dip_retention:dip_rls_pg18_retention@localhost:5432/dip_rls_pg18
+
   processing-integration:
     name: Integration / Processing
     runs-on: ubuntu-24.04
@@ -186,7 +236,7 @@ jobs:
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dip_processing
       - name: Configure ephemeral runtime role
-        run: psql "$DATABASE_URL" --set=ON_ERROR_STOP=1 --command="ALTER ROLE dip_app PASSWORD 'dip_processing_runtime'"
+        run: psql "$DATABASE_URL" --set=ON_ERROR_STOP=1 --command="ALTER ROLE dip_app PASSWORD 'dip_processing_runtime'; ALTER ROLE dip_retention PASSWORD 'dip_processing_retention'"
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dip_processing
       - name: Verify application dependencies are ready
@@ -218,6 +268,7 @@ jobs:
           REDIS_URL: redis://localhost:6379
           DIP_RLS_TEST_OWNER_URL: postgresql://postgres:postgres@localhost:5432/dip_processing
           DIP_RLS_TEST_DATABASE_URL: postgresql://dip_app:dip_processing_runtime@localhost:5432/dip_processing
+          DIP_RETENTION_TEST_DATABASE_URL: postgresql://dip_retention:dip_processing_retention@localhost:5432/dip_processing
           RUN_STORAGE_E2E: "1"
           RUN_PROCESSING_CORPUS: "1"
           FULL_PROCESSING_E2E: "1"

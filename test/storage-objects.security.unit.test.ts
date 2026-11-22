@@ -21,10 +21,12 @@ import {
   findStorageObjectForApiClient,
   findStorageObjectForOrganization,
   findStorageObjectForUser,
+  isAuthorizedFileStorageAccess,
   updateStorageObjectMetadataForApiClient,
   updateStorageObjectMetadataForOrganization,
   updateStorageObjectMetadataForUser,
 } from "@/lib/storage/metadata";
+import { evaluateRlsTestCounts, validateIsolatedRlsGateEnv } from "../scripts/run-rls-security-gate.mjs";
 
 /**
  * NOTE ON EVIDENCE BOUNDARIES (Phase 4):
@@ -153,7 +155,7 @@ class SimulatedTenantDatabase {
       o !== null &&
       row.organizationId === o &&
       this.isOrgMember(row.organizationId, u) &&
-      (c === null || row.apiClientId === c);
+      row.apiClientId === c;
 
     const apiClientPolicy =
       row.ownerUserId !== null &&
@@ -412,6 +414,7 @@ class SimulatedTenantDatabase {
                 let storageObjectId = (data.storageObjectId as string | null | undefined) ?? null;
                 const nested = data.storageObject as
                   | {
+                      connect?: { id: string };
                       connectOrCreate?: {
                         where: { provider_bucket_objectKey: { provider: string; bucket: string; objectKey: string } };
                         create: Record<string, unknown>;
@@ -419,7 +422,9 @@ class SimulatedTenantDatabase {
                     }
                   | undefined;
 
-                if (nested?.connectOrCreate) {
+                if (nested?.connect?.id) {
+                  storageObjectId = nested.connect.id;
+                } else if (nested?.connectOrCreate) {
                   const coords = nested.connectOrCreate.where.provider_bucket_objectKey;
                   const visibleExisting = [...this.storageObjects.values()].find(
                     (row) =>
@@ -447,6 +452,10 @@ class SimulatedTenantDatabase {
                   ) {
                     throw Object.assign(new Error("STORAGE_OBJECT_TENANT_MISMATCH"), { code: "42501" });
                   }
+                  const ctxApiClientId = guc.apiClientId || null;
+                  if (obj.apiClientId !== ctxApiClientId) {
+                    throw Object.assign(new Error("STORAGE_OBJECT_API_CLIENT_MISMATCH"), { code: "42501" });
+                  }
                 }
 
                 const file: SimFile = {
@@ -463,7 +472,13 @@ class SimulatedTenantDatabase {
                 this.files.set(file.id, file);
                 return file;
               },
-              findMany: async ({ where = {}, include }: { where?: Record<string, unknown>; include?: { document?: boolean } }) => {
+              findMany: async ({
+                where = {},
+                include,
+              }: {
+                where?: Record<string, unknown>;
+                include?: { document?: boolean; storageObject?: boolean };
+              }) => {
                 const matchClause = (file: SimFile, doc: SimDocument, clause: Record<string, unknown>): boolean => {
                   if (clause.id && typeof clause.id === "object" && "in" in (clause.id as object)) {
                     if (!((clause.id as { in: string[] }).in).includes(file.id)) return false;
@@ -471,8 +486,10 @@ class SimulatedTenantDatabase {
                     return false;
                   }
 
-                  if (clause.storageKey && typeof clause.storageKey === "object" && "in" in (clause.storageKey as object)) {
-                    if (!((clause.storageKey as { in: string[] }).in).includes(file.storageKey)) return false;
+                  if (clause.storageKey && typeof clause.storageKey === "object") {
+                    const sk = clause.storageKey as Record<string, unknown>;
+                    if ("in" in sk && !((sk.in as string[]) ?? []).includes(file.storageKey)) return false;
+                    if (typeof sk.startsWith === "string" && !file.storageKey.startsWith(sk.startsWith)) return false;
                   }
 
                   if ("storageObjectId" in clause && file.storageObjectId !== clause.storageObjectId) {
@@ -495,6 +512,10 @@ class SimulatedTenantDatabase {
                     if ("organizationId" in f && so.organizationId !== f.organizationId) return false;
                     if ("apiClientId" in f && so.apiClientId !== f.apiClientId) return false;
                     if ("deletedAt" in f && so.deletedAt !== f.deletedAt) return false;
+                  }
+
+                  if (clause.NOT && typeof clause.NOT === "object") {
+                    if (matchClause(file, doc, clause.NOT as Record<string, unknown>)) return false;
                   }
 
                   if (Array.isArray(clause.AND)) {
@@ -521,12 +542,21 @@ class SimulatedTenantDatabase {
                     (doc.organizationId === null && u === doc.userId) ||
                     (doc.organizationId !== null && o === doc.organizationId && this.isOrgMember(doc.organizationId, u));
                   if (!docVisible) return false;
+                  // Restrictive files_storage_object_rls_guard TO dip_app
+                  if (role === "dip_app" && file.storageObjectId !== null) {
+                    const so = this.storageObjects.get(file.storageObjectId);
+                    if (!so || !this.canSelectStorageObject(role, guc, so)) return false;
+                  }
                   return matchClause(file, doc, where);
                 });
 
-                return matches.map((file) =>
-                  include?.document ? { ...file, document: this.documents.get(file.documentId)! } : { ...file },
-                );
+                return matches.map((file) => ({
+                  ...file,
+                  ...(include?.document ? { document: this.documents.get(file.documentId)! } : {}),
+                  ...(include?.storageObject
+                    ? { storageObject: file.storageObjectId ? this.storageObjects.get(file.storageObjectId) ?? null : null }
+                    : {}),
+                }));
               },
               findFirst: async (args: { where?: Record<string, unknown> }) => {
                 const rows = await tx.file.findMany(args);
@@ -1218,4 +1248,207 @@ test("13-16. Orphan quarantine, download/result compatibility, narrow retention 
   sim.forceRls = false;
   assert.equal((await ownerClient.$transaction((tx) => tx.storageObject.findMany())).length, 3);
   sim.forceRls = true;
+});
+
+test("17. BLOCKER 2 regression: API Client B cannot link a File to or read API Client A's StorageObject/File when sharing organization and execution user", async () => {
+  const { sim, userA, orgA, clientA1, clientA2 } = seedMultiTenantWorld();
+  const appClient = sim.clientForRole("dip_app");
+
+  // clientA1 and clientA2 both belong to orgA and both have createdByUserId === userA.
+  const apiFileA1 = await withTenantScope(
+    { userId: userA, organizationId: orgA, apiClientId: clientA1 },
+    async (tx) => {
+      const doc = await tx.document.create({ data: { userId: userA, organizationId: orgA, title: "Client A1 Doc" } });
+      return tx.file.create({
+        data: {
+          document: { connect: { id: doc.id } },
+          originalName: "a1-secret.pdf",
+          mimeType: "application/pdf",
+          size: BigInt(400),
+          storageKey: `api/${orgA}/${clientA1}/secret.pdf`,
+          storageObject: buildStorageObjectConnectOrCreate(
+            { userId: userA, organizationId: orgA, apiClientId: clientA1 },
+            { bucket: "dip-test", objectKey: `api/${orgA}/${clientA1}/secret.pdf`, size: 400 },
+          ),
+        },
+      });
+    },
+    appClient,
+  );
+  assert.ok(apiFileA1.storageObjectId);
+
+  // clientA2 CANNOT create a File referencing clientA1's StorageObjectId!
+  await assert.rejects(
+    () =>
+      withTenantScope(
+        { userId: userA, organizationId: orgA, apiClientId: clientA2 },
+        async (tx) => {
+          const doc2 = await tx.document.create({ data: { userId: userA, organizationId: orgA, title: "Client A2 Doc" } });
+          return tx.file.create({
+            data: {
+              document: { connect: { id: doc2.id } },
+              originalName: "hijack-a1.pdf",
+              mimeType: "application/pdf",
+              size: BigInt(400),
+              storageKey: `api/${orgA}/${clientA1}/secret.pdf`,
+              storageObject: { connect: { id: apiFileA1.storageObjectId! } },
+            },
+          });
+        },
+        appClient,
+      ),
+    /STORAGE_OBJECT_API_CLIENT_MISMATCH|row-level security/,
+  );
+
+  // Non-API org scope for userA also CANNOT create a File referencing clientA1's StorageObjectId!
+  await assert.rejects(
+    () =>
+      withTenantScope(
+        { userId: userA, organizationId: orgA },
+        async (tx) => {
+          const docOrg = await tx.document.create({ data: { userId: userA, organizationId: orgA, title: "Org Member Doc" } });
+          return tx.file.create({
+            data: {
+              document: { connect: { id: docOrg.id } },
+              originalName: "org-hijack-a1.pdf",
+              mimeType: "application/pdf",
+              size: BigInt(400),
+              storageKey: `api/${orgA}/${clientA1}/secret.pdf`,
+              storageObject: { connect: { id: apiFileA1.storageObjectId! } },
+            },
+          });
+        },
+        appClient,
+      ),
+    /STORAGE_OBJECT_API_CLIENT_MISMATCH|row-level security/,
+  );
+
+  // clientA2 CANNOT read clientA1's File (restrictive files_storage_object_rls_guard)!
+  const visibleToA2 = await withTenantScope(
+    { userId: userA, organizationId: orgA, apiClientId: clientA2 },
+    (tx) => tx.file.findMany({ where: { id: apiFileA1.id } }),
+    appClient,
+  );
+  assert.equal(visibleToA2.length, 0);
+
+  // Worker pipeline running a job for clientA2 CANNOT consume clientA1's File.storageKey!
+  let storageReads = 0;
+  const guardedStorage: ObjectStorage = {
+    createUploadKey: () => "",
+    put: async () => ({ key: "", bucket: "dip-test", contentType: "application/pdf", size: 0 }),
+    get: async () => {
+      storageReads += 1;
+      return new Uint8Array([1, 2, 3]);
+    },
+    head: async () => undefined,
+    exists: async () => true,
+    deleteObject: async () => {},
+    close: async () => {},
+  };
+
+  const hijackJobId = randomUUID();
+  sim.jobs.set(hijackJobId, {
+    id: hijackJobId,
+    toolId: "rotate-pdf",
+    requesterId: userA,
+    organizationId: orgA,
+    apiClientId: clientA2,
+    status: "QUEUED",
+    params: { inputFileIds: [apiFileA1.id], options: { degrees: 90 } },
+    result: null,
+    outputFileId: null,
+    correlationId: "corr-hijack",
+    startedAt: null,
+    completedAt: null,
+    errorCode: null,
+  });
+
+  await assert.rejects(
+    () =>
+      processDocumentJob(
+        { jobId: hijackJobId, toolId: "rotate-pdf", idempotencyKey: "idem-hijack", correlationId: "corr-hijack", userId: userA },
+        { client: appClient, storage: guardedStorage },
+      ),
+    /Input file is missing/,
+  );
+  assert.equal(storageReads, 0, "storage.get must never be invoked when StorageObject access fails");
+});
+
+test("18. File.storageKey access guard and fail-closed RLS gate runner enforce strict boundaries", () => {
+  const userA = randomUUID();
+  const orgA = randomUUID();
+  const clientA1 = randomUUID();
+  const clientA2 = randomUUID();
+
+  assert.equal(
+    isAuthorizedFileStorageAccess(
+      {
+        storageKey: `ephemeral/${userA}/quarantine.pdf`,
+        storageObjectId: null,
+        document: { userId: userA, organizationId: null, status: "ACTIVE" },
+      },
+      { userId: userA },
+    ),
+    false,
+  );
+  assert.equal(
+    isAuthorizedFileStorageAccess(
+      {
+        storageKey: `api/${orgA}/${clientA1}/doc.pdf`,
+        storageObjectId: randomUUID(),
+        document: { userId: userA, organizationId: orgA, status: "ACTIVE" },
+        storageObject: { ownerUserId: userA, organizationId: orgA, apiClientId: clientA1, deletedAt: null },
+      },
+      { userId: userA, organizationId: orgA, apiClientId: clientA2 },
+    ),
+    false,
+  );
+  assert.equal(
+    isAuthorizedFileStorageAccess(
+      {
+        storageKey: `api/${orgA}/${clientA1}/doc.pdf`,
+        storageObjectId: randomUUID(),
+        document: { userId: userA, organizationId: orgA, status: "ACTIVE" },
+        storageObject: { ownerUserId: userA, organizationId: orgA, apiClientId: clientA1, deletedAt: new Date() },
+      },
+      { userId: userA, organizationId: orgA, apiClientId: clientA1 },
+    ),
+    false,
+  );
+  assert.equal(
+    isAuthorizedFileStorageAccess(
+      {
+        storageKey: `api/${orgA}/${clientA1}/doc.pdf`,
+        storageObjectId: randomUUID(),
+        document: { userId: userA, organizationId: orgA, status: "ACTIVE" },
+        storageObject: { ownerUserId: userA, organizationId: orgA, apiClientId: clientA1, deletedAt: null },
+      },
+      { userId: userA, organizationId: orgA, apiClientId: clientA1 },
+    ),
+    true,
+  );
+
+  // Fail-closed RLS gate environment & skip checks:
+  assert.throws(() => validateIsolatedRlsGateEnv({}), /RLS_GATE_ENV_MISSING/);
+  assert.throws(
+    () =>
+      validateIsolatedRlsGateEnv({
+        DIP_RLS_TEST_OWNER_URL: "postgresql://placeholder@ep-example.neon.tech/exampledb",
+        DIP_RLS_TEST_DATABASE_URL: "postgresql://dip_app:pass@localhost:5432/dip_rls_pg18",
+        DIP_RETENTION_TEST_DATABASE_URL: "postgresql://dip_retention:pass@localhost:5432/dip_rls_pg18",
+      }),
+    /RLS_GATE_FORBIDDEN_HOST/,
+  );
+  const validEnv = validateIsolatedRlsGateEnv({
+    DIP_RLS_TEST_OWNER_URL: "postgresql://postgres:postgres@localhost:5432/dip_rls_pg18",
+    DIP_RLS_TEST_DATABASE_URL: "postgresql://dip_app:dip_rls_pg18_runtime@localhost:5432/dip_rls_pg18",
+    DIP_RETENTION_TEST_DATABASE_URL: "postgresql://dip_retention:dip_rls_pg18_retention@localhost:5432/dip_rls_pg18",
+    DIP_REQUIRE_PG18: "1",
+  });
+  assert.equal(validEnv.requirePg18, true);
+
+  assert.throws(() => evaluateRlsTestCounts({ passed: 8, failed: 0, skipped: 1 }), /RLS_GATE_SKIPPED_FORBIDDEN/);
+  assert.throws(() => evaluateRlsTestCounts({ passed: 8, failed: 1, skipped: 0 }), /RLS_GATE_TEST_FAILURE/);
+  assert.throws(() => evaluateRlsTestCounts({ passed: 0, failed: 0, skipped: 0 }), /RLS_GATE_EMPTY_SUITE/);
+  assert.doesNotThrow(() => evaluateRlsTestCounts({ passed: 9, failed: 0, skipped: 0 }));
 });

@@ -30,7 +30,28 @@ export async function startWorkflowRun(userId: string, workflowId: string, input
   if (!workflow?.currentVersion) throw Object.assign(new Error("NOT_FOUND"), { code: "NOT_FOUND" });
   const plan = await resolvePlan(userId); assertValidWorkflow(workflow.currentVersion.definition, plan.entitlements);
   const ids = [...new Set(Object.values(inputs).flat())];
-  const owned = await withTenant({ userId }, (tx) => tx.file.count({ where: { id: { in: ids }, document: { userId } } }));
+  const owned = await withTenant(
+    { userId },
+    (tx) =>
+      tx.file.count({
+        where: {
+          id: { in: ids },
+          document: { userId, organizationId: null, status: "ACTIVE" },
+          NOT: { storageKey: { startsWith: "ephemeral/" } },
+          OR: [
+            { storageObjectId: null },
+            {
+              storageObject: {
+                ownerUserId: userId,
+                organizationId: null,
+                apiClientId: null,
+                deletedAt: null,
+              },
+            },
+          ],
+        },
+      }),
+  );
   if (!ids.length || owned !== ids.length) throw Object.assign(new Error("WORKFLOW_ARTIFACT_UNAUTHORIZED"), { code: "WORKFLOW_ARTIFACT_UNAUTHORIZED" });
   const run = await withTenant({ userId }, (tx) => tx.workflowRun.create({ data: { ownerId: userId, workflowVersionId: workflow.currentVersion!.id, status: "QUEUED", inputs, correlationId } }));
   recordMetric("workflow_runs_total", 1, "count", { status: "queued" }); await advanceWorkflowRun(run.id, userId); return run;

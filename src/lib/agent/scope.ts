@@ -3,7 +3,39 @@ import { AgentError } from "./errors";
 import type { AgentRequest, ResolvedAgentFile, ResolvedAgentScope } from "./types";
 
 export type AgentFileLookup = (userId: string, fileIds: readonly string[]) => Promise<readonly ResolvedAgentFile[]>;
-const databaseLookup: AgentFileLookup = (userId, fileIds) => withTenant({ userId }, (tx) => tx.file.findMany({ where: { id: { in: [...fileIds] }, document: { userId } }, select: { id: true, mimeType: true, size: true, pageCount: true } }).then((files) => files.map((file) => ({ id: file.id, mimeType: file.mimeType, size: Number(file.size), ...(file.pageCount === null ? {} : { pageCount: file.pageCount }) }))));
+const databaseLookup: AgentFileLookup = (userId, fileIds) =>
+  withTenant(
+    { userId },
+    (tx) =>
+      tx.file
+        .findMany({
+          where: {
+            id: { in: [...fileIds] },
+            document: { userId, organizationId: null, status: "ACTIVE" },
+            NOT: { storageKey: { startsWith: "ephemeral/" } },
+            OR: [
+              { storageObjectId: null },
+              {
+                storageObject: {
+                  ownerUserId: userId,
+                  organizationId: null,
+                  apiClientId: null,
+                  deletedAt: null,
+                },
+              },
+            ],
+          },
+          select: { id: true, mimeType: true, size: true, pageCount: true },
+        })
+        .then((files) =>
+          files.map((file) => ({
+            id: file.id,
+            mimeType: file.mimeType,
+            size: Number(file.size),
+            ...(file.pageCount === null ? {} : { pageCount: file.pageCount }),
+          })),
+        ),
+  );
 
 export async function resolveAgentScope(request: AgentRequest, userId: string, lookup: AgentFileLookup = databaseLookup): Promise<ResolvedAgentScope> {
   const requested = [...new Set(Object.values(request.scope.inputs).flat())]; if (!requested.length) throw new AgentError("AGENT_SCOPE_EMPTY", "Agent document scope cannot be empty.", "$.scope");

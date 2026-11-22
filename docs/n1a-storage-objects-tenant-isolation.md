@@ -12,10 +12,12 @@
 | --- | --- | --- | --- |
 | Web / Workflow / Agent upload job creation | `src/lib/jobs/orchestrator.ts` (`createToolJob`) | Wrote S3 object under `input/<userId>/<ts>-<uuid>-<name>`, then inside `withTenant({ userId })` ran `tx.file.create({ ..., storageObject: { connectOrCreate: ... } })` | Runs inside `withTenantScope({ userId, organizationId, apiClientId })` and binds `(ownerUserId, organizationId, apiClientId)` via `buildStorageObjectConnectOrCreate` |
 | Public API v1 job submission | `src/lib/public-api/jobs.ts` (`submitPublicJob`) → `createToolJob` | Passed `{ userId: principal.executionUserId, organizationId: principal.organizationId, apiClientId: principal.apiClientId }`, but `createToolJob` only called `withTenant({ userId })` | Sets full `(userId, organizationId, apiClientId)` GUC context and persists all three ownership attributes on `storage_objects` |
-| Worker output commit (`document-worker`) | `src/lib/jobs/document-pipeline.ts` (`processDocumentJob`) | Screened outputs, wrote S3 keys under `output/<requesterId>/<jobId>/<attemptId>/<idx>-<name>`, and committed `Document` + `File` + `StorageObject` (`connectOrCreate`) inside `withTenant` | Fails closed if `job.requesterId` is null; commits output `Document`, `File`, and `StorageObject` inside `withTenantScope({ userId: job.requesterId, organizationId: job.organizationId, apiClientId: job.apiClientId })` |
-| Client-side ephemeral usage history | `src/lib/jobs/history.ts` (`recordClientJobUsage`) | Creates `File` with `storageKey = ephemeral/...` and `storageObjectId = null` | Unchanged (`storageObjectId IS NULL` remains explicitly permitted) |
-| Web output file download | `src/lib/jobs/access.ts` (`findOutputFileForUser`) & `src/app/api/files/[fileId]/route.ts` | Checked `document: { userId }` without checking `storageObject` ownership or `deletedAt` | Enforces `document: { userId, organizationId: null, status: "ACTIVE" }` and non-deleted personal `storageObject` ownership |
-| Public API v1 result listing & download | `src/lib/public-api/jobs.ts` (`getPublicJobResult`, `downloadPublicJobResult`) | Used `withTenant({ userId: principal.executionUserId })` | Uses `withTenantScope({ userId: principal.executionUserId, organizationId: principal.organizationId, apiClientId: principal.apiClientId })` and verifies active, non-deleted org/API-client `storageObject` |
+| Worker output commit & input read (`document-worker`) | `src/lib/jobs/document-pipeline.ts` (`processDocumentJob`) | Screened outputs, wrote S3 keys under `output/<requesterId>/<jobId>/<attemptId>/<idx>-<name>`, and committed `Document` + `File` + `StorageObject` (`connectOrCreate`) inside `withTenant` | Fails closed if `job.requesterId` is missing/mismatched; validates input `File` + `Document` + `StorageObject` (`isAuthorizedFileStorageAccess`) before `storage.get(file.storageKey)`; commits outputs inside `withTenantScope({ userId: job.requesterId, organizationId: job.organizationId, apiClientId: job.apiClientId })` |
+| AI worker input read (`ai-worker`) | `workers/document-worker.ts` (`processAiJob`) | Read `File` + `Document` under `withTenant({ userId })` before `getStorage().get(file.storageKey)` | Reads `File` + `Document` + `StorageObject` under `withTenantScope({ userId: job.requesterId, organizationId: job.organizationId, apiClientId: job.apiClientId })` and validates `isAuthorizedFileStorageAccess` before `getStorage().get(file.storageKey)` |
+| Client-side ephemeral usage history | `src/lib/jobs/history.ts` (`recordClientJobUsage`) | Creates `File` with `storageKey = ephemeral/...` and `storageObjectId = null` | Unchanged (`storageObjectId IS NULL` remains permitted for history rows, while all download/worker/workflow/agent `File` consumers explicitly reject `ephemeral/*` storage keys) |
+| Web output file download | `src/lib/jobs/access.ts` (`findOutputFileForUser`) & `src/app/api/files/[fileId]/route.ts` | Checked `document: { userId }` without checking `storageObject` ownership or `deletedAt` | Enforces `document: { userId, organizationId: null, status: "ACTIVE" }`, rejects `ephemeral/*`, and enforces non-deleted personal `storageObject` ownership |
+| Public API v1 result listing & download | `src/lib/public-api/jobs.ts` (`getPublicJobResult`, `downloadPublicJobResult`) | Used `withTenant({ userId: principal.executionUserId })` | Uses `withTenantScope({ userId: principal.executionUserId, organizationId: principal.organizationId, apiClientId: principal.apiClientId })`, rejects `ephemeral/*`, and verifies active, non-deleted org/API-client `storageObject` matched to `(executionUserId, organizationId, apiClientId)` |
+| Workflow & Agent internal `File` scope resolution | `src/lib/jobs/orchestrator.ts` (`createToolJobFromFiles`), `src/lib/workflows/service.ts` (`startWorkflowRun`), `src/lib/agent/scope.ts` (`databaseLookup`) | Checked `document: { userId }` only | Enforces active personal document (`organizationId: null, status: "ACTIVE"`), rejects `ephemeral/*`, and verifies personal non-deleted `storageObject` ownership alongside DB `files_storage_object_rls_guard` |
 | Retention cleanup & job-expiry sweep | `src/lib/retention/repository.ts`, `src/lib/retention/expiry-write.ts`, `scripts/cleanup-expired-jobs.ts` | Connects as dedicated `dip_retention` (`NOBYPASSRLS`, `NOINHERIT`) without tenant GUC; `SELECT`s `storage_objects` and `UPDATE`s `deleted_at` | Preserved via narrow `TO dip_retention` `SELECT` + `UPDATE` RLS policies paired with `GRANT SELECT` and column-only `GRANT UPDATE ("deleted_at")` |
 
 ### 1.3 Answers to Phase 1 Investigation Questions
@@ -55,19 +57,25 @@
 
 ### 3.1 Summary of Schema, Constraint, Trigger & RLS Controls
 Implemented in forward-only migration `prisma/migrations/20261121120000_n1a_storage_objects_tenant_isolation/migration.sql`:
-1. **Columns**: Nullable `owner_user_id UUID`, `organization_id UUID`, `api_client_id UUID` on `storage_objects`.
-2. **Constraints & Composite FK**:
+1. **Preflight Role & Attribution Safety**:
+   - Rejects execution as `dip_app` or `dip_retention` (`MIGRATION_ROLE_INVALID`) so `SECURITY DEFINER` routines are always owned by the schema migration owner.
+   - Fails closed on any multi-user/multi-org link (`STORAGE_OBJECT_TENANT_CONFLICT`) or mixed/conflicting API-client attribution (`STORAGE_OBJECT_API_CLIENT_CONFLICT`, including mixed `NULL` vs non-`NULL` `jobs.api_client_id` and multi-file JSONB `params->'inputFileIds'` / `result->'outputFileIds'` links).
+2. **Columns**: Nullable `owner_user_id UUID`, `organization_id UUID`, `api_client_id UUID` on `storage_objects`.
+3. **Constraints & Composite FK**:
    - `storage_objects_tenant_scope_check`: Either all three columns are `NULL` (quarantined historical unlinked orphan) OR `owner_user_id IS NOT NULL AND (api_client_id IS NULL OR organization_id IS NOT NULL)`.
    - `storage_objects_owner_user_id_fkey`: `FOREIGN KEY (owner_user_id) REFERENCES users(id) ON DELETE RESTRICT ON UPDATE CASCADE`.
    - `storage_objects_organization_id_fkey`: `FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE RESTRICT ON UPDATE CASCADE`.
    - `storage_objects_api_client_organization_fkey`: Composite `FOREIGN KEY (api_client_id, organization_id) REFERENCES api_clients(id, organization_id) ON DELETE RESTRICT ON UPDATE CASCADE`.
-3. **Immutability & Cross-Table Triggers (`SECURITY DEFINER`, `SET search_path = pg_catalog, public`)**:
+4. **Immutability & Cross-Table Triggers (`SECURITY DEFINER`, `SET search_path = pg_catalog, public`)**:
    - `storage_objects_immutability_guard`: Blocks mutating `(provider, bucket, object_key)` and blocks reassigning `(owner_user_id, organization_id, api_client_id)` once attributed.
-   - `files_storage_object_tenant_guard`: Blocks linking any `File` to an unattributed (`owner_user_id IS NULL`) or differently owned `(owner_user_id, organization_id)` `StorageObject`.
+   - `files_storage_object_tenant_guard`: Blocks linking any `File` to an unattributed (`owner_user_id IS NULL`) `StorageObject`, a differently owned `(owner_user_id, organization_id)` `StorageObject` (`STORAGE_OBJECT_TENANT_MISMATCH`), or a `StorageObject` whose `api_client_id` is distinct from `app.current_api_client_id` (`STORAGE_OBJECT_API_CLIENT_MISMATCH` — preventing API Client B from cross-linking API Client A's `StorageObject` even when sharing the same organization and execution user).
    - `documents_storage_object_tenant_guard`: Blocks mutating `documents.(user_id, organization_id)` while linked to `storage_objects` of another tenant.
-4. **RLS & `FORCE ROW LEVEL SECURITY` + Least-Privilege Grants**:
+   - Trigger functions revoke `EXECUTE` from `PUBLIC`, `dip_app`, and `dip_retention`; `app_api_client_matches_tenant` binds arguments to the active session GUCs (anti-oracle), revokes `PUBLIC` and `dip_retention`, and grants `EXECUTE` solely to `dip_app`.
+5. **RLS & `FORCE ROW LEVEL SECURITY` + Least-Privilege Grants**:
    - `ENABLE ROW LEVEL SECURITY` + `FORCE ROW LEVEL SECURITY` on `storage_objects`.
-   - Separate explicit policies for personal user scope, active org-member scope (`app_is_org_member`), direct API-client scope (`app_api_client_matches_tenant`), and `TO dip_retention` (`SELECT` + `UPDATE`).
+   - All 7 runtime tenant policies on `storage_objects` are explicitly scoped **`TO dip_app`** (never `PUBLIC`), with `storage_objects_org_member_{select,update}` requiring `"api_client_id" IS NOT DISTINCT FROM NULLIF(current_setting('app.current_api_client_id', true), '')::uuid`.
+   - `files_storage_object_rls_guard` (`AS RESTRICTIVE FOR ALL TO dip_app` on `files`) guarantees `dip_app` can never `SELECT`, `INSERT`, or `UPDATE` a `File` (or read `File.storage_key`) whose linked `StorageObject` is outside the caller's active user/org/API-client RLS scope.
+   - Dedicated retention policies are scoped **`TO dip_retention`**.
    - `dip_app`: `SELECT, INSERT` + column-scoped `UPDATE (region, checksum, deleted_at)` (no `DELETE`).
    - `dip_retention`: `SELECT` + column-scoped `UPDATE (deleted_at)` (no `INSERT`, `DELETE`, or other column updates).
 
@@ -101,34 +109,39 @@ Implemented in forward-only migration `prisma/migrations/20261121120000_n1a_stor
    ```
    Verify one authenticated personal upload/download, one Public API v1 job submission/result download, and `npm run retention:dry-run`.
 
-### 3.3 Forward-Safe Rollback Plan
-- **Never delete or edit applied migration history**, and **never drop `owner_user_id`, `organization_id`, or `api_client_id` columns** during an emergency rollback (retaining nullable populated columns is backward-compatible with previous application code and preserves all attribution data).
-- If an unexpected runtime regression occurs immediately post-deploy and application binaries must revert to the prior release, apply a **new forward-only emergency mitigation migration** that:
-  1. Drops `files_storage_object_tenant_guard` on `files`,
-  2. Disables `FORCE`/`ENABLE ROW LEVEL SECURITY` on `storage_objects` temporarily while keeping the populated nullable columns and indexes intact, and
-  3. Preserves all rows without deleting or altering customer ownership while root cause is investigated.
+### 3.3 Fail-Closed Incident & Recovery Strategy (No RLS Reduction)
+- **Strict Security Invariant**: Turning off PostgreSQL RLS, removing `FORCE ROW LEVEL SECURITY`, or dropping cross-table tenant-match triggers on `storage_objects` / `files` is **never** a standard rollback procedure, because reverting to an unprotected table re-opens cross-tenant metadata exposure.
+- **Never delete or edit applied migration history**, and **never drop `owner_user_id`, `organization_id`, or `api_client_id` columns or customer rows**.
+- If a post-deployment runtime defect is detected after N1-A activation, follow this **fail-closed recovery sequence** while keeping `ENABLE` + `FORCE ROW LEVEL SECURITY` and all tenant triggers active:
+  1. **Fail-Closed Write Containment**: Immediately suspend upload/job submission intake (or gate write endpoints via feature flags / maintenance mode) and pause BullMQ worker consumption so in-flight jobs remain safely queued in Redis without partial writes or cross-tenant exposure.
+  2. **Controlled Queue Drain & Triage**: Inspect structured error codes (`42501` RLS violation, `STORAGE_OBJECT_TENANT_MISMATCH`, `STORAGE_OBJECT_API_CLIENT_MISMATCH`) against isolated logs while existing authenticated read/download paths that satisfy RLS remain protected.
+  3. **Forward-Compatible Application or Policy Fix**: Ship a verified forward application patch (ensuring `withTenantScope` + `buildStorageObjectConnectOrCreate` on the affected caller) or a narrow forward-only SQL migration validated against the isolated PostgreSQL 18 `rls-security` gate (`npm run test:rls`) — preserving full tenant isolation throughout recovery.
+  4. **Controlled Resume**: Resume worker queue processing and re-open write intake only after isolated PostgreSQL 18 RLS verification passes with 0 skipped tests.
+  5. **Governance Escalation for Any DB Security Change**: Any emergency action that would weaken database RLS, triggers, or role privileges is prohibited under standard operations and requires separate, explicit written security authorization from the project owner during an active incident.
 
 ---
 
 ## 4. Phase 4 — Security Verification Matrix & Gate Status
 
-| # | Required Security Scenario | Static DDL Test (`test/storage-objects.migration.test.ts`) | Unit / Synthetic Pipeline Test (`test/storage-objects.security.unit.test.ts`) | Real PostgreSQL 18 RLS Test (`test/storage-objects.rls.integration.test.mjs`) |
+| # | Required Security Scenario | Static DDL & CI Test (`test/storage-objects.migration.test.ts`) | Unit / Synthetic Pipeline Test (`test/storage-objects.security.unit.test.ts`) | Real PostgreSQL 18 RLS Gate (`test/storage-objects.rls.integration.test.mjs` via `npm run test:rls`) |
 | --- | --- | --- | --- | --- |
-| 1 | Tenant A can access its own metadata | Policy & grant assertions | PASS | Implemented (**BLOCKED locally**) |
-| 2 | Tenant A cannot read Tenant B metadata | Policy predicate assertions | PASS | Implemented (**BLOCKED locally**) |
-| 3 | Tenant A cannot update Tenant B metadata | Policy + column grant assertions | PASS | Implemented (**BLOCKED locally**) |
-| 4 | Unauthorized `INSERT` is rejected | `WITH CHECK` assertions | PASS | Implemented (**BLOCKED locally**) |
-| 5 | Missing or invalid tenant context fails closed | `NULLIF(current_setting(...),'')` assertions | PASS | Implemented (**BLOCKED locally**) |
-| 6 | User-owned document access works | `storage_objects_user_tenant_policy` | PASS | Implemented (**BLOCKED locally**) |
-| 7 | Organization-owned document access works (incl. revoked member denial) | `app_is_org_member` policy assertions | PASS | Implemented (**BLOCKED locally**) |
-| 8 | API-client context cannot escape its organization | Composite FK + API-client policy assertions | PASS | Implemented (**BLOCKED locally**) |
-| 9 | Worker output creation remains correct | Schema + helper wiring | PASS (`processDocumentJob`) | Implemented (**BLOCKED locally**) |
-| 10 | `connectOrCreate` respects isolation | Unique + policy assertions | PASS | Implemented (**BLOCKED locally**) |
-| 11 | Concurrent retries do not produce duplicate side effects | Immutability + CAS preservation | PASS (concurrent `processDocumentJob`) | Covered by `pr1-output-screening.integration.test.ts` (**BLOCKED locally**) |
-| 12 | Object-key collisions cannot link unrelated tenants | Unique + trigger assertions | PASS | Implemented (**BLOCKED locally**) |
-| 13 | Unlinked and orphaned records are handled safely | No-DELETE backfill + trigger check | PASS | Implemented (**BLOCKED locally**) |
-| 14 | Authorized download and metadata operations remain compatible | Column/select compatibility | PASS (`findOutputFileForUser`, Public API v1) | Covered by E2E/RLS suites (**BLOCKED locally**) |
-| 15 | Retention has only its necessary independent privileges | `TO dip_retention` + `UPDATE (deleted_at)` | PASS | Implemented (**BLOCKED locally**) |
-| 16 | RLS and `FORCE` behavior is explicitly verified | `ENABLE` + `FORCE ROW LEVEL SECURITY` | PASS (simulated `forceRls` toggle) | `pg_class` `relrowsecurity` & `relforcerowsecurity` (**BLOCKED locally**) |
+| 1 | Tenant A can access its own metadata | Policy & `TO dip_app` assertions | PASS | Implemented (**NOT VERIFIED locally; enforced in CI `rls-security` PG18**) |
+| 2 | Tenant A cannot read Tenant B metadata | Policy predicate assertions | PASS | Implemented (**NOT VERIFIED locally; enforced in CI `rls-security` PG18**) |
+| 3 | Tenant A cannot update Tenant B metadata | Policy + column grant assertions | PASS | Implemented (**NOT VERIFIED locally; enforced in CI `rls-security` PG18**) |
+| 4 | Unauthorized `INSERT` is rejected | `WITH CHECK` assertions | PASS | Implemented (**NOT VERIFIED locally; enforced in CI `rls-security` PG18**) |
+| 5 | Missing or invalid tenant context fails closed | `NULLIF(current_setting(...),'')` assertions | PASS | Implemented (**NOT VERIFIED locally; enforced in CI `rls-security` PG18**) |
+| 6 | User-owned document access works | `storage_objects_user_tenant_policy` | PASS | Implemented (**NOT VERIFIED locally; enforced in CI `rls-security` PG18**) |
+| 7 | Organization-owned document access works (incl. revoked member denial) | `app_is_org_member` policy assertions | PASS | Implemented (**NOT VERIFIED locally; enforced in CI `rls-security` PG18**) |
+| 8 | API-client context cannot escape its organization | Composite FK + API-client policy assertions | PASS | Implemented (**NOT VERIFIED locally; enforced in CI `rls-security` PG18**) |
+| 9 | Worker output creation & input `storageKey` validation | Helper + pipeline checks | PASS (`processDocumentJob`) | Implemented (**NOT VERIFIED locally; enforced in CI `rls-security` PG18**) |
+| 10 | Real Prisma `connectOrCreate` respects isolation | Unique + policy assertions | PASS | Implemented with real `PrismaClient` (`@prisma/adapter-pg`) (**NOT VERIFIED locally; enforced in CI `rls-security` PG18**) |
+| 11 | Concurrent retries do not produce duplicate side effects | Immutability + CAS preservation | PASS (concurrent `processDocumentJob`) | Covered in CI integration suites |
+| 12 | Object-key collisions cannot link unrelated tenants | Unique + trigger assertions | PASS | Implemented (**NOT VERIFIED locally; enforced in CI `rls-security` PG18**) |
+| 13 | Unlinked and orphaned records are handled safely | No-DELETE backfill + mixed API-client preflight | PASS | Implemented (**NOT VERIFIED locally; enforced in CI `rls-security` PG18**) |
+| 14 | Authorized download & all `File.storageKey` consumers validate `StorageObject` | Source & query assertions | PASS (`access.ts`, `public-api/jobs.ts`, `document-pipeline.ts`, `document-worker.ts`, `orchestrator.ts`, `workflows/service.ts`, `agent/scope.ts`) | Covered in CI RLS/E2E suites |
+| 15 | Retention has only its necessary independent privileges | `TO dip_retention` + `UPDATE (deleted_at)` | PASS | Implemented (**NOT VERIFIED locally; enforced in CI `rls-security` PG18**) |
+| 16 | RLS, `FORCE`, `TO dip_app`, and `SECURITY DEFINER` ACLs verified | Catalog & SQL assertions | PASS (simulated `forceRls` toggle) | `pg_class`, `pg_policies`, `pg_proc` catalog checks (**NOT VERIFIED locally; enforced in CI `rls-security` PG18**) |
+| 17 | API Client B cannot cross-link or read API Client A's `StorageObject`/`File` when sharing org + execution user | `STORAGE_OBJECT_API_CLIENT_MISMATCH` + `files_storage_object_rls_guard` | PASS | Explicit negative suite implemented (**NOT VERIFIED locally; enforced in CI `rls-security` PG18**) |
+| 18 | Fail-closed PostgreSQL 18 RLS gate forbids skips and external DBs | `.github/workflows/ci.yml` `postgres:18-alpine` assertions | PASS (`validateIsolatedRlsGateEnv`, `evaluateRlsTestCounts`) | Enforced by `scripts/run-rls-security-gate.mjs` (`DIP_REQUIRE_PG18=1`) |
 
-> **Explicit Gate Honesty Statement**: Local verification in this sandbox confirmed static SQL contracts, Prisma schema/client generation, TypeScript compilation, ESLint, and synthetic/unit security tests. Because no local PostgreSQL 18 runtime or Docker daemon is installed in this sandbox—and external/Neon databases are strictly off-limits—**real PostgreSQL 18 RLS execution (`DIP_RLS_TEST_DATABASE_URL`) is marked `BLOCKED` locally** and must run in an isolated disposable PostgreSQL 18 environment (`rls-security` job) before production promotion or RLS acceptance sign-off.
+> **Explicit Gate Honesty Statement**: Local verification in this sandbox confirmed static SQL contracts, Prisma schema/client generation, TypeScript compilation, ESLint, and synthetic/unit security tests. Because no local PostgreSQL 18 runtime or Docker daemon is installed in this sandbox—and external/Neon databases are strictly off-limits—**real PostgreSQL 18 RLS execution is `NOT VERIFIED` locally** and is enforced fail-closed (requiring `server_version_num >= 180000` and 0 skipped tests) by the isolated `rls-security` (`postgres:18-alpine`) job in `.github/workflows/ci.yml`.

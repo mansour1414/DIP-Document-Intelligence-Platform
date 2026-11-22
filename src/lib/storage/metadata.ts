@@ -41,6 +41,69 @@ export const storageObjectMetadataSelect = {
   deletedAt: true,
 } as const;
 
+export type FileStorageAccessCandidate = Readonly<{
+  storageKey: string;
+  storageObjectId?: string | null;
+  document: Readonly<{
+    userId: string;
+    organizationId?: string | null;
+    status?: string | null;
+  }> | null;
+  storageObject?: Readonly<{
+    ownerUserId?: string | null;
+    organizationId?: string | null;
+    apiClientId?: string | null;
+    deletedAt?: Date | null;
+  }> | null;
+}>;
+
+export function isAuthorizedFileStorageAccess(
+  file: FileStorageAccessCandidate | null | undefined,
+  principal: TenantExecutionScope,
+): boolean {
+  if (!file || !file.storageKey || file.storageKey.startsWith("ephemeral/")) {
+    return false;
+  }
+
+  const scope = assertValidTenantExecutionScope(principal);
+  if ("document" in file) {
+    const doc = file.document;
+    if (!doc) {
+      return false;
+    }
+    if (doc.userId !== scope.userId) {
+      return false;
+    }
+    if ((doc.organizationId ?? null) !== scope.organizationId) {
+      return false;
+    }
+    if ((doc.status ?? "ACTIVE") !== "ACTIVE") {
+      return false;
+    }
+  }
+
+  if ((file.storageObjectId ?? null) !== null) {
+    const so = file.storageObject;
+    if (!so) {
+      return false;
+    }
+    if (so.deletedAt !== null && so.deletedAt !== undefined) {
+      return false;
+    }
+    if (so.ownerUserId !== scope.userId) {
+      return false;
+    }
+    if ((so.organizationId ?? null) !== scope.organizationId) {
+      return false;
+    }
+    if ((so.apiClientId ?? null) !== scope.apiClientId) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 export function buildStorageObjectConnectOrCreate(
   principal: TenantExecutionScope,
   object: StorageObjectCoordinatesInput,
@@ -120,6 +183,7 @@ export function findStorageObjectForOrganization(
         where: {
           id: storageObjectId,
           organizationId: principal.organizationId,
+          apiClientId: null,
           deletedAt: null,
         },
         select: storageObjectMetadataSelect,
@@ -188,6 +252,7 @@ export function updateStorageObjectMetadataForOrganization(
         where: {
           id: storageObjectId,
           organizationId: principal.organizationId,
+          apiClientId: null,
         },
         data,
       });

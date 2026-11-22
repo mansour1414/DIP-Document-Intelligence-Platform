@@ -12,6 +12,7 @@
     "lint": "eslint",
     "typecheck": "tsc --noEmit",
     "test": "node --import ./scripts/node-platform-compat.mjs --import tsx --test --test-concurrency=1 test/*.test.ts test/*.test.mjs",
+    "test:rls": "node --import ./scripts/node-platform-compat.mjs --import tsx scripts/run-rls-security-gate.mjs",
     "test:browser": "playwright test",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
