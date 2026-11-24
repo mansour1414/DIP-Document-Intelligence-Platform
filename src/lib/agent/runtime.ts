@@ -25,7 +25,9 @@ import { logger } from "@/lib/logging";
 
 const json = (value: unknown) => value as Prisma.InputJsonValue;
 const terminal = new Set(["SUCCEEDED", "FAILED", "CANCELLED"]);
-const agentExcludedTools = new Set(["protect-pdf", "unlock-pdf", "pdf-permissions"]);
+// Secret-bearing tools need interactive ephemeral input; `fill-forms` needs a
+// typed per-field payload that an Agent plan (flat options only) cannot carry.
+const agentExcludedTools = new Set(["protect-pdf", "unlock-pdf", "pdf-permissions", "fill-forms"]);
 type Planner = (task: AgentPlannerTask, context: { agentRunId: string; correlationId: string; userId: string; toolId: "agent-planner" }) => Promise<{ output: AgentPlanDraft; estimatedCost: number }>;
 const productionPlanner: Planner = (task, context) => executeAiGateway(task, context);
 

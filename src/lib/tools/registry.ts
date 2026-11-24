@@ -1,11 +1,13 @@
 import { toolsConfig } from "@/config";
-import { optionJsonSchema, toolOptionContracts } from "@/lib/tools/options";
+import { optionJsonSchema, toolOptionContracts, toolsWithDedicatedJobParameters } from "@/lib/tools/options";
 
 export type ToolDefinition = {
   toolId: string; name: string; version: string; inputSchema: Record<string, unknown>; outputSchema: Record<string, unknown>;
   executionMode: "server" | "ai" | "client"; mime: { input: string[]; output: string[] }; limits: { maxBytes: number; maxFiles: number; maxPages?: number; maxObjects?: number };
   capabilities: string[]; securityClass: "standard" | "restricted" | "isolated"; resourceCost: "low" | "medium" | "high"; aiFlag: boolean; locales: string[];
   enabled: boolean; apiEligible: boolean; optionSchemaVersion: string; optionSchema: Record<string, unknown>;
+  /** Present only for tools with a typed per-item payload (Stage 2 `fill-forms`). */
+  fieldsParameter?: string;
 };
 function outputMime(toolId: string) {
   if (toolId === "pdf-to-word") return ["application/vnd.openxmlformats-officedocument.wordprocessingml.document"];
@@ -32,6 +34,7 @@ export const toolRegistry = Object.fromEntries(toolsConfig.map((tool) => [tool.i
   executionMode: tool.execution, mime: { input: [...tool.supportedMimeTypes], output: outputMime(tool.id) }, limits: { ...tool.limits, maxObjects: tool.id === "extract-images" ? 100 : tool.limits.maxFiles },
   capabilities: [...tool.capabilities], securityClass: tool.securityClass, resourceCost: tool.aiEnabled || tool.securityClass === "isolated" ? "high" : tool.capabilities.length ? "medium" : "low",
   aiFlag: tool.aiEnabled, locales: [...tool.locales], enabled: true, apiEligible: tool.execution !== "client", optionSchemaVersion: toolOptionContracts[tool.id].version, optionSchema: optionJsonSchema(toolOptionContracts[tool.id]),
+  ...(toolsWithDedicatedJobParameters.has(tool.id) ? { fieldsParameter: "fields" } : {}),
 }])) as Record<string, ToolDefinition>;
 
 /** Tools enabled on the unified runtime workers. */
@@ -40,6 +43,7 @@ export const workerToolIds = new Set([
   "compress-pdf", "pdf-to-jpg", "watermark-pdf", "crop-pdf", "page-numbers", "header-footer", "resize-pages", "alternate-mix", "flip-pages",
   "split-pdf-by-size", "split-pdf-by-bookmarks", "split-pdf-by-text", "n-up-pdf", "remove-annotations",
   "extract-images", "protect-pdf", "unlock-pdf", "pdf-permissions", "repair-pdf",
+  "fill-forms",
   "word-to-pdf", "pdf-to-word", "excel-to-pdf", "powerpoint-to-pdf", "ocr-pdf",
   "summarize-pdf", "chat-with-pdf", "extract-data",
 ]);

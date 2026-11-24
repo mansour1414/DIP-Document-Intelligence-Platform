@@ -16,6 +16,8 @@ import type { QueuedJob } from "@/lib/queue";
 import { validateToolOptions } from "@/lib/tools/options";
 import { deletePhase1Secret, takePhase1Secret, type Phase1SecretPurpose } from "@/lib/secrets/phase1";
 import { APPROVED_QPDF_VERSION, runQpdfTool } from "@/lib/pdf/qpdf";
+import { FORM_ENGINE, FORM_ENGINE_VERSION, fillFormPdf } from "@/lib/pdf/form-fill";
+import { parseFieldsPayload } from "@/lib/pdf/form-schema";
 import type { MalwareScanner } from "@/lib/malware";
 
 /**
@@ -59,7 +61,7 @@ export async function processDocumentJob(message: QueuedJob, deps: DocumentPipel
   const scopedTenant = <T>(operation: Parameters<typeof withTenantScope<T>>[1]) => withTenantScope(jobExecutionScope, operation, deps.client);
   const attemptId = deps.attemptId ?? randomUUID();
   const context = { job_id: job.id, correlation_id: job.correlationId ?? message.correlationId, tool_id: job.toolId, attempt_id: attemptId };
-  const rawParams = job.params as { inputFileIds?: string[]; options?: Record<string, unknown>; secretRef?: string };
+  const rawParams = job.params as { inputFileIds?: string[]; options?: Record<string, unknown>; secretRef?: string; fields?: unknown };
   if (job.status === "SUCCEEDED" || job.outputFileId) { logger.info("job.idempotent_skip", context); return; }
   if (job.status === "CANCELLED" || job.status === "EXPIRED") { await deletePhase1Secret(rawParams.secretRef).catch(() => undefined); return; }
   const step = job.steps.find((item) => item.name === job.toolId);
@@ -94,10 +96,20 @@ export async function processDocumentJob(message: QueuedJob, deps: DocumentPipel
     const documentTools = new Set(["word-to-pdf", "pdf-to-word", "excel-to-pdf", "powerpoint-to-pdf", "ocr-pdf"]);
     let outputs: Array<{ name: string; mimeType: string; bytes: Uint8Array }>;
     if (pdfTools.has(job.toolId)) { const pdfTool = job.toolId as PdfWorkerTool; outputs = await withTimeout(job.toolId, timeoutFor("pdf"), runPdfWorkerTool(pdfTool, bytes, options)); ({ engine, engineVersion } = pdfWorkerEngine(pdfTool)); }
+    else if (job.toolId === "fill-forms") {
+      // `fields` is a dedicated job parameter, validated here with the same
+      // schema module the browser uses. Options remain flat and versioned.
+      if (ids.length !== 1) throw Object.assign(new Error("Fill PDF Forms accepts exactly one PDF."), { code: "INPUT_FILE_COUNT_INVALID" });
+      const fields = parseFieldsPayload(rawParams.fields);
+      const filled = await withTimeout(job.toolId, timeoutFor("pdf"), fillFormPdf(bytes[0], fields, { flatten: options.flatten === true }));
+      outputs = [{ name: filled.name, mimeType: filled.mimeType, bytes: filled.bytes }];
+      engine = FORM_ENGINE; engineVersion = FORM_ENGINE_VERSION;
+      logger.info("fill_forms.succeeded", { ...context, engine, engine_version: engineVersion, filled_fields: filled.report.filled.length, untouched_fields: filled.report.untouched, raster_appearances: filled.report.rasterAppearances.length, flatten: filled.report.flatten, status: "succeeded" });
+    }
     else if (qpdfTools.has(job.toolId)) { const secret = params.secretRef ? await takePhase1Secret({ reference: params.secretRef, tenantId: message.userId, jobId: job.id, purpose: job.toolId as Phase1SecretPurpose }) : undefined; outputs = [await withTimeout(job.toolId, timeoutFor("pdf"), runQpdfTool(job.toolId as "protect-pdf" | "unlock-pdf" | "pdf-permissions" | "repair-pdf", bytes[0], options, secret))]; engine = "qpdf"; engineVersion = APPROVED_QPDF_VERSION; }
     else if (documentTools.has(job.toolId)) { const input = inputById.get(ids[0])!; const result = await processServerDocument(job.toolId as ServerToolId, new File([bytes[0] as BlobPart], input.originalName, { type: input.mimeType }), typeof options.language === "string" ? options.language : "ara+eng"); outputs = [{ name: result.filename, mimeType: result.contentType, bytes: result.bytes }]; engine = job.toolId === "ocr-pdf" ? "ocrmypdf" : "libreoffice"; engineVersion = "host"; }
     else throw Object.assign(new Error("Tool is not enabled on this worker"), { code: "TOOL_NOT_WORKER_ENABLED" });
-    const preservePages = ["compress-pdf", "rotate-pdf", "watermark-pdf", "crop-pdf", "page-numbers", "header-footer", "resize-pages", "flip-pages", "remove-annotations", "ocr-pdf"].includes(job.toolId) ? files[0]?.pageCount ?? undefined : undefined;
+    const preservePages = ["compress-pdf", "rotate-pdf", "watermark-pdf", "crop-pdf", "page-numbers", "header-footer", "fill-forms", "resize-pages", "flip-pages", "remove-annotations", "ocr-pdf"].includes(job.toolId) ? files[0]?.pageCount ?? undefined : undefined;
     const validated = await validateWorkerOutputs(outputs, preservePages, { encryptedPdfAlreadyValidated: job.toolId === "protect-pdf" || job.toolId === "pdf-permissions" });
     recordMetric("storage_bytes_out", validated.totalBytes, "bytes", { tool_id: job.toolId, engine, engine_version: engineVersion, status: "succeeded" });
     if (job.toolId === "compress-pdf") recordMetric("compression_ratio", validated.totalBytes / bytes[0].byteLength, "ratio", { tool_id: job.toolId, engine, engine_version: engineVersion });

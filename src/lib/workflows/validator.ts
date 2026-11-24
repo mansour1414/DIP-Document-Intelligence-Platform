@@ -1,7 +1,7 @@
 import { planCanUseTool, type Entitlements } from "@/lib/entitlements/policy";
 import { toolRegistry, workerToolIds } from "@/lib/tools/registry";
 import type { WorkflowDefinition, WorkflowNode, WorkflowValidationIssue, WorkflowValidationResult } from "./types";
-import { ToolOptionsValidationError, validateToolOptions } from "@/lib/tools/options";
+import { ToolOptionsValidationError, toolsWithDedicatedJobParameters, validateToolOptions } from "@/lib/tools/options";
 
 export const MAX_WORKFLOW_NODES = 20;
 const NODE_ID = /^[a-zA-Z][a-zA-Z0-9_-]{0,99}$/;
@@ -27,6 +27,10 @@ export function validateWorkflowDefinition(value: unknown, entitlements?: Entitl
     else {
       if (!workerToolIds.has(node.toolId)) issue(issues, "TOOL_DISABLED", `${path}.toolId`, "Referenced tool is disabled for workflow execution.");
       if (secretTools.has(node.toolId)) issue(issues, "WORKFLOW_SECRET_INPUT_UNSUPPORTED", `${path}.toolId`, "Secret-bearing tools require interactive ephemeral input and cannot be persisted in workflows.");
+      // Stage 2 `fill-forms` needs a typed per-field payload that a persisted
+      // workflow definition cannot carry yet; rejection is explicit rather than
+      // a run-time surprise. Tracked as pending integration, not as supported.
+      if (toolsWithDedicatedJobParameters.has(node.toolId)) issue(issues, "WORKFLOW_TYPED_INPUT_UNSUPPORTED", `${path}.toolId`, "This tool requires typed per-field input that persisted workflows cannot carry yet.");
       if (node.toolVersion !== tool.version) issue(issues, "TOOL_VERSION_UNSUPPORTED", `${path}.toolVersion`, `Expected tool version ${tool.version}.`);
       if (entitlements && !planCanUseTool(entitlements, node.toolId)) issue(issues, "PLAN_LIMIT_EXCEEDED", `${path}.toolId`, "The active plan cannot use this tool.");
     }

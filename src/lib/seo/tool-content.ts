@@ -5,7 +5,7 @@ export type Locale = (typeof locales)[number];
 
 export const mvpToolIds = [
   "merge-pdf", "split-pdf", "compress-pdf", "organize-pdf", "rotate-pdf", "delete-pages", "extract-pages",
-  "jpg-to-pdf", "pdf-to-jpg", "watermark-pdf", "crop-pdf", "page-numbers", "header-footer", "resize-pages", "alternate-mix", "flip-pages", "split-pdf-by-size", "split-pdf-by-bookmarks", "split-pdf-by-text", "n-up-pdf", "remove-annotations", "word-to-pdf", "pdf-to-word", "excel-to-pdf", "powerpoint-to-pdf", "ocr-pdf",
+  "jpg-to-pdf", "pdf-to-jpg", "watermark-pdf", "crop-pdf", "page-numbers", "header-footer", "fill-forms", "resize-pages", "alternate-mix", "flip-pages", "split-pdf-by-size", "split-pdf-by-bookmarks", "split-pdf-by-text", "n-up-pdf", "remove-annotations", "word-to-pdf", "pdf-to-word", "excel-to-pdf", "powerpoint-to-pdf", "ocr-pdf",
   "extract-images", "protect-pdf", "unlock-pdf", "pdf-permissions", "repair-pdf", "summarize-pdf", "chat-with-pdf", "extract-data",
 ] as const;
 export type MvpToolId = (typeof mvpToolIds)[number];
@@ -24,6 +24,7 @@ const related: Record<MvpToolId, MvpToolId[]> = {
   "extract-pages": ["split-pdf", "delete-pages"], "jpg-to-pdf": ["pdf-to-jpg", "merge-pdf"],
   "pdf-to-jpg": ["jpg-to-pdf", "compress-pdf"], "watermark-pdf": ["organize-pdf", "compress-pdf"],
   "crop-pdf": ["organize-pdf", "page-numbers"], "page-numbers": ["header-footer", "crop-pdf"], "header-footer": ["page-numbers", "watermark-pdf"],
+  "fill-forms": ["header-footer", "ocr-pdf"],
   "resize-pages": ["crop-pdf", "flip-pages"], "alternate-mix": ["merge-pdf", "organize-pdf"], "flip-pages": ["rotate-pdf", "resize-pages"],
   "split-pdf-by-size": ["split-pdf", "compress-pdf"], "split-pdf-by-bookmarks": ["split-pdf", "extract-pages"], "split-pdf-by-text": ["split-pdf", "ocr-pdf"],
   "n-up-pdf": ["resize-pages", "page-numbers"], "remove-annotations": ["organize-pdf", "watermark-pdf"],
@@ -47,6 +48,7 @@ const enDetails: Record<MvpToolId, { intent: string; result: string; use: string
   "pdf-to-jpg": { intent: "render PDF pages as JPG images", result: "downloadable page images", use: "previews, slides, and image workflows", caveat: "Rendered images do not retain selectable PDF text." },
   "watermark-pdf": { intent: "apply a text watermark to PDF pages", result: "a marked PDF", use: "draft, confidential, or ownership labels", caveat: "Preview wording and placement before distribution." },
   "crop-pdf": { intent: "adjust the visible area of PDF pages", result: "a PDF with updated CropBox boundaries", use: "trimming margins and focusing the visible page area", caveat: "Cropping does not delete hidden content and must not be used as redaction." },
+  "fill-forms": { intent: "fill existing AcroForm fields with Arabic or English values", result: "a PDF with your typed values stored in its form fields", use: "applications, HR forms, and bilingual paperwork", caveat: "Only existing AcroForm text, checkbox, radio, dropdown, and option-list fields can be filled; XFA, signed, encrypted, and password fields are rejected, and non-Latin values are drawn into their field's appearance rather than typed as selectable text." },
   "page-numbers": { intent: "add page numbers in a chosen position", result: "a numbered PDF", use: "reports, submissions, and printed document sets", caveat: "Review mixed-size and rotated pages before distribution." },
   "header-footer": { intent: "add Arabic or English header and footer text", result: "a PDF with consistent page labels", use: "document titles, classifications, and reference labels", caveat: "Keep text concise so it fits safely within page margins." },
   "resize-pages": { intent: "resize pages to A3, A4, Letter, or Legal dimensions", result: "a PDF with consistent page dimensions", use: "standardizing mixed scans and preparing documents for printing", caveat: "Contain preserves proportions with possible whitespace; Stretch fills the page and may distort content." },
@@ -84,6 +86,7 @@ const arDetails: Record<MvpToolId, { intent: string; result: string; use: string
   "pdf-to-jpg": { intent: "تحويل صفحات PDF إلى صور JPG", result: "صور قابلة للتنزيل لكل صفحة", use: "المعاينات والعروض وسير عمل الصور", caveat: "الصور الناتجة لا تحتفظ بالنص القابل للتحديد." },
   "watermark-pdf": { intent: "إضافة علامة مائية نصية إلى الصفحات", result: "ملف PDF موسوم", use: "تمييز المسودات والمحتوى السري والملكية", caveat: "راجع النص وموضعه قبل توزيع الملف." },
   "crop-pdf": { intent: "ضبط المساحة الظاهرة من صفحات PDF", result: "ملف PDF بحدود CropBox محدثة", use: "تقليل الهوامش والتركيز على المساحة الظاهرة", caveat: "لا يحذف القص المحتوى المخفي ولا يجوز استخدامه كإخفاء آمن للبيانات." },
+  "fill-forms": { intent: "تعبئة حقول النماذج الحالية بقيم عربية أو إنجليزية", result: "ملف PDF تحفظ قيمك في حقول نموذجه", use: "طلب التقديم ونماذج الموارد البشرية والمعاملات ثنائية اللغة", caveat: "تُعبّأ فقط حقول AcroForm الحالية من نوع نص ومربع اختيار وأزرار اختيار وقوائم منسدلة وقوائم خيارات؛ وتُرفض نماذج XFA والملفات الموقعة أو المشفرة وحقول كلمات المرور، وتُرسم القيم غير اللاتينية داخل مظهر الحقل بدل كتابتها كنص قابل للتحديد." },
   "page-numbers": { intent: "إضافة أرقام الصفحات في الموضع المختار", result: "ملف PDF مرقم", use: "التقارير وملفات التقديم والمستندات المطبوعة", caveat: "راجع الصفحات مختلفة الأحجام والمدوّرة قبل توزيع الملف." },
   "header-footer": { intent: "إضافة نص عربي أو إنجليزي في الرأس والتذييل", result: "ملف PDF بعناوين صفحات متسقة", use: "عناوين المستندات والتصنيفات والمراجع", caveat: "استخدم نصًا موجزًا ليتسع بأمان داخل هوامش الصفحة." },
   "resize-pages": { intent: "تغيير الصفحات إلى أبعاد A3 أو A4 أو Letter أو Legal", result: "ملف PDF بأبعاد صفحات متسقة", use: "توحيد الملفات الممسوحة مختلفة الأحجام وتجهيز المستندات للطباعة", caveat: "يحافظ خيار الاحتواء على النسب وقد يضيف فراغًا، بينما قد يؤدي التمديد إلى تشويه المحتوى." },

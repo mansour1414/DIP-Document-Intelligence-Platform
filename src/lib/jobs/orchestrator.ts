@@ -9,15 +9,24 @@ import { measure, recordMetric } from "@/lib/observability/metrics";
 import { withTenant, withTenantScope } from "@/lib/db/tenant";
 import { buildStorageObjectConnectOrCreate, isAuthorizedFileStorageAccess } from "@/lib/storage/metadata";
 import { requireCleanUpload } from "@/lib/malware";
-import { validateToolOptions } from "@/lib/tools/options";
+import { requiresDedicatedJobParameters, validateToolOptions } from "@/lib/tools/options";
 import { deletePhase1Secret, enforceUnlockRateLimit, phase1SecretToolIds, putPhase1Secret, type Phase1SecretPayload, type Phase1SecretPurpose } from "@/lib/secrets/phase1";
+import { parseFieldsPayload } from "@/lib/pdf/form-schema";
 
 type Upload = { filename: string; mimeType: string; bytes: Uint8Array };
 function minimumFilesFor(toolId: string) { return ["merge-pdf", "alternate-mix"].includes(toolId) ? 2 : 1; }
-export async function createToolJob(input: { userId: string; toolId: string; uploads: Upload[]; options?: Record<string, string | number | boolean>; secrets?: Phase1SecretPayload; idempotencyKey: string; correlationId?: string; organizationId?: string; apiClientId?: string }) {
+export async function createToolJob(input: { userId: string; toolId: string; uploads: Upload[]; options?: Record<string, string | number | boolean>; fields?: Record<string, unknown>; secrets?: Phase1SecretPayload; idempotencyKey: string; correlationId?: string; organizationId?: string; apiClientId?: string }) {
   const apiStarted = performance.now();
   const tool = getToolDefinition(input.toolId);
   const options = validateToolOptions(tool.toolId, input.options ?? {});
+  // Tools with a typed per-item payload validate its *shape* before any upload
+  // is read, scanned or stored, so a malformed request costs nothing and never
+  // reaches the worker. Semantic validation against the actual form happens in
+  // the worker, where the PDF is available.
+  if (requiresDedicatedJobParameters(tool.toolId) !== (input.fields !== undefined)) {
+    throw Object.assign(new Error(requiresDedicatedJobParameters(tool.toolId) ? "Form field values are required for this tool." : "Form field values are not accepted by this tool."), { code: "FIELDS_INPUT_INVALID" });
+  }
+  const fields = input.fields === undefined ? undefined : parseFieldsPayload(input.fields);
   const minimumFiles = minimumFilesFor(input.toolId);
   if (input.uploads.length < minimumFiles || input.uploads.length > tool.limits.maxFiles) throw new Error("INPUT_FILE_COUNT_INVALID");
   if (input.uploads.reduce((total, upload) => total + upload.bytes.byteLength, 0) > tool.limits.maxBytes) throw new Error("TOTAL_SIZE_LIMIT_EXCEEDED");
@@ -43,7 +52,7 @@ export async function createToolJob(input: { userId: string; toolId: string; upl
     const job = await withTenantScope(executionScope, async (tx) => {
       const document = await tx.document.create({ data: { userId: input.userId, organizationId: input.organizationId, title: `${tool.name} input` } });
       const files = await Promise.all(stored.map(async (item) => { const file = await tx.file.create({ data: { document: { connect: { id: document.id } }, originalName: item.upload.filename.slice(0, 255), mimeType: item.validation.mimeType, size: BigInt(item.upload.bytes.byteLength), storageKey: item.key, checksum: item.validation.checksum, pageCount: item.validation.pageCount, storageObject: buildStorageObjectConnectOrCreate(executionScope, { provider: "s3", bucket: item.bucket, objectKey: item.key, size: BigInt(item.upload.bytes.byteLength), checksum: item.validation.checksum }) } }); await tx.fileVersion.create({ data: { fileId: file.id, ownerId: input.userId, version: 1, storageKey: item.key, checksum: item.validation.checksum } }); return file; }));
-      return tx.job.create({ data: { id: jobId, toolId: tool.toolId, idempotencyKey: input.idempotencyKey, requesterId: input.userId, organizationId: input.organizationId, apiClientId: input.apiClientId, inputFileId: files[0].id, status: "QUEUED", params: { inputFileIds: files.map((file) => file.id), options, ...(secretRef ? { secretRef } : {}) }, correlationId, steps: { create: { name: tool.toolId, idempotencyKey: `${input.idempotencyKey}:${tool.toolId}`, status: "QUEUED", correlationId } } }, select: { id: true, status: true } });
+      return tx.job.create({ data: { id: jobId, toolId: tool.toolId, idempotencyKey: input.idempotencyKey, requesterId: input.userId, organizationId: input.organizationId, apiClientId: input.apiClientId, inputFileId: files[0].id, status: "QUEUED", params: { inputFileIds: files.map((file) => file.id), options, ...(fields ? { fields } : {}), ...(secretRef ? { secretRef } : {}) }, correlationId, steps: { create: { name: tool.toolId, idempotencyKey: `${input.idempotencyKey}:${tool.toolId}`, status: "QUEUED", correlationId } } }, select: { id: true, status: true } });
     });
     const queuedJob = { jobId: job.id, toolId: tool.toolId, idempotencyKey: input.idempotencyKey, correlationId, userId: input.userId };
     const queueOptions = { priority: monetization.entitlements.processingPriority === "high" ? 1 : 5, ...(secretRef ? { attempts: 1 } : {}) };
@@ -63,6 +72,7 @@ export function createMergePdfJob(input: { userId: string; uploads: Upload[]; id
 export async function createToolJobFromFiles(input: { userId: string; toolId: string; fileIds: string[]; options?: Record<string, string | number | boolean>; idempotencyKey: string; correlationId: string; workflowRunId: string; workflowNodeId: string }) {
   const tool = getToolDefinition(input.toolId);
   if (phase1SecretToolIds.has(tool.toolId)) throw Object.assign(new Error("Secret-bearing tools are not available in persisted workflows."), { code: "WORKFLOW_SECRET_INPUT_UNSUPPORTED" });
+  if (requiresDedicatedJobParameters(tool.toolId)) throw Object.assign(new Error("This tool requires typed per-field input that persisted workflows cannot carry."), { code: "WORKFLOW_TYPED_INPUT_UNSUPPORTED" });
   const options = validateToolOptions(tool.toolId, input.options ?? {});
   const existing = await withTenant({ userId: input.userId }, (tx) => tx.job.findUnique({ where: { toolId_idempotencyKey: { toolId: tool.toolId, idempotencyKey: input.idempotencyKey } }, select: { id: true, status: true } }));
   if (existing) return { ...existing, reused: true };
