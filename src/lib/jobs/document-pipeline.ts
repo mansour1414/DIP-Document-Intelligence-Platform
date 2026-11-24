@@ -4,9 +4,9 @@ import { getStorage, type ObjectStorage } from "@/lib/storage";
 import { pdfWorkerEngine, runPdfWorkerTool, type PdfWorkerTool } from "@/lib/pdf/server";
 import { processServerDocument, type ServerToolId } from "@/lib/document-processing/server";
 import { logger } from "@/lib/logging";
-import { timeoutFor } from "@/lib/runtime/config";
+import { runtimeLimits, timeoutFor } from "@/lib/runtime/config";
 import { withTimeout } from "@/lib/runtime/timeout";
-import { validateWorkerOutputs } from "@/lib/outputs/validation";
+import { validateBoundedFillOutput, validateWorkerOutputs } from "@/lib/outputs/validation";
 import { OutputCommitSupersededError, discardStoredObjects, screenAndStoreWorkerOutputs } from "@/lib/outputs/screening";
 import { recordMetric } from "@/lib/observability/metrics";
 import { configuredCostRates, estimateJobCost } from "@/lib/cost/model";
@@ -20,7 +20,8 @@ import { jobErrorRecord, publicErrorCode } from "@/lib/jobs/error-boundary";
 import { classifyAtProcessorEntry } from "@/lib/jobs/payload-lifecycle";
 import { isUnrecoverableQueueError } from "@/lib/jobs/queue-errors";
 import { APPROVED_QPDF_VERSION, runQpdfTool } from "@/lib/pdf/qpdf";
-import { FORM_ENGINE, FORM_ENGINE_VERSION, fillFormPdf } from "@/lib/pdf/form-fill";
+import { FORM_ENGINE, FORM_ENGINE_VERSION } from "@/lib/pdf/form-fill";
+import { fillPdfBounded, formWorkerLimits } from "@/lib/pdf/form-worker";
 import { parseFieldsPayload } from "@/lib/pdf/form-schema";
 import type { MalwareScanner } from "@/lib/malware";
 
@@ -216,10 +217,16 @@ export async function processDocumentJob(message: QueuedJob, deps: DocumentPipel
       const fields = parseFieldsPayload(rawParams.fieldsRef
         ? await readFormFields({ reference: rawParams.fieldsRef, tenantId: asJob(job).requesterId ?? "", jobId: jobIdOf(job) })
         : legacyFields);
-      const filled = await withTimeout(job.toolId, timeoutFor("pdf"), fillFormPdf(bytes[0], fields, { flatten: options.flatten === true }));
-      outputs = [{ name: filled.name, mimeType: filled.mimeType, bytes: filled.bytes }];
+      // B31-02: the fill, the appearance generation (including the native Arabic
+      // canvas) and the reopen/verification parse all run inside the bounded child.
+      // Previously the engine ran on this thread behind a Promise timeout, which
+      // cannot interrupt a synchronous parse: it bounded the *wait*, never the work.
+      // The output is now re-verified here without parsing.
+      const filled = await fillPdfBounded(bytes[0], fields, { flatten: options.flatten === true }, formWorkerLimits({ timeoutMs: runtimeLimits.formWorkerTimeoutMs, maxHeapMb: runtimeLimits.formWorkerMaxHeapMb, concurrency: runtimeLimits.formWorkerConcurrency, maxInputBytes: runtimeLimits.maxInputBytes, maxOutputBytes: runtimeLimits.maxOutputBytes }));
+      await validateBoundedFillOutput(filled, { inputPages: files[0]?.pageCount ?? undefined, maxOutputBytes: runtimeLimits.maxOutputBytes, maxOutputFiles: runtimeLimits.maxOutputFiles });
+      outputs = [{ name: `${job.toolId}.pdf`, mimeType: "application/pdf", bytes: filled.bytes }];
       engine = FORM_ENGINE; engineVersion = FORM_ENGINE_VERSION;
-      logger.info("fill_forms.succeeded", { ...context, engine, engine_version: engineVersion, filled_fields: filled.report.filled.length, untouched_fields: filled.report.untouched, raster_appearances: filled.report.rasterAppearances.length, flatten: filled.report.flatten, status: "succeeded" });
+      logger.info("fill_forms.succeeded", { ...context, engine, engine_version: engineVersion, filled_fields: filled.report.filled, untouched_fields: filled.report.untouched, raster_appearances: filled.report.rasterAppearances, flatten: filled.report.flatten, status: "succeeded" });
     }
     else if (qpdfTools.has(job.toolId)) { const secret = params.secretRef ? await takePhase1Secret({ reference: params.secretRef, tenantId: message.userId, jobId: job.id, purpose: job.toolId as Phase1SecretPurpose }) : undefined; outputs = [await withTimeout(job.toolId, timeoutFor("pdf"), runQpdfTool(job.toolId as "protect-pdf" | "unlock-pdf" | "pdf-permissions" | "repair-pdf", bytes[0], options, secret))]; engine = "qpdf"; engineVersion = APPROVED_QPDF_VERSION; }
     else if (documentTools.has(job.toolId)) { const input = inputById.get(ids[0])!; const result = await processServerDocument(job.toolId as ServerToolId, new File([bytes[0] as BlobPart], input.originalName, { type: input.mimeType }), typeof options.language === "string" ? options.language : "ara+eng"); outputs = [{ name: result.filename, mimeType: result.contentType, bytes: result.bytes }]; engine = job.toolId === "ocr-pdf" ? "ocrmypdf" : "libreoffice"; engineVersion = "host"; }

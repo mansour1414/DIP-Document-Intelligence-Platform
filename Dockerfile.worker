@@ -53,8 +53,19 @@ COPY --chown=dipworker:dipworker src ./src
 COPY --chown=dipworker:dipworker workers ./workers
 COPY --chown=dipworker:dipworker scripts/verify-ocr-runtime.py ./scripts/verify-ocr-runtime.py
 COPY --chown=dipworker:dipworker scripts/verify-qpdf-security-runtime.mjs ./scripts/verify-qpdf-security-runtime.mjs
+# B31-04: the bounded PDF child is launched with the same `--import` preloads the
+# worker itself uses. Without this file in the image, `--import
+# ./scripts/node-platform-compat.mjs` fails and *every* Fill Forms job would die
+# with WORKER_CRASHED at the first inspection — while every test here passed,
+# because the repository checkout happens to contain it. The child entry itself
+# ships inside `src/` (copied above), and `form-worker.ts` asserts its presence at
+# startup rather than failing per-request in production.
+COPY --chown=dipworker:dipworker scripts/node-platform-compat.mjs ./scripts/node-platform-compat.mjs
 
-RUN python3 scripts/verify-ocr-runtime.py \
+RUN test -f scripts/node-platform-compat.mjs \
+ && test -f src/lib/pdf/form-worker-child.ts \
+ && test -f src/lib/pdf/worker-protocol.ts \
+ && python3 scripts/verify-ocr-runtime.py \
  && soffice --version \
  && qpdf --version \
  && tesseract --version \

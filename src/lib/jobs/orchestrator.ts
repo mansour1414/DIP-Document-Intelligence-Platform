@@ -2,7 +2,7 @@ import { randomUUID } from "crypto";
 import { enqueueAiJob, enqueueJob } from "@/lib/queue";
 import { getStorage } from "@/lib/storage";
 import { controlledPreflightToolIds, getToolDefinition } from "@/lib/tools/registry";
-import { validateUpload } from "@/lib/uploads/validation";
+import { validateInspectedPdf, validateUploadBytes, validateUploadWithParse } from "@/lib/uploads/validation";
 import { logger } from "@/lib/logging";
 import { enforceJobCreation } from "@/lib/usage/enforcement";
 import { measure, recordMetric } from "@/lib/observability/metrics";
@@ -102,6 +102,10 @@ export async function createToolJob(input: { userId: string; toolId: string; upl
     // therefore the same one `validateUpload` uses, imported rather than restated.
     const looksPdf = upload.mimeType === "application/pdf" || upload.filename.toLowerCase().endsWith(".pdf");
     if (looksPdf && !controlledPreflightToolIds.has(tool.toolId)) assertCheapPdfShape(upload.bytes);
+    // Stage 1 (parser-free) precedes screening: it allocates nothing proportional
+    // to the document, so a bad MIME, signature or size is refused before the
+    // scanner is asked to look at the bytes.
+    validateUploadBytes({ toolId: tool.toolId, declaredMime: upload.mimeType, bytes: upload.bytes });
     const malwareScan = await requireCleanUpload(upload.bytes);
     return { upload, malwareScan };
   }));
@@ -112,11 +116,16 @@ export async function createToolJob(input: { userId: string; toolId: string; upl
   // precedes it, so no document reaches the inspector unscanned. This runs once per
   // job for a single-file tool, so the document is inspected exactly once.
   const inspectionPages = tool.toolId === "fill-forms" ? await assertFillableInput(screened[0].upload.bytes) : undefined;
-  const prepared = await Promise.all(screened.map(async ({ upload, malwareScan }) => ({
-    upload,
-    malwareScan,
-    validation: await validateUpload({ toolId: tool.toolId, declaredMime: upload.mimeType, bytes: upload.bytes, inspectionPages }),
-  })));
+  const prepared = await Promise.all(screened.map(async ({ upload, malwareScan }) => {
+    // Stage 1 already ran inside the screening map (parser-free). Stage 2 consumes
+    // the isolated result for Fill Forms; every other tool keeps its established
+    // path, including the residual in-process parse for ordinary PDF tools.
+    const bytes = validateUploadBytes({ toolId: tool.toolId, declaredMime: upload.mimeType, bytes: upload.bytes });
+    const validation = tool.toolId === "fill-forms"
+      ? validateInspectedPdf({ toolId: tool.toolId, bytes: upload.bytes, bytes_: bytes, inspectedPages: inspectionPages as number })
+      : await validateUploadWithParse({ toolId: tool.toolId, declaredMime: upload.mimeType, bytes: upload.bytes });
+    return { upload, malwareScan, validation };
+  }));
   // FF-06 / B31-01: prove the document is fillable *before* billing, storage and
   // the queue, and do it in the bounded child rather than in this process. A
   // restricted input previously still created a document, file and file-version row,
@@ -129,7 +138,7 @@ export async function createToolJob(input: { userId: string; toolId: string; upl
   // keeps its own recheck: these bytes are screened and inspected here, but the
   // worker re-reads them from storage and must not trust the API's decision.
   const monetization = await enforceJobCreation({ userId: input.userId, toolId: tool.toolId, idempotencyKey: input.idempotencyKey, correlationId, options, files: prepared.map(({upload,validation})=>({size:upload.bytes.byteLength,pageCount:validation.pageCount})) });
-  const stored: Array<{ key: string; bucket: string; upload: Upload; validation: Awaited<ReturnType<typeof validateUpload>> }> = [];
+  const stored: Array<{ key: string; bucket: string; upload: Upload; validation: Awaited<ReturnType<typeof validateUploadWithParse>> }> = [];
   let secretRef: string | undefined;
   let fieldsRef: string | undefined;
   // Set once the job row and its files are committed. Cleanup decisions depend on

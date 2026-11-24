@@ -9,7 +9,7 @@ import { deletePhase1Secret, PHASE1_SECRET_TTL_SECONDS, putPhase1Secret, takePha
 import { toolRegistry, workerToolIds, isPublicApiTool } from "@/lib/tools/registry";
 import { validateToolOptions } from "@/lib/tools/options";
 import { validateWorkflowDefinition } from "@/lib/workflows/validator";
-import { validateUpload } from "@/lib/uploads/validation";
+import { validateUploadBytes, validateUploadWithParse } from "@/lib/uploads/validation";
 import { parsePublicJobRequest } from "@/lib/public-api/jobs";
 import { redactLogContext } from "@/lib/logging";
 import { scrubSentryEvent } from "@/lib/observability/sentry-scrub";
@@ -132,8 +132,8 @@ test("Public API transports passwords outside options and excludes them from the
 });
 
 test("encrypted/repair preflight is scoped and normal PDF validation stays strict", async () => {
-  const malformed = new TextEncoder().encode("%PDF-1.7\nmalformed"); const unlock = await validateUpload({ toolId: "unlock-pdf", declaredMime: "application/pdf", bytes: malformed }); assert.equal(unlock.controlledWorkerPreflight, true); const repair = await validateUpload({ toolId: "repair-pdf", declaredMime: "application/pdf", bytes: malformed }); assert.equal(repair.controlledWorkerPreflight, true);
-  await assert.rejects(() => validateUpload({ toolId: "protect-pdf", declaredMime: "application/pdf", bytes: malformed }), { code: "PDF_INVALID" });
+  const malformed = new TextEncoder().encode("%PDF-1.7\nmalformed"); const unlock = await validateUploadBytes({ toolId: "unlock-pdf", declaredMime: "application/pdf", bytes: malformed }); assert.equal(unlock.controlledWorkerPreflight, true); const repair = await validateUploadBytes({ toolId: "repair-pdf", declaredMime: "application/pdf", bytes: malformed }); assert.equal(repair.controlledWorkerPreflight, true);
+  await assert.rejects(() => validateUploadWithParse({ toolId: "protect-pdf", declaredMime: "application/pdf", bytes: malformed }), { code: "PDF_INVALID" });
 });
 
 test("Extract Images emits decoded embedded PNGs, deduplicates, reports policy, and never renders pages", async () => {

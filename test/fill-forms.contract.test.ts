@@ -105,7 +105,14 @@ test("S2 fill-forms worker: the engine is invoked by the pipeline, never by a ro
   const orchestrator = read("src/lib/jobs/orchestrator.ts");
   assert.match(orchestrator, /params: \{ inputFileIds: files\.map\(\(file\) => file\.id\), options, \.\.\.\(fieldsRef \? \{ fieldsRef \} : \{\}\)/u, "job params must carry the encrypted reference, not raw values");
   assert.doesNotMatch(orchestrator, /\{ fields \} : \{\}/u, "raw fields must never be written into job params");
-  assert.match(pipeline, /fillFormPdf\(bytes\[0\]/u);
+  // B31-02: the engine is no longer called on this thread. The pipeline invokes the
+  // bounded child, and the engine is reached only from inside the child. Asserting
+  // the *absence* here is the point — `withTimeout(..., fillFormPdf(...))` bounded
+  // the wait, not the work, because a timer cannot interrupt a synchronous parse.
+  assert.doesNotMatch(pipeline, /fillFormPdf\(/u, "the pipeline must not call the engine on the main thread");
+  assert.match(pipeline, /fillPdfBounded\(/u, "the pipeline must reach the engine through the bounded child");
+  const child = read("src/lib/pdf/form-worker-child.ts");
+  assert.match(child, /fillFormPdf\(/u, "the child is where the engine runs");
   assert.match(pipeline, /"fill-forms"/u);
   // The output screening step must run for the filled PDF like any other tool.
   assert.match(pipeline, /screenAndStoreWorkerOutputs/u);

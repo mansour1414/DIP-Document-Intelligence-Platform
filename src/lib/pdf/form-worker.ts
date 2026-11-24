@@ -48,13 +48,29 @@
  * kernel. That limitation is recorded rather than glossed over.
  */
 import { spawn, type ChildProcess } from "node:child_process";
+import { FormFillError } from "@/lib/pdf/form-validation";
+import { FORM_ERROR_MESSAGES, isFormFillErrorCode, type FormInventory } from "@/lib/pdf/form-types";
+import {
+  WORKER_LIMITS,
+  WORKER_PROTOCOL_VERSION,
+  decodeResult,
+  encodeControl,
+  type Frame,
+  type WorkerControl,
+} from "@/lib/pdf/worker-protocol";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 /** Result of one bounded processing run. */
 export type WorkerResult =
-  | { ok: true; inventory: unknown; pages: number }
+  // `inventory` is typed, not `unknown`: `parseMeta` proves the full `FormInventory`
+  // shape before this value exists, so callers do not have to re-cast it to find out
+  // whether `fields` is an array. When it is already known to be an array, the
+  // defensive `Array.isArray((result.inventory as {fields?: unknown}).fields)` checks
+  // at the call sites are dead weight — they survive only where a value arrives from
+  // somewhere the protocol did not produce.
+  | { ok: true; inventory: FormInventory | undefined; pages: number }
   | { ok: false; code: string; message: string; details?: unknown };
 
 export type WorkerLimits = {
@@ -158,6 +174,29 @@ function childLaunch(): { args: string[]; env: NodeJS.ProcessEnv } {
   return { args, env: { PATH: process.env.PATH ?? "", NODE_ENV: process.env.NODE_ENV ?? "production" } };
 }
 
+/**
+ * Fail at boot, not per job.
+ *
+ * The child is launched with `--import ./scripts/node-platform-compat.mjs`. That file
+ * lives under `scripts/`, which the worker image had to be told to copy — for a while
+ * it was not, and the only symptom was `WORKER_CRASHED` on every Fill Forms job in
+ * production, because every test ran from a checkout that happened to contain it.
+ * A missing launch input is a deployment defect, so it is detected once, eagerly, with
+ * a message that names the missing file.
+ */
+const childLaunchChecked = (() => {
+  let checked = false;
+  return () => {
+    if (checked) return;
+    checked = true;
+    const { path, isTypeScript } = childEntry();
+    if (!existsSync(path)) throw new Error(`PDF worker child entry is missing: ${path}`);
+    if (isTypeScript && !existsSync("./scripts/node-platform-compat.mjs")) {
+      throw new Error("PDF worker child preload is missing: ./scripts/node-platform-compat.mjs (not packaged in this deployment)");
+    }
+  };
+})();
+
 type Slot = { child: ChildProcess; busy: boolean };
 
 const pool: Slot[] = [];
@@ -198,63 +237,85 @@ export function activeFormWorkers() {
 }
 
 /**
- * Run one document in a bounded child.
+ * Run one operation in a bounded child.
  *
  * The child is always killed afterwards. A pooled, long-lived child would be
  * faster, but "always start clean" is the property that makes the guarantees
  * meaningful: no state, no leaked handles and no inherited heap growth can
  * survive from one document into the next.
+ *
+ * ## Wire protocol
+ *
+ * Control + PDF go in on stdin; the result comes back on **fd 3** as one framed
+ * envelope (`worker-protocol.ts`). stdout and stderr are diagnostics only. This
+ * replaces "parse the last non-empty line of stdout as JSON", which had no frame
+ * boundary and could not carry a binary PDF back at all.
+ *
+ * ## What the parent still does not trust
+ *
+ * A well-framed reply proves the bytes arrived as declared, not that the child is
+ * honest. Output bytes are re-verified independently (`sha256` over what actually
+ * arrived, magic bytes, length, page preservation) by the caller; the checksum in
+ * the metadata is consistency evidence, never a substitute.
  */
-export async function processPdfBounded(bytes: Uint8Array, limits: WorkerLimits = DEFAULT_WORKER_LIMITS): Promise<WorkerResult> {
+async function runBounded(control: WorkerControl, pdf: Uint8Array, limits: WorkerLimits): Promise<Frame> {
   if (shuttingDown) throw new FormWorkerError("WORKER_CRASHED", "The document processor is shutting down.");
-  if (bytes.byteLength > limits.maxInputBytes) throw new FormWorkerError("WORKER_INPUT_TOO_LARGE", "The document exceeds the processing input limit.");
+  if (pdf.byteLength > limits.maxInputBytes) throw new FormWorkerError("WORKER_INPUT_TOO_LARGE", "The document exceeds the processing input limit.");
   // Bounded concurrency: refuse instead of queueing without limit.
   if (activeFormWorkers() >= limits.concurrency) throw new FormWorkerError("WORKER_BUSY", "The document processor is busy.");
 
+  let frame: Buffer;
+  try { frame = encodeControl(control, pdf); }
+  catch (error) { throw new FormWorkerError("WORKER_INPUT_TOO_LARGE", error instanceof Error ? error.message : "The request exceeds the transport limit."); }
+
+  childLaunchChecked();
   const { args, env } = childLaunch();
-  const slot: Slot = { child: spawn(process.execPath, [`--max-old-space-size=${limits.maxHeapMb}`, ...args], { shell: false, env, stdio: ["pipe", "pipe", "pipe"] }), busy: true };
+  // fd 3 is a dedicated result pipe. `stdio[3]` is a built-in Node capability, so
+  // this needs no dependency and keeps the authoritative channel free of any
+  // library output on stdout.
+  const slot: Slot = { child: spawn(process.execPath, [`--max-old-space-size=${limits.maxHeapMb}`, ...args], { shell: false, env, stdio: ["pipe", "pipe", "pipe", "pipe"] }), busy: true };
   pool.push(slot);
 
-  return await new Promise<WorkerResult>((resolve, reject) => {
+  return await new Promise<Frame>((resolve, reject) => {
     const child = slot.child;
-    let stdout = "";
-    let stdoutBytes = 0;
+    const resultPipe = child.stdio[3] as NodeJS.ReadableStream | null;
+    const chunks: Buffer[] = [];
+    let receivedBytes = 0;
     let stderr = "";
     let settled = false;
     let timedOut = false;
 
-    const finish = (error: Error | undefined, result?: WorkerResult) => {
+    const finish = (error: Error | undefined, result?: Frame) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       // Always reap: a killed-but-referenced child would otherwise keep its slot.
       if (!child.killed) child.kill("SIGKILL");
       retire(slot);
-      if (error) reject(error); else resolve(result as WorkerResult);
+      if (error) reject(error); else resolve(result as Frame);
     };
 
     const timer = setTimeout(() => {
       timedOut = true;
-      // The only thing that actually stops an unbounded parse.
+      // The only thing that actually stops an unbounded, non-returning parse.
       child.kill("SIGKILL");
       finish(new FormWorkerError("WORKER_TIMEOUT", "The document took too long to process and was stopped."));
     }, limits.timeoutMs);
 
-    child.stdout?.on("data", (chunk: Buffer) => {
+    resultPipe?.on("data", (chunk: Buffer) => {
       if (settled) return;
-      // Bound the **bytes**, not the decoded string length. `stdout.length` counts
-      // UTF-16 code units, so a multi-byte payload could exceed the real budget by
-      // up to 4x before this tripped. `chunk.byteLength` is the wire size.
-      stdoutBytes += chunk.byteLength;
-      if (stdoutBytes > limits.maxOutputBytes) {
-        stdout = "";
+      // Bound the **bytes** as they arrive, before buffering, so a child that
+      // floods the result pipe is stopped rather than accumulated.
+      receivedBytes += chunk.byteLength;
+      if (receivedBytes > limits.maxOutputBytes + WORKER_LIMITS.metaBytes) {
+        chunks.length = 0;
         child.kill("SIGKILL");
         finish(new FormWorkerError("WORKER_OUTPUT_TOO_LARGE", "The document processor produced too much output."));
         return;
       }
-      stdout += chunk.toString("utf8");
+      chunks.push(chunk);
     });
-    child.stderr?.on("data", (chunk: Buffer) => { stderr = `${stderr}${chunk.toString("utf8")}`.slice(-4_000); });
+    child.stderr?.on("data", (chunk: Buffer) => { stderr = `${stderr}${chunk.toString("utf8")}`.slice(-WORKER_LIMITS.stderrTailBytes); });
 
     child.once("error", (error: NodeJS.ErrnoException) => {
       finish(new FormWorkerError("WORKER_CRASHED", `The document processor could not start (${error.code ?? "unknown"}).`));
@@ -263,42 +324,75 @@ export async function processPdfBounded(bytes: Uint8Array, limits: WorkerLimits 
     child.once("close", (code) => {
       if (settled) return;
       if (timedOut) return; // the timeout path already settled
-      // A memory abort surfaces as a non-zero exit, not as JSON.
+      // A memory abort or a crash surfaces as a non-zero exit, never as a frame.
       if (code !== 0) {
         const oom = /heap out of memory|Allocation failed|Invalid string length|Reached heap limit/iu.test(stderr);
         finish(new FormWorkerError("WORKER_CRASHED", oom ? "The document exceeded the processor memory limit." : "The document processor stopped unexpectedly."));
         return;
       }
-      const line = stdout.trim().split("\n").filter(Boolean).pop();
-      if (!line) { finish(new FormWorkerError("WORKER_PROTOCOL_ERROR", "The document processor returned no result.")); return; }
-      let parsed: unknown;
-      try { parsed = JSON.parse(line) as unknown; }
-      catch { finish(new FormWorkerError("WORKER_PROTOCOL_ERROR", "The document processor returned an unreadable result.")); return; }
-      if (!parsed || typeof parsed !== "object" || !("ok" in parsed)) {
-        finish(new FormWorkerError("WORKER_PROTOCOL_ERROR", "The document processor returned an unexpected result."));
+      if (!chunks.length) { finish(new FormWorkerError("WORKER_PROTOCOL_ERROR", "The document processor returned no result.")); return; }
+      // Defer parsing to a later tick so a frame written and then followed by an
+      // abnormal exit is still rejected by the `code !== 0` branch above: the exit
+      // status is the authority on whether the run completed.
+      let parsed: Frame;
+      try { parsed = decodeResult(Buffer.concat(chunks), limits.maxOutputBytes); }
+      catch (error) {
+        finish(new FormWorkerError("WORKER_PROTOCOL_ERROR", error instanceof Error ? error.message : "The document processor returned an unreadable result."));
         return;
       }
-      // A successful reply is only trusted as far as it is shaped. `pages` in
-      // particular becomes the authoritative page count for Fill Forms — it is fed
-      // to plan enforcement and persisted on the file row — so a non-numeric or
-      // nonsense value must be a boundary failure, never an implicit pass. Without
-      // this check a malformed `{ ok: true }` would carry `undefined` pages into
-      // `pageCount`, and a negative or fractional value would slip past a limit
-      // comparison.
-      if ((parsed as { ok?: unknown }).ok === true) {
-        const pages = (parsed as { pages?: unknown }).pages;
-        if (typeof pages !== "number" || !Number.isInteger(pages) || pages < 0) {
-          finish(new FormWorkerError("WORKER_PROTOCOL_ERROR", "The document processor returned an invalid page count."));
-          return;
-        }
-      }
-      finish(undefined, parsed as WorkerResult);
+      finish(undefined, parsed);
     });
 
-    // Feed the document. `end()` is required: the child parses on EOF.
+    // Feed the request. `end()` is required: the child parses on EOF.
     child.stdin?.on("error", () => undefined); // EPIPE when the child dies early
-    child.stdin?.end(Buffer.from(bytes));
+    child.stdin?.end(frame);
   });
+}
+
+/** Map a child-side refusal onto the existing coded result shape. */
+function toResult(frame: Frame): WorkerResult {
+  if (frame.meta.ok) return { ok: true, inventory: frame.meta.op === "inspect" ? frame.meta.inventory : undefined, pages: frame.meta.pages };
+  return { ok: false, code: frame.meta.code, message: FORM_ERROR_MESSAGES.FORM_UNSUPPORTED, ...(frame.meta.details === undefined ? {} : { details: frame.meta.details }) };
+}
+
+/** Inspect one document in a bounded child. */
+export async function processPdfBounded(bytes: Uint8Array, limits: WorkerLimits = DEFAULT_WORKER_LIMITS): Promise<WorkerResult> {
+  try {
+    const frame = await runBounded({ v: WORKER_PROTOCOL_VERSION, op: "inspect" }, bytes, limits);
+    if (frame.meta.ok && frame.meta.op !== "inspect") throw new FormWorkerError("WORKER_PROTOCOL_ERROR", "The document processor answered a different operation.");
+    return toResult(frame);
+  } catch (error) {
+    if (error instanceof FormWorkerError) throw error;
+    throw new FormWorkerError("WORKER_PROTOCOL_ERROR", "The document processor returned an unreadable result.");
+  }
+}
+
+/** The verified fill result, as received from the bounded child. */
+export type BoundedFillResult = {
+  bytes: Uint8Array;
+  pages: number;
+  checksum: string;
+  report: { filled: number; untouched: number; rasterAppearances: number; flatten: boolean };
+};
+
+/**
+ * Fill one document in a bounded child.
+ *
+ * The engine, the native Arabic canvas and the reopen/verification parse all run
+ * inside the child. The parent receives bytes plus metadata and re-verifies them
+ * independently — it does not parse the PDF and it does not take the child's word
+ * for the page count.
+ */
+export async function fillPdfBounded(bytes: Uint8Array, fields: Record<string, string | boolean | string[]>, options: { flatten: boolean }, limits: WorkerLimits = DEFAULT_WORKER_LIMITS): Promise<BoundedFillResult> {
+  const frame = await runBounded({ v: WORKER_PROTOCOL_VERSION, op: "fill", flatten: options.flatten, fields }, bytes, limits);
+  if (!frame.meta.ok) {
+    // A fill refusal is a coded domain error, not a boundary failure.
+    const code = isFormFillErrorCode(frame.meta.code) ? frame.meta.code : "FORM_FILL_FAILED";
+    throw new FormFillError(code, FORM_ERROR_MESSAGES[code], frame.meta.details && typeof frame.meta.details === "object" ? frame.meta.details as Record<string, unknown> : undefined);
+  }
+  if (frame.meta.op !== "fill") throw new FormWorkerError("WORKER_PROTOCOL_ERROR", "The document processor answered a different operation.");
+  if (!frame.output || frame.output.byteLength === 0) throw new FormWorkerError("WORKER_PROTOCOL_ERROR", "The document processor returned no output.");
+  return { bytes: frame.output, pages: frame.meta.pages, checksum: frame.meta.checksum, report: frame.meta.report };
 }
 
 /** Kill every pooled child. Intended for tests and graceful shutdown. */

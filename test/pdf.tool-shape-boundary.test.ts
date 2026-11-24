@@ -21,7 +21,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { assertCheapPdfShape } from "@/lib/pdf/form-inspection";
 import { controlledPreflightToolIds } from "@/lib/tools/registry";
-import { validateUpload } from "@/lib/uploads/validation";
+import { validateUploadBytes, validateUploadWithParse } from "@/lib/uploads/validation";
 
 /** The exact bytes the E2E suite hands to Repair PDF. */
 const truncated = new TextEncoder().encode("%PDF-1.7\ntruncated");
@@ -44,7 +44,7 @@ test("Repair PDF and Unlock PDF accept damaged input without the Fill Forms shap
   // reports `controlledWorkerPreflight` and performs no parse, so damaged bytes are
   // accepted here and their authoritative validation happens in the contained worker.
   for (const toolId of ["repair-pdf", "unlock-pdf"]) {
-    const result = await validateUpload({ toolId, declaredMime: "application/pdf", bytes: truncated });
+    const result = validateUploadBytes({ toolId, declaredMime: "application/pdf", bytes: truncated });
     assert.equal(result.controlledWorkerPreflight, true, `${toolId} must defer structural validation to the worker`);
     assert.equal(result.pageCount, undefined, `${toolId} must not have parsed the document`);
   }
@@ -54,7 +54,7 @@ test("ordinary PDF tools still reject the same damaged input", async () => {
   // Unchanged by B31-01: an ordinary tool parses in the API and must fail before
   // allocating work.
   await assert.rejects(
-    () => validateUpload({ toolId: "compress-pdf", declaredMime: "application/pdf", bytes: truncated }),
+    () => validateUploadWithParse({ toolId: "compress-pdf", declaredMime: "application/pdf", bytes: truncated }),
     (error: unknown) => {
       assert.ok(error instanceof Error, "compress-pdf must refuse the document");
       return true;
@@ -79,8 +79,15 @@ test("Fill Forms still refuses a damaged document, but at its isolated boundary"
     "the isolated boundary must still refuse the document",
   );
   // And the transport layer genuinely no longer parses for this tool.
-  const result = await validateUpload({ toolId: "fill-forms", declaredMime: "application/pdf", bytes: truncated });
-  assert.equal(result.pageCount, undefined, "validateUpload must not have parsed the document");
+  const bytes = validateUploadBytes({ toolId: "fill-forms", declaredMime: "application/pdf", bytes: truncated });
+  assert.equal(bytes.pageCount, undefined, "stage 1 must not produce a page count");
+  // And the parse path refuses to serve an isolated tool at all, so a caller cannot
+  // accidentally re-introduce the in-process parse by choosing the wrong function.
+  await assert.rejects(
+    () => validateUploadWithParse({ toolId: "fill-forms", declaredMime: "application/pdf", bytes: truncated }),
+    (error: unknown) => (error as { code?: string }).code === "PDF_INVALID",
+    "the parse path must refuse an isolated tool",
+  );
 });
 
 test("the shape gate still rejects documents the controlled tools cannot repair", async () => {
@@ -89,8 +96,9 @@ test("the shape gate still rejects documents the controlled tools cannot repair"
   // exemption is from the *structural* pre-filter, not from validation.
   const notPdf = new Uint8Array([0x50, 0x4b, 0x03, 0x04, ...new Array(120).fill(0)]);
   for (const toolId of ["fill-forms", "repair-pdf", "unlock-pdf", "compress-pdf"]) {
-    await assert.rejects(
-      () => validateUpload({ toolId, declaredMime: "application/pdf", bytes: notPdf }),
+    // Stage 1 is synchronous, so this is `assert.throws`, not `assert.rejects`.
+    assert.throws(
+      () => validateUploadBytes({ toolId, declaredMime: "application/pdf", bytes: notPdf }),
       (error: unknown) => ["MAGIC_BYTES_INVALID", "PDF_INVALID"].includes((error as { code?: string }).code ?? ""),
       `${toolId} must reject bytes that are not a PDF`,
     );
@@ -116,5 +124,5 @@ test("malware screening is not part of this boundary and cannot be skipped by it
   assert.match(guard, /controlledPreflightToolIds\.has\(/u, `the shape gate must be scoped to the non-controlled tools, saw: ${guard.trim()}`);
   assert.match(guard, /!/u, "the guard must exempt the controlled tools, not require them");
   // A clean, parseable document must still reach the parser for ordinary tools.
-  assert.match(body, /validateUpload\(\{ toolId: tool\.toolId/u);
+  assert.match(body, /validateUploadBytes\(/u);
 });
