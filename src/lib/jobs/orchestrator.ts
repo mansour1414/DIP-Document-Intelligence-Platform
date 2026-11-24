@@ -12,8 +12,12 @@ import { requireCleanUpload } from "@/lib/malware";
 import { requiresDedicatedJobParameters, validateToolOptions } from "@/lib/tools/options";
 import { deletePhase1Secret, enforceUnlockRateLimit, phase1SecretToolIds, putPhase1Secret, type Phase1SecretPayload, type Phase1SecretPurpose } from "@/lib/secrets/phase1";
 import { parseFieldsPayload } from "@/lib/pdf/form-schema";
-import { inspectFormPdf } from "@/lib/pdf/form-inspection";
+import { assertCheapPdfShape } from "@/lib/pdf/form-inspection";
 import { purgeFormFields, putFormFields } from "@/lib/pdf/form-payload";
+import { formWorkerLimits, processPdfBounded } from "@/lib/pdf/form-worker";
+import { FormFillError } from "@/lib/pdf/form-validation";
+import { FORM_ERROR_MESSAGES, isFormFillErrorCode } from "@/lib/pdf/form-types";
+import { runtimeLimits } from "@/lib/runtime/config";
 
 type Upload = { filename: string; mimeType: string; bytes: Uint8Array };
 
@@ -25,8 +29,31 @@ type Upload = { filename: string; mimeType: string; bytes: Uint8Array };
  * error is a `FormFillError`, which the route already maps to a coded 422 with
  * an allowlisted, content-free message.
  */
+/**
+ * Submission preflight (P3).
+ *
+ * This previously called `inspectFormPdf` **in-process**, so the submission path
+ * parsed the PDF on the web server's main thread while the inspect endpoint parsed
+ * it in a bounded child — two different authorities, one of them unbounded, for the
+ * same decision. It now goes through `processPdfBounded`, which runs the identical
+ * restriction logic (`assertCheapPdfShape` → structural walk →
+ * `assertFillableRestrictions` → inventory) in the child, with the deadline, heap
+ * cap and minimal environment that the route already relies on.
+ */
 async function assertFillableInput(bytes: Uint8Array) {
-  await inspectFormPdf(bytes, { budgetMs: 20_000 });
+  const result = await processPdfBounded(bytes, formWorkerLimits({ timeoutMs: runtimeLimits.formWorkerTimeoutMs, maxHeapMb: runtimeLimits.formWorkerMaxHeapMb, concurrency: runtimeLimits.formWorkerConcurrency }));
+  // The child's verdict is data, and data from a subprocess is not trusted: a
+  // malformed reply is a boundary failure, never an implicit "the document is fine".
+  if (!result.ok) {
+    // Validated, not trusted: an unrecognised code from the child collapses to a
+    // generic refusal instead of being forwarded verbatim.
+    if (!isFormFillErrorCode(result.code)) throw new FormFillError("FORM_UNSUPPORTED", FORM_ERROR_MESSAGES.FORM_UNSUPPORTED, { boundary: "INVALID_CODE" });
+    const details = result.details && typeof result.details === "object" && !Array.isArray(result.details) ? (result.details as Record<string, unknown>) : undefined;
+    throw new FormFillError(result.code, FORM_ERROR_MESSAGES[result.code] ?? FORM_ERROR_MESSAGES.FORM_UNSUPPORTED, details);
+  }
+  if (!result.inventory || !Array.isArray((result.inventory as { fields?: unknown }).fields)) {
+    throw new FormFillError("FORM_UNSUPPORTED", FORM_ERROR_MESSAGES.FORM_UNSUPPORTED, { boundary: "INVALID_INVENTORY" });
+  }
 }
 function minimumFilesFor(toolId: string) { return ["merge-pdf", "alternate-mix"].includes(toolId) ? 2 : 1; }
 export async function createToolJob(input: { userId: string; toolId: string; uploads: Upload[]; options?: Record<string, string | number | boolean>; fields?: Record<string, unknown>; secrets?: Phase1SecretPayload; idempotencyKey: string; correlationId?: string; organizationId?: string; apiClientId?: string }) {
@@ -51,11 +78,20 @@ export async function createToolJob(input: { userId: string; toolId: string; upl
   if (phase1SecretToolIds.has(tool.toolId) !== Boolean(input.secrets)) throw Object.assign(new Error("Secure secret input does not match this tool."), { code: "SECRET_INPUT_INVALID" });
   if (tool.toolId === "unlock-pdf") await enforceUnlockRateLimit(input.userId);
   const storage = getStorage();
-  const prepared = await Promise.all(input.uploads.map(async (upload) => {
-    const validation = await validateUpload({ toolId: tool.toolId, declaredMime: upload.mimeType, bytes: upload.bytes });
+  // P3: screening precedes complex parsing. `validateUpload` parses the PDF with
+  // pdf-lib to count pages, so running it first meant an unscanned document was
+  // handed to a parser. Cheap, parser-free checks and the malware gate now run
+  // first; only a clean, plausibly-shaped file reaches `validateUpload`.
+  const screened = await Promise.all(input.uploads.map(async (upload) => {
+    // Parser-free shape checks apply only to documents declared as PDF; other
+    // accepted formats go straight to screening.
+    const looksPdf = upload.mimeType === "application/pdf" || upload.filename.toLowerCase().endsWith(".pdf");
+    if (looksPdf) assertCheapPdfShape(upload.bytes);
     const malwareScan = await requireCleanUpload(upload.bytes);
+    const validation = await validateUpload({ toolId: tool.toolId, declaredMime: upload.mimeType, bytes: upload.bytes });
     return { upload, validation, malwareScan };
   }));
+  const prepared = screened;
   // FF-06: prove the document is fillable *before* billing, storage and the
   // queue. The review found that a restricted input still created a document,
   // file and file-version row, a job row and a billing attempt, and only then
@@ -72,6 +108,10 @@ export async function createToolJob(input: { userId: string; toolId: string; upl
   const stored: Array<{ key: string; bucket: string; upload: Upload; validation: Awaited<ReturnType<typeof validateUpload>> }> = [];
   let secretRef: string | undefined;
   let fieldsRef: string | undefined;
+  // Set once the job row and its files are committed. Cleanup decisions depend on
+  // it: a charge may only be released, and stored inputs may only be deleted, when
+  // no job row exists to reference them.
+  let committedJobId: string | undefined;
   try {
     for (const item of prepared) { const key = storage.createUploadKey({ userId: input.userId, filename: item.upload.filename }); const object = await storage.put({ key, bytes: item.upload.bytes, contentType: item.validation.mimeType, checksum: item.validation.checksum }); stored.push({ key: object.key, bucket: object.bucket, upload: item.upload, validation: item.validation }); }
     const jobId = randomUUID();
@@ -87,6 +127,7 @@ export async function createToolJob(input: { userId: string; toolId: string; upl
       const files = await Promise.all(stored.map(async (item) => { const file = await tx.file.create({ data: { document: { connect: { id: document.id } }, originalName: item.upload.filename.slice(0, 255), mimeType: item.validation.mimeType, size: BigInt(item.upload.bytes.byteLength), storageKey: item.key, checksum: item.validation.checksum, pageCount: item.validation.pageCount, storageObject: buildStorageObjectConnectOrCreate(executionScope, { provider: "s3", bucket: item.bucket, objectKey: item.key, size: BigInt(item.upload.bytes.byteLength), checksum: item.validation.checksum }) } }); await tx.fileVersion.create({ data: { fileId: file.id, ownerId: input.userId, version: 1, storageKey: item.key, checksum: item.validation.checksum } }); return file; }));
       return tx.job.create({ data: { id: jobId, toolId: tool.toolId, idempotencyKey: input.idempotencyKey, requesterId: input.userId, organizationId: input.organizationId, apiClientId: input.apiClientId, inputFileId: files[0].id, status: "QUEUED", params: { inputFileIds: files.map((file) => file.id), options, ...(fieldsRef ? { fieldsRef } : {}), ...(secretRef ? { secretRef } : {}) }, correlationId, steps: { create: { name: tool.toolId, idempotencyKey: `${input.idempotencyKey}:${tool.toolId}`, status: "QUEUED", correlationId } } }, select: { id: true, status: true } });
     });
+    committedJobId = job.id;
     const queuedJob = { jobId: job.id, toolId: tool.toolId, idempotencyKey: input.idempotencyKey, correlationId, userId: input.userId };
     const queueOptions = { priority: monetization.plan.entitlements.processingPriority === "high" ? 1 : 5, ...(secretRef ? { attempts: 1 } : {}) };
     if (tool.aiFlag) await enqueueAiJob(queuedJob, queueOptions); else await enqueueJob(queuedJob, queueOptions);
@@ -95,10 +136,28 @@ export async function createToolJob(input: { userId: string; toolId: string; upl
     recordMetric("jobs_total", 1, "count", { tool_id: tool.toolId });
     return { ...job, reused: false };
   } catch (error) {
-    // Enqueue failure, transaction failure and every other creation-path failure
-    // remove the encrypted payload too: nothing will ever read it.
-    // A failure here means no job row exists, so nothing will consume the credit
-    // that authorization already took. Release it alongside the other artifacts.
+    // Cleanup must depend on whether a job row actually committed, because the
+    // two failure classes have opposite correct answers:
+    //
+    //   - **before the commit** (storage, secret/payload write, transaction): no
+    //     job exists, nothing will ever read the inputs, and the credit that
+    //     authorization already took has no work to pay for. Release everything.
+    //   - **after the commit** (enqueue failed, or the acknowledgement was lost):
+    //     the job row exists and is discoverable. A caught exception does *not*
+    //     prove the queue rejected it — an ambiguous acknowledgement means the job
+    //     may be queued and about to run. Releasing the charge would give the work
+    //     away, and deleting the inputs would leave a QUEUED job pointing at
+    //     objects that no longer exist.
+    if (committedJobId) {
+      // Keep the charge (the job exists and may still run) and keep every input.
+      // The row is left QUEUED: `planStalledJobExpiry` expires anything that is
+      // never claimed, and the payload/secret TTL is the backstop, so an enqueue
+      // that genuinely never landed is reconciled rather than stranded.
+      logger.error("job.enqueue_failed_after_commit", { job_id: committedJobId, correlation_id: correlationId, tool_id: tool.toolId, status: "queued_unconfirmed" });
+      recordMetric("jobs_enqueue_unconfirmed", 1, "count", { tool_id: tool.toolId });
+      throw error;
+    }
+    // No job row: release the charge and remove every artifact this attempt wrote.
     await Promise.all([deletePhase1Secret(secretRef).catch(() => undefined), purgeFormFields(fieldsRef).catch(() => undefined), ...stored.map((object) => storage.deleteObject(object.key).catch(() => undefined)), monetization.charge?.release().catch(() => undefined)]);
     throw error;
   }

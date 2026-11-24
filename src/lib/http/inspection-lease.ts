@@ -32,10 +32,13 @@
  *     slot, and a double release is a no-op;
  *   - the global set bounds the whole process independently of the per-tenant set.
  *
- * Redis failures **fail open**: admission is availability-critical and the parser
- * pool already has its own hard concurrency bound in the worker boundary. A Redis
- * outage must not turn inspection into an outage, and the failure is recorded rather
- * than hidden.
+ * Redis failures **fail closed**. An earlier version failed open on the argument
+ * that the parser pool bounds itself; that argument does not hold. The in-process
+ * cap is only reached *after* admission, so failing open removes both the per-tenant
+ * and the global ceiling for as long as Redis is degraded — precisely when a tenant
+ * could most profit from it, and on the one endpoint that spawns child processes to
+ * parse attacker-supplied documents. A caller receives a safe
+ * temporary-unavailability response instead, and the body is never read.
  */
 import { randomUUID } from "node:crypto";
 import { getReadyQueueConnection } from "@/lib/queue";
@@ -79,7 +82,10 @@ export function admissionLimits(overrides: Partial<AdmissionLimits> = {}): Admis
     perMinute: runtimeLimits.formInspectRatePerMinute,
     perTenant: runtimeLimits.formInspectConcurrency,
     global: runtimeLimits.formInspectGlobalConcurrency,
-    leaseSeconds: 120,
+    // Must cover the whole admitted span: upload (deadline 120 s), malware
+    // screening, then the bounded parse (20 s). 120 s was shorter than the upload
+    // deadline alone, so a lease could expire while its work was still running.
+    leaseSeconds: 420,
     ...overrides,
   };
 }
@@ -135,6 +141,21 @@ redis.call('ZREM', KEYS[2], ARGV[1])
 return 1
 `;
 
+/**
+ * Admission could not be established at all (Redis down, script rejected).
+ *
+ * Distinct from `InspectionBusyError`: that one is a *policy* refusal with a
+ * retry hint, this is an infrastructure refusal. Both mean "do not consume the
+ * body"; they differ in what the caller should be told.
+ */
+export class AdmissionUnavailableError extends Error {
+  readonly code = "PROCESSING_UNAVAILABLE";
+  constructor(readonly reason: "REDIS_UNAVAILABLE" | "SCRIPT_FAILED") {
+    super("Admission control is temporarily unavailable.");
+    this.name = "AdmissionUnavailableError";
+  }
+}
+
 export class InspectionBusyError extends Error {
   readonly code = "INSPECTION_BUSY";
   constructor(readonly reason: "RATE_LIMITED" | "CONCURRENCY_LIMITED" | "GLOBAL_LIMITED") {
@@ -152,10 +173,11 @@ export async function acquireInspectionLease(
   let redis: LeaseRedis;
   try { redis = await connect(); }
   catch {
-    // Fail open: a Redis outage must not take inspection down. Recorded, not hidden.
+    // Fail closed: without a lease there is no ceiling, and this is the one
+    // endpoint that spawns processes over attacker-supplied bytes.
     logger.warn("fill_forms.admission_unavailable", { reason: "REDIS_UNAVAILABLE" });
-    recordMetric("fill_forms_admission_fail_open", 1, "count", { reason: "redis" });
-    return { release: async () => undefined };
+    recordMetric("fill_forms_admission_unavailable", 1, "count", { reason: "redis" });
+    throw new AdmissionUnavailableError("REDIS_UNAVAILABLE");
   }
   const keys = [
     `${KEY_PREFIX}:rate:${tenantId}`,
@@ -170,10 +192,10 @@ export async function acquireInspectionLease(
       String(limits.perMinute), String(limits.leaseSeconds * 1_000), String(60_000),
     )) as [number, string];
   } catch {
-    // Same reasoning as above: availability first, and the failure is visible.
+    // Same reasoning as above: no lease, no admission.
     logger.warn("fill_forms.admission_unavailable", { reason: "SCRIPT_FAILED" });
-    recordMetric("fill_forms_admission_fail_open", 1, "count", { reason: "script" });
-    return { release: async () => undefined };
+    recordMetric("fill_forms_admission_unavailable", 1, "count", { reason: "script" });
+    throw new AdmissionUnavailableError("SCRIPT_FAILED");
   }
   if (Number(verdict[0]) !== 1) throw new InspectionBusyError(String(verdict[1]) as InspectionBusyError["reason"]);
   let released = false;

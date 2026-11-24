@@ -35,8 +35,9 @@ export const ALLOWED_ERROR_CODES = new Set([
   "FIELDS_INPUT_INVALID", "FIELD_VALUE_INVALID", "OPTION_NOT_OFFERED", "UNKNOWN_FIELD",
   "TYPE_MISMATCH", "READ_ONLY_FIELD", "DUPLICATE_SELECTION", "LENGTH_EXCEEDED",
   "LINE_BREAK_IN_SINGLE_LINE", "CONTROL_CHARACTER", "UNRENDERABLE_SCRIPT",
-  // pdf / form
+  // pdf / form (the `FormFillErrorCode` union is the authority for these)
   "FORM_UNSUPPORTED", "FORM_RESTRICTED", "FORM_NOT_FOUND", "FORM_VALUE_INVALID",
+  "FORM_FILL_FAILED", "FORM_OUTPUT_UNVERIFIED",
   "FORM_STRUCTURE_UNSAFE", "WIDGET_TOO_SMALL", "VALUE_OVERFLOWS_WIDGET", "VALUE_NEEDS_MORE_LINES",
   // boundary
   "WORKER_TIMEOUT", "WORKER_CRASHED", "WORKER_PROTOCOL_ERROR", "WORKER_BUSY",
@@ -46,6 +47,21 @@ export const ALLOWED_ERROR_CODES = new Set([
   // monetization
   "INSUFFICIENT_CREDITS", "PLAN_LIMIT_EXCEEDED", "PRO_FEATURE_REQUIRED",
   "DAILY_JOB_LIMIT_EXCEEDED", "MONTHLY_JOB_LIMIT_EXCEEDED", "CONCURRENCY_LIMIT_EXCEEDED",
+  // --- operational codes already emitted by the processing paths -----------------
+  // Added after reviewing the boundary for regressions: before it existed, *any*
+  // `error.code` was persisted, so these reached users and support runbooks. A
+  // closed vocabulary must not silently collapse codes other tools already depend
+  // on — that would trade a leak for a blind spot. Each is a real, content-free
+  // condition raised by the upload, PDF, secret-handoff, storage or output paths.
+  "UPLOAD_DECODE_FAILED", "PDF_INVALID", "MAGIC_BYTES_INVALID", "MIME_NOT_ALLOWED",
+  "APPEARANCE_LIMIT_EXCEEDED", "EMBEDDED_IMAGE_FORMAT_UNSUPPORTED", "FONT_UNAVAILABLE",
+  "FORM_PAYLOAD_EXPIRED", "FORM_PAYLOAD_INVALID", "FORM_PAYLOAD_UNAVAILABLE",
+  "IMAGE_DIMENSION_LIMIT_EXCEEDED", "NO_SUPPORTED_EMBEDDED_IMAGES", "OUTPUT_LIMIT_EXCEEDED",
+  "PAGE_DIMENSION_LIMIT_EXCEEDED", "PDF_RENDER_FAILED",
+  "SECRET_HANDOFF_UNAVAILABLE", "SECRET_INPUT_INVALID", "SECRET_REFERENCE_EXPIRED",
+  "SECRET_REFERENCE_INVALID", "UNLOCK_RATE_LIMITED",
+  // Pipeline-internal refusals that are safe to name.
+  "TENANT_CONTEXT_REQUIRED", "JOB_NOT_FOUND", "OUTPUT_SCAN_FAILED",
 ]);
 
 const CODE_SHAPE = /^[A-Z][A-Z0-9_]{2,63}$/u;

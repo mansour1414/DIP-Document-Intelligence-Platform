@@ -100,25 +100,48 @@ export class FormWorkerError extends Error {
 const HERE = dirname(fileURLToPath(import.meta.url));
 
 /**
- * Locate the child entry next to this module.
+ * Locate the child entry.
  *
- * Two environments exist and they must both work:
+ * ## Why a sibling of this module is not enough
  *
- *   - **source / tests** — `form-worker-child.ts`, loaded through the project's
- *     own `tsx` + platform-compat loader (the same pair `npm test` and the
- *     document worker use);
- *   - **production build** — the compiler emits `.js` alongside, so the sibling
- *     `.js` is preferred and no loader is needed.
+ * `next.config.ts` sets `output: "standalone"`. Under that build this module is
+ * inlined into a server chunk, so `import.meta.url` points at
+ * `.next/server/.../chunk.js` — a directory the child was never emitted into. The
+ * previous version looked only for a *sibling* `form-worker-child.js` and would have
+ * thrown `WORKER_CRASHED` on the first inspection in a deployed image, while passing
+ * every test in the repository. Both the source tree and the traced output are
+ * therefore searched, and a miss is a loud, typed failure rather than a spawn error.
  *
- * The previous version hardcoded `.ts`, which would have spawned a file that does
- * not exist in a built image. Resolution happens once, and a missing entry is
- * reported as a boundary failure rather than a spawn error.
+ * `FORM_WORKER_ENTRY` is the operator escape hatch: an image that stages the child
+ * somewhere else (a worker image, a custom layer) sets it explicitly, and that path
+ * is used verbatim.
+ *
+ * The genuinely correct fix for a standalone image is for the build to copy the
+ * entry next to the chunk; `next.config.ts` declares it through
+ * `outputFileTracingIncludes` and the deployment check in
+ * `docs/stage2-fill-forms.md` describes what to verify. Until an image is built and
+ * exercised here, this is a **release blocker**, not a closed gate.
  */
 function childEntry(): { path: string; isTypeScript: boolean } {
-  const js = join(HERE, "form-worker-child.js");
-  if (existsSync(js)) return { path: js, isTypeScript: false };
-  const ts = join(HERE, "form-worker-child.ts");
-  if (existsSync(ts)) return { path: ts, isTypeScript: true };
+  const override = process.env.FORM_WORKER_ENTRY;
+  if (override) {
+    if (!existsSync(override)) throw new FormWorkerError("WORKER_CRASHED", "The configured document processor entry does not exist.");
+    return { path: override, isTypeScript: /\.ts$/u.test(override) };
+  }
+  // Candidate directories: beside this module (source + tests), the project root
+  // (standalone images that copy the entry), and the traced source path.
+  const roots = [
+    HERE,
+    join(HERE, "../../../../src/lib/pdf"),
+    join(process.cwd(), "src/lib/pdf"),
+    join(process.cwd(), ".next/standalone/src/lib/pdf"),
+  ];
+  for (const root of roots) {
+    for (const [name, isTypeScript] of [["form-worker-child.js", false], ["form-worker-child.ts", true]] as const) {
+      const candidate = join(root, name);
+      if (existsSync(candidate)) return { path: candidate, isTypeScript };
+    }
+  }
   throw new FormWorkerError("WORKER_CRASHED", "The document processor is not available in this deployment.");
 }
 
@@ -140,15 +163,38 @@ type Slot = { child: ChildProcess; busy: boolean };
 const pool: Slot[] = [];
 let shuttingDown = false;
 
+/**
+ * Retire a slot and, crucially, keep it counted until the process is gone.
+ *
+ * `child.kill("SIGKILL")` only *sends* the signal; the process survives until the
+ * kernel reaps it, and it holds its heap until then. Removing the slot from the pool
+ * immediately let a new child start while a killed one was still resident, so the
+ * configured concurrency was not a real bound on simultaneous processes — and on a
+ * memory-bound host the overshoot is exactly what matters. The slot stays in the pool
+ * (`busy` cleared only once the process has exited) and is removed on `exit`.
+ */
 function retire(slot: Slot) {
-  const index = pool.indexOf(slot);
-  if (index >= 0) pool.splice(index, 1);
+  slot.busy = false;
   if (!slot.child.killed) slot.child.kill("SIGKILL");
+  // `exit` fires when the process has terminated but before stdio closes; `close`
+  // fires after both. Either is proof the kernel has reaped it.
+  const drop = () => {
+    const index = pool.indexOf(slot);
+    if (index >= 0) pool.splice(index, 1);
+  };
+  if (slot.child.exitCode !== null || slot.child.signalCode !== null) drop();
+  else slot.child.once("exit", drop);
 }
 
-/** Number of children currently working. Exposed for the concurrency tests. */
+/**
+ * Number of child processes that exist or may still exist.
+ *
+ * Counts retired-but-not-yet-exited slots too: a killed child still holds its
+ * memory until the kernel reaps it, so admitting a replacement before that happens
+ * would exceed the configured bound.
+ */
 export function activeFormWorkers() {
-  return pool.filter((slot) => slot.busy).length;
+  return pool.length;
 }
 
 /**
@@ -172,6 +218,7 @@ export async function processPdfBounded(bytes: Uint8Array, limits: WorkerLimits 
   return await new Promise<WorkerResult>((resolve, reject) => {
     const child = slot.child;
     let stdout = "";
+    let stdoutBytes = 0;
     let stderr = "";
     let settled = false;
     let timedOut = false;
@@ -195,12 +242,17 @@ export async function processPdfBounded(bytes: Uint8Array, limits: WorkerLimits 
 
     child.stdout?.on("data", (chunk: Buffer) => {
       if (settled) return;
-      stdout += chunk.toString("utf8");
-      // A child that floods stdout is treated as hostile, not buffered.
-      if (stdout.length > limits.maxOutputBytes) {
+      // Bound the **bytes**, not the decoded string length. `stdout.length` counts
+      // UTF-16 code units, so a multi-byte payload could exceed the real budget by
+      // up to 4x before this tripped. `chunk.byteLength` is the wire size.
+      stdoutBytes += chunk.byteLength;
+      if (stdoutBytes > limits.maxOutputBytes) {
+        stdout = "";
         child.kill("SIGKILL");
         finish(new FormWorkerError("WORKER_OUTPUT_TOO_LARGE", "The document processor produced too much output."));
+        return;
       }
+      stdout += chunk.toString("utf8");
     });
     child.stderr?.on("data", (chunk: Buffer) => { stderr = `${stderr}${chunk.toString("utf8")}`.slice(-4_000); });
 

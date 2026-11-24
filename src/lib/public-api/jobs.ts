@@ -15,7 +15,7 @@ import { deletePhase1Secret, phase1SecretsFromForm, type Phase1SecretPayload } f
 import { purgeFormFields } from "@/lib/pdf/form-payload";
 import { requiresDedicatedJobParameters } from "@/lib/tools/options";
 import { FormFillError, assertFieldsPayloadSize, assertNoDuplicateJsonKeys, parseFieldsPayload } from "@/lib/pdf/form-validation";
-import { BodyTooLargeError, multipartBudget, withBodyLimit } from "@/lib/http/bounded-body";
+import { BodyTooLargeError, UploadDeadlineError, boundedMultipartRequest, multipartBudget } from "@/lib/http/bounded-body";
 import { getToolDefinition } from "@/lib/tools/registry";
 
 type PublicUpload = { filename: string; mimeType: string; bytes: Uint8Array };
@@ -27,22 +27,31 @@ type PublicUpload = { filename: string; mimeType: string; bytes: Uint8Array };
  */
 const MAX_PUBLIC_BODY_BYTES = Math.max(...["fill-forms"].map((id) => getToolDefinition(id).limits.maxBytes));
 
+/** Wall-clock ceiling for the client to finish the multipart body. */
+const PUBLIC_UPLOAD_DEADLINE_MS = 120_000;
+
 export type PublicJobInput = { toolId: string; uploads: PublicUpload[]; options: Record<string, string | number | boolean>; fields?: Record<string, unknown>; secrets?: Phase1SecretPayload; idempotencyKey: string };
 
 export async function parsePublicJobRequest(request: Request): Promise<PublicJobInput & { bytesIn: number; requestHash: string }> {
   const contentType = request.headers.get("content-type") ?? ""; if (!contentType.toLowerCase().includes("multipart/form-data")) throw new PublicApiError("VALIDATION_ERROR", "multipart/form-data is required.", 400);
   const key = request.headers.get("idempotency-key")?.trim(); if (!key) throw new PublicApiError("VALIDATION_ERROR", "Idempotency-Key is required.", 400);
-  // FF-04: bound the body *before* the framework buffers it. The Public API is
-  // unauthenticated-by-cookie and machine-callable, so a header-only check is even
-  // weaker here: `Content-Length` may be absent (chunked) or false, and the whole
-  // multipart body would still be buffered. The counting stream aborts the read at
-  // the ceiling regardless.
+  // FF-04: bound the body against actual bytes as the multipart parser pulls
+  // them. The Public API is machine-callable, so a header-only check is especially
+  // weak here: `Content-Length` may be absent (chunked) or false. The derived
+  // request carries a bounded stream, so the limit applies whether or not a
+  // declaration is present or truthful.
   const declaredTool = String(request.headers.get("x-dip-tool") ?? "").trim();
   const bodyBudget = multipartBudget(declaredTool ? getToolDefinition(declaredTool).limits.maxBytes : MAX_PUBLIC_BODY_BYTES);
-  let bounded: Request;
-  try { bounded = withBodyLimit(request, bodyBudget); }
-  catch (error) { if (error instanceof BodyTooLargeError) throw new PublicApiError("SIZE_LIMIT_EXCEEDED", "The request body exceeds the size limit.", 413); throw error; }
-  const form = await (async () => { try { return await bounded.formData(); } catch (error) { if (error instanceof BodyTooLargeError) throw new PublicApiError("SIZE_LIMIT_EXCEEDED", "The request body exceeds the size limit.", 413); throw error; } })(); const toolId = String(form.get("toolId") ?? "").trim(); if (!toolId) throw new PublicApiError("VALIDATION_ERROR", "toolId is required.", 400);
+  let form: FormData;
+  try {
+    const bounded = boundedMultipartRequest(request, { limitBytes: bodyBudget, deadlineMs: PUBLIC_UPLOAD_DEADLINE_MS });
+    form = await bounded.formData();
+  } catch (error) {
+    if (error instanceof BodyTooLargeError) throw new PublicApiError("SIZE_LIMIT_EXCEEDED", "The request body exceeds the size limit.", 413);
+    if (error instanceof UploadDeadlineError) throw new PublicApiError("TIMEOUT", "The upload did not complete in time.", 408);
+    throw error;
+  }
+  const toolId = String(form.get("toolId") ?? "").trim(); if (!toolId) throw new PublicApiError("VALIDATION_ERROR", "toolId is required.", 400);
   let options: Record<string, string | number | boolean> = {}; const rawOptions = form.get("options");
   if (typeof rawOptions === "string" && rawOptions) { try { const parsed = JSON.parse(rawOptions) as unknown; if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || Object.values(parsed).some((value) => !["string", "number", "boolean"].includes(typeof value))) throw new Error(); options = parsed as Record<string, string | number | boolean>; } catch { throw new PublicApiError("VALIDATION_ERROR", "options must be a flat JSON object.", 400); } }
   // `fields` is the typed per-field payload used by tools that cannot express
@@ -101,7 +110,21 @@ export async function cancelPublicJob(principal: ApiPrincipal, jobId: string) {
     const job = await tx.job.findFirst({ where: { id: jobId, organizationId: principal.organizationId, apiClientId: principal.apiClientId }, select: { id: true, status: true, params: true } }); if (!job) throw new PublicApiError("NOT_FOUND", "The requested job was not found.", 404);
     if (["SUCCEEDED", "FAILED", "CANCELLED", "EXPIRED"].includes(job.status)) return { result: { id: job.id, status: job.status.toLowerCase() }, secretRef: undefined, fieldsRef: undefined };
     if (job.status === "RUNNING") throw new PublicApiError("CONFLICT", "A running job can no longer be cancelled safely.", 409);
-    await tx.job.update({ where: { id: job.id }, data: { status: "CANCELLED", completedAt: new Date(), errorCode: "API_CANCELLED" } }); await tx.jobStep.updateMany({ where: { jobId: job.id, status: { in: ["QUEUED", "RETRYING"] } }, data: { status: "CANCELLED", completedAt: new Date(), errorCode: "API_CANCELLED" } }); await writeBusinessAudit(tx, { organizationId: principal.organizationId, action: "api_job.cancelled", resource: "job", resourceId: job.id, details: { apiClientId: principal.apiClientId } }); return { result: { id: job.id, status: "cancelled" }, secretRef: (job.params as { secretRef?: string }).secretRef, fieldsRef: (job.params as { fieldsRef?: string }).fieldsRef };
+    // Cancel-vs-claim: a guarded write, not an unconditional one. The status was
+    // read a moment ago, but a worker may have claimed the job in between; an
+    // `update()` here would overwrite a row that had just become RUNNING (or even
+    // SUCCEEDED) and then this path would purge the inputs of a live attempt.
+    const cancelledWrite = await tx.job.updateMany({
+      where: { id: job.id, status: { in: ["QUEUED", "RETRYING"] } },
+      data: { status: "CANCELLED", completedAt: new Date(), errorCode: "API_CANCELLED" },
+    });
+    if (cancelledWrite.count !== 1) {
+      // Someone else moved it first. Report what actually happened instead of
+      // claiming a cancellation that did not take effect; nothing is purged.
+      const latest = await tx.job.findUnique({ where: { id: job.id }, select: { status: true } });
+      if (latest?.status === "RUNNING") throw new PublicApiError("CONFLICT", "A running job can no longer be cancelled safely.", 409);
+      return { result: { id: job.id, status: String(latest?.status ?? "unknown").toLowerCase() }, secretRef: undefined, fieldsRef: undefined };
+    } await tx.jobStep.updateMany({ where: { jobId: job.id, status: { in: ["QUEUED", "RETRYING"] } }, data: { status: "CANCELLED", completedAt: new Date(), errorCode: "API_CANCELLED" } }); await writeBusinessAudit(tx, { organizationId: principal.organizationId, action: "api_job.cancelled", resource: "job", resourceId: job.id, details: { apiClientId: principal.apiClientId } }); return { result: { id: job.id, status: "cancelled" }, secretRef: (job.params as { secretRef?: string }).secretRef, fieldsRef: (job.params as { fieldsRef?: string }).fieldsRef };
   });
   // FF-03: cancellation is terminal, so the encrypted values are removed with the
   // rest of the job's sensitive material. The TTL is only the backstop for a

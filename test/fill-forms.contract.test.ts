@@ -278,13 +278,18 @@ test("FF-04: the inspect route bounds the request before buffering and screens b
   // Round 2: the header check survives as an early exit, but enforcement moved to a
   // counting stream. Both must precede the buffering call.
   const declaredAt = body.indexOf("declaredLength(request)");
-  const boundedAt = body.indexOf("withBodyLimit(request");
+  const boundedAt = body.indexOf("boundedMultipartRequest(request");
   const formDataAt = Math.max(body.indexOf("bounded.formData()"), body.indexOf("request.formData()"));
   const screeningAt = body.indexOf("requireCleanUpload(bytes)");
   const parseAt = body.indexOf("processPdfBounded(");
   const cheapAt = body.indexOf("assertCheapPdfShape(bytes)");
   assert.ok(declaredAt > 0 && declaredAt < formDataAt, "the declared length must be checked before formData()");
-  assert.ok(boundedAt > 0 && boundedAt < formDataAt, "the body must be bounded by a counting stream before formData()");
+  assert.ok(boundedAt > 0 && boundedAt < formDataAt, "the body must be bounded before formData() consumes it");
+  // The derived request must be the one formData() is called on: bounding a request
+  // and then parsing the original is the regression that broke every endpoint.
+  assert.match(body, /const bounded = boundedMultipartRequest\(request/u);
+  assert.match(body, /await bounded\.formData\(\)/u);
+  assert.doesNotMatch(body, /Object\.defineProperty\(request, "body"/u, "substituting .body in place leaves formData() unusable");
   assert.ok(cheapAt > 0 && cheapAt < screeningAt, "cheap shape checks must precede screening");
   assert.ok(screeningAt > 0 && screeningAt < parseAt, "malware screening must precede the PDF parse");
   // Round 2: admission is an atomic Lua lease with per-tenant AND global ceilings,
@@ -339,18 +344,29 @@ test("FF-06: `fill-forms` is inspected after screening and before billing/storag
   assert.ok(preflightAt < enqueueAt, "the preflight must precede queueing");
 });
 
-test("FF-06: a failed creation releases the authorization charge (no orphan charge)", () => {
+test("FF-06: the authorization charge is released only when no job committed", () => {
   const enforcement = read("src/lib/usage/enforcement.ts");
   const orchestrator = read("src/lib/jobs/orchestrator.ts");
   // Authorization still happens where it always did — before storage — but it now
-  // hands back a release handle that the creation-failure path uses.
+  // hands back a release handle.
   assert.match(enforcement, /charge: creditReused \? undefined : \{ release:/u, "authorization must return a release handle");
   assert.match(enforcement, /reverseCredits\(/u, "the release must reverse the ledger entry");
   assert.match(enforcement, /job-release:\$\{input\.toolId\}:\$\{input\.idempotencyKey\}/u, "the reversal must be idempotent per idempotency key");
-  const creationCatch = orchestrator.slice(orchestrator.indexOf("Enqueue failure, transaction failure"));
-  assert.match(creationCatch, /monetization\.charge\?\.release\(\)/u, "the creation-failure path must release the charge");
-  // The ordering the previous test pins must not have moved.
-  const preflightAt = orchestrator.indexOf("await assertFillableInput(prepared[0].upload.bytes)");
+  // Round 3: the release is conditional. An unconditional `Promise.all` of every
+  // cleanup released the charge after the job row had already committed — giving
+  // away work that may be queued and running, and deleting inputs a QUEUED job
+  // still references.
+  assert.match(orchestrator, /let committedJobId: string \| undefined/u, "the commit point must be tracked");
+  const postCommit = orchestrator.slice(orchestrator.indexOf("if (committedJobId) {"));
+  assert.equal(
+    postCommit.slice(0, postCommit.indexOf("throw error")).includes("charge?.release()"),
+    false,
+    "a post-commit failure must not release the charge",
+  );
+  const preCommit = orchestrator.slice(orchestrator.indexOf("No job row: release the charge"));
+  assert.match(preCommit.slice(0, 400), /charge\?\.release\(\)/u, "a pre-commit failure must release it");
+  // The ordering the earlier test pins must not have moved.
+  const preflightAt = orchestrator.indexOf("processPdfBounded(bytes");
   const billingAt = orchestrator.indexOf("await enforceJobCreation(");
   assert.ok(preflightAt > 0 && preflightAt < billingAt, "preflight must still precede billing");
 });

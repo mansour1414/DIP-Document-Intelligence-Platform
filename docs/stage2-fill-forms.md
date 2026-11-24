@@ -338,3 +338,183 @@ this repository supports.
 * `npx prisma generate`: **still blocked** (TLS to the binary host). FF-01
   therefore remains *pending clean-build verification* and no later claim rests
   on a stubbed build.
+
+---
+
+## Remediation round 3 (architect review of `dfe658b`)
+
+Review returned **NO-GO** with six priorities plus a CI failure. This round was
+deliberately bounded: no new abstractions, no scope growth, and two of the
+architect's findings turned out to be defects in the round-2 work itself.
+
+### CI classification
+
+The failing run (`45409389856`) reported 4 pass / 7 fail. **Only one defect was
+real, and it was mine:** `src/lib/jobs/document-pipeline.ts:122`,
+`TS2322` on `data: { params: rest }`. It broke Type Check, Build, Browser and
+Full Release B, which all run the type checker.
+
+| Job | Classified as | Evidence |
+| --- | --- | --- |
+| Type Check | **PR defect (fixed)** | `TS2322` annotation on `document-pipeline.ts:122` |
+| Build / Browser / Full Release B | **cascade of the same** | same annotation; these jobs typecheck first |
+| Test, Integration / Processing | **not established** | logs unavailable — see the gap below |
+| CR-002 Groq evaluation | **independent** | HTTP 413 from the provider; no provider, model, secret or acceptance gate was touched |
+
+**Evidence gap, stated plainly:** the job logs could not be downloaded —
+`gh run view --log-failed` and the per-job logs API both redirect to
+`blob.core.windows.net`, which this environment cannot reach. My only CI evidence
+is the check-run annotations, which carry the `TS2322` and nothing about the
+workflow/`audit_logs` failures the architect saw in Integration/Processing. I
+therefore **do not claim** that those are pre-existing. The files involved
+(`test/workflow.*`, `test/phase9*.rls.integration.mjs`) are untouched by this
+branch, which makes a PR-caused regression unlikely but not proven, and nothing
+here should be read as such.
+
+### P1 — the multipart regression (a total outage on three endpoints)
+
+Undocumented in the round-2 report: `withBodyLimit` substituted `request.body`
+via `Object.defineProperty` and then the route called `request.formData()` on the
+**original** request. `formData()` reads the body state the request was
+constructed with, which the substitute had already drained:
+
+```
+TypeError: Body is unusable: Body has already been read
+```
+
+That is Inspect, Web submission and the Public API — all of them, not an edge
+case. My tests missed it because they called `.body.getReader()` on the stream I
+had just substituted, exercising the substitute and never the consumer.
+
+The replacement builds a **new `Request`** over a pull-based bounded stream, so
+`formData()` parses the bounded stream like any other body. Measured behaviour:
+
+| Requirement | Result |
+| --- | --- |
+| Valid multipart succeeds via `formData()` | pass (`test/http.bounded-body.test.ts`) |
+| Oversized rejected while consuming bytes | pass |
+| Missing / false `Content-Length` cannot bypass | pass (both cases) |
+| Backpressure | pull-based; one chunk per consumer read, no eager drain |
+| Upload deadline | enforced **inside the stream** after measuring that an `AbortSignal` does *not* interrupt `formData()` (a slow body kept reading past the abort) |
+| Admission before the upload is consumed | pass — the lease is acquired before a single byte is read |
+| Duplicate / invalid parts | repeated `options`/`fields`/`secrets` parts rejected; `files` remains multi-valued by design |
+| 64 KiB fields payload preserved | `multipartBudget` adds framing overhead to the file budget, never subtracts from the fields allowance |
+
+### P2 — admission now fails closed
+
+The round-2 code failed open on a Redis error. The justification was that the
+parser pool bounds itself; that is wrong, because the in-process cap is only
+reached **after** admission, so failing open removes both ceilings exactly when a
+tenant could exploit it. It now raises `AdmissionUnavailableError` and the route
+answers 503 without reading the body. Lease lifetime was also wrong: 120 s is
+shorter than the 120 s upload deadline alone, so it is now 420 s (upload +
+screening + parse) and a test asserts the relationship.
+
+**Not proven:** that Redis executed the Lua. There is no Redis here, so the
+semantics are exercised against an in-memory implementation of the same commands.
+Atomicity of `EVAL` is Redis's documented guarantee, not something this repository
+demonstrates.
+
+### P3 — boundary gaps closed, and what is *not* closed
+
+Closed: submission preflight now goes through `processPdfBounded` instead of
+parsing in-process; `validateUpload`'s page-counting parse now runs *after*
+screening; the child's reply is validated against `isFormFillErrorCode` rather
+than trusted; IPC output is bounded by **bytes** (`chunk.byteLength`, not
+`stdout.length`); a killed child keeps its pool slot until the kernel reaps it.
+
+**Two of the architect's points are confirmed, not closed:**
+
+1. **A V8 heap cap is not an RSS cap.** Measured: a child with
+   `--max-old-space-size=64` still reads and writes arbitrary files.
+2. **A stripped environment is not a sandbox.** Measured: the child read
+   `/tmp/dip-secret-probe.txt` successfully. Network egress was blocked here by
+   the *sandbox*, not by the boundary.
+3. `node --permission` **does** deny filesystem access (`ERR_ACCESS_DENIED`) and
+   would be the right OS-level control — but it breaks the `tsx` loader the child
+   depends on, so it cannot be enabled without changing the child's module
+   strategy.
+
+**Release blocker (unchanged in kind, restated precisely):** the child is
+contained in a *process*, not in a security boundary. It runs as the same OS user
+with the same filesystem and (absent a network policy) the same egress. Closing
+this needs a deployment control — a dedicated container/namespace with a read-only
+root, no egress policy and a memory cgroup — which is infrastructure, so it stays
+open and is **not claimed as closed**.
+
+Also open: **the standalone build does not emit the child.** `output: "standalone"`
+inlines this module into a server chunk, so a sibling `form-worker-child.js` does
+not exist there. `childEntry()` now searches several roots and honours
+`FORM_WORKER_ENTRY`, and `next.config.ts` declares the entry through
+`outputFileTracingIncludes`, but **no standalone image was built and exercised in
+this environment**. That is a release blocker, not a closed gate.
+
+### P4 — the counter frame (a real bug in round 2)
+
+In BullMQ 6.3.4, `attemptsMade` is incremented **inside** `Job.moveToFailed`
+(`job.js:510`) and the worker emits `failed` afterwards (`worker.js:651`). The
+retry decision is taken earlier still, from the pre-increment value
+(`job.js:446`). Round 2 applied the processor-entry form (`attemptsMade + 1`) in
+the `failed` handler — adding one to an already-incremented counter. Reproduced:
+
+```
+attempt 2 of 3: entry=1  bullmqRetries=true  failedEventCounter=2
+   truth: queueWillRetry=true   my "terminal"=true   <-- MISMATCH
+```
+
+On attempt 2 of 3 the payload was purged **while a retry was still scheduled**.
+The two frames are now separate exports — `classifyFailedEvent` takes the
+post-increment counter, `classifyAtProcessorEntry` the pre-increment one — and the
+tests walk a real three-attempt run asserting that the
+worker, the pipeline and the queue always agree.
+
+Also fixed: the `classifyTerminal` hook was declared and consumed but never
+passed by the worker — dead wiring, removed. The duplicate-success early return
+now retries the purge instead of skipping it, since a crash between commit and
+purge would otherwise leave the payload to the TTL. Public API cancellation was
+an unguarded `tx.job.update`; it is now status-guarded, so a cancel racing a claim
+cannot overwrite a RUNNING or SUCCEEDED job and then purge a live attempt's inputs.
+
+### P5 — the charge could be released after the job committed
+
+Round 2's compensation ran in a single `catch`, so it also fired when the failure
+came **after** the job row committed. Reproduced:
+
+```
+enqueue-throws   committed=1 releases=1 -> BUG: job committed but charge released
+ambiguous        committed=1 releases=1 -> BUG: job committed but charge released
+```
+
+Cleanup now branches on whether a job committed. Before: release the charge and
+delete the inputs. After: keep both, log `job.enqueue_failed_after_commit`, and
+leave the row QUEUED so the expiry sweep reconciles a job that never ran. An
+ambiguous acknowledgement is exactly the case where "the exception proves the
+queue rejected it" is false.
+
+### P6 — preserved fixes
+
+The expiry purge still follows the transitioned rows only. **Not verified here:**
+that the retention role can run `UPDATE … RETURNING params` against a real
+database. The migration grants `SELECT` on `jobs` and
+`UPDATE (status, error_code, completed_at, updated_at)`, which is exactly what the
+statement needs and requires no widening — but the assertion is a new integration
+test that **skips** without a database, so it is unproven. (The SET list does not
+touch `params`; only the `RETURNING` reads it, which `SELECT` covers.)
+
+The error boundary was reviewed for regressions and **did** have one: the closed
+vocabulary collapsed ~24 operational codes that previously reached users and
+runbooks (`FONT_UNAVAILABLE`, `SECRET_REFERENCE_EXPIRED`, `PDF_INVALID`, …). Those
+are restored, with a test that fails if any is dropped again.
+
+HKDF/TTL remains proposed only. `RETENTION_APPLY` remains disabled.
+
+### Round-3 verification
+
+| Gate | Result |
+| --- | --- |
+| `npm test` | **574 tests, 515 pass, 15 fail, 44 skipped** |
+| Failing files | the **same 15** as the branch base; all environment (no Prisma client, Redis, Postgres, ClamAV) |
+| `tsc --noEmit` | **447 = baseline exactly**, zero net new errors |
+| `eslint src/ workers/ test/` | 0 errors, 0 warnings |
+| `prisma generate` | still blocked (TLS); the `TS2322` fix is verified against a faithful mock of Prisma's JSON input types, not the generated client |
+| CI logs | **unavailable** (storage host unreachable); annotations only |

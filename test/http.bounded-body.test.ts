@@ -1,94 +1,153 @@
 /**
- * FF-04 — request-byte enforcement, behaviourally.
+ * FF-04 — bounded request consumption, tested through the *real* consumer.
  *
- * Each case is one of the bypasses the architect identified. They are driven
- * through real `Request` objects and a real `ReadableStream`, so this tests the
- * enforcement mechanism rather than the presence of a header check.
+ * ## Why this file was rewritten
+ *
+ * The first version called `.body.getReader()` directly on the stream the wrapper
+ * had substituted. That passes even when the application's actual consumer is
+ * broken, and it was: `Object.defineProperty(request, "body", …)` left the original
+ * `Request` in place, whose body state had already been consumed. Routing code calls
+ * `request.formData()`, which threw
+ *
+ *     TypeError: Body is unusable: Body has already been read
+ *
+ * on every multipart endpoint. Every case below therefore goes through
+ * `formData()` — the same call the routes make — and a "valid multipart request
+ * must still parse" case exists specifically so that breaking the consumer can never
+ * again be mistaken for a passing test.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { BodyTooLargeError, MULTIPART_OVERHEAD_BYTES, multipartBudget, withBodyLimit } from "../src/lib/http/bounded-body";
+import {
+  MULTIPART_OVERHEAD_BYTES,
+  BodyTooLargeError,
+  UploadDeadlineError,
+  boundedMultipartRequest,
+  multipartBudget,
+} from "../src/lib/http/bounded-body";
 
-/** A request whose body streams `chunks` of `size` bytes, optionally lying about its length. */
-function streamingRequest(chunks: number, size: number, declared?: number) {
-  let emitted = 0;
-  const body = new ReadableStream<Uint8Array>({
-    pull(controller) {
-      if (emitted >= chunks) { controller.close(); return; }
-      emitted += 1;
-      controller.enqueue(new Uint8Array(size));
-    },
-  });
-  const headers = new Headers();
-  if (declared !== undefined) headers.set("content-length", String(declared));
-  return new Request("https://example.test/upload", { method: "POST", body, headers, duplex: "half" } as RequestInit);
-}
-
-/** Read a bounded request to completion; returns total bytes seen or throws. */
-async function drain(request: Request) {
-  let total = 0;
-  const reader = request.body!.getReader();
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) return total;
-    total += value.byteLength;
+/** A real multipart request, as a browser or proxy would send it. */
+function multipartRequest(fields: Record<string, string | { bytes: number; name: string }>, headers: Record<string, string> = {}) {
+  const form = new FormData();
+  for (const [key, value] of Object.entries(fields)) {
+    if (typeof value === "string") form.set(key, value);
+    else form.set(key, new File([new Uint8Array(value.bytes)], value.name, { type: "application/pdf" }));
   }
+  return new Request("https://example.test/api/jobs/fill-forms", { method: "POST", body: form, headers });
 }
 
-test("a truthful oversized Content-Length is rejected without reading the body", () => {
-  const request = streamingRequest(100, 1024, 100 * 1024);
-  assert.throws(() => withBodyLimit(request, 50 * 1024), BodyTooLargeError);
+/** A multipart body of known size delivered as a stream, with no Content-Length. */
+function streamedRequest(totalBytes: number, chunk = 1024) {
+  const boundary = "----dipstream";
+  const head = `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="a.pdf"\r\nContent-Type: application/pdf\r\n\r\n`;
+  const tail = `\r\n--${boundary}--\r\n`;
+  const prefix = new TextEncoder().encode(head);
+  const suffix = new TextEncoder().encode(tail);
+  let sent = 0;
+  return new Request("https://example.test/api/fill-forms/inspect", {
+    method: "POST",
+    headers: { "content-type": `multipart/form-data; boundary=${boundary}` },
+    body: new ReadableStream({
+      pull(controller) {
+        if (sent === 0) { sent += prefix.length; controller.enqueue(prefix); return; }
+        if (sent - prefix.length < totalBytes) {
+          const remaining = totalBytes - (sent - prefix.length);
+          const size = Math.min(chunk, remaining);
+          sent += size;
+          controller.enqueue(new Uint8Array(size));
+          return;
+        }
+        controller.enqueue(suffix);
+        controller.close();
+      },
+    }),
+    duplex: "half",
+  } as RequestInit);
+}
+
+test("a valid multipart request still parses through formData()", async () => {
+  // The regression: this is the call every route makes, and it must work.
+  const bounded = boundedMultipartRequest(multipartRequest({ file: { bytes: 2048, name: "a.pdf" }, options: "{}" }), { limitBytes: 1024 * 1024 });
+  const form = await bounded.formData();
+  const file = form.get("file");
+  assert.ok(file instanceof File, "the file part must survive bounding");
+  assert.equal(file.size, 2048);
+  assert.equal(form.get("options"), "{}", "text parts must survive bounding too");
 });
 
-test("the declared length is an early exit only, never the enforcement", async () => {
-  // Declares 1 KiB, streams 100 KiB. The old implementation passed this.
-  const request = streamingRequest(100, 1024, 1024);
-  const bounded = withBodyLimit(request, 10 * 1024);
-  await assert.rejects(() => drain(bounded), BodyTooLargeError);
+test("the derived request does not carry a stale Content-Length", async () => {
+  // A declaration *within* budget is used only as an early exit and then dropped:
+  // the derived body is a different stream, so its length is not the declared one.
+  const bounded = boundedMultipartRequest(multipartRequest({ file: { bytes: 64, name: "a.pdf" } }, { "content-length": "5000" }), { limitBytes: multipartBudget(1024) });
+  assert.equal(bounded.headers.get("content-length"), null, "a stale declaration must not be forwarded");
+  assert.ok((await bounded.formData()).get("file") instanceof File);
 });
 
-test("a missing Content-Length (chunked) is still bounded", async () => {
-  // No header at all: the previous guard was skipped entirely.
-  const request = streamingRequest(100, 1024, undefined);
-  const bounded = withBodyLimit(request, 10 * 1024);
-  await assert.rejects(() => drain(bounded), BodyTooLargeError);
+test("an oversized declaration is rejected before any byte is read", () => {
+  assert.throws(
+    () => boundedMultipartRequest(multipartRequest({ file: { bytes: 64, name: "a.pdf" } }, { "content-length": "999999" }), { limitBytes: multipartBudget(1024) }),
+    BodyTooLargeError,
+  );
 });
 
-test("a body exactly at the limit is accepted", async () => {
-  const request = streamingRequest(10, 1024, 10 * 1024);
-  const bounded = withBodyLimit(request, 10 * 1024);
-  assert.equal(await drain(bounded), 10 * 1024, "a body at the ceiling must pass unchanged");
+test("an oversized body is rejected while the consumer reads actual bytes", async () => {
+  const bounded = boundedMultipartRequest(multipartRequest({ file: { bytes: 20_000, name: "a.pdf" } }), { limitBytes: 4_000 });
+  await assert.rejects(() => bounded.formData(), BodyTooLargeError);
 });
 
-test("one byte over the limit is rejected, and the over-limit chunk is never delivered", async () => {
-  const request = streamingRequest(11, 1024, undefined);
-  const bounded = withBodyLimit(request, 10 * 1024);
-  let delivered = 0;
-  const reader = bounded.body!.getReader();
-  await assert.rejects(async () => {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) return;
-      delivered += value.byteLength;
-    }
-  }, BodyTooLargeError);
-  assert.ok(delivered <= 10 * 1024, `consumers must never buffer more than the budget (got ${delivered})`);
+test("a false Content-Length cannot bypass the limit", async () => {
+  const bounded = boundedMultipartRequest(
+    multipartRequest({ file: { bytes: 20_000, name: "a.pdf" } }, { "content-length": "10" }),
+    { limitBytes: 4_000 },
+  );
+  await assert.rejects(() => bounded.formData(), BodyTooLargeError);
 });
 
-test("the multipart overhead allowance is explicit and separate from the file budget", () => {
-  assert.equal(multipartBudget(100), 100 + MULTIPART_OVERHEAD_BYTES);
-  assert.ok(MULTIPART_OVERHEAD_BYTES > 0 && MULTIPART_OVERHEAD_BYTES <= 64 * 1024);
+test("a missing Content-Length (chunked) cannot bypass the limit", async () => {
+  const bounded = boundedMultipartRequest(streamedRequest(20_000), { limitBytes: 4_000 });
+  await assert.rejects(() => bounded.formData(), BodyTooLargeError);
 });
 
-test("a request without a body passes through untouched", () => {
-  const request = new Request("https://example.test/inspect", { method: "POST" });
-  assert.equal(withBodyLimit(request, 10), request);
+test("a streamed body under the limit parses fully", async () => {
+  const bounded = boundedMultipartRequest(streamedRequest(3_000), { limitBytes: 4_000 });
+  const form = await bounded.formData();
+  assert.equal((form.get("file") as File).size, 3_000);
 });
 
-test("a caller cannot smuggle extra bytes with duplicate parts", async () => {
-  // Two parts of 8 KiB each under a 10 KiB budget: the budget is on the *body*,
-  // so the second part is what crosses the line.
-  const request = streamingRequest(2, 8 * 1024, undefined);
-  const bounded = withBodyLimit(request, 10 * 1024);
-  await assert.rejects(() => drain(bounded), BodyTooLargeError);
+test("an upload that outlives the deadline is aborted during consumption", async () => {
+  const slow = new Request("https://example.test/x", {
+    method: "POST",
+    headers: { "content-type": "multipart/form-data; boundary=b" },
+    body: new ReadableStream({
+      async pull(controller) { await new Promise((resolve) => setTimeout(resolve, 20)); controller.enqueue(new Uint8Array(256)); },
+    }),
+    duplex: "half",
+  } as RequestInit);
+  const started = Date.now();
+  await assert.rejects(() => boundedMultipartRequest(slow, { limitBytes: 10 * 1024 * 1024, deadlineMs: 120 }).formData(), UploadDeadlineError);
+  // Enforced by the stream's timer, which is the only mechanism measured to work:
+  // an AbortSignal passed to formData() did not interrupt parsing.
+  assert.ok(Date.now() - started < 3_000, "the deadline must fire promptly, not after the body finishes");
+});
+
+test("an accepted body at exactly the ceiling passes", async () => {
+  const probe = multipartRequest({ file: { bytes: 1_000, name: "a.pdf" } });
+  const measured = (await probe.arrayBuffer()).byteLength;
+  const again = multipartRequest({ file: { bytes: 1_000, name: "a.pdf" } });
+  const bounded = boundedMultipartRequest(again, { limitBytes: measured });
+  assert.ok((await bounded.formData()).get("file") instanceof File);
+});
+
+test("the multipart overhead allowance is separate and explicit", () => {
+  // The documented 64 KiB fields payload is not reduced by framing overhead.
+  assert.equal(multipartBudget(64 * 1024), 64 * 1024 + MULTIPART_OVERHEAD_BYTES);
+  assert.ok(MULTIPART_OVERHEAD_BYTES >= 8 * 1024, "framing overhead must clear realistic boundaries and filenames");
+});
+
+test("a body that is already consumed is refused rather than silently empty", async () => {
+  const consumed = multipartRequest({ file: { bytes: 32, name: "a.pdf" } });
+  await consumed.arrayBuffer();
+  // Nothing left to reuse: the derived request must not pretend to be empty and
+  // valid, or a caller would see a validation error that misdescribes the cause.
+  await assert.rejects(async () => (await boundedMultipartRequest(consumed, { limitBytes: 4096 }).formData()));
 });

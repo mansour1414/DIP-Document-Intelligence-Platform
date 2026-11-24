@@ -120,3 +120,28 @@ test("the pipeline no longer persists a raw message (synthetic-canary source che
   const api = readFileSync(new URL("../src/app/api/jobs/[tool]/route.ts", import.meta.url), "utf8");
   assert.equal(/message: error\.message/u.test(api.split("\n").filter((line) => line.includes("Response.json")).join("\n")), false);
 });
+
+test("every code the processing paths actually raise is preserved, not collapsed", () => {
+  // A closed vocabulary is only useful if it does not blind support. These are
+  // collected from the modules that feed the pipeline; if one is missing from the
+  // allowlist it would silently become PROCESSING_FAILED and the specific condition
+  // would be lost from the job row.
+  const operational = [
+    "APPEARANCE_LIMIT_EXCEEDED", "EMBEDDED_IMAGE_FORMAT_UNSUPPORTED", "FONT_UNAVAILABLE",
+    "FORM_FILL_FAILED", "FORM_PAYLOAD_EXPIRED", "FORM_PAYLOAD_INVALID", "FORM_PAYLOAD_UNAVAILABLE",
+    "IMAGE_DIMENSION_LIMIT_EXCEEDED", "NO_SUPPORTED_EMBEDDED_IMAGES", "OUTPUT_LIMIT_EXCEEDED",
+    "PAGE_DIMENSION_LIMIT_EXCEEDED", "PDF_RENDER_FAILED", "SECRET_HANDOFF_UNAVAILABLE",
+    "SECRET_INPUT_INVALID", "SECRET_REFERENCE_EXPIRED", "SECRET_REFERENCE_INVALID",
+    "UNLOCK_RATE_LIMITED", "VALIDATION_ERROR", "WORKER_TIMEOUT", "INPUT_FILE_COUNT_INVALID",
+    "TOTAL_SIZE_LIMIT_EXCEEDED", "PDF_INVALID", "MIME_NOT_ALLOWED", "MAGIC_BYTES_INVALID",
+  ];
+  const lost = operational.filter((code) => !isPublicErrorCode(code));
+  assert.deepEqual(lost, [], `these established codes would be collapsed to PROCESSING_FAILED: ${lost.join(", ")}`);
+});
+
+test("the allowlist still rejects anything message-like", () => {
+  // Widening the vocabulary must not have widened it to free text.
+  for (const junk of ["Cannot read properties of undefined", "ENOENT: /var/task/x", "error: boom", "a b c"]) {
+    assert.equal(isPublicErrorCode(junk), false, junk);
+  }
+});

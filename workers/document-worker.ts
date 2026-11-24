@@ -13,7 +13,7 @@ import { withTenant, withTenantScope } from "@/lib/db/tenant";
 import { isAuthorizedFileStorageAccess } from "@/lib/storage/metadata";
 import { isUnrecoverableAiQueueError, toAiQueueError } from "@/lib/ai/gateway/retry";
 import { isUnrecoverableQueueError, toDocumentQueueError } from "@/lib/jobs/queue-errors";
-import { classifyAttemptOutcome, retryTransitionTarget } from "@/lib/jobs/payload-lifecycle";
+import { classifyFailedEvent, retryTransitionTarget } from "@/lib/jobs/payload-lifecycle";
 import { purgeFormFields } from "@/lib/pdf/form-payload";
 import { processDocumentJob } from "@/lib/jobs/document-pipeline";
 
@@ -56,7 +56,10 @@ documentWorker.on("failed", async (message, error) => {
   if (!message) return;
   // Unrecoverable errors are terminal on the first attempt: without this the job
   // would be parked in RETRYING with no retry ever scheduled.
-  const outcome = classifyAttemptOutcome({
+  // BullMQ has already incremented `attemptsMade` by the time this event fires
+  // (`job.js:510` increments inside `moveToFailed`, `worker.js:651` emits after),
+  // so this is the post-increment frame — not the processor-entry one.
+  const outcome = classifyFailedEvent({
     attemptsMade: message.attemptsMade,
     maxAttempts: message.opts.attempts ?? 1,
     unrecoverable: isUnrecoverableQueueError(error),

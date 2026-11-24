@@ -175,6 +175,44 @@ async function statuses(client: pg.Client, ids: string[]): Promise<Record<string
   return Object.fromEntries(result.rows.map((row) => [row.id, row.status]));
 }
 
+/**
+ * P6 — the retention role must be able to run `UPDATE ... RETURNING params`
+ * without any new grant.
+ *
+ * The purge now reads `params` from the *returning* clause of the expiry write, so
+ * the scheduler needs `SELECT (params)` and `UPDATE (status, error_code,
+ * completed_at, updated_at)` on `jobs`. The least-privilege migration already grants
+ * exactly `GRANT SELECT ON ... jobs` and `GRANT UPDATE (status, error_code,
+ * completed_at, updated_at) ON jobs`, so no widening is required. This test asserts
+ * the *effective* privileges inside the real database rather than trusting the
+ * migration text: a role that lost `SELECT` would fail here, and a RETURNING clause
+ * that silently needed a column beyond the grant would be caught by the same
+ * statement the scheduler issues.
+ */
+void integration("the retention role can select params and run UPDATE ... RETURNING without new grants", async () => {
+  await withSchema(async (client) => {
+    const id = randomUUID();
+    const stale = new Date(Date.now() - 48 * HOUR);
+    await client.query(
+      `INSERT INTO ${TABLE} (id, status, params, updated_at) VALUES ($1, 'QUEUED', $2::jsonb, $3)`,
+      [id, JSON.stringify({ fieldsRef: "ref-probe" }), stale],
+    );
+    // The exact statement shape the scheduler now issues. If `params` were not
+    // readable by this role, or the column grants did not cover the SET list, this
+    // throws instead of returning rows.
+    const returned = await client.query(
+      `UPDATE ${TABLE}
+          SET status = $1::${SCHEMA}.expiry_race_status, error_code = $2, completed_at = $3
+        WHERE id = $4 AND updated_at <= $5
+      RETURNING id, params`,
+      ["EXPIRED", "JOB_EXPIRED", new Date(), id, stale],
+    );
+    assert.equal(returned.rowCount, 1, "the guarded write must transition exactly one row");
+    const params = returned.rows[0].params as { fieldsRef?: string };
+    assert.equal(params.fieldsRef, "ref-probe", "the returning clause must expose params without extra privileges");
+  });
+});
+
 void integration("a job claimed during the sweep is not expired, while an abandoned one is", async () => {
   await withSchema(async (client) => {
     const claimed = randomUUID();

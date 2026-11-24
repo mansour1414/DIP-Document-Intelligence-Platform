@@ -1,5 +1,5 @@
 import { randomUUID } from "crypto";
-import { BodyTooLargeError, multipartBudget, withBodyLimit } from "@/lib/http/bounded-body";
+import { BodyTooLargeError, UploadDeadlineError, boundedMultipartRequest, multipartBudget } from "@/lib/http/bounded-body";
 import { requireUser } from "@/lib/auth/user";
 import { createToolJob } from "@/lib/jobs/orchestrator";
 import { FormFillError, assertNoDuplicateJsonKeys, fieldsPayloadBytes } from "@/lib/pdf/form-validation";
@@ -8,19 +8,34 @@ import { UploadValidationError } from "@/lib/uploads/validation";
 import { ToolOptionsValidationError } from "@/lib/tools/options";
 import { phase1SecretsFromForm } from "@/lib/secrets/phase1";
 
+/**
+ * Wall-clock ceiling for the client to finish sending the multipart body.
+ *
+ * Enforced inside the bounded stream: an abort signal was measured not to
+ * interrupt `formData()` parsing.
+ */
+const UPLOAD_DEADLINE_MS = 120_000;
+
 export const runtime = "nodejs";
 export async function POST(request: Request, { params }: { params: Promise<{ tool: string }> }) {
   const { tool } = await params;
   if (!workerToolIds.has(tool)) return Response.json({ code: "TOOL_NOT_WORKER_ENABLED", message: "This tool has not moved to the worker pipeline yet." }, { status: 409 });
   try {
     const user = await requireUser();
-    // FF-04: the same stream-level bound as the inspect route. This path had no
-    // byte check at all before `formData()`, so the full multipart body was
-    // buffered whatever its size; a chunked or misdeclared body is now cut off by
-    // the counting stream rather than by a header that may be absent or false.
+    // FF-04: the same bounded-consumption path as the inspect route. This endpoint
+    // previously called `formData()` with no byte check at all, so the whole
+    // multipart body was buffered whatever its size. The limit is enforced against
+    // actual bytes as the parser pulls them, so a missing (chunked), false or
+    // absent `Content-Length` cannot raise it.
     const toolLimit = getToolDefinition(tool).limits.maxBytes;
-    const bounded = withBodyLimit(request, multipartBudget(toolLimit));
+    const bounded = boundedMultipartRequest(request, { limitBytes: multipartBudget(toolLimit), deadlineMs: UPLOAD_DEADLINE_MS });
     const form = await bounded.formData(); const files = form.getAll("files").filter((value): value is File => value instanceof File);
+    // Exactly one part per scalar field: `form.get()` silently takes the first of
+    // several, which would make a repeated `fields`/`options`/`secrets` part
+    // first-wins. `files` is the only multi-valued field allowed.
+    for (const field of ["options", "fields", "secrets"]) {
+      if (form.getAll(field).length > 1) return Response.json({ code: "VALIDATION_ERROR", message: `${field} must be sent at most once.` }, { status: 400 });
+    }
     const rawOptions = form.get("options"); let options: Record<string, string | number | boolean> = {};
     if (typeof rawOptions === "string" && rawOptions) { const parsed = JSON.parse(rawOptions) as unknown; if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("INVALID_OPTIONS"); options = parsed as Record<string, string | number | boolean>; }
     // `fields` is a typed per-field payload (see tools/options.ts). It is parsed
@@ -57,6 +72,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ too
     // 413, not 400/422: the body itself was refused, and the message says nothing
     // about the contents.
     if (error instanceof BodyTooLargeError) return Response.json({ code: "SIZE_LIMIT_EXCEEDED", message: "The upload exceeds the size limit." }, { status: 413 });
+    if (error instanceof UploadDeadlineError) return Response.json({ code: "UPLOAD_TIMEOUT", message: "The upload did not complete in time." }, { status: 408 });
     const coded = typeof error === "object" && error && "code" in error ? String(error.code) : undefined;
     const formError = coded === "FIELDS_INPUT_INVALID" || coded === "FORM_VALUE_INVALID" || coded === "FORM_UNSUPPORTED" || coded === "FORM_NOT_FOUND" || coded === "FORM_RESTRICTED";
     const message = formError && error instanceof Error ? error.message : auth ? "Sign in to process documents." : upload || options ? error.message : "Unable to queue tool job.";

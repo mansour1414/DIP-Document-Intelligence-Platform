@@ -186,16 +186,35 @@ test("admission and release are each a single atomic call", async () => {
   assert.deepEqual(fake.calls, ["admit", "release"], "no separate INCR/EXPIRE pairs, no read-then-write");
 });
 
-test("a Redis outage fails open and is recorded, never blocking inspection", async () => {
+test("a Redis outage fails closed, never admitting ungoverned work", async () => {
   const leaseModule = await import("../src/lib/http/inspection-lease");
-  // Both the connection failing and the script failing must behave identically:
-  // admission succeeds, the returned release is a no-op, and the failure is metric'd.
-  leaseModule.setLeaseConnectionForTest(async () => { throw new Error("ECONNREFUSED"); });
-  const lease = await leaseModule.acquireInspectionLease("tenant-k", leaseModule.admissionLimits({ perMinute: 1, perTenant: 1, global: 1, leaseSeconds: 60 }));
-  await lease.release();
+  const limits = leaseModule.admissionLimits({ perMinute: 1, perTenant: 1, global: 1, leaseSeconds: 60 });
 
+  // Connection failure: no lease can exist, so no work may be admitted. The
+  // endpoint spawns processes over attacker-supplied bytes, so an ungoverned
+  // window is exactly when both ceilings would stop applying.
+  leaseModule.setLeaseConnectionForTest(async () => { throw new Error("ECONNREFUSED"); });
+  await assert.rejects(() => leaseModule.acquireInspectionLease("tenant-k", limits), (error: unknown) => {
+    assert.ok(error instanceof leaseModule.AdmissionUnavailableError);
+    assert.equal(error.reason, "REDIS_UNAVAILABLE");
+    return true;
+  });
+
+  // A broken script is not a licence to skip admission either.
   leaseModule.setLeaseConnectionForTest(async () => ({ eval: async () => { throw new Error("NOSCRIPT"); } }));
-  const second = await leaseModule.acquireInspectionLease("tenant-k", leaseModule.admissionLimits({ perMinute: 1, perTenant: 1, global: 1, leaseSeconds: 60 }));
-  await second.release();
+  await assert.rejects(() => leaseModule.acquireInspectionLease("tenant-k", limits), (error: unknown) => {
+    assert.ok(error instanceof leaseModule.AdmissionUnavailableError);
+    assert.equal(error.reason, "SCRIPT_FAILED");
+    return true;
+  });
   leaseModule.setLeaseConnectionForTest(undefined);
+});
+
+test("the lease outlives the upload deadline plus screening and parsing", async () => {
+  const leaseModule = await import("../src/lib/http/inspection-lease");
+  const limits = leaseModule.admissionLimits();
+  // Upload deadline is 120 s in the routes and the bounded parse is 20 s; a lease
+  // shorter than their sum could expire under live work, admitting a second
+  // request while the first is still running.
+  assert.ok(limits.leaseSeconds * 1_000 > 120_000 + 20_000, `lease ${limits.leaseSeconds}s must cover upload + parse`);
 });

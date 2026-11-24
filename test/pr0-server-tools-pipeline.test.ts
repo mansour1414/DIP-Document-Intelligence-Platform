@@ -170,13 +170,19 @@ test("PR-0 (structure): five tools, MIME accepts, and OCR language options are p
   assert.match(read("test/merge-pdf.runtime.test.ts"), /Object\.keys\(toolRegistry\)\.length, toolsConfig\.length/);
 });
 
-test("PR-0 (structure): job ingress order is validateUpload -> requireCleanUpload -> storage.put -> enqueue", () => {
+test("PR-0 (structure): job ingress order is shape check -> requireCleanUpload -> validateUpload -> storage.put -> enqueue", () => {
   const orchestrator = read("src/lib/jobs/orchestrator.ts");
-  const validateIdx = orchestrator.indexOf("validateUpload(");
+  // Round 3: `validateUpload` parses the PDF with pdf-lib to count pages, so it must
+  // not run before the malware gate. Parser-free shape checks come first, then
+  // screening, then the parse, then storage and the queue.
+  const shapeIdx = orchestrator.indexOf("assertCheapPdfShape(");
   const scanIdx = orchestrator.indexOf("requireCleanUpload(");
+  const validateIdx = orchestrator.indexOf("validateUpload(");
   const storeIdx = orchestrator.indexOf("storage.put(");
   const enqueueIdx = orchestrator.indexOf("enqueueJob(");
-  assert.ok(validateIdx >= 0 && scanIdx > validateIdx && storeIdx > scanIdx && enqueueIdx > storeIdx);
+  assert.ok(shapeIdx >= 0 && scanIdx > shapeIdx, "cheap shape checks must precede screening");
+  assert.ok(validateIdx > scanIdx, "the page-counting parse must not precede screening");
+  assert.ok(storeIdx > validateIdx && enqueueIdx > storeIdx);
   const jobsRoute = read("src/app/api/jobs/[tool]/route.ts");
   assert.match(jobsRoute, /createToolJob/);
   assert.match(jobsRoute, /workerToolIds\.has\(tool\)/);

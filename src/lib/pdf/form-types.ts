@@ -97,3 +97,24 @@ export const FORM_VALUE_CHAR_LIMIT = 4_000;
 export const FORM_OPTION_LIMIT = 200;
 export const FORM_FIELD_NAME_LIMIT = 200;
 export const FORM_FIELDS_JSON_LIMIT = 64 * 1024;
+
+/**
+ * The codes a child process is allowed to report, as a runtime-checkable set.
+ *
+ * A child is untrusted input: its reply is bytes over a pipe. Persisting or
+ * forwarding `result.code` without checking it would let a crashed, buggy or
+ * compromised child inject an arbitrary string into a user-visible field. This set
+ * is the schema.
+ */
+export const FORM_FILL_ERROR_CODES: ReadonlySet<string> = new Set<FormFillErrorCode>([
+  "FORM_NOT_FOUND",
+  "FORM_UNSUPPORTED",
+  "FORM_RESTRICTED",
+  "FORM_VALUE_INVALID",
+  "FORM_FILL_FAILED",
+  "FORM_OUTPUT_UNVERIFIED",
+]);
+
+export function isFormFillErrorCode(value: unknown): value is FormFillErrorCode {
+  return typeof value === "string" && FORM_FILL_ERROR_CODES.has(value);
+}

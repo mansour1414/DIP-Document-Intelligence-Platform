@@ -3,6 +3,15 @@ import { withSentryConfig } from "@sentry/nextjs";
 
 const nextConfig: NextConfig = {
   output: "standalone",
+  // The bounded PDF child is executed, not imported, so the bundler cannot see it
+  // and would not include it in a standalone image. This is the declaration that
+  // makes the entry a first-class build input. `form-worker.ts` resolves it through
+  // `FORM_WORKER_ENTRY` or one of the searched roots; see the deployment check in
+  // `docs/stage2-fill-forms.md`.
+  outputFileTracingIncludes: {
+    "/api/fill-forms/inspect": ["./src/lib/pdf/form-worker-child.ts"],
+    "/api/jobs/[tool]": ["./src/lib/pdf/form-worker-child.ts"],
+  },
   images: {
     remotePatterns: [],
   },

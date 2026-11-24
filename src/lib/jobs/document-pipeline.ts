@@ -17,6 +17,8 @@ import { validateToolOptions } from "@/lib/tools/options";
 import { deletePhase1Secret, takePhase1Secret, type Phase1SecretPurpose } from "@/lib/secrets/phase1";
 import { purgeFormFields, readFormFields } from "@/lib/pdf/form-payload";
 import { jobErrorRecord, publicErrorCode } from "@/lib/jobs/error-boundary";
+import { classifyAtProcessorEntry } from "@/lib/jobs/payload-lifecycle";
+import { isUnrecoverableQueueError } from "@/lib/jobs/queue-errors";
 import { APPROVED_QPDF_VERSION, runQpdfTool } from "@/lib/pdf/qpdf";
 import { FORM_ENGINE, FORM_ENGINE_VERSION, fillFormPdf } from "@/lib/pdf/form-fill";
 import { parseFieldsPayload } from "@/lib/pdf/form-schema";
@@ -55,15 +57,6 @@ export type DocumentPipelineDeps = {
    */
   attemptsMade?: number;
   maxAttempts?: number;
-  /**
-   * The worker's own verdict on whether the queue will retry this attempt.
-   *
-   * Only the worker can compute this correctly — it has the thrown error and
-   * `attemptsMade`/`opts.attempts` at the same time, which is exactly what BullMQ
-   * uses to decide. When supplied it replaces the attempts arithmetic entirely;
-   * the arithmetic remains the fallback for direct callers (tests).
-   */
-  classifyTerminal?: (error: unknown) => boolean;
 };
 
 /** Job states in which no attempt may (re)enter the pipeline. */
@@ -110,6 +103,36 @@ const TERMINAL_JOB_STATES = ["SUCCEEDED", "FAILED", "CANCELLED", "EXPIRED"] as c
  * `test/pr1-output-screening.structure.test.ts`), and the guard also means a row
  * that is still live — and may still need its values — is left alone.
  */
+/**
+ * The JSON shape `Job.params` accepts.
+ *
+ * Declared structurally rather than as `Prisma.InputJsonValue` so this module does
+ * not need the generated `Prisma` namespace just to describe its own payload — the
+ * namespace import is unavailable whenever the client is not generated, and the
+ * resulting error would be indistinguishable from a real one. The runtime check
+ * above is what actually guarantees the value is JSON.
+ */
+type JobParamsJson = { [key: string]: string | number | boolean | null | JobParamsJson | Array<string | number | boolean | null | JobParamsJson> };
+
+/**
+ * Convert a plain object to that JSON shape.
+ *
+ * `Record<string, unknown>` is not assignable to `InputJsonValue` because `unknown`
+ * admits `undefined`, functions and symbols — values JSON cannot represent. The
+ * conversion is a round trip through `JSON`, which is what the column will do
+ * anyway, and it is *checked* rather than asserted: the result is re-validated as
+ * JSON before it is handed to Prisma. This is the contract change the CI failure
+ * (`TS2322` at this line) was reporting; casting it away would have hidden a value
+ * that Prisma would reject at runtime.
+ */
+function toJsonInput(value: Record<string, unknown>): JobParamsJson {
+  const serialised = JSON.stringify(value);
+  if (serialised === undefined) throw new Error("JSON_SERIALISATION_FAILED");
+  const parsed: unknown = JSON.parse(serialised);
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("JSON_SERIALISATION_FAILED");
+  return parsed as JobParamsJson;
+}
+
 async function scrubLegacyFields(
   tenant: <T>(operation: Parameters<typeof withTenant<T>>[1]) => Promise<T>,
   jobId: string,
@@ -119,7 +142,7 @@ async function scrubLegacyFields(
   void _discarded;
   await tenant((tx) => tx.job.updateMany({
     where: { id: jobId, status: { in: [...TERMINAL_JOB_STATES] } },
-    data: { params: rest },
+    data: { params: toJsonInput(rest) },
   })).catch(() => undefined);
 }
 
@@ -138,7 +161,20 @@ export async function processDocumentJob(message: QueuedJob, deps: DocumentPipel
   // readable for exactly one reason — an already-queued job must not fail on
   // deploy — and are scrubbed from the row on their next terminal transition.
   const legacyFields = rawParams.fields;
-  if (job.status === "SUCCEEDED" || job.outputFileId) { logger.info("job.idempotent_skip", context); return; }
+  if (job.status === "SUCCEEDED" || job.outputFileId) {
+    // Duplicate delivery of a job whose output is already committed.
+    //
+    // The commit already happened, so there is nothing to write — but the payload
+    // purge that follows a commit is *not* guaranteed to have run. The attempt that
+    // committed may have crashed between the commit and the purge, and a queue
+    // redelivery is the last moment anyone will look at this job. Cleanup is
+    // therefore retried here rather than skipped; it is idempotent, so a redelivery
+    // after a successful purge is a no-op.
+    await purgeFormFields((job as { params?: { fieldsRef?: string } | null }).params?.fieldsRef)
+      .catch(() => logger.warn("fill_forms.payload_purge_failed", { ...context, reason: "IDEMPOTENT_REDELIVERY" }));
+    logger.info("job.idempotent_skip", context);
+    return;
+  }
   if (job.status === "CANCELLED" || job.status === "EXPIRED") { await Promise.all([deletePhase1Secret(rawParams.secretRef).catch(() => undefined), purgeFormFields(rawParams.fieldsRef).catch(() => undefined)]); return; }
   const step = job.steps.find((item) => item.name === job.toolId);
   try {
@@ -253,16 +289,21 @@ export async function processDocumentJob(message: QueuedJob, deps: DocumentPipel
     // every terminal state is guarded, not just SUCCEEDED.
     const failed = await tenant((tx) => tx.job.updateMany({ where: { id: job.id, outputFileId: null, status: { notIn: [...CLOSED_JOB_STATES] } }, data: { status: "FAILED", errorCode, error: jobErrorRecord(error), completedAt: new Date() } }));
     // FF-03: a retry still needs the values, so the payload is only removed when
-    // no further attempt can run. `message.attemptsMade` counts the attempts
-    // BullMQ has already started before this one; `maxAttempts` is what the job
-    // was enqueued with (1 when a secret is bound, 3 otherwise).
-    const attemptsUsed = (deps.attemptsMade ?? 0) + 1;
-    // FF-03 / architect round 2: the worker's classification wins when present.
-    // Attempt arithmetic alone missed the `UnrecoverableError` case (attempt 1 of
-    // 3 is terminal, but `1 >= 3` is false), leaving a payload that no attempt
-    // would ever use again.
-    const lastAttempt = deps.classifyTerminal ? deps.classifyTerminal(error) : attemptsUsed >= (deps.maxAttempts ?? 1);
-    if (lastAttempt) await purgeFormFields(rawParams.fieldsRef).catch(() => logger.warn("fill_forms.payload_purge_failed", { ...context, reason: "FINAL_FAILURE" }));
+    // no further attempt can run.
+    //
+    // This runs on the **processor** side, where `attemptsMade` has not yet been
+    // incremented for the current attempt (BullMQ increments inside
+    // `moveToFailed`, after the handler throws). The classification therefore uses
+    // the processor-entry frame. A previously declared `classifyTerminal` hook was
+    // never passed by the worker and has been removed rather than left as dead
+    // wiring: the worker classifies its own `failed` event separately, with the
+    // post-increment counter, in `classifyFailedEvent`.
+    const outcome = classifyAtProcessorEntry({
+      attemptsMade: deps.attemptsMade ?? 0,
+      maxAttempts: deps.maxAttempts ?? 1,
+      unrecoverable: isUnrecoverableQueueError(error instanceof Error ? error : undefined),
+    });
+    if (outcome.terminal) await purgeFormFields(rawParams.fieldsRef).catch(() => logger.warn("fill_forms.payload_purge_failed", { ...context, reason: "FINAL_FAILURE" }));
     if (failed.count === 0) {
       // Either another attempt committed, the job was cancelled/expired mid-run, or
       // the row is gone (retention). All mean "do not write"; the log says which.

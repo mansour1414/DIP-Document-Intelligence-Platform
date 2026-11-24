@@ -3,10 +3,10 @@ import { runtimeLimits } from "@/lib/runtime/config";
 import { getToolDefinition } from "@/lib/tools/registry";
 import { requireCleanUpload } from "@/lib/malware";
 import { assertCheapPdfShape } from "@/lib/pdf/form-inspection";
-import { InspectionBusyError, acquireInspectionLease, type InspectionLease } from "@/lib/http/inspection-lease";
+import { AdmissionUnavailableError, InspectionBusyError, acquireInspectionLease, type InspectionLease } from "@/lib/http/inspection-lease";
 import { FormWorkerError, formWorkerLimits, processPdfBounded } from "@/lib/pdf/form-worker";
 import { FormFillError } from "@/lib/pdf/form-validation";
-import { BodyTooLargeError, multipartBudget, withBodyLimit } from "@/lib/http/bounded-body";
+import { BodyTooLargeError, UploadDeadlineError, boundedMultipartRequest, multipartBudget } from "@/lib/http/bounded-body";
 import { logger } from "@/lib/logging";
 import { recordMetric } from "@/lib/observability/metrics";
 
@@ -24,18 +24,16 @@ import { recordMetric } from "@/lib/observability/metrics";
  * re-reads the inventory and validates every submitted value against it, so a
  * tampered descriptor list cannot influence the output.
  */
+/**
+ * Wall-clock ceiling for the client to finish sending the multipart body.
+ *
+ * Enforced inside the bounded stream, not by `AbortSignal`: an abort signal was
+ * measured not to interrupt `formData()` parsing.
+ */
+const UPLOAD_DEADLINE_MS = 120_000;
+
 export const runtime = "nodejs";
 export const maxDuration = 60;
-
-/**
- * Multipart framing overhead allowed on top of the PDF itself.
- *
- * A `multipart/form-data` body is bigger than the file it carries: the boundary
- * lines, the part headers and the terminating delimiter. 8 KiB covers any
- * realistic filename and boundary without letting the overhead itself become a
- * bypass of the byte limit.
- */
-const MULTIPART_OVERHEAD_BYTES = 8 * 1024;
 
 /**
  * Read the declared length before touching the body (FF-04).
@@ -61,19 +59,20 @@ export async function POST(request: Request) {
     const tool = getToolDefinition("fill-forms");
     const limitBytes = tool.limits.maxBytes;
     const declared = declaredLength(request);
-    if (declared !== undefined && declared > limitBytes + MULTIPART_OVERHEAD_BYTES) {
+    if (declared !== undefined && declared > multipartBudget(limitBytes)) {
       // Rejected before `formData()`: the body is never buffered.
       return Response.json({ code: "SIZE_LIMIT_EXCEEDED", message: "The PDF exceeds the size limit." }, { status: 422 });
     }
-    // FF-04 / architect round 2: the declaration above is only an early exit. The
-    // body is re-wrapped in a counting stream, so a missing (chunked), false or
-    // absent `Content-Length` cannot get past the same budget: the read is aborted
-    // the moment the count crosses it, before the bytes are buffered.
-    const bounded = withBodyLimit(request, multipartBudget(limitBytes));
-    // Admission before the body is read, so a caller cannot queue unbounded work
-    // ahead of the limits. Atomic and uniquely owned (one Lua evaluation), with
-    // expiry as crash recovery and both a per-tenant and a global ceiling.
+    // Admission *first*, before a single body byte is read: a caller must not be
+    // able to occupy upload bandwidth or a parser slot it was never granted. The
+    // lease is atomic and uniquely owned (one Lua evaluation), with expiry as crash
+    // recovery and both per-tenant and global ceilings. If admission cannot be
+    // established the lease call throws and the body is never consumed.
     admission = await acquireInspectionLease(user.id);
+    // Then re-issue the request with a body that cannot exceed the budget. The
+    // declaration above is only an early exit; this stream enforces the limit
+    // against actual bytes, so chunked or falsely-declared bodies are bounded too.
+    const bounded = boundedMultipartRequest(request, { limitBytes: multipartBudget(limitBytes), deadlineMs: UPLOAD_DEADLINE_MS });
     const form = await bounded.formData();
     const file = form.get("file");
     if (!(file instanceof File)) return Response.json({ code: "VALIDATION_ERROR", message: "One PDF file is required." }, { status: 400 });
@@ -109,10 +108,17 @@ export async function POST(request: Request) {
     }
     // Admission is a legitimate refusal, not a document problem: 429 with the
     // specific reason so a client can back off intelligently.
+    // Admission could not be established: refuse rather than run ungoverned. The
+    // body was never read, so nothing was consumed and the caller can retry.
+    if (error instanceof AdmissionUnavailableError) {
+      logger.warn("fill_forms.admission_unavailable_response", { reason: error.reason });
+      return Response.json({ code: "PROCESSING_UNAVAILABLE", message: "The document could not be processed right now. Try again shortly." }, { status: 503 });
+    }
     if (error instanceof InspectionBusyError) {
       return Response.json({ code: "RATE_LIMITED", message: error.reason === "RATE_LIMITED" ? "Too many inspections. Try again shortly." : "Too many inspections are running. Try again shortly." }, { status: 429 });
     }
     if (error instanceof BodyTooLargeError) return Response.json({ code: "SIZE_LIMIT_EXCEEDED", message: "The PDF exceeds the size limit." }, { status: 413 });
+    if (error instanceof UploadDeadlineError) return Response.json({ code: "UPLOAD_TIMEOUT", message: "The upload did not complete in time." }, { status: 408 });
     const known = error instanceof FormFillError;
     const coded = typeof error === "object" && error && "code" in error ? String(error.code) : undefined;
     if (!known) logger.warn("fill_forms.inspect_failed", { error_code: coded ?? "INSPECTION_FAILED" });
