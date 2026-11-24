@@ -62,9 +62,13 @@ COPY --chown=dipworker:dipworker scripts/verify-qpdf-security-runtime.mjs ./scri
 # startup rather than failing per-request in production.
 COPY --chown=dipworker:dipworker scripts/node-platform-compat.mjs ./scripts/node-platform-compat.mjs
 
-RUN test -f scripts/node-platform-compat.mjs \
- && test -f src/lib/pdf/form-worker-child.ts \
- && test -f src/lib/pdf/worker-protocol.ts \
+# Packaging verification, at build time, against the image's own files.
+# The child is launched with `tsx` and `--import ./scripts/node-platform-compat.mjs`;
+# neither is visible to a bundler, so nothing except this check would notice their
+# absence until the first Fill Forms job failed in production.
+COPY --chown=dipworker:dipworker scripts/verify-pdf-worker-artifact.mjs ./scripts/verify-pdf-worker-artifact.mjs
+
+RUN node scripts/verify-pdf-worker-artifact.mjs /app \
  && python3 scripts/verify-ocr-runtime.py \
  && soffice --version \
  && qpdf --version \

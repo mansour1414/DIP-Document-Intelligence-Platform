@@ -6,7 +6,7 @@ import { processServerDocument, type ServerToolId } from "@/lib/document-process
 import { logger } from "@/lib/logging";
 import { runtimeLimits, timeoutFor } from "@/lib/runtime/config";
 import { withTimeout } from "@/lib/runtime/timeout";
-import { validateBoundedFillOutput, validateWorkerOutputs } from "@/lib/outputs/validation";
+import { OutputValidationError, validateBoundedFillOutput, validateWorkerOutputs } from "@/lib/outputs/validation";
 import { OutputCommitSupersededError, discardStoredObjects, screenAndStoreWorkerOutputs } from "@/lib/outputs/screening";
 import { recordMetric } from "@/lib/observability/metrics";
 import { configuredCostRates, estimateJobCost } from "@/lib/cost/model";
@@ -208,6 +208,9 @@ export async function processDocumentJob(message: QueuedJob, deps: DocumentPipel
     const qpdfTools = new Set(["protect-pdf", "unlock-pdf", "pdf-permissions", "repair-pdf"]);
     const documentTools = new Set(["word-to-pdf", "pdf-to-word", "excel-to-pdf", "powerpoint-to-pdf", "ocr-pdf"]);
     let outputs: Array<{ name: string; mimeType: string; bytes: Uint8Array }>;
+    // Set only by the Fill Forms branch, which is the only path whose output has been
+    // verified by the bounded child rather than by the generic validator.
+    let boundedFill: { outputCount: number; totalBytes: number; pages: number } | undefined;
     if (pdfTools.has(job.toolId)) { const pdfTool = job.toolId as PdfWorkerTool; outputs = await withTimeout(job.toolId, timeoutFor("pdf"), runPdfWorkerTool(pdfTool, bytes, options)); ({ engine, engineVersion } = pdfWorkerEngine(pdfTool)); }
     else if (job.toolId === "fill-forms") {
       // `fields` is a dedicated job parameter, validated here with the same
@@ -222,8 +225,13 @@ export async function processDocumentJob(message: QueuedJob, deps: DocumentPipel
       // Previously the engine ran on this thread behind a Promise timeout, which
       // cannot interrupt a synchronous parse: it bounded the *wait*, never the work.
       // The output is now re-verified here without parsing.
-      const filled = await fillPdfBounded(bytes[0], fields, { flatten: options.flatten === true }, formWorkerLimits({ timeoutMs: runtimeLimits.formWorkerTimeoutMs, maxHeapMb: runtimeLimits.formWorkerMaxHeapMb, concurrency: runtimeLimits.formWorkerConcurrency, maxInputBytes: runtimeLimits.maxInputBytes, maxOutputBytes: runtimeLimits.maxOutputBytes }));
-      await validateBoundedFillOutput(filled, { inputPages: files[0]?.pageCount ?? undefined, maxOutputBytes: runtimeLimits.maxOutputBytes, maxOutputFiles: runtimeLimits.maxOutputFiles });
+      const requestedFlatten = options.flatten === true;
+      const filled = await fillPdfBounded(bytes[0], fields, { flatten: requestedFlatten }, formWorkerLimits({ timeoutMs: runtimeLimits.formWorkerTimeoutMs, maxHeapMb: runtimeLimits.formWorkerMaxHeapMb, concurrency: runtimeLimits.formWorkerConcurrency, maxInputBytes: runtimeLimits.maxInputBytes, maxOutputBytes: runtimeLimits.maxOutputBytes }));
+      // `inputPages` is required. The page count came from the row written at
+      // submission time, after isolated inspection accepted it; if it is missing the
+      // job is not verifiable and must fail rather than skip the comparison.
+      if (!Number.isSafeInteger(files[0]?.pageCount) || (files[0]?.pageCount ?? 0) <= 0) throw new OutputValidationError("The input page count is not available for output verification.");
+      boundedFill = await validateBoundedFillOutput(filled, { inputPages: files[0].pageCount as number, requestedFlatten, maxOutputBytes: runtimeLimits.maxOutputBytes, maxOutputFiles: runtimeLimits.maxOutputFiles });
       outputs = [{ name: `${job.toolId}.pdf`, mimeType: "application/pdf", bytes: filled.bytes }];
       engine = FORM_ENGINE; engineVersion = FORM_ENGINE_VERSION;
       logger.info("fill_forms.succeeded", { ...context, engine, engine_version: engineVersion, filled_fields: filled.report.filled, untouched_fields: filled.report.untouched, raster_appearances: filled.report.rasterAppearances, flatten: filled.report.flatten, status: "succeeded" });
@@ -231,8 +239,35 @@ export async function processDocumentJob(message: QueuedJob, deps: DocumentPipel
     else if (qpdfTools.has(job.toolId)) { const secret = params.secretRef ? await takePhase1Secret({ reference: params.secretRef, tenantId: message.userId, jobId: job.id, purpose: job.toolId as Phase1SecretPurpose }) : undefined; outputs = [await withTimeout(job.toolId, timeoutFor("pdf"), runQpdfTool(job.toolId as "protect-pdf" | "unlock-pdf" | "pdf-permissions" | "repair-pdf", bytes[0], options, secret))]; engine = "qpdf"; engineVersion = APPROVED_QPDF_VERSION; }
     else if (documentTools.has(job.toolId)) { const input = inputById.get(ids[0])!; const result = await processServerDocument(job.toolId as ServerToolId, new File([bytes[0] as BlobPart], input.originalName, { type: input.mimeType }), typeof options.language === "string" ? options.language : "ara+eng"); outputs = [{ name: result.filename, mimeType: result.contentType, bytes: result.bytes }]; engine = job.toolId === "ocr-pdf" ? "ocrmypdf" : "libreoffice"; engineVersion = "host"; }
     else throw Object.assign(new Error("Tool is not enabled on this worker"), { code: "TOOL_NOT_WORKER_ENABLED" });
-    const preservePages = ["compress-pdf", "rotate-pdf", "watermark-pdf", "crop-pdf", "page-numbers", "header-footer", "fill-forms", "resize-pages", "flip-pages", "remove-annotations", "ocr-pdf"].includes(job.toolId) ? files[0]?.pageCount ?? undefined : undefined;
-    const validated = await validateWorkerOutputs(outputs, preservePages, { encryptedPdfAlreadyValidated: job.toolId === "protect-pdf" || job.toolId === "pdf-permissions" });
+    // B31-02: Fill Forms does **not** go through `validateWorkerOutputs`.
+    //
+    // Its output was already verified by `validateBoundedFillOutput` above, which
+    // checks the same properties the generic validator would (count, bytes, magic,
+    // MIME, framing, page preservation) without a parse. Calling the generic
+    // validator afterwards re-parsed the filled PDF in this process with
+    // `PDFDocument.load()`, so the isolation the child provides was undone one line
+    // after it was established.
+    //
+    // The two paths are separate statements rather than a flag on one function. A
+    // `skipPdfValidation: true` option would be reachable by every caller and would
+    // eventually be set by one of them; a distinct branch cannot be taken by a tool
+    // whose output did not come from the bounded child.
+    let validated: { outputCount: number; totalBytes: number };
+    if (job.toolId === "fill-forms") {
+      // Page preservation was already enforced against the *input* page count, and
+      // the result is the only output. Re-deriving the numbers here would be a
+      // second, weaker opinion about the same bytes.
+      // Taken from the verification result, not recomputed here: `verified.pages` is
+      // the page count the child derived from the document it wrote, which is the only
+      // count in this process that is not just the input's own number echoed back.
+      if (!boundedFill) throw new OutputValidationError("The bounded fill output was not verified.");
+      validated = { outputCount: boundedFill.outputCount, totalBytes: boundedFill.totalBytes };
+      // `count` is the existing unit vocabulary; the metric name says what is counted.
+      recordMetric("fill_forms_verified_pages", boundedFill.pages, "count", { tool_id: job.toolId });
+    } else {
+      const preservePages = ["compress-pdf", "rotate-pdf", "watermark-pdf", "crop-pdf", "page-numbers", "header-footer", "resize-pages", "flip-pages", "remove-annotations", "ocr-pdf"].includes(job.toolId) ? files[0]?.pageCount ?? undefined : undefined;
+      validated = await validateWorkerOutputs(outputs, preservePages, { encryptedPdfAlreadyValidated: job.toolId === "protect-pdf" || job.toolId === "pdf-permissions" });
+    }
     recordMetric("storage_bytes_out", validated.totalBytes, "bytes", { tool_id: job.toolId, engine, engine_version: engineVersion, status: "succeeded" });
     if (job.toolId === "compress-pdf") recordMetric("compression_ratio", validated.totalBytes / bytes[0].byteLength, "ratio", { tool_id: job.toolId, engine, engine_version: engineVersion });
     // PR-1: every output is scanned first, then the batch is stored. A rejection

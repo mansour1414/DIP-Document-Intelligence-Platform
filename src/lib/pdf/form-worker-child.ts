@@ -36,7 +36,7 @@ import { PDFDocument } from "pdf-lib";
 import { readFormInventory } from "@/lib/pdf/form-schema";
 import { FormFillError } from "@/lib/pdf/form-validation";
 import { fillFormPdf } from "@/lib/pdf/form-fill";
-import { FORM_ERROR_MESSAGES, isFormFillErrorCode } from "@/lib/pdf/form-types";
+import { FORM_ERROR_MESSAGES, FORM_VALUE_ISSUES, isFormFillErrorCode } from "@/lib/pdf/form-types";
 import {
   assertCheapPdfShape,
   assertFillableRestrictions,
@@ -45,6 +45,7 @@ import {
   type Restrictions,
 } from "@/lib/pdf/form-inspection";
 import {
+  WORKER_LIMITS,
   decodeControl,
   encodeResult,
   WorkerProtocolError,
@@ -132,33 +133,95 @@ async function fill(bytes: Uint8Array, control: Extract<WorkerControl, { op: "fi
   return { meta, output: filled.bytes };
 }
 
-/** Everything the parent is allowed to learn about a failure. */
+/**
+ * Everything the parent is allowed to learn about a failure.
+ *
+ * The keys here are the parent's allowlist, deliberately: the parent rebuilds
+ * `details` field by field, so emitting a key it does not know (`boundary`, in the
+ * previous version) meant the diagnostic silently vanished in transit. Writing the
+ * sanitized shape on both sides — rather than "child says anything, parent filters"
+ * — keeps the contract visible in one place instead of only at the receiver.
+ */
 function failureMeta(control: WorkerControl | undefined, error: unknown): FailureMeta {
   const op = control?.op ?? "inspect";
-  if (error instanceof WorkerProtocolError) return { ok: false, op, code: "FORM_UNSUPPORTED", details: { boundary: error.reason } };
+  if (error instanceof WorkerProtocolError) return { ok: false, op, code: "FORM_UNSUPPORTED", details: { reason: error.reason } };
   if (error instanceof FormFillError && isFormFillErrorCode(error.code)) {
-    return { ok: false, op, code: error.code, ...(error.details ? { details: error.details } : {}) };
+    const issues = allowlistedIssues(error.details);
+    return { ok: false, op, code: error.code, ...(issues.length ? { details: { issues } } : {}) };
   }
   // An unexpected throw is not forwarded: its message could quote document bytes.
-  return { ok: false, op, code: "FORM_UNSUPPORTED", details: { boundary: "UNEXPECTED" } };
+  return { ok: false, op, code: "FORM_UNSUPPORTED", details: { reason: "UNEXPECTED" } };
 }
 
+/** Project `FormFillError.details` onto the allowlisted `issues` codes. */
+function allowlistedIssues(details: unknown): string[] {
+  if (!details || typeof details !== "object") return [];
+  const candidates = (details as { issues?: unknown; issue?: unknown }).issues ?? (details as { issue?: unknown }).issue;
+  const list = Array.isArray(candidates) ? candidates : [candidates];
+  return list.filter((entry): entry is string => typeof entry === "string" && (FORM_VALUE_ISSUES as readonly string[]).includes(entry));
+}
+
+/**
+ * Write the whole frame to fd 3, or fail.
+ *
+ * `writeSync` returns the number of bytes written and is explicitly permitted to
+ * write fewer than the whole buffer — on a pipe that happens when the frame is
+ * larger than the pipe buffer and the reader has not drained it yet. The previous
+ * version called it once and ignored the return value, so a large filled PDF (or a
+ * large inventory) produced a *truncated* frame that the parent correctly rejected
+ * as `TRUNCATED`. The bug and the parent's rejection were both real; only the child
+ * needed fixing.
+ *
+ * EPIPE (the parent died or timed out) propagates: a partial frame written into a
+ * closed pipe is a failed run, and the caller turns that into a non-zero exit rather
+ * than a half-success.
+ */
+function writeAll(frame: Buffer): void {
+  let offset = 0;
+  while (offset < frame.byteLength) {
+    offset += writeSync(3, frame, offset, frame.byteLength - offset);
+  }
+}
+
+/**
+ * Accumulate stdin, but stop at the declared ceiling.
+ *
+ * The child previously pushed every chunk it received, so the *parent's* limit was
+ * the only thing standing between a hostile or buggy writer and an unbounded heap in
+ * the child. The pipe is the channel the parent controls least, so the bound belongs
+ * on both ends. Exceeding it is a protocol error, reported as data like any other.
+ */
 const chunks: Buffer[] = [];
-process.stdin.on("data", (chunk: Buffer) => chunks.push(chunk));
+let received = 0;
+let overLimit = false;
+/** Control header + JSON + PDF, with the framing overhead accounted separately. */
+const MAX_RECEIVED_BYTES = MAX_INPUT_BYTES + WORKER_LIMITS.controlBytes + 8;
+process.stdin.on("data", (chunk: Buffer) => {
+  if (overLimit) return;
+  received += chunk.byteLength;
+  if (received > MAX_RECEIVED_BYTES) {
+    // Discard what was buffered: keeping it would defeat the bound it just violated.
+    overLimit = true;
+    chunks.length = 0;
+    return;
+  }
+  chunks.push(chunk);
+});
 process.stdin.on("end", () => {
   void (async () => {
     let control: WorkerControl | undefined;
     try {
+      if (overLimit) throw new WorkerProtocolError("The input exceeds the transport limit.", "PDF_TOO_LARGE");
       const { control: parsed, pdf } = decodeControl(Buffer.concat(chunks), MAX_INPUT_BYTES);
       control = parsed;
       const result = parsed.op === "inspect"
         ? { meta: await inspect(pdf), output: undefined }
         : await fill(pdf, parsed);
-      writeSync(3, encodeResult(result.meta, result.output));
+      writeAll(encodeResult(result.meta, result.output));
       process.exitCode = 0;
     } catch (error) {
       const meta = failureMeta(control, error);
-      try { writeSync(3, encodeResult(meta)); }
+      try { writeAll(encodeResult(meta)); }
       catch { process.exitCode = 1; return; }
       // A refused document is data, not a crash: exit 0 so the parent distinguishes
       // "child refused" from "child died".

@@ -1,7 +1,7 @@
 import { randomUUID } from "crypto";
 import { enqueueAiJob, enqueueJob } from "@/lib/queue";
 import { getStorage } from "@/lib/storage";
-import { controlledPreflightToolIds, getToolDefinition } from "@/lib/tools/registry";
+import { getToolDefinition } from "@/lib/tools/registry";
 import { validateInspectedPdf, validateUploadBytes, validateUploadWithParse } from "@/lib/uploads/validation";
 import { logger } from "@/lib/logging";
 import { enforceJobCreation } from "@/lib/usage/enforcement";
@@ -88,26 +88,37 @@ export async function createToolJob(input: { userId: string; toolId: string; upl
   // handed to a parser. Cheap, parser-free checks and the malware gate now run
   // first; only a clean, plausibly-shaped file reaches `validateUpload`.
   const screened = await Promise.all(input.uploads.map(async (upload) => {
-    // Parser-free shape checks apply only to documents declared as PDF; other
-    // accepted formats go straight to screening.
+    // Order inside this map is: generic cheap checks → tool-specific shape → scan.
     //
-    // The check is a *substitute* for the generic parse that follows, not an extra
-    // gate in front of it, so it must be scoped exactly as broadly as that parse is.
-    // `validateUpload` deliberately does not parse for the controlled-preflight tools
-    // (Repair PDF and Unlock PDF), because a document they are meant to accept — a
-    // damaged or undecryptable one — would fail a shape check for precisely the
-    // reason the tool exists. Applying `assertCheapPdfShape` to them anyway leaked a
-    // Fill Forms verdict into unrelated tools: a truncated PDF handed to Repair PDF
-    // was refused with `FORM_UNSUPPORTED` instead of being repaired. The predicate is
-    // therefore the same one `validateUpload` uses, imported rather than restated.
-    const looksPdf = upload.mimeType === "application/pdf" || upload.filename.toLowerCase().endsWith(".pdf");
-    if (looksPdf && !controlledPreflightToolIds.has(tool.toolId)) assertCheapPdfShape(upload.bytes);
-    // Stage 1 (parser-free) precedes screening: it allocates nothing proportional
-    // to the document, so a bad MIME, signature or size is refused before the
-    // scanner is asked to look at the bytes.
-    validateUploadBytes({ toolId: tool.toolId, declaredMime: upload.mimeType, bytes: upload.bytes });
+    // 1. **Stage 1 first** (size, declared MIME, magic bytes). It is the cheapest
+    //    check, it allocates nothing proportional to the document, and it is the one
+    //    shared by every tool. Running it before anything tool-specific means an
+    //    upload that is not a PDF at all — or that exceeds the size limit — is
+    //    refused without ever reaching PDF logic.
+    const receipt = validateUploadBytes({ toolId: tool.toolId, declaredMime: upload.mimeType, bytes: upload.bytes });
+
+    // 2. **Fill Forms shape gate, scoped to Fill Forms.**
+    //
+    //    `assertCheapPdfShape` is not a generic PDF safeguard: it throws Fill
+    //    Forms' own `FORM_*` codes, and its page-marker scan decodes the *whole*
+    //    document to latin1 to count `/Type /Page` occurrences. Applying it to
+    //    unrelated tools on the previous predicate
+    //    (`looksPdf && !controlledPreflightToolIds`) meant an ordinary tool's
+    //    document was whole-file decoded on the request path and, worse, that a
+    //    user uploading to, say, Compress could receive `FORM_UNSUPPORTED` — an
+    //    error code from a tool they never invoked. The filename test made it worse
+    //    still: a valid upload was refused because its name merely ended in `.pdf`.
+    //
+    //    Ordinary tools keep the generic safeguards (stage 1 here, then the
+    //    established page-counting parse), which is what the project actually
+    //    contracts for. The gate now runs exactly where its error codes and its cost
+    //    are meaningful.
+    if (tool.toolId === "fill-forms" && receipt.mimeType === "application/pdf") assertCheapPdfShape(upload.bytes);
+
+    // 3. Malware screening precedes every complex parse, including isolated
+    //    inspection below.
     const malwareScan = await requireCleanUpload(upload.bytes);
-    return { upload, malwareScan };
+    return { upload, malwareScan, receipt };
   }));
   // B31-01: Fill Forms must not parse in this process. Its structural verdict and
   // page count come from the bounded child, and the child must run *before*
@@ -116,13 +127,17 @@ export async function createToolJob(input: { userId: string; toolId: string; upl
   // precedes it, so no document reaches the inspector unscanned. This runs once per
   // job for a single-file tool, so the document is inspected exactly once.
   const inspectionPages = tool.toolId === "fill-forms" ? await assertFillableInput(screened[0].upload.bytes) : undefined;
-  const prepared = await Promise.all(screened.map(async ({ upload, malwareScan }) => {
-    // Stage 1 already ran inside the screening map (parser-free). Stage 2 consumes
-    // the isolated result for Fill Forms; every other tool keeps its established
-    // path, including the residual in-process parse for ordinary PDF tools.
-    const bytes = validateUploadBytes({ toolId: tool.toolId, declaredMime: upload.mimeType, bytes: upload.bytes });
+  const prepared = await Promise.all(screened.map(async ({ upload, malwareScan, receipt }) => {
+    // Stage 1 already ran in the screening map and produced `receipt`; it is reused
+    // here rather than recomputed. Re-running it hashed the same bytes a second time
+    // and, more importantly, made "which validation does this request depend on?"
+    // ambiguous — the receipt the request was *screened* against and the one carried
+    // into storage were two different objects.
     const validation = tool.toolId === "fill-forms"
-      ? validateInspectedPdf({ toolId: tool.toolId, bytes: upload.bytes, bytes_: bytes, inspectedPages: inspectionPages as number })
+      ? validateInspectedPdf({ toolId: tool.toolId, bytes: upload.bytes, bytes_: receipt, inspectedPages: inspectionPages as number })
+      // The parse stage re-runs stage 1 internally, which is what keeps it a single
+      // self-contained call for every ordinary tool. It receives the same inputs the
+      // receipt was derived from, so the result is identical by construction.
       : await validateUploadWithParse({ toolId: tool.toolId, declaredMime: upload.mimeType, bytes: upload.bytes });
     return { upload, malwareScan, validation };
   }));

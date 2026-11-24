@@ -113,16 +113,25 @@ test("malware screening is not part of this boundary and cannot be skipped by it
   const source = readFileSync(new URL("../src/lib/jobs/orchestrator.ts", import.meta.url), "utf8");
   const body = source.slice(source.indexOf("const screened = await Promise.all"), source.indexOf("const prepared = screened"));
   assert.match(body, /requireCleanUpload\(upload\.bytes\)/u, "screening must run for every upload");
-  // The gate exemption is the only tool-specific branch in the pre-screening step.
-  // The gate call must be conditioned on the controlled-preflight set. Asserted by
-  // finding the guarding statement rather than matching an exact string, so
-  // reformatting the condition cannot produce a false red.
+
+  // R6.1: the gate is scoped to Fill Forms, whose `FORM_*` codes and whole-document
+  // page-marker scan it actually belongs to. This test previously required the guard
+  // to be `!controlledPreflightToolIds.has(...)`, which was the *defect*: it sent every
+  // other ordinary tool through Fill Forms' structural gate. Asserting the new scope
+  // without also asserting that stage 1 runs first would let the ordering regress, so
+  // both are checked here.
   const callIndex = body.indexOf("assertCheapPdfShape(");
   assert.ok(callIndex > 0, "the shape gate must still be present");
   const statementStart = Math.max(body.lastIndexOf(";", callIndex), body.lastIndexOf("\n", callIndex));
   const guard = body.slice(statementStart, callIndex);
-  assert.match(guard, /controlledPreflightToolIds\.has\(/u, `the shape gate must be scoped to the non-controlled tools, saw: ${guard.trim()}`);
-  assert.match(guard, /!/u, "the guard must exempt the controlled tools, not require them");
-  // A clean, parseable document must still reach the parser for ordinary tools.
-  assert.match(body, /validateUploadBytes\(/u);
+  assert.match(guard, /tool\.toolId === "fill-forms"/u, `the shape gate must be scoped to Fill Forms, saw: ${guard.trim()}`);
+  assert.doesNotMatch(guard, /controlledPreflightToolIds/u, "the gate must not be scoped by the controlled-preflight set: that was the leak");
+
+  // Generic, parser-free validation must run *before* the tool-specific gate, so an
+  // upload that is the wrong size or the wrong format never reaches PDF logic.
+  const bytesIndex = body.indexOf("validateUploadBytes(");
+  assert.ok(bytesIndex > 0, "the parser-free stage must be present");
+  assert.ok(bytesIndex < callIndex, "parser-free size/MIME/magic checks must precede the tool-specific shape gate");
+  // And the gate must sit strictly before screening.
+  assert.ok(callIndex < body.indexOf("requireCleanUpload("), "the shape gate must still precede screening");
 });

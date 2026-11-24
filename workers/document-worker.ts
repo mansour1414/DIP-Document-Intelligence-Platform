@@ -15,7 +15,20 @@ import { isUnrecoverableAiQueueError, toAiQueueError } from "@/lib/ai/gateway/re
 import { isUnrecoverableQueueError, toDocumentQueueError } from "@/lib/jobs/queue-errors";
 import { classifyFailedEvent, retryTransitionTarget } from "@/lib/jobs/payload-lifecycle";
 import { purgeFormFields } from "@/lib/pdf/form-payload";
+import { verifyFormWorkerStartup } from "@/lib/pdf/form-worker";
 import { processDocumentJob } from "@/lib/jobs/document-pipeline";
+
+/**
+ * Verify the bounded PDF child at **startup**, not on the first Fill Forms job.
+ *
+ * This worker cannot do Fill Forms without the child, so a deployment that is missing
+ * any part of its launch inputs is misbuilt. Checking here turns that into one
+ * attributable boot-time signal instead of a per-request `WORKER_CRASHED` that looks
+ * like a document-specific failure. The message is sanitized by the verifier and names
+ * the missing input, never a document.
+ */
+const formWorkerReadiness = verifyFormWorkerStartup();
+if (!formWorkerReadiness.ok) logger.error("pdf_worker.unavailable", { reason: formWorkerReadiness.reason, status: "degraded" });
 
 export const documentWorker = new Worker<QueuedJob>(JOB_QUEUE_NAME, async (message) => {
   recordMetric("queue_wait_ms", Math.max(0, Date.now() - message.timestamp), "ms", { tool_id: message.data.toolId, queue: "document" });

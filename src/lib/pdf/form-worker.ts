@@ -52,6 +52,7 @@ import { FormFillError } from "@/lib/pdf/form-validation";
 import { FORM_ERROR_MESSAGES, isFormFillErrorCode, type FormInventory } from "@/lib/pdf/form-types";
 import {
   WORKER_LIMITS,
+  setExpectedOp,
   WORKER_PROTOCOL_VERSION,
   decodeResult,
   encodeControl,
@@ -185,17 +186,52 @@ function childLaunch(): { args: string[]; env: NodeJS.ProcessEnv } {
  * a message that names the missing file.
  */
 const childLaunchChecked = (() => {
-  let checked = false;
+  let verified = false;
   return () => {
-    if (checked) return;
-    checked = true;
-    const { path, isTypeScript } = childEntry();
-    if (!existsSync(path)) throw new Error(`PDF worker child entry is missing: ${path}`);
+    // The flag is set only *after* a successful check. The previous version set it
+    // first, so the first call that detected a missing file threw once and then every
+    // later call believed the launch inputs were fine — a false negative that outlived
+    // the condition it was meant to report.
+    if (verified) return;
+    const { path, isTypeScript } = childEntryChecked();
+    if (!existsSync(path)) throw new FormWorkerError("WORKER_CRASHED", "The document processor entry is missing from this deployment.");
     if (isTypeScript && !existsSync("./scripts/node-platform-compat.mjs")) {
-      throw new Error("PDF worker child preload is missing: ./scripts/node-platform-compat.mjs (not packaged in this deployment)");
+      throw new FormWorkerError("WORKER_CRASHED", "The document processor preload is missing from this deployment.");
     }
+    verified = true;
   };
 })();
+
+/** `childEntry()` with launch-input validation, used by the startup boundary. */
+function childEntryChecked(): { path: string; isTypeScript: boolean } {
+  const entry = childEntry();
+  if (!existsSync(entry.path)) throw new FormWorkerError("WORKER_CRASHED", "The document processor entry is missing from this deployment.");
+  return entry;
+}
+
+/**
+ * Verify at process start that this deployment can run the child at all.
+ *
+ * The check previously ran lazily, inside `runBounded()` — that is, on the first job
+ * rather than at startup. A misbuilt image therefore accepted traffic, reported the
+ * problem as a per-request `WORKER_CRASHED`, and gave no single signal that the whole
+ * capability was absent. Callers that own a process lifecycle (the worker entrypoint)
+ * call this once at boot so the failure is immediate and attributable.
+ *
+ * Returns a result instead of throwing so a caller can decide whether a missing child
+ * is fatal for *its* process: the worker cannot do Fill Forms without it, while an app
+ * server that merely offers the route can still serve everything else.
+ */
+export function verifyFormWorkerStartup(): { ok: true } | { ok: false; reason: string } {
+  try {
+    childLaunchChecked();
+    return { ok: true };
+  } catch (error) {
+    // A sanitized reason: this string may be logged, and the paths it would otherwise
+    // contain describe the deployment's layout.
+    return { ok: false, reason: error instanceof FormWorkerError ? error.message : "The document processor could not be verified." };
+  }
+}
 
 type Slot = { child: ChildProcess; busy: boolean };
 
@@ -275,6 +311,8 @@ async function runBounded(control: WorkerControl, pdf: Uint8Array, limits: Worke
   // library output on stdout.
   const slot: Slot = { child: spawn(process.execPath, [`--max-old-space-size=${limits.maxHeapMb}`, ...args], { shell: false, env, stdio: ["pipe", "pipe", "pipe", "pipe"] }), busy: true };
   pool.push(slot);
+  // The reply is matched against the request at the one place it is decoded.
+  setExpectedOp(control.op);
 
   return await new Promise<Frame>((resolve, reject) => {
     const child = slot.child;
@@ -289,6 +327,7 @@ async function runBounded(control: WorkerControl, pdf: Uint8Array, limits: Worke
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      setExpectedOp(null);
       // Always reap: a killed-but-referenced child would otherwise keep its slot.
       if (!child.killed) child.kill("SIGKILL");
       retire(slot);
@@ -343,6 +382,23 @@ async function runBounded(control: WorkerControl, pdf: Uint8Array, limits: Worke
       finish(undefined, parsed);
     });
 
+    // D6: stdout is diagnostics, and it must be *consumed* even though it is never
+    // authoritative. An unread pipe fills (64 KiB on Linux) and the child then blocks
+    // in `write()`, so a chatty engine turned into a timeout that looked like a slow
+    // document. The bytes are counted and discarded: nothing from stdout is parsed,
+    // logged or forwarded, so no diagnostic text can reach a log sink.
+    let stdoutBytes = 0;
+    child.stdout?.on("data", (chunk: Buffer) => {
+      stdoutBytes = Math.min(stdoutBytes + chunk.byteLength, Number.MAX_SAFE_INTEGER);
+      if (stdoutBytes > WORKER_LIMITS.stdoutCeilingBytes) {
+        // Excessively noisy is a fault in its own right, not something to absorb.
+        child.kill("SIGKILL");
+        finish(new FormWorkerError("WORKER_PROTOCOL_ERROR", "The document processor produced unexpected diagnostic output."));
+      }
+    });
+    child.stdout?.on("error", () => undefined);
+    child.stderr?.on("error", () => undefined);
+
     // Feed the request. `end()` is required: the child parses on EOF.
     child.stdin?.on("error", () => undefined); // EPIPE when the child dies early
     child.stdin?.end(frame);
@@ -372,6 +428,8 @@ export type BoundedFillResult = {
   bytes: Uint8Array;
   pages: number;
   checksum: string;
+  /** The child's claim about flattening, carried through for the parent to check. */
+  flatten: boolean;
   report: { filled: number; untouched: number; rasterAppearances: number; flatten: boolean };
 };
 
@@ -392,15 +450,27 @@ export async function fillPdfBounded(bytes: Uint8Array, fields: Record<string, s
   }
   if (frame.meta.op !== "fill") throw new FormWorkerError("WORKER_PROTOCOL_ERROR", "The document processor answered a different operation.");
   if (!frame.output || frame.output.byteLength === 0) throw new FormWorkerError("WORKER_PROTOCOL_ERROR", "The document processor returned no output.");
-  return { bytes: frame.output, pages: frame.meta.pages, checksum: frame.meta.checksum, report: frame.meta.report };
+  return { bytes: frame.output, pages: frame.meta.pages, checksum: frame.meta.checksum, flatten: frame.meta.report.flatten, report: frame.meta.report };
 }
 
 /** Kill every pooled child. Intended for tests and graceful shutdown. */
+/**
+ * Stop accepting work and wait for the children to actually exit.
+ *
+ * The previous version emptied the pool immediately after sending SIGKILL. That made
+ * `activeFormWorkers()` report zero while every killed child was still resident, so
+ * the number the concurrency bound is built on was wrong at exactly the moment
+ * (shutdown, redeploy) when overshoot is most likely. Slots are removed by the same
+ * `retire()` path used everywhere else — on real `exit` — and this awaits that.
+ */
 export async function shutdownFormWorkers() {
   shuttingDown = true;
   const slots = [...pool];
-  pool.length = 0;
   for (const slot of slots) if (!slot.child.killed) slot.child.kill("SIGKILL");
+  await Promise.all(slots.map((slot) => new Promise<void>((resolve) => {
+    if (slot.child.exitCode !== null || slot.child.signalCode !== null) { resolve(); return; }
+    slot.child.once("exit", () => resolve());
+  })));
 }
 
 /** Allow a later call after a shutdown (tests only). */

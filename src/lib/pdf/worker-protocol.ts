@@ -41,7 +41,11 @@
  * metadata. A matching checksum proves integrity in transit, not honesty.
  */
 
-import { FORM_FIELD_LIMIT, FORM_VALUE_LIMIT, type FormFieldDescriptor, type FormFieldKind, type FormInventory } from "@/lib/pdf/form-types";
+import {
+  FORM_FIELD_LIMIT, FORM_FIELD_NAME_LIMIT, FORM_OPTION_LIMIT, FORM_VALUE_CHAR_LIMIT,
+  FORM_VALUE_ISSUES, isFormFillErrorCode,
+  type FormFieldDescriptor, type FormFieldKind, type FormFillErrorCode, type FormInventory,
+} from "@/lib/pdf/form-types";
 
 /**
  * The closed set of field kinds, named from the type so the two cannot drift.
@@ -77,6 +81,15 @@ export const WORKER_LIMITS = {
   metaBytes: 4 * 1024 * 1024,
   /** Largest diagnostic tail kept from stderr. */
   stderrTailBytes: 4_000,
+  /**
+   * Largest stdout volume tolerated before the child is treated as faulty.
+   *
+   * stdout is drained but never read as a result, so this is not a result limit: it
+   * is the point past which "the engine is talking a lot" becomes "this is not the
+   * run we asked for". 1 MiB is far above any legitimate diagnostic volume and far
+   * below what a runaway loop can emit.
+   */
+  stdoutCeilingBytes: 1024 * 1024,
 } as const;
 
 /** The two operations this boundary serves. */
@@ -100,8 +113,19 @@ export type FillMeta = {
   report: { filled: number; untouched: number; rasterAppearances: number; flatten: boolean };
 };
 
-/** Metadata accompanying a refusal. Details are allowlisted, never free-form. */
-export type FailureMeta = { ok: false; op: WorkerOp; code: string; details?: unknown };
+/**
+ * A refusal's details, rebuilt from an allowlist.
+ *
+ * Every value here is a code, a count or a bound — never a field name, a submitted
+ * value, arbitrary child text or a nested object. The child's own `details` object
+ * is *not* forwarded: it is rebuilt key by key, so a compromised or buggy child
+ * cannot smuggle document content into a user-visible or logged field by inventing
+ * a key the parent happens to spread.
+ */
+export type SanitizedDetails = { issues?: string[]; shape?: string; reason?: string; limit?: number; pageMarkers?: number };
+
+/** Metadata accompanying a refusal. `code` comes from the existing error allowlist. */
+export type FailureMeta = { ok: false; op: WorkerOp; code: FormFillErrorCode; details?: SanitizedDetails };
 
 export type WorkerMeta = InspectMeta | FillMeta | FailureMeta;
 
@@ -163,10 +187,7 @@ export function decodeControl(buffer: Buffer, maxPdfBytes: number): { control: W
   const controlLength = readLength(buffer, 0, WORKER_LIMITS.controlBytes, "control");
   const end = 4 + controlLength;
   if (end > buffer.byteLength) throw new WorkerProtocolError("The control block is truncated.", "TRUNCATED");
-  let parsed: unknown;
-  try { parsed = JSON.parse(buffer.subarray(4, end).toString("utf8")); }
-  catch { throw new WorkerProtocolError("The control block is not valid JSON.", "INVALID_JSON"); }
-  const control = parseControl(parsed);
+  const control = parseControl(decodeJson(buffer.subarray(4, end), "control block"));
   const pdf = new Uint8Array(buffer.subarray(end));
   if (pdf.byteLength > maxPdfBytes) throw new WorkerProtocolError("The document exceeds the transport limit.", "PDF_TOO_LARGE");
   if (control.op !== "inspect" && pdf.byteLength === 0) throw new WorkerProtocolError("The document is empty.", "PDF_EMPTY");
@@ -183,11 +204,18 @@ export function decodeResult(buffer: Buffer, maxOutputBytes: number): Frame {
   const metaLength = readLength(buffer, 0, WORKER_LIMITS.metaBytes, "result metadata");
   const metaEnd = 4 + metaLength;
   if (metaEnd > buffer.byteLength) throw new WorkerProtocolError("The result metadata is truncated.", "TRUNCATED");
-  let parsed: unknown;
-  try { parsed = JSON.parse(buffer.subarray(4, metaEnd).toString("utf8")); }
-  catch { throw new WorkerProtocolError("The result metadata is not valid JSON.", "INVALID_JSON"); }
-  const meta = parseMeta(parsed);
-  if (meta.ok !== true) return { meta };
+  const meta = parseMeta(decodeJson(buffer.subarray(4, metaEnd), "result metadata"));
+
+  // A refusal carries no output bytes at all. Exact consumption applies here too:
+  // previously a failure frame returned before the trailing check, so a child could
+  // append an arbitrary payload — including, in principle, document bytes — to a
+  // refusal and the parent would never look at it. "We do not read it" is not the
+  // same as "it is not there".
+  if (meta.ok === false) {
+    if (metaEnd !== buffer.byteLength) throw new WorkerProtocolError("Unexpected trailing data after a failure frame.", "TRAILING_DATA");
+    return { meta };
+  }
+
   // A success frame from a *fill* must carry exactly its declared output.
   if (meta.op === "fill") {
     const outLength = readLength(buffer, metaEnd, maxOutputBytes, "output");
@@ -265,22 +293,28 @@ function parseInventory(value: unknown, pages: number): FormInventory {
     const where = `field ${index}`;
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new WorkerProtocolError(`The inventory ${where} is not an object.`, "INVALID_INVENTORY");
     const field = entry as Record<string, unknown>;
-    if (typeof field.name !== "string" || !field.name || field.name.length > FORM_VALUE_LIMIT) throw new WorkerProtocolError(`The inventory ${where} has an invalid name.`, "INVALID_INVENTORY");
+    if (typeof field.name !== "string" || !field.name || field.name.length > FORM_FIELD_NAME_LIMIT) throw new WorkerProtocolError(`The inventory ${where} has an invalid name.`, "INVALID_INVENTORY");
     if (!FORM_FIELD_KINDS.includes(field.kind as FormFieldKind)) throw new WorkerProtocolError(`The inventory ${where} has an unknown kind.`, "INVALID_INVENTORY");
     if (typeof field.page !== "number" || !Number.isSafeInteger(field.page) || field.page < 1 || field.page > pages) throw new WorkerProtocolError(`The inventory ${where} names a page outside the document.`, "INVALID_INVENTORY");
     for (const flag of ["required", "readOnly"] as const) if (typeof field[flag] !== "boolean") throw new WorkerProtocolError(`The inventory ${where} has an invalid ${flag} flag.`, "INVALID_INVENTORY");
-    for (const optional of ["maxLength"] as const) if (field[optional] !== undefined && (typeof field[optional] !== "number" || !Number.isSafeInteger(field[optional]))) throw new WorkerProtocolError(`The inventory ${where} has an invalid ${optional}.`, "INVALID_INVENTORY");
+    // `maxLength` is a character bound the document itself declares, so it is checked
+    // against FORM_VALUE_CHAR_LIMIT rather than the value-count limit.
+    if (field.maxLength !== undefined && (typeof field.maxLength !== "number" || !Number.isSafeInteger(field.maxLength) || field.maxLength < 0 || field.maxLength > FORM_VALUE_CHAR_LIMIT)) throw new WorkerProtocolError(`The inventory ${where} has an invalid maxLength.`, "INVALID_INVENTORY");
     if (field.multiline !== undefined && typeof field.multiline !== "boolean") throw new WorkerProtocolError(`The inventory ${where} has an invalid multiline flag.`, "INVALID_INVENTORY");
     if (field.options !== undefined) {
-      if (!Array.isArray(field.options) || field.options.length > FORM_FIELD_LIMIT || field.options.some((option: unknown) => typeof option !== "string" || option.length > FORM_VALUE_LIMIT)) throw new WorkerProtocolError(`The inventory ${where} has invalid options.`, "INVALID_INVENTORY");
+      if (!Array.isArray(field.options) || field.options.length > FORM_OPTION_LIMIT || field.options.some((option: unknown) => typeof option !== "string" || option.length > FORM_VALUE_CHAR_LIMIT)) throw new WorkerProtocolError(`The inventory ${where} has invalid options.`, "INVALID_INVENTORY");
     }
     const kind = field.kind as FormFieldKind;
     const fieldValue = field.value;
+    const shortString = (item: unknown) => typeof item === "string" && item.length <= FORM_VALUE_CHAR_LIMIT;
+    // An `optionlist` holds a *count* of selections (FORM_OPTION_LIMIT) whose entries
+    // are strings (FORM_VALUE_CHAR_LIMIT). Collapsing those two bounds into one number
+    // is what made a 400-entry list look legal against a 200-count limit.
     const valueOk = kind === "checkbox"
       ? typeof fieldValue === "boolean" || fieldValue === null
       : kind === "optionlist"
-        ? Array.isArray(fieldValue) ? fieldValue.every((item: unknown) => typeof item === "string") : typeof fieldValue === "string" || fieldValue === null
-        : typeof fieldValue === "string" || fieldValue === null;
+        ? Array.isArray(fieldValue) ? fieldValue.length <= FORM_OPTION_LIMIT && fieldValue.every(shortString) : fieldValue === null || shortString(fieldValue)
+        : fieldValue === null || shortString(fieldValue);
     if (!valueOk) throw new WorkerProtocolError(`The inventory ${where} has a value that does not match its kind.`, "INVALID_INVENTORY");
     return {
       name: field.name, kind, page: field.page, required: field.required as boolean, readOnly: field.readOnly as boolean,
@@ -295,15 +329,90 @@ function parseInventory(value: unknown, pages: number): FormInventory {
   const unsupported = inventory.unsupported.map((entry: unknown, index: number) => {
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new WorkerProtocolError(`Unsupported entry ${index} is not an object.`, "INVALID_INVENTORY");
     const item = entry as Record<string, unknown>;
-    if (typeof item.name !== "string" || !item.name || item.name.length > FORM_VALUE_LIMIT) throw new WorkerProtocolError(`Unsupported entry ${index} has an invalid name.`, "INVALID_INVENTORY");
-    if (typeof item.reason !== "string" || !item.reason || item.reason.length > FORM_VALUE_LIMIT) throw new WorkerProtocolError(`Unsupported entry ${index} has an invalid reason.`, "INVALID_INVENTORY");
+    if (typeof item.name !== "string" || !item.name || item.name.length > FORM_FIELD_NAME_LIMIT) throw new WorkerProtocolError(`Unsupported entry ${index} has an invalid name.`, "INVALID_INVENTORY");
+    if (typeof item.reason !== "string" || !item.reason || item.reason.length > FORM_VALUE_CHAR_LIMIT) throw new WorkerProtocolError(`Unsupported entry ${index} has an invalid reason.`, "INVALID_INVENTORY");
     return { name: item.name, reason: item.reason };
   });
   for (const flag of ["hasXfa", "needAppearances"] as const) if (typeof inventory[flag] !== "boolean") throw new WorkerProtocolError(`The inventory has an invalid ${flag} flag.`, "INVALID_META");
   if (inventory.pages !== pages) throw new WorkerProtocolError("The inventory page count disagrees with the result.", "INVALID_INVENTORY");
   if (!Array.isArray(inventory.duplicates)) throw new WorkerProtocolError("The inventory carries no duplicate list.", "INVALID_META");
-  if (inventory.duplicates.length > FORM_FIELD_LIMIT || inventory.duplicates.some((name: unknown) => typeof name !== "string" || !name || name.length > FORM_VALUE_LIMIT)) throw new WorkerProtocolError("The inventory has invalid duplicates.", "INVALID_INVENTORY");
+  if (inventory.duplicates.length > FORM_FIELD_LIMIT || inventory.duplicates.some((name: unknown) => typeof name !== "string" || !name || name.length > FORM_FIELD_NAME_LIMIT)) throw new WorkerProtocolError("The inventory has invalid duplicates.", "INVALID_INVENTORY");
   return { fields, unsupported, pages, hasXfa: inventory.hasXfa as boolean, needAppearances: inventory.needAppearances as boolean, duplicates: inventory.duplicates as string[] };
+}
+
+/**
+ * Which operation the parent actually asked for.
+ *
+ * Set once per `runBounded()` call and read by `parseMeta`, so the request and the
+ * reply are compared at the one place the reply is decoded. `null` means "not
+ * decoding a live exchange" (protocol unit tests), in which case the reply must
+ * still name a valid operation but is not matched against a request.
+ */
+let expectedOp: WorkerOp | null = null;
+
+export function setExpectedOp(op: WorkerOp | null) { expectedOp = op; }
+
+function assertOpMatchesRequest(op: unknown): void {
+  if (op !== "inspect" && op !== "fill") throw new WorkerProtocolError("The result names an unexpected operation.", "UNKNOWN_OP");
+  if (expectedOp !== null && op !== expectedOp) throw new WorkerProtocolError("The result does not match the operation that was requested.", "OP_MISMATCH");
+}
+
+/**
+ * Rebuild the child's `details` from an allowlist.
+ *
+ * The child is a trust boundary once its reply leaves the process, but its *errors*
+ * were previously passed straight through. Two things were wrong with that: a
+ * `details` object could carry an arbitrary nested structure into the parent, and it
+ * could carry a field name or a submitted value — the exact plaintext the round is
+ * required to keep out of logs, metrics and temp files.
+ *
+ * Only content-free identifiers survive: `issues` entries must be existing
+ * `FORM_VALUE_ISSUES` codes, `shape`/`reason` must match a code-shaped pattern, and
+ * `limit`/`pageMarkers` must be non-negative safe integers. Anything else is
+ * dropped rather than rejected, because an unknown extra key is not a protocol
+ * violation — it is simply not something the parent will look at.
+ */
+function parseDetails(value: unknown): SanitizedDetails | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const out: SanitizedDetails = {};
+  if (Array.isArray(record.issues)) {
+    // Bounded by the existing option limit: an `issues` list cannot exceed the number
+    // of fields that could produce one, and each entry is a known code.
+    const issues = record.issues
+      .filter((entry): entry is string => typeof entry === "string" && (FORM_VALUE_ISSUES as readonly string[]).includes(entry))
+      .slice(0, FORM_OPTION_LIMIT);
+    if (issues.length) out.issues = issues;
+  }
+  for (const key of ["shape", "reason"] as const) {
+    const entry = record[key];
+    if (typeof entry === "string" && /^[A-Z0-9_]{1,64}$/u.test(entry)) out[key] = entry;
+  }
+  for (const key of ["limit", "pageMarkers"] as const) {
+    const entry = record[key];
+    if (typeof entry === "number" && Number.isSafeInteger(entry) && entry >= 0) out[key] = entry;
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
+/**
+ * Decode UTF-8 strictly.
+ *
+ * `Buffer.toString("utf8")` and a default `TextDecoder` both replace malformed
+ * sequences with U+FFFD rather than failing, which means invalid bytes could be
+ * *silently repaired* into a string that then parses as JSON. A frame is a binary
+ * transport: if a metadata block is not valid UTF-8 it is corrupt, and corruption
+ * must be a protocol error, not a transliteration.
+ */
+const strictUtf8 = new TextDecoder("utf-8", { fatal: true });
+
+function decodeJson(buffer: Buffer, what: string): unknown {
+  let text: string;
+  try { text = strictUtf8.decode(buffer); }
+  catch { throw new WorkerProtocolError(`The ${what} is not valid UTF-8.`, "INVALID_UTF8"); }
+  try { return JSON.parse(text); }
+  catch { throw new WorkerProtocolError(`The ${what} is not valid JSON.`, "INVALID_JSON"); }
 }
 
 export function parseMeta(value: unknown): WorkerMeta {
@@ -311,15 +420,26 @@ export function parseMeta(value: unknown): WorkerMeta {
   const record = value as Record<string, unknown>;
   if (typeof record.ok !== "boolean") throw new WorkerProtocolError("The result discriminator must be a boolean.", "INVALID_DISCRIMINATOR");
   if (record.ok === false) {
-    if (record.op !== "inspect" && record.op !== "fill") throw new WorkerProtocolError("The failure result names no operation.", "INVALID_META");
-    if (typeof record.code !== "string" || !record.code) throw new WorkerProtocolError("The failure result names no code.", "INVALID_META");
-    return { ok: false, op: record.op as WorkerOp, code: record.code, ...(record.details === undefined ? {} : { details: record.details }) };
+    // D4: a failure response must satisfy the same operation contract as a success.
+    // A fill request answered by an "inspect failed" frame is not a fill refusal; it
+    // is a frame that does not belong to this exchange.
+    assertOpMatchesRequest(record.op);
+    // D1: the code is allowlisted, not merely a string. Without this a child could
+    // inject an arbitrary string into a user-visible error field, and a caller
+    // branching on `code` would be branching on child-controlled text.
+    if (!isFormFillErrorCode(record.code)) throw new WorkerProtocolError("The failure result names an unknown code.", "UNKNOWN_ERROR_CODE");
+    const details = parseDetails(record.details);
+    return { ok: false, op: record.op as WorkerOp, code: record.code, ...(details === undefined ? {} : { details }) };
   }
   if (record.op === "inspect") {
+    // D4 applies to every frame, not only refusals: a fill request answered with an
+    // inspect success is just as much the wrong exchange as an inspect failure is.
+    assertOpMatchesRequest(record.op);
     const pages = assertPages(record.pages);
     return { ok: true, op: "inspect", pages, inventory: parseInventory(record.inventory, pages) };
   }
   if (record.op === "fill") {
+    assertOpMatchesRequest(record.op);
     if (typeof record.checksum !== "string" || !/^[0-9a-f]{64}$/u.test(record.checksum)) throw new WorkerProtocolError("The fill result carries no valid checksum.", "INVALID_META");
     if (typeof record.outBytes !== "number" || !Number.isSafeInteger(record.outBytes) || record.outBytes <= 0) throw new WorkerProtocolError("The fill result carries no valid output length.", "INVALID_META");
     const report = record.report;

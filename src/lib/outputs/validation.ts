@@ -62,9 +62,29 @@ export type BoundedFillOutput = {
   pages: number;
   /** Checksum the child reported for its own output. */
   checksum: string;
+  /** Whether the child reports it flattened the result. */
+  flatten: boolean;
 };
 
-export async function validateBoundedFillOutput(output: BoundedFillOutput, expected: { inputPages?: number; maxOutputBytes: number; maxOutputFiles: number }): Promise<{ outputCount: number; totalBytes: number }> {
+export async function validateBoundedFillOutput(
+  output: BoundedFillOutput,
+  expected: {
+    /**
+     * The input page count, established independently of the child.
+     *
+     * Required, not optional. When this was `inputPages?: number` a missing value
+     * silently skipped page-preservation entirely — `undefined !== n` is false, so the
+     * check passed for every document whose count was not loaded. "We could not
+     * establish the expected count" and "the count is correct" became the same
+     * outcome, which is exactly the F01 failure mode in a different place.
+     */
+    inputPages: number;
+    /** Flattening that was actually requested for this job. */
+    requestedFlatten: boolean;
+    maxOutputBytes: number;
+    maxOutputFiles: number;
+  },
+): Promise<{ outputCount: number; totalBytes: number; pages: number }> {
   const { createHash } = await import("node:crypto");
   if (expected.maxOutputFiles < 1) throw new OutputValidationError("Output file count is outside the configured limit.");
   if (!output.bytes.byteLength) throw new OutputValidationError("The output file is empty.");
@@ -77,6 +97,18 @@ export async function validateBoundedFillOutput(output: BoundedFillOutput, expec
   const actualChecksum = createHash("sha256").update(output.bytes).digest("hex");
   if (actualChecksum !== output.checksum) throw new OutputValidationError("Output checksum does not match the delivered bytes.");
   if (!Number.isSafeInteger(output.pages) || output.pages <= 0) throw new OutputValidationError("PDF output contains no pages.");
-  if (expected.inputPages !== undefined && output.pages !== expected.inputPages) throw new OutputValidationError("PDF output did not preserve the expected page count.");
-  return { outputCount: 1, totalBytes: output.bytes.byteLength };
+
+  // Page preservation is required. `output.pages` is the count the *child* derived
+  // from the document it wrote and re-opened, so this compares two independent
+  // observations: the parent's stored input count and the child's output count. It is
+  // deliberately not "input count compared with input count".
+  if (!Number.isSafeInteger(expected.inputPages) || expected.inputPages <= 0) throw new OutputValidationError("The expected input page count is not available.");
+  if (output.pages !== expected.inputPages) throw new OutputValidationError("PDF output did not preserve the expected page count.");
+
+  // The flatten flag is the child's claim about what it did. A request that asked for
+  // flattening and an output that says it was not flattened is a mismatch the parent
+  // can see without parsing, and it changes what the user receives.
+  if (output.flatten !== expected.requestedFlatten) throw new OutputValidationError("PDF output flattening does not match the requested operation.");
+
+  return { outputCount: 1, totalBytes: output.bytes.byteLength, pages: output.pages };
 }
