@@ -45,6 +45,14 @@ export const REQUIRED_PDF_WORKER_FILES = [
   "src/lib/pdf/form-appearance.ts",
   "src/lib/runtime/config.ts",
   "scripts/node-platform-compat.mjs",
+  // R6.2: the launcher starts the child with `--import tsx`, and tsx resolves the `@/`
+  // path alias from `tsconfig.json` in the child's working directory. It is a build
+  // input, so Next does not copy it into a standalone tree on its own; it is declared in
+  // `outputFileTracingIncludes`. Without it every aliased import inside the child fails
+  // with MODULE_NOT_FOUND — the same total failure as a missing source file, and
+  // invisible to a source-file check alone. (Written without quoting a specifier so a
+  // list-scraping test cannot mistake this comment for a declared file.)
+  "tsconfig.json",
 ];
 
 /** Non-source assets the child needs at runtime. */

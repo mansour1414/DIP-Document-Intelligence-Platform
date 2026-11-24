@@ -53,11 +53,9 @@ import {
   type WorkerControl,
   type WorkerMeta,
 } from "@/lib/pdf/worker-protocol";
-import { runtimeLimits } from "@/lib/runtime/config";
 import { createHash } from "node:crypto";
 
 /** The maximum document this child will read, from the shared runtime contract. */
-const MAX_INPUT_BYTES = runtimeLimits.maxInputBytes;
 
 function reasonOf(error: unknown): string {
   if (error && typeof error === "object" && "reason" in error) return String((error as { reason: unknown }).reason);
@@ -191,28 +189,69 @@ function writeAll(frame: Buffer): void {
  * the child. The pipe is the channel the parent controls least, so the bound belongs
  * on both ends. Exceeding it is a protocol error, reported as data like any other.
  */
+/**
+ * How many bytes may still arrive.
+ *
+ * The bound cannot be a constant: this process is launched with a minimal environment
+ * and so cannot see the parent's `MAX_INPUT_BYTES`. It is learned from the control
+ * header as soon as the first bytes arrive, which is why the ceiling below is only a
+ * provisional bound — large enough for any frame the transport permits, tight enough
+ * that a peer which never finishes its header cannot make us buffer indefinitely.
+ *
+ * Enforcing it here (rather than only after the frame is complete) matters because the
+ * parent is the party that decides the limit: if the child used its own compiled
+ * default, raising the limit on the parent would leave the child refusing documents the
+ * parent had already accepted, and lowering it would let the child buffer more than the
+ * parent ever intended to send.
+ */
+let effectiveLimit = 4 + WORKER_LIMITS.controlBytes; // header alone, until we can read it
+let headerRead = false;
 const chunks: Buffer[] = [];
 let received = 0;
 let overLimit = false;
-/** Control header + JSON + PDF, with the framing overhead accounted separately. */
-const MAX_RECEIVED_BYTES = MAX_INPUT_BYTES + WORKER_LIMITS.controlBytes + 8;
+/** Peek at the control header; once parseable, adopt the bound it declares. */
+function adoptDeclaredBound(): void {
+  if (headerRead || received < 4) return;
+  const head = chunks.length === 1 ? chunks[0] : Buffer.concat(chunks);
+  const controlLen = head.readUInt32BE(0);
+  if (controlLen === 0 || controlLen > WORKER_LIMITS.controlBytes) { overLimit = true; return; }
+  if (received < 4 + controlLen) { effectiveLimit = 4 + controlLen + WORKER_LIMITS.maxInputBytesCeiling; return; }
+  headerRead = true;
+  let declared: number;
+  try {
+    const parsed = JSON.parse(head.subarray(4, 4 + controlLen).toString("utf8")) as { maxInputBytes?: unknown };
+    if (typeof parsed.maxInputBytes !== "number" || !Number.isSafeInteger(parsed.maxInputBytes) || parsed.maxInputBytes <= 0) {
+      overLimit = true;
+      return;
+    }
+    declared = parsed.maxInputBytes;
+  } catch { overLimit = true; return; }
+  effectiveLimit = declared + 4 + controlLen;
+}
 process.stdin.on("data", (chunk: Buffer) => {
   if (overLimit) return;
   received += chunk.byteLength;
-  if (received > MAX_RECEIVED_BYTES) {
+  chunks.push(chunk);
+  if (!headerRead) adoptDeclaredBound();
+  if (received > effectiveLimit) {
     // Discard what was buffered: keeping it would defeat the bound it just violated.
     overLimit = true;
     chunks.length = 0;
-    return;
   }
-  chunks.push(chunk);
 });
 process.stdin.on("end", () => {
   void (async () => {
     let control: WorkerControl | undefined;
     try {
       if (overLimit) throw new WorkerProtocolError("The input exceeds the transport limit.", "PDF_TOO_LARGE");
-      const { control: parsed, pdf } = decodeControl(Buffer.concat(chunks), MAX_INPUT_BYTES);
+      // Decode against the transport ceiling, then re-check against the bound the
+      // parent actually declared in the frame. Decoding first avoids parsing the
+      // header twice; the second check is what makes the *declared* number
+      // authoritative, so parent and child cannot enforce different limits.
+      const { control: parsed, pdf } = decodeControl(Buffer.concat(chunks), WORKER_LIMITS.maxInputBytesCeiling);
+      if (pdf.byteLength > parsed.maxInputBytes) {
+        throw new WorkerProtocolError("The document exceeds the declared input limit.", "PDF_TOO_LARGE");
+      }
       control = parsed;
       const result = parsed.op === "inspect"
         ? { meta: await inspect(pdf), output: undefined }

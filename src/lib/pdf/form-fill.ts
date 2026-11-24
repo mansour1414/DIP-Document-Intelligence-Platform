@@ -267,7 +267,19 @@ export async function fillFormPdf(bytes: Uint8Array, fields: RawFieldMap, option
   try { (form as unknown as { acroForm: { dict: { delete(key: PDFName): void } } }).acroForm.dict.delete(PDFName.of("NeedAppearances")); } catch { /* header-only forms */ }
 
   const firstPass = await document.save({ useObjectStreams: true, updateFieldAppearances: false });
-  await verifyFilledForm(firstPass, values, { untouched: previous });
+  // `verifyFilledForm` reopens `firstPass` and reports the page count it actually
+  // contains. That number was previously discarded, and the report below fell back to
+  // `inventory.pages` — the *input's* count. The two are equal for a correct fill,
+  // which is exactly why the substitution was invisible: a transformation that dropped
+  // or added a page would still have been reported with the input's count, and the
+  // parent compares the reported count against the input count it already holds, so the
+  // check would have agreed with itself.
+  const verified = await verifyFilledForm(firstPass, values, { untouched: previous });
+  // Preservation is asserted here, against the reopened document, so a mismatch fails
+  // in the child that produced it rather than being reported as a success.
+  if (verified.pages !== inventory.pages) {
+    throw new FormFillError("FORM_OUTPUT_UNVERIFIED", FORM_ERROR_MESSAGES.FORM_OUTPUT_UNVERIFIED, { issue: "PAGE_COUNT_CHANGED" });
+  }
 
   if (options.flatten === true) {
     const reopened = await PDFDocument.load(firstPass, { ignoreEncryption: false });
@@ -284,7 +296,10 @@ export async function fillFormPdf(bytes: Uint8Array, fields: RawFieldMap, option
     const flattened = await reopened.save({ useObjectStreams: true, updateFieldAppearances: false });
     if (pruned.removed !== widgets.size) throw new FormFillError("FORM_OUTPUT_UNVERIFIED", FORM_ERROR_MESSAGES.FORM_OUTPUT_UNVERIFIED, { flatten: "ANNOTATION_COUNT_MISMATCH" });
     const check = await PDFDocument.load(flattened, { ignoreEncryption: false });
-    if (check.getPageCount() !== inventory.pages) throw new FormFillError("FORM_OUTPUT_UNVERIFIED", FORM_ERROR_MESSAGES.FORM_OUTPUT_UNVERIFIED, { flatten: "PAGE_COUNT_CHANGED" });
+    // This is the flattened output's own page count, read from the bytes that will be
+    // returned — not the input's count and not the pre-flatten intermediate's.
+    const flattenedPages = check.getPageCount();
+    if (flattenedPages !== inventory.pages) throw new FormFillError("FORM_OUTPUT_UNVERIFIED", FORM_ERROR_MESSAGES.FORM_OUTPUT_UNVERIFIED, { flatten: "PAGE_COUNT_CHANGED" });
     // Structural post-condition: no page may reference a widget that no longer
     // exists. Checked on the re-read bytes, not on the in-memory document, so a
     // serialisation regression cannot hide behind an unsaved edit.
@@ -292,13 +307,14 @@ export async function fillFormPdf(bytes: Uint8Array, fields: RawFieldMap, option
     if (dangling.unresolved || dangling.widgets) throw new FormFillError("FORM_OUTPUT_UNVERIFIED", FORM_ERROR_MESSAGES.FORM_OUTPUT_UNVERIFIED, { flatten: "DANGLING_ANNOTATIONS", ...dangling });
     return {
       name: "filled-form.pdf", mimeType: "application/pdf", bytes: flattened,
-      report: { filled: applied, untouched: inventory.fields.length - applied.length, pages: inventory.pages, flatten: true, rasterAppearances, engine: FORM_ENGINE, engineVersion: FORM_ENGINE_VERSION },
+      report: { filled: applied, untouched: inventory.fields.length - applied.length, pages: flattenedPages, flatten: true, rasterAppearances, engine: FORM_ENGINE, engineVersion: FORM_ENGINE_VERSION },
     };
   }
 
   return {
     name: "filled-form.pdf", mimeType: "application/pdf", bytes: firstPass,
-    report: { filled: applied, untouched: inventory.fields.length - applied.length, pages: inventory.pages, flatten: false, rasterAppearances, engine: FORM_ENGINE, engineVersion: FORM_ENGINE_VERSION },
+    // The page count of the bytes being returned, as reopened and verified above.
+    report: { filled: applied, untouched: inventory.fields.length - applied.length, pages: verified.pages, flatten: false, rasterAppearances, engine: FORM_ENGINE, engineVersion: FORM_ENGINE_VERSION },
   };
 }
 

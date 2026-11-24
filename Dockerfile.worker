@@ -68,7 +68,15 @@ COPY --chown=dipworker:dipworker scripts/node-platform-compat.mjs ./scripts/node
 # absence until the first Fill Forms job failed in production.
 COPY --chown=dipworker:dipworker scripts/verify-pdf-worker-artifact.mjs ./scripts/verify-pdf-worker-artifact.mjs
 
+# B31-04: presence is necessary and not sufficient. This script *runs* the child inside
+# the image and drives it through the real protocol — inspect, fill, flatten, and an
+# Arabic value that exercises the native canvas and the bundled font. Each of those can
+# fail at runtime with every required file present (a wrong-platform native addon, an
+# unresolvable font, an unresolved path alias), which is invisible to a file check.
+COPY --chown=dipworker:dipworker scripts/smoke-pdf-worker-artifact.mjs ./scripts/smoke-pdf-worker-artifact.mjs
+
 RUN node scripts/verify-pdf-worker-artifact.mjs /app \
+ && node scripts/smoke-pdf-worker-artifact.mjs /app \
  && python3 scripts/verify-ocr-runtime.py \
  && soffice --version \
  && qpdf --version \

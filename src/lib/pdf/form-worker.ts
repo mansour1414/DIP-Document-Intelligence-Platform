@@ -52,12 +52,11 @@ import { FormFillError } from "@/lib/pdf/form-validation";
 import { FORM_ERROR_MESSAGES, isFormFillErrorCode, type FormInventory } from "@/lib/pdf/form-types";
 import {
   WORKER_LIMITS,
-  setExpectedOp,
   WORKER_PROTOCOL_VERSION,
   decodeResult,
   encodeControl,
   type Frame,
-  type WorkerControl,
+  type WorkerRequest,
 } from "@/lib/pdf/worker-protocol";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -253,12 +252,22 @@ function retire(slot: Slot) {
   if (!slot.child.killed) slot.child.kill("SIGKILL");
   // `exit` fires when the process has terminated but before stdio closes; `close`
   // fires after both. Either is proof the kernel has reaped it.
+  //
+  // For a failed spawn (`ENOENT` on the interpreter, `EAGAIN`/`EMFILE` on the process
+  // table) Node emits `error` then `close`, and never `exit` — there was no process to
+  // exit. That case is already covered by the `exitCode !== null` branch above, because
+  // `spawn()` sets `exitCode` to `-2` before emitting `error`; verified directly rather
+  // than assumed. The `close` listener below is redundancy for that ordering, which is a
+  // Node implementation detail: if a future version emitted `error` with `exitCode`
+  // still `null`, relying on `exit` alone would strand the slot with `activeFormWorkers()`
+  // permanently elevated, until the concurrency bound refused every request.
   const drop = () => {
     const index = pool.indexOf(slot);
     if (index >= 0) pool.splice(index, 1);
   };
-  if (slot.child.exitCode !== null || slot.child.signalCode !== null) drop();
-  else slot.child.once("exit", drop);
+  if (slot.child.exitCode !== null || slot.child.signalCode !== null) { drop(); return; }
+  slot.child.once("exit", drop);
+  slot.child.once("close", drop);
 }
 
 /**
@@ -294,14 +303,14 @@ export function activeFormWorkers() {
  * arrived, magic bytes, length, page preservation) by the caller; the checksum in
  * the metadata is consistency evidence, never a substitute.
  */
-async function runBounded(control: WorkerControl, pdf: Uint8Array, limits: WorkerLimits): Promise<Frame> {
+async function runBounded(request: WorkerRequest, pdf: Uint8Array, limits: WorkerLimits): Promise<Frame> {
   if (shuttingDown) throw new FormWorkerError("WORKER_CRASHED", "The document processor is shutting down.");
   if (pdf.byteLength > limits.maxInputBytes) throw new FormWorkerError("WORKER_INPUT_TOO_LARGE", "The document exceeds the processing input limit.");
   // Bounded concurrency: refuse instead of queueing without limit.
   if (activeFormWorkers() >= limits.concurrency) throw new FormWorkerError("WORKER_BUSY", "The document processor is busy.");
 
   let frame: Buffer;
-  try { frame = encodeControl(control, pdf); }
+  try { frame = encodeControl(request, pdf, limits.maxInputBytes); }
   catch (error) { throw new FormWorkerError("WORKER_INPUT_TOO_LARGE", error instanceof Error ? error.message : "The request exceeds the transport limit."); }
 
   childLaunchChecked();
@@ -311,8 +320,9 @@ async function runBounded(control: WorkerControl, pdf: Uint8Array, limits: Worke
   // library output on stdout.
   const slot: Slot = { child: spawn(process.execPath, [`--max-old-space-size=${limits.maxHeapMb}`, ...args], { shell: false, env, stdio: ["pipe", "pipe", "pipe", "pipe"] }), busy: true };
   pool.push(slot);
-  // The reply is matched against the request at the one place it is decoded.
-  setExpectedOp(control.op);
+  // The expectation is captured per invocation and threaded into `decodeResult` below.
+  // It is deliberately not stored anywhere the next call could see it.
+  const expectedOp = request.op;
 
   return await new Promise<Frame>((resolve, reject) => {
     const child = slot.child;
@@ -327,7 +337,6 @@ async function runBounded(control: WorkerControl, pdf: Uint8Array, limits: Worke
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      setExpectedOp(null);
       // Always reap: a killed-but-referenced child would otherwise keep its slot.
       if (!child.killed) child.kill("SIGKILL");
       retire(slot);
@@ -374,7 +383,7 @@ async function runBounded(control: WorkerControl, pdf: Uint8Array, limits: Worke
       // abnormal exit is still rejected by the `code !== 0` branch above: the exit
       // status is the authority on whether the run completed.
       let parsed: Frame;
-      try { parsed = decodeResult(Buffer.concat(chunks), limits.maxOutputBytes); }
+      try { parsed = decodeResult(Buffer.concat(chunks), limits.maxOutputBytes, expectedOp); }
       catch (error) {
         finish(new FormWorkerError("WORKER_PROTOCOL_ERROR", error instanceof Error ? error.message : "The document processor returned an unreadable result."));
         return;
@@ -405,10 +414,26 @@ async function runBounded(control: WorkerControl, pdf: Uint8Array, limits: Worke
   });
 }
 
-/** Map a child-side refusal onto the existing coded result shape. */
+/**
+ * Map a child-side refusal onto the existing coded result shape.
+ *
+ * The message comes from `FORM_ERROR_MESSAGES` keyed by the *allowlisted* code. It was
+ * previously hardcoded to `FORM_UNSUPPORTED`'s text, so an Inspect request refused
+ * because the document was restricted told the user "this document uses a form feature
+ * that is not supported" — a different, and misleading, reason. Both the code and the
+ * message are now derived from the same validated value, and neither is child-authored
+ * prose: the child sends a code, the parent owns the sentence.
+ */
 function toResult(frame: Frame): WorkerResult {
   if (frame.meta.ok) return { ok: true, inventory: frame.meta.op === "inspect" ? frame.meta.inventory : undefined, pages: frame.meta.pages };
-  return { ok: false, code: frame.meta.code, message: FORM_ERROR_MESSAGES.FORM_UNSUPPORTED, ...(frame.meta.details === undefined ? {} : { details: frame.meta.details }) };
+  return {
+    ok: false,
+    code: frame.meta.code,
+    // `frame.meta.code` is a `FormFillErrorCode` by construction (`parseMeta` rejects
+    // anything else), so this lookup cannot miss.
+    message: FORM_ERROR_MESSAGES[frame.meta.code],
+    ...(frame.meta.details === undefined ? {} : { details: frame.meta.details }),
+  };
 }
 
 /** Inspect one document in a bounded child. */
@@ -468,8 +493,13 @@ export async function shutdownFormWorkers() {
   const slots = [...pool];
   for (const slot of slots) if (!slot.child.killed) slot.child.kill("SIGKILL");
   await Promise.all(slots.map((slot) => new Promise<void>((resolve) => {
+    // Settle on the first of `exit`/`close`, and treat an already-dead child as
+    // terminated. A failed spawn produces `close` without `exit`; it is normally already
+    // filtered out by the `exitCode` check above, so the `close` listener is redundancy
+    // against `exitCode` not yet being set when `error` fires.
     if (slot.child.exitCode !== null || slot.child.signalCode !== null) { resolve(); return; }
     slot.child.once("exit", () => resolve());
+    slot.child.once("close", () => resolve());
   })));
 }
 

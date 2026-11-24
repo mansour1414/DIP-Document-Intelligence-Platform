@@ -90,15 +90,32 @@ export const WORKER_LIMITS = {
    * below what a runaway loop can emit.
    */
   stdoutCeilingBytes: 1024 * 1024,
+  /**
+   * Absolute ceiling for document bytes, independent of any runtime setting.
+   *
+   * The runtime limit is configurable (`MAX_INPUT_BYTES`, up to 500 MiB); this is the
+   * point past which the transport itself refuses to assemble a frame, so a misconfigured
+   * or hostile bound cannot make either side buffer without limit.
+   */
+  maxInputBytesCeiling: 512 * 1024 * 1024,
 } as const;
 
 /** The two operations this boundary serves. */
 export type WorkerOp = "inspect" | "fill";
 
-/** Control envelope sent to the child. Never contains secrets or file paths. */
-export type WorkerControl =
+/**
+ * What a caller asks for. Does not carry the input bound: that is a property of the
+ * transport, added by `encodeControl()` from the caller's limits, so a call site cannot
+ * forget it or disagree with the value actually enforced by `runBounded()`.
+ */
+export type WorkerRequest =
   | { v: typeof WORKER_PROTOCOL_VERSION; op: "inspect" }
   | { v: typeof WORKER_PROTOCOL_VERSION; op: "fill"; flatten: boolean; fields: Record<string, string | boolean | string[]> };
+
+/** What travels on the wire: the request plus the bound both sides must enforce. */
+export type WorkerControl =
+  | (Extract<WorkerRequest, { op: "inspect" }> & { maxInputBytes: number })
+  | (Extract<WorkerRequest, { op: "fill" }> & { maxInputBytes: number });
 
 /** Metadata accompanying a successful inspect. */
 export type InspectMeta = { ok: true; op: "inspect"; pages: number; inventory: FormInventory };
@@ -122,6 +139,24 @@ export type FillMeta = {
  * cannot smuggle document content into a user-visible or logged field by inventing
  * a key the parent happens to spread.
  */
+/**
+ * The `shape` values the structural probe can produce.
+ *
+ * Enumerated from the call sites rather than pattern-matched. An allowlist of *known
+ * diagnostics* cannot leak by construction; a shape test can leak anything that happens
+ * to look like a code.
+ */
+const ALLOWED_SHAPES = ["TOO_SHORT", "NO_PDF_HEADER", "NO_PDF_TRAILER", "PAGE_MARKERS_EXCEEDED"] as const;
+
+/**
+ * The `reason` values a refusal may carry.
+ *
+ * These are the protocol reasons a child can report about a boundary failure. Domain
+ * issue details travel separately in `issues`, which is checked against the existing
+ * `FORM_VALUE_ISSUES` vocabulary.
+ */
+const ALLOWED_REASONS = ["UNEXPECTED", "TRUNCATED", "INVALID_JSON", "INVALID_UTF8", "INVALID_CONTROL", "INVALID_FIELDS", "INVALID_META", "INVALID_INVENTORY", "INVALID_DISCRIMINATOR", "INVALID_PAGES", "UNKNOWN_OP", "OP_MISMATCH", "FIELD_TOO_LARGE", "PDF_TOO_LARGE", "PDF_EMPTY", "CONTROL_TOO_LARGE", "META_TOO_LARGE", "VERSION_MISMATCH", "TRAILING_DATA", "OUTPUT_LENGTH_MISMATCH", "UNKNOWN_ERROR_CODE"] as const;
+
 export type SanitizedDetails = { issues?: string[]; shape?: string; reason?: string; limit?: number; pageMarkers?: number };
 
 /** Metadata accompanying a refusal. `code` comes from the existing error allowlist. */
@@ -145,7 +180,8 @@ export class WorkerProtocolError extends Error {
 }
 
 /** Build the parent → child frame. */
-export function encodeControl(control: WorkerControl, pdf: Uint8Array): Buffer {
+export function encodeControl(request: WorkerRequest, pdf: Uint8Array, maxInputBytes: number): Buffer {
+  const control = { ...request, maxInputBytes };
   const json = Buffer.from(JSON.stringify(control), "utf8");
   if (json.byteLength > WORKER_LIMITS.controlBytes) {
     throw new WorkerProtocolError("The control metadata exceeds the transport limit.", "CONTROL_TOO_LARGE");
@@ -200,11 +236,11 @@ export function decodeControl(buffer: Buffer, maxPdfBytes: number): { control: W
  * Rejects truncated frames, oversized metadata, trailing data after the declared
  * output, and an output length that disagrees with the bytes present.
  */
-export function decodeResult(buffer: Buffer, maxOutputBytes: number): Frame {
+export function decodeResult(buffer: Buffer, maxOutputBytes: number, expectedOp: WorkerOp | null = null): Frame {
   const metaLength = readLength(buffer, 0, WORKER_LIMITS.metaBytes, "result metadata");
   const metaEnd = 4 + metaLength;
   if (metaEnd > buffer.byteLength) throw new WorkerProtocolError("The result metadata is truncated.", "TRUNCATED");
-  const meta = parseMeta(decodeJson(buffer.subarray(4, metaEnd), "result metadata"));
+  const meta = parseMeta(decodeJson(buffer.subarray(4, metaEnd), "result metadata"), expectedOp);
 
   // A refusal carries no output bytes at all. Exact consumption applies here too:
   // previously a failure frame returned before the trailing check, so a child could
@@ -231,14 +267,39 @@ export function decodeResult(buffer: Buffer, maxOutputBytes: number): Frame {
 }
 
 /** Exactly one, Boolean, known operation. A truthy string is not a discriminator. */
+/**
+ * The declared input ceiling.
+ *
+ * Validated so a malformed or hostile control block cannot ask the child to buffer
+ * without bound: it must be a positive safe integer no larger than the transport
+ * ceiling the protocol itself imposes. The parent still enforces its own limit before
+ * writing anything, so this is a consistency check, not a trust boundary.
+ */
+function parseInputBound(value: unknown): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
+    throw new WorkerProtocolError("The input bound is not a positive integer.", "INVALID_CONTROL");
+  }
+  if (value > WORKER_LIMITS.maxInputBytesCeiling) {
+    throw new WorkerProtocolError("The input bound exceeds the transport ceiling.", "FIELD_TOO_LARGE");
+  }
+  return value;
+}
+
 function parseControl(value: unknown): WorkerControl {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new WorkerProtocolError("The control block is not an object.", "INVALID_CONTROL");
   const record = value as Record<string, unknown>;
   if (record.v !== WORKER_PROTOCOL_VERSION) throw new WorkerProtocolError("The protocol version is not supported.", "VERSION_MISMATCH");
-  if (record.op === "inspect") return { v: WORKER_PROTOCOL_VERSION, op: "inspect" };
+  // The input ceiling is declared by the parent in the control frame rather than read
+  // from the child's own environment. The child is launched with only `PATH` and
+  // `NODE_ENV` (deliberately), so it cannot inherit `MAX_INPUT_BYTES`; previously it
+  // silently fell back to the compiled default, and a deployment that raised the limit
+  // on the parent would have had the child reject documents the parent accepted. One
+  // frame now carries the number both sides enforce.
+  const maxInputBytes = parseInputBound(record.maxInputBytes);
+  if (record.op === "inspect") return { v: WORKER_PROTOCOL_VERSION, op: "inspect", maxInputBytes };
   if (record.op === "fill") {
     if (typeof record.flatten !== "boolean") throw new WorkerProtocolError("The flatten option must be a boolean.", "INVALID_CONTROL");
-    return { v: WORKER_PROTOCOL_VERSION, op: "fill", flatten: record.flatten, fields: parseFields(record.fields) };
+    return { v: WORKER_PROTOCOL_VERSION, op: "fill", flatten: record.flatten, fields: parseFields(record.fields), maxInputBytes };
   }
   throw new WorkerProtocolError("The requested operation is not supported.", "UNKNOWN_OP");
 }
@@ -348,13 +409,21 @@ function parseInventory(value: unknown, pages: number): FormInventory {
  * decoding a live exchange" (protocol unit tests), in which case the reply must
  * still name a valid operation but is not matched against a request.
  */
-let expectedOp: WorkerOp | null = null;
-
-export function setExpectedOp(op: WorkerOp | null) { expectedOp = op; }
-
-function assertOpMatchesRequest(op: unknown): void {
+/**
+ * Check that a reply names the operation the caller asked for.
+ *
+ * The expectation is a **parameter**, never module state. The previous version kept it
+ * in a module-level `let` that each `runBounded()` set on entry and cleared on exit,
+ * which is not request-local: two overlapping invocations shared one variable, so the
+ * second could overwrite the first's expectation and the first's reply would then be
+ * judged against the wrong operation — or the first could clear it to `null` and
+ * silently disable the check for the second. Passing it down from the call that owns
+ * the exchange makes the check a property of *this* reply rather than of whatever ran
+ * most recently. There is deliberately no global setter to reintroduce that.
+ */
+function assertOpMatchesRequest(op: unknown, expected: WorkerOp | null): void {
   if (op !== "inspect" && op !== "fill") throw new WorkerProtocolError("The result names an unexpected operation.", "UNKNOWN_OP");
-  if (expectedOp !== null && op !== expectedOp) throw new WorkerProtocolError("The result does not match the operation that was requested.", "OP_MISMATCH");
+  if (expected !== null && op !== expected) throw new WorkerProtocolError("The result does not match the operation that was requested.", "OP_MISMATCH");
 }
 
 /**
@@ -367,8 +436,9 @@ function assertOpMatchesRequest(op: unknown): void {
  * required to keep out of logs, metrics and temp files.
  *
  * Only content-free identifiers survive: `issues` entries must be existing
- * `FORM_VALUE_ISSUES` codes, `shape`/`reason` must match a code-shaped pattern, and
- * `limit`/`pageMarkers` must be non-negative safe integers. Anything else is
+ * `FORM_VALUE_ISSUES` codes, `shape`/`reason` must be entries of the explicit
+ * `ALLOWED_SHAPES`/`ALLOWED_REASONS` lists, and `limit`/`pageMarkers` must be
+ * non-negative safe integers. Anything else is
  * dropped rather than rejected, because an unknown extra key is not a protocol
  * violation — it is simply not something the parent will look at.
  */
@@ -385,10 +455,13 @@ function parseDetails(value: unknown): SanitizedDetails | undefined {
       .slice(0, FORM_OPTION_LIMIT);
     if (issues.length) out.issues = issues;
   }
-  for (const key of ["shape", "reason"] as const) {
-    const entry = record[key];
-    if (typeof entry === "string" && /^[A-Z0-9_]{1,64}$/u.test(entry)) out[key] = entry;
-  }
+  // Explicit allowlists, not a shape test. `/^[A-Z0-9_]{1,64}$/` accepts *any*
+  // upper-case token, and a code-shaped string is not automatically content-free: a
+  // child can emit `CUSTOMER_IBAN_DE893704` and it would have passed. These are the
+  // values the codebase actually produces, so an unknown token is dropped rather than
+  // forwarded.
+  if (typeof record.shape === "string" && (ALLOWED_SHAPES as readonly string[]).includes(record.shape)) out.shape = record.shape;
+  if (typeof record.reason === "string" && (ALLOWED_REASONS as readonly string[]).includes(record.reason)) out.reason = record.reason;
   for (const key of ["limit", "pageMarkers"] as const) {
     const entry = record[key];
     if (typeof entry === "number" && Number.isSafeInteger(entry) && entry >= 0) out[key] = entry;
@@ -415,7 +488,7 @@ function decodeJson(buffer: Buffer, what: string): unknown {
   catch { throw new WorkerProtocolError(`The ${what} is not valid JSON.`, "INVALID_JSON"); }
 }
 
-export function parseMeta(value: unknown): WorkerMeta {
+export function parseMeta(value: unknown, expectedOp: WorkerOp | null = null): WorkerMeta {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new WorkerProtocolError("The result metadata is not an object.", "INVALID_META");
   const record = value as Record<string, unknown>;
   if (typeof record.ok !== "boolean") throw new WorkerProtocolError("The result discriminator must be a boolean.", "INVALID_DISCRIMINATOR");
@@ -423,7 +496,7 @@ export function parseMeta(value: unknown): WorkerMeta {
     // D4: a failure response must satisfy the same operation contract as a success.
     // A fill request answered by an "inspect failed" frame is not a fill refusal; it
     // is a frame that does not belong to this exchange.
-    assertOpMatchesRequest(record.op);
+    assertOpMatchesRequest(record.op, expectedOp);
     // D1: the code is allowlisted, not merely a string. Without this a child could
     // inject an arbitrary string into a user-visible error field, and a caller
     // branching on `code` would be branching on child-controlled text.
@@ -434,12 +507,12 @@ export function parseMeta(value: unknown): WorkerMeta {
   if (record.op === "inspect") {
     // D4 applies to every frame, not only refusals: a fill request answered with an
     // inspect success is just as much the wrong exchange as an inspect failure is.
-    assertOpMatchesRequest(record.op);
+    assertOpMatchesRequest(record.op, expectedOp);
     const pages = assertPages(record.pages);
     return { ok: true, op: "inspect", pages, inventory: parseInventory(record.inventory, pages) };
   }
   if (record.op === "fill") {
-    assertOpMatchesRequest(record.op);
+    assertOpMatchesRequest(record.op, expectedOp);
     if (typeof record.checksum !== "string" || !/^[0-9a-f]{64}$/u.test(record.checksum)) throw new WorkerProtocolError("The fill result carries no valid checksum.", "INVALID_META");
     if (typeof record.outBytes !== "number" || !Number.isSafeInteger(record.outBytes) || record.outBytes <= 0) throw new WorkerProtocolError("The fill result carries no valid output length.", "INVALID_META");
     const report = record.report;

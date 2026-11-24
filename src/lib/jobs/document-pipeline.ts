@@ -273,13 +273,21 @@ export async function processDocumentJob(message: QueuedJob, deps: DocumentPipel
     // PR-1: every output is scanned first, then the batch is stored. A rejection
     // throws before the first object write, so no object, file row or SUCCEEDED
     // status can exist for a batch that was not explicitly declared clean.
+    // A published artifact carries the page count that was *verified* for it, so a
+    // consumer (a chained job, an agent scope, plan enforcement) does not have to
+    // re-parse it, and so `pageCount ?? 0` downstream is not silently true of
+    // everything. For fill-forms the verified count is `boundedFill.pages` — derived
+    // from the document the child wrote, and equal to the input's by the preservation
+    // check above. Any other tool's page count is not established on this path, so the
+    // column stays null rather than being guessed from the input.
+    const outputPageCount = message.toolId === "fill-forms" ? boundedFill?.pages : undefined;
     const { stored: storedOutputs } = await screenAndStoreWorkerOutputs(outputs, { job, storage, scanner: deps.scanner, attemptId });
     try {
       await scopedTenant(async (tx) => {
         const current = await tx.job.findUniqueOrThrow({ where: { id: job.id }, select: { outputFileId: true } });
         if (current.outputFileId) throw new OutputCommitSupersededError();
         const outputDocument = await tx.document.create({ data: { userId: jobExecutionScope.userId, organizationId: jobExecutionScope.organizationId, title: `${job.toolId} output` } }); const outputFileIds: string[] = [];
-        for (const item of storedOutputs) { const outputFile = await tx.file.create({ data: { document: { connect: { id: outputDocument.id } }, originalName: item.output.name, mimeType: item.output.mimeType, size: BigInt(item.output.bytes.byteLength), storageKey: item.object.key, checksum: item.checksum, storageObject: buildStorageObjectConnectOrCreate(jobExecutionScope, { provider: "s3", bucket: item.object.bucket, objectKey: item.object.key, size: BigInt(item.output.bytes.byteLength), checksum: item.checksum }) } }); await tx.fileVersion.create({ data: { fileId: outputFile.id, ownerId: jobExecutionScope.userId, version: 1, storageKey: item.object.key, checksum: item.checksum } }); outputFileIds.push(outputFile.id); }
+        for (const item of storedOutputs) { const outputFile = await tx.file.create({ data: { document: { connect: { id: outputDocument.id } }, originalName: item.output.name, mimeType: item.output.mimeType, size: BigInt(item.output.bytes.byteLength), storageKey: item.object.key, checksum: item.checksum, ...(outputPageCount === undefined ? {} : { pageCount: outputPageCount }), storageObject: buildStorageObjectConnectOrCreate(jobExecutionScope, { provider: "s3", bucket: item.object.bucket, objectKey: item.object.key, size: BigInt(item.output.bytes.byteLength), checksum: item.checksum }) } }); await tx.fileVersion.create({ data: { fileId: outputFile.id, ownerId: jobExecutionScope.userId, version: 1, storageKey: item.object.key, checksum: item.checksum } }); outputFileIds.push(outputFile.id); }
         // The commit itself is the compare-and-set. Under READ COMMITTED a second
         // attempt blocks on this row, re-evaluates `outputFileId IS NULL` after the
         // winner commits, matches nothing, and rolls its own rows back — so exactly

@@ -45,9 +45,26 @@ const nextConfig: NextConfig = {
   // included because the child is launched with `--import` of that file; it is not
   // importable TypeScript, so no bundler would ever infer it.
   outputFileTracingIncludes: {
-    "/api/fill-forms/inspect": [...PDF_WORKER_TRACING],
-    "/api/jobs/[tool]": [...PDF_WORKER_TRACING],
-    "/api/v1/jobs": [...PDF_WORKER_TRACING],
+    // R6.2: the child's launcher needs `tsconfig.json` *as a runtime file*.
+    //
+    // `childLaunch()` starts the child with `--import tsx`, and tsx resolves the `@/`
+    // path alias by reading `paths` from `tsconfig.json` relative to the child's
+    // working directory. That file is a build input, so Next does not copy it into the
+    // standalone tree — the launcher's own requirement was therefore never packaged.
+    // The worker image copies it explicitly and has always worked; a standalone
+    // deployment would have failed at the first Fill Forms job with WORKER_CRASHED
+    // while `verify-pdf-worker-artifact.mjs` reported every source file present.
+    //
+    // This is a packaging declaration, not a test convenience: the shipped artifact
+    // gains the file the shipped launcher already reads, and the smoke test verifies
+    // exactly that artifact with no injected configuration.
+    //
+    // Declared on the same routes as the child, because those are the routes that start
+    // it. `outputFileTracingIncludes` is an object of route → globs; a bare string in
+    // this position would be a syntax error, which is how this was caught.
+    "/api/fill-forms/inspect": [...PDF_WORKER_TRACING, "./tsconfig.json"],
+    "/api/jobs/[tool]": [...PDF_WORKER_TRACING, "./tsconfig.json"],
+    "/api/v1/jobs": [...PDF_WORKER_TRACING, "./tsconfig.json"],
   },
   images: {
     remotePatterns: [],

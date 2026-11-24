@@ -279,3 +279,80 @@ test("S2 fill-forms pipeline: flatten is honoured through the queued option valu
   assert.equal(reopened.getForm().getFields().length, 0, "flatten was not applied to the stored output");
   assert.equal(reopened.getPageCount(), 1);
 });
+
+// ------------------------------------------------------ R6.2-E: evidence cases
+//
+// Each case below closes a specific gap where the *claim* was previously supported
+// only by reading source. The distinguishing question in every one is: what
+// observable effect proves this, and would the test fail if the property were lost?
+
+test("R6.2-E: a rejected fill refuses with an exact code and publishes nothing", async (t) => {
+  const pipeline = await loadPipeline(t);
+  if (!pipeline) return;
+  // A value the document itself cannot accept. The rejection must be a specific
+  // code, not a generic failure, so an operator can tell these apart in the log.
+  const { jobId, fileId, db, message, storage, objects } = await fixture({ "applicant.name": { nested: true } } as Record<string, unknown>);
+  const before = new Set(objects.keys());
+  await assert.rejects(() => pipeline.processDocumentJob(message, { storage, scanner: cleanScanner, client: asClient(db) }));
+
+  const job = db.state.jobs.get(jobId)!;
+  assert.equal(job.status, "FAILED");
+  assert.ok(job.errorCode, "a rejected job must carry an exact error code, not a null");
+  assert.equal(typeof job.errorCode, "string");
+  // `PROCESSING_FAILED` is the terminal fallback of `publicErrorCode()`: reaching it
+  // means the thrown error carried no allowlisted code, so the rejection would be
+  // indistinguishable from an internal fault in the operator's view. A specific code is
+  // the property under test.
+  assert.notEqual(job.errorCode, "PROCESSING_FAILED", `expected a specific rejection, saw ${job.errorCode}`);
+  assert.equal(job.outputFileId, null, "a rejected job must not be linked to an output");
+  // "No output published" is stronger than "no output row": nothing new may exist in
+  // object storage either, so a reader could not reach the bytes by key.
+  const added = [...objects.keys()].filter((key) => !before.has(key));
+  assert.deepEqual(added, [], `rejected fill wrote ${added.length} object(s)`);
+  assert.equal(db.state.files.filter((row) => row.id !== fileId).length, 0);
+});
+
+test("R6.2-E: a malformed stored page count fails before any output is published", async (t) => {
+  const pipeline = await loadPipeline(t);
+  if (!pipeline) return;
+  // `inputPages` is required for output verification. A row with no usable page count
+  // means the output cannot be proven page-preserving, so the job must fail closed
+  // rather than skip the comparison.
+  //
+  // The child still runs first (the page-count guard sits immediately after the fill,
+  // not before it), so this asserts on what is *published*, not on whether the document
+  // was processed: a FAILED job with no output row, no output object, and no page count
+  // recorded.
+  for (const pageCount of [null, 0, -1, 1.5]) {
+    const { jobId, fileId, db, message, storage, objects } = await fixture({ "applicant.name": "No Count" });
+    const row = db.state.files.find((item) => item.id === fileId)!;
+    (row as Record<string, unknown>).pageCount = pageCount;
+    const before = new Set(objects.keys());
+    await assert.rejects(
+      () => pipeline.processDocumentJob(message, { storage, scanner: cleanScanner, client: asClient(db) }),
+      `pageCount=${String(pageCount)} must not be silently accepted`,
+    );
+    assert.equal(db.state.jobs.get(jobId)!.status, "FAILED");
+    assert.equal(db.state.jobs.get(jobId)!.outputFileId, null);
+    assert.deepEqual([...objects.keys()].filter((key) => !before.has(key)), []);
+    assert.equal(db.state.files.filter((item) => item.id !== fileId).length, 0);
+  }
+});
+
+test("R6.2-E: the verified page count reaches persisted output metadata, not the input's value", async (t) => {
+  const pipeline = await loadPipeline(t);
+  if (!pipeline) return;
+  const { jobId, fileId, db, message, storage } = await fixture({ "applicant.name": "Counted" });
+  await pipeline.processDocumentJob(message, { storage, scanner: cleanScanner, client: asClient(db) });
+  assert.equal(db.state.jobs.get(jobId)!.status, "SUCCEEDED");
+
+  const output = db.state.files.find((row) => row.id !== fileId)!;
+  // The output row must carry the count derived from the document that was written.
+  // A null here would mean downstream consumers have no count for the artifact, and a
+  // value copied from the input would be unfalsifiable — the same number regardless of
+  // what the child actually produced.
+  assert.ok(output.pageCount !== undefined && output.pageCount !== null,
+    "the published output row has no page count");
+  assert.equal(Number(output.pageCount), 1);
+  assert.equal(db.state.executions.length, 1);
+});

@@ -311,6 +311,18 @@ jobs:
           docker run --rm --read-only --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777 --tmpfs /tmp/dip:rw,nosuid,nodev,noexec,size=256m,uid=10001,gid=10001,mode=0700 --entrypoint python3 dip-document-worker:release-a -c "from pathlib import Path; from tempfile import TemporaryDirectory; d=TemporaryDirectory(dir='/tmp/dip'); p=Path(d.name)/'probe'; p.write_text('ok'); assert p.read_text() == 'ok'; d.cleanup()"
           docker run --rm --read-only --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777 --tmpfs /tmp/dip:rw,nosuid,nodev,noexec,size=256m,uid=10001,gid=10001,mode=0700 --entrypoint python3 dip-document-worker:release-a scripts/verify-ocr-runtime.py
           docker run --rm --read-only --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777 --tmpfs /tmp/dip:rw,nosuid,nodev,noexec,size=256m,uid=10001,gid=10001,mode=0700 --entrypoint sh dip-document-worker:release-a -c 'test "$(id -u):$(id -g)" = "10001:10001"; test "$(stat -c %a /tmp)" = "1777"; test "$(stat -c %a /tmp/dip)" = "700"; awk '\''$2 == "/" && $4 ~ /(^|,)ro(,|$)/ { root=1 } $2 == "/tmp" && $4 ~ /size=65536k/ { tmp=1 } $2 == "/tmp/dip" && $4 ~ /size=262144k/ { dip=1 } END { exit !(root && tmp && dip) }'\'' /proc/mounts; soffice -env:UserInstallation=file:///tmp/dip/lo-startup-profile --headless --terminate_after_init'
+      - name: Execute the bounded PDF child inside the production image (B31-04)
+        # Presence checks are not execution. This runs the child in the image it ships
+        # in and drives the real protocol: inspect, fill, flatten, Arabic appearance
+        # (native canvas + bundled font), and protocol/alias resolution. A missing
+        # platform-specific native addon or an unresolvable font passes every file
+        # check and fails here, which is the failure this step exists to catch.
+        run: |
+          docker run --rm \
+            --read-only \
+            --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777 \
+            --tmpfs /tmp/dip:rw,nosuid,nodev,noexec,size=256m,uid=10001,gid=10001,mode=0700 \
+            --entrypoint node dip-document-worker:release-a scripts/smoke-pdf-worker-artifact.mjs /app
       - name: Verify qpdf security capabilities in the production worker
         run: |
           mkdir -p "$RUNNER_TEMP/qpdf-sbom"
@@ -590,6 +602,12 @@ jobs:
           GROQ_MODEL: openai/gpt-oss-120b
         run: |
           npm run build
+          # B31-04: execute the child against the *standalone build output*, not the
+          # checkout. The standalone tree is what ships, and its module layout differs
+          # from the repository's: traced files land elsewhere and `@/` aliases resolve
+          # through it. Running here proves the deployed layout can actually start the
+          # child, which no file-presence check can establish.
+          node scripts/smoke-pdf-worker-artifact.mjs .next/standalone
           nohup node scripts/start-browser-e2e.mjs >/tmp/dip-release-b-web.log 2>&1 &
           echo $! >/tmp/dip-release-b-web.pid
           for i in {1..60}; do curl --fail --silent http://127.0.0.1:3000/api/health && exit 0; sleep 1; done

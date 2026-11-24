@@ -25,7 +25,6 @@ import {
   decodeResult,
   encodeResult,
   parseMeta,
-  setExpectedOp,
   type WorkerMeta,
 } from "../src/lib/pdf/worker-protocol";
 
@@ -115,21 +114,21 @@ test("D3: a failure frame with trailing bytes is refused", () => {
 
 test("D4: operation mismatch applies to failure frames too", () => {
   // The parent asked for a fill; the child answered "inspect failed". That is not a
-  // fill refusal, it is a frame from a different exchange.
-  setExpectedOp("fill");
-  try {
-    assert.equal(reason(() => parseMeta({ ok: false, op: "inspect", code: "FORM_UNSUPPORTED" })), "OP_MISMATCH");
-    // The matching operation is accepted.
-    const matching = parseMeta({ ok: false, op: "fill", code: "FORM_FILL_FAILED" });
-    assert.equal(matching.ok, false);
-  } finally { setExpectedOp(null); }
+  // fill refusal, it is a frame from a different exchange. The expectation is now an
+  // argument, so there is nothing for a concurrent call to overwrite.
+  assert.equal(reason(() => parseMeta({ ok: false, op: "inspect", code: "FORM_UNSUPPORTED" }, "fill")), "OP_MISMATCH");
+  // The matching operation is accepted.
+  const matching = parseMeta({ ok: false, op: "fill", code: "FORM_FILL_FAILED" }, "fill");
+  assert.equal(matching.ok, false);
 });
 
 test("D4: success frames are still checked against the requested operation", () => {
-  setExpectedOp("fill");
-  try {
-    assert.equal(reason(() => parseMeta(okInspect)), "OP_MISMATCH");
-  } finally { setExpectedOp(null); }
+  assert.equal(reason(() => parseMeta(okInspect, "fill")), "OP_MISMATCH");
+  // And the correct expectation still passes: this must not become a blanket refusal.
+  assert.equal(parseMeta(okInspect, "inspect").ok, true);
+  // A null expectation means "no live exchange to match against"; the frame must still
+  // name a valid operation.
+  assert.equal(reason(() => parseMeta({ ...okInspect, op: "delete" }, null)), "UNKNOWN_OP");
 });
 
 test("D5: invalid UTF-8 in the metadata is a protocol error, not a substitution", () => {

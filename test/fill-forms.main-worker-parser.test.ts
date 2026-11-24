@@ -124,11 +124,98 @@ test("the traced file list and the artifact verifier cannot drift apart", async 
   const traced = listFrom(config, "const PDF_WORKER_TRACING = [");
   const verified = listFrom(verifier, "export const REQUIRED_PDF_WORKER_FILES = [");
   assert.ok(traced.length >= 8, `the traced list looks truncated: ${traced.join(", ")}`);
+  // `PDF_WORKER_TRACING` is the child's dependency closure. The artifact must also
+  // contain two things that are *not* part of that closure but are still required by the
+  // launcher at runtime, declared directly on `outputFileTracingIncludes`:
+  //
+  //   - `tsconfig.json` — tsx reads `paths` from it to resolve `@/` inside the child.
+  //   - `scripts/node-platform-compat.mjs` — is in the traced list already.
+  //
+  // Both are handled below: every verified file must be reachable either through the
+  // traced list or through the extra packaging declarations, so the verifier can never
+  // demand something the build does not include.
+  // Anchored on `outputFileTracingIncludes`, whose entries are route → glob arrays.
+  // Only string literals *inside a route's array* count as packaged files; the block's
+  // comments also quote paths, and a looser scrape treated those as declarations.
+  const packagedBlock = config.slice(config.indexOf("outputFileTracingIncludes:"));
+  const extraPackaged = [...packagedBlock.matchAll(/\.\/([A-Za-z0-9_.\/-]+)"/gu)]
+    .map((match) => match[1])
+    .filter((file) => file.includes(".") && !traced.includes(file));
   for (const file of verified) {
-    assert.ok(traced.includes(file), `${file} is verified but not traced, so the build would not include it`);
+    assert.ok(
+      traced.includes(file) || extraPackaged.includes(file),
+      `${file} is verified but neither traced nor packaged, so the build would not include it`,
+    );
+  }
+  // The packaging entries are load-bearing, not decoration: each must be present.
+  for (const file of extraPackaged) {
+    assert.ok(verified.includes(file), `${file} is packaged but the verifier does not check for it`);
   }
   // Every transitive source the child needs must be declared, not just the entry.
   for (const file of ["src/lib/pdf/form-worker-child.ts", "src/lib/pdf/worker-protocol.ts", "src/lib/pdf/form-types.ts", "scripts/node-platform-compat.mjs"]) {
     assert.ok(verified.includes(file), `${file} must be verified`);
+  }
+});
+
+test("the reported page count is derived from the actual output, not the input", async () => {
+  // `fillFormPdf` used to report `inventory.pages` — the count of the document it read
+  // *in*. For a correct fill the two are equal, which is precisely why the substitution
+  // was invisible. This asserts the value against an independent reopen of the bytes
+  // that are actually returned.
+  const { fillFormPdf } = await import("../src/lib/pdf/form-fill");
+  const document = await PDFDocument.create();
+  for (let index = 0; index < 4; index += 1) document.addPage([300, 300]);
+  document.getForm().createTextField("n").addToPage(document.getPages()[0], { x: 10, y: 10, width: 100, height: 20 });
+  const input = new Uint8Array(await document.save({ updateFieldAppearances: false }));
+
+  const filled = await fillFormPdf(input, { n: "x" }, { flatten: false });
+  const reopened = await PDFDocument.load(filled.bytes);
+  assert.equal(filled.report.pages, reopened.getPageCount(), "the report must carry the output's own page count");
+  assert.equal(filled.report.pages, 4);
+
+  const flattened = await fillFormPdf(input, { n: "y" }, { flatten: true });
+  const reopenedFlat = await PDFDocument.load(flattened.bytes);
+  assert.equal(flattened.report.pages, reopenedFlat.getPageCount(), "flatten must report the flattened output's count");
+  assert.equal(flattened.report.pages, 4);
+});
+
+test("a page-count change in the actual output is rejected, not reported as success", async () => {
+  // Simulate an output that lost a page by patching the verification result the engine
+  // consumes. The fill must fail rather than report the input's count, which is the
+  // behaviour that made the original substitution dangerous: the parent compares the
+  // reported count against the input count it already holds, so an input-derived report
+  // always agrees with itself.
+  const { readFileSync, writeFileSync } = await import("node:fs");
+  const path = new URL("../src/lib/pdf/form-fill.ts", import.meta.url);
+  const original = readFileSync(path, "utf8");
+  assert.match(original, /pages: verified\.pages/u, "the engine must report the verified output count");
+  const patched = original.replace(
+    "const verified = await verifyFilledForm(firstPass, values, { untouched: previous });",
+    "const verified = await verifyFilledForm(firstPass, values, { untouched: previous });\n  (verified as { pages: number }).pages -= 1;",
+  );
+  assert.notEqual(patched, original, "the patch must apply, or this test proves nothing");
+  try {
+    writeFileSync(path, patched);
+    // A fresh module instance is required: the imported module is cached per process,
+    // and a cached instance would silently exercise the *unpatched* code.
+    const { execFileSync } = await import("node:child_process");
+    const script = `
+      const { PDFDocument } = require("pdf-lib");
+      const { fillFormPdf } = require("${path.pathname.replace(/\.ts$/u, "")}");
+    `;
+    void script;
+    const probe = await import(`../src/lib/pdf/form-fill.ts?patched=${Date.now()}`);
+    const document = await PDFDocument.create();
+    for (let index = 0; index < 3; index += 1) document.addPage([300, 300]);
+    document.getForm().createTextField("n").addToPage(document.getPages()[0], { x: 10, y: 10, width: 100, height: 20 });
+    const input = new Uint8Array(await document.save({ updateFieldAppearances: false }));
+    await assert.rejects(
+      () => probe.fillFormPdf(input, { n: "x" }, { flatten: false }),
+      (error: unknown) => (error as { code?: string }).code === "FORM_OUTPUT_UNVERIFIED",
+      "an output whose page count disagrees with its input must be refused",
+    );
+    void execFileSync;
+  } finally {
+    writeFileSync(path, original);
   }
 });
