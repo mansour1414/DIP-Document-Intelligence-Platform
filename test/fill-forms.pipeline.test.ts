@@ -25,10 +25,30 @@ import { PDFDocument } from "pdf-lib";
 import type { MalwareScanner } from "../src/lib/malware";
 import type { ObjectStorage, StoredObject } from "../src/lib/storage";
 
-/** Skips (rather than fails) where `prisma generate` has not run; CI always has it. */
+/**
+ * Load the pipeline, skipping **only** when the generated Prisma client is
+ * genuinely absent (FF-11).
+ *
+ * The previous version caught every import error and reported it as "Prisma not
+ * generated". A syntax error, a bad import path or a broken dependency would
+ * therefore be silently converted into a skip — the suite would stay green while
+ * the pipeline was unloadable. A skip is now allowed for exactly one cause, and
+ * anything else is rethrown so CI fails.
+ *
+ * The skip itself is a local-environment concession: `npm test` sets
+ * `DIP_REQUIRE_PIPELINE=1` in CI, which turns even that one case into a failure.
+ */
+const PRISMA_MISSING = /Cannot find module ['"]\.prisma\/client\/default|@prisma\/client['"] did not initialize yet/iu;
+
 async function loadPipeline(client: { skip: (message?: string) => void }) {
   try { return await import("../src/lib/jobs/document-pipeline"); }
-  catch { client.skip("the generated Prisma client is not available in this environment"); return undefined; }
+  catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!PRISMA_MISSING.test(message)) throw error;
+    if (process.env.DIP_REQUIRE_PIPELINE === "1") throw new Error(`The generated Prisma client is required in this environment: ${message}`);
+    client.skip("the generated Prisma client is not available in this environment");
+    return undefined;
+  }
 }
 
 // ------------------------------------------------------------- fake database

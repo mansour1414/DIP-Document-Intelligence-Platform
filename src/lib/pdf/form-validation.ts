@@ -14,6 +14,7 @@
  * half lives in `form-schema.ts`.
  */
 import {
+  FORM_ERROR_MESSAGES,
   FORM_FIELD_NAME_LIMIT,
   FORM_FIELDS_JSON_LIMIT,
   FORM_OPTION_LIMIT,
@@ -22,6 +23,7 @@ import {
   type FormFillErrorCode,
   type FormFillValue,
   type FormInventory,
+  type FormValueIssue,
   type RawFieldMap,
 } from "@/lib/pdf/form-types";
 
@@ -37,52 +39,63 @@ export class FormFillError extends Error {
 
 /**
  * Validate a caller-supplied `{ name: value }` map against the inventory.
+ *
  * All problems are collected; nothing is written unless every entry is valid.
+ *
+ * FF-08: issues carry a stable `FormValueIssue` code and the field's *index* in
+ * the request — never the name and never the value. A field name is data too
+ * (`patient.diagnosis`), and these issues reach the persisted job error and the
+ * status API. The index is enough to point a client at the offending control.
  */
 export function validateFillValues(inventory: FormInventory, values: Record<string, unknown>) {
   const entries = Object.entries(values);
-  if (!entries.length) throw new FormFillError("FORM_VALUE_INVALID", "At least one field value is required.");
-  if (entries.length > FORM_VALUE_LIMIT) throw new FormFillError("FORM_VALUE_INVALID", `No more than ${FORM_VALUE_LIMIT} fields may be filled in one request.`);
+  if (!entries.length) throw valueRejection([{ issue: "NO_VALUES" }]);
+  if (entries.length > FORM_VALUE_LIMIT) throw valueRejection([{ issue: "TOO_MANY_VALUES", limit: FORM_VALUE_LIMIT }]);
   const byName = new Map(inventory.fields.map((field) => [field.name, field]));
-  const unsupported = new Map(inventory.unsupported.map((field) => [field.name, field.reason]));
-  const issues: string[] = [];
+  const unsupported = new Set(inventory.unsupported.map((field) => field.name));
+  const issues: Array<{ issue: FormValueIssue; index: number; limit?: number }> = [];
   const normalized = new Map<string, FormFillValue>();
-  for (const [name, raw] of entries) {
-    if (!name.trim()) { issues.push("Field names must not be blank."); continue; }
-    if (name.length > FORM_FIELD_NAME_LIMIT) { issues.push(`Field name "${name.slice(0, 40)}…" exceeds the ${FORM_FIELD_NAME_LIMIT} character limit.`); continue; }
+  entries.forEach(([name, raw], index) => {
+    if (!name.trim() || name.length > FORM_FIELD_NAME_LIMIT) { issues.push({ issue: "NAME_INVALID", index }); return; }
     const field = byName.get(name);
     if (!field) {
-      const reason = unsupported.get(name);
-      issues.push(reason ? `Field "${name}" cannot be filled: ${reason}` : `Field "${name}" does not exist in this form.`);
-      continue;
+      issues.push({ issue: unsupported.has(name) ? "UNSUPPORTED_FIELD" : "UNKNOWN_FIELD", index });
+      return;
     }
-    if (field.readOnly) { issues.push(`Field "${name}" is read-only.`); continue; }
+    if (field.readOnly) { issues.push({ issue: "READ_ONLY_FIELD", index }); return; }
     if (field.kind === "text") {
-      if (typeof raw !== "string") { issues.push(`Field "${name}" expects a string value.`); continue; }
-      if ([...raw].length > (field.maxLength ?? FORM_VALUE_CHAR_LIMIT)) { issues.push(`Field "${name}" exceeds its ${field.maxLength ?? FORM_VALUE_CHAR_LIMIT} character limit.`); continue; }
-      if (!field.multiline && /[\r\n]/u.test(raw)) { issues.push(`Field "${name}" is single-line and cannot contain line breaks.`); continue; }
-      if (textControls.test(raw)) { issues.push(`Field "${name}" contains an unsupported control character.`); continue; }
-      // NOTE: issue messages name the field and the rule, never the submitted
-      // value — they are returned to the caller, persisted as the job error and
-      // copied into logs.
-      normalized.set(name, raw); continue;
+      if (typeof raw !== "string") { issues.push({ issue: "TYPE_MISMATCH", index }); return; }
+      if ([...raw].length > (field.maxLength ?? FORM_VALUE_CHAR_LIMIT)) { issues.push({ issue: "LENGTH_EXCEEDED", index, limit: field.maxLength ?? FORM_VALUE_CHAR_LIMIT }); return; }
+      if (!field.multiline && /[\r\n]/u.test(raw)) { issues.push({ issue: "LINE_BREAK_IN_SINGLE_LINE", index }); return; }
+      if (textControls.test(raw)) { issues.push({ issue: "CONTROL_CHARACTER", index }); return; }
+      normalized.set(name, raw); return;
     }
     if (field.kind === "checkbox") {
-      if (typeof raw !== "boolean") { issues.push(`Field "${name}" expects a boolean value.`); continue; }
-      normalized.set(name, raw); continue;
+      if (typeof raw !== "boolean") { issues.push({ issue: "TYPE_MISMATCH", index }); return; }
+      normalized.set(name, raw); return;
     }
     if (field.kind === "radio" || field.kind === "dropdown") {
-      if (typeof raw !== "string") { issues.push(`Field "${name}" expects one option string.`); continue; }
-      if (!(field.options ?? []).includes(raw)) { issues.push(`Field "${name}" does not offer the selected option.`); continue; }
-      normalized.set(name, raw); continue;
+      if (typeof raw !== "string") { issues.push({ issue: "TYPE_MISMATCH", index }); return; }
+      if (!(field.options ?? []).includes(raw)) { issues.push({ issue: "OPTION_NOT_OFFERED", index }); return; }
+      normalized.set(name, raw); return;
     }
-    if (!Array.isArray(raw) || raw.some((item) => typeof item !== "string")) { issues.push(`Field "${name}" expects an array of option strings.`); continue; }
-    if (new Set(raw).size !== raw.length) { issues.push(`Field "${name}" contains duplicate selections.`); continue; }
-    if ((raw as string[]).some((item) => !(field.options ?? []).includes(item))) { issues.push(`Field "${name}" does not offer one of the selected options.`); continue; }
+    if (!Array.isArray(raw) || raw.some((item) => typeof item !== "string")) { issues.push({ issue: "TYPE_MISMATCH", index }); return; }
+    if (new Set(raw).size !== raw.length) { issues.push({ issue: "DUPLICATE_SELECTION", index }); return; }
+    if ((raw as string[]).some((item) => !(field.options ?? []).includes(item))) { issues.push({ issue: "OPTION_NOT_OFFERED", index }); return; }
     normalized.set(name, raw as string[]);
-  }
-  if (issues.length) throw new FormFillError("FORM_VALUE_INVALID", issues.join(" "), { issues });
+  });
+  if (issues.length) throw valueRejection(issues);
   return normalized;
+}
+
+/** Build the one error type used for every rejected-value outcome. */
+function valueRejection(issues: Array<{ issue: FormValueIssue; index?: number; limit?: number }>) {
+  // The field *index* identifies the offending control to a caller that sent the
+  // map; the name does not travel, because a name is data (`patient.diagnosis`)
+  // and this object is what a route or a log line may serialize.
+  return new FormFillError("FORM_VALUE_INVALID", FORM_ERROR_MESSAGES.FORM_VALUE_INVALID, {
+    issues: issues.map(({ issue, index, limit }) => ({ issue, ...(index === undefined ? {} : { index }), ...(limit === undefined ? {} : { limit }) })),
+  });
 }
 
 /** Snapshot of every supported field value, used to prove untouched fields survive. */
@@ -97,32 +110,169 @@ export function valueSnapshot(inventory: FormInventory) {
  * the worker, so a malformed payload can never reach the engine. Semantic
  * validation against the actual form inventory happens later in
  * `validateFillValues`.
+ *
+ * Every failure is `FORM_VALUE_INVALID` with a content-free message (FF-08);
+ * structured detail lives in `details`.
  */
 export function parseFieldsPayload(value: unknown): RawFieldMap {
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw new FormFillError("FORM_VALUE_INVALID", "Form fields must be a JSON object of field name to value.");
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw valueRejection([{ issue: "NAME_INVALID" }]);
+  // `Object.entries` would silently keep only the last duplicate key, so a
+  // duplicate is detected on the raw JSON text before it can be lost. (FF-10)
   const entries = Object.entries(value as Record<string, unknown>);
-  if (!entries.length) throw new FormFillError("FORM_VALUE_INVALID", "At least one field value is required.");
-  if (entries.length > FORM_VALUE_LIMIT) throw new FormFillError("FORM_VALUE_INVALID", `No more than ${FORM_VALUE_LIMIT} fields may be filled in one request.`);
+  if (!entries.length) throw valueRejection([{ issue: "NO_VALUES" }]);
+  if (entries.length > FORM_VALUE_LIMIT) throw valueRejection([{ issue: "TOO_MANY_VALUES", limit: FORM_VALUE_LIMIT }]);
   const parsed: RawFieldMap = {};
-  for (const [name, raw] of entries) {
-    if (!name.trim() || name.length > FORM_FIELD_NAME_LIMIT) throw new FormFillError("FORM_VALUE_INVALID", "Field names must be between 1 and 200 characters.");
-    if (name === "__proto__" || name === "constructor" || name === "prototype") throw new FormFillError("FORM_VALUE_INVALID", "Field names must not use reserved object keys.");
-    if (typeof raw === "boolean") { parsed[name] = raw; continue; }
+  const issues: Array<{ issue: FormValueIssue; index: number; limit?: number }> = [];
+  entries.forEach(([name, raw], index) => {
+    if (!name.trim() || name.length > FORM_FIELD_NAME_LIMIT) { issues.push({ issue: "NAME_INVALID", index }); return; }
+    if (name === "__proto__" || name === "constructor" || name === "prototype") { issues.push({ issue: "NAME_RESERVED", index }); return; }
+    if (typeof raw === "boolean") { parsed[name] = raw; return; }
     if (typeof raw === "string") {
-      if ([...raw].length > FORM_VALUE_CHAR_LIMIT) throw new FormFillError("FORM_VALUE_INVALID", `Field "${name}" exceeds the ${FORM_VALUE_CHAR_LIMIT} character limit.`);
-      parsed[name] = raw; continue;
+      if ([...raw].length > FORM_VALUE_CHAR_LIMIT) { issues.push({ issue: "VALUE_TOO_LONG", index, limit: FORM_VALUE_CHAR_LIMIT }); return; }
+      parsed[name] = raw; return;
     }
     if (Array.isArray(raw) && raw.every((item) => typeof item === "string")) {
-      if (raw.length > FORM_OPTION_LIMIT) throw new FormFillError("FORM_VALUE_INVALID", `Field "${name}" selects more than ${FORM_OPTION_LIMIT} options.`);
-      if (raw.some((item) => [...item].length > FORM_VALUE_CHAR_LIMIT)) throw new FormFillError("FORM_VALUE_INVALID", `Field "${name}" contains an option that is too long.`);
-      parsed[name] = [...raw] as string[]; continue;
+      if (raw.length > FORM_OPTION_LIMIT) { issues.push({ issue: "TOO_MANY_VALUES", index, limit: FORM_OPTION_LIMIT }); return; }
+      if (raw.some((item) => [...item].length > FORM_VALUE_CHAR_LIMIT)) { issues.push({ issue: "VALUE_TOO_LONG", index, limit: FORM_VALUE_CHAR_LIMIT }); return; }
+      parsed[name] = [...raw] as string[]; return;
     }
-    throw new FormFillError("FORM_VALUE_INVALID", `Field "${name}" must be a string, a boolean, or an array of strings.`);
-  }
+    issues.push({ issue: "TYPE_MISMATCH", index });
+  });
+  if (issues.length) throw valueRejection(issues);
   return parsed;
 }
 
-/** Reject a payload whose serialised form exceeds the transport limit. */
-export function assertFieldsPayloadSize(serialized: string) {
-  if (serialized.length > FORM_FIELDS_JSON_LIMIT) throw new FormFillError("FORM_VALUE_INVALID", `The form field payload exceeds ${Math.round(FORM_FIELDS_JSON_LIMIT / 1024)} KB.`);
+/**
+ * Parse a `fields` multipart part.
+ *
+ * Two properties the review found missing (FF-10):
+ *   - the 64 KiB limit is measured in **UTF-8 bytes**, not UTF-16 code units
+ *     (35,121 Arabic characters are 70,121 bytes and used to pass);
+ *   - **duplicate object keys are rejected**, because `JSON.parse` keeps only the
+ *     last one and would silently accept an ambiguous request.
+ */
+export function parseFieldsPart(part: unknown): RawFieldMap {
+  if (typeof part !== "string" || part.length === 0) throw valueRejection([{ issue: "NO_VALUES" }]);
+  assertFieldsPayloadSize(part);
+  assertNoDuplicateJsonKeys(part);
+  let parsed: unknown;
+  try { parsed = JSON.parse(part) as unknown; }
+  catch { throw valueRejection([{ issue: "NAME_INVALID" }]); }
+  return parseFieldsPayload(parsed);
 }
+
+/**
+ * Reject a `fields` object whose JSON text repeats a key.
+ *
+ * `JSON.parse` keeps only the last duplicate, so an ambiguous request would be
+ * accepted and silently reinterpreted. This walks the document with a minimal
+ * recursive-descent parser (structure only, no coercion) and throws on a
+ * repeated key *within the same object*. The same key in different objects is
+ * legitimate — only siblings are compared.
+ *
+ * The scan is bounded by the payload size, which is checked first, and by
+ * `MAX_JSON_DEPTH`, so it cannot be used as a stack-exhaustion vector.
+ */
+export function assertNoDuplicateJsonKeys(source: string) {
+  const MAX_JSON_DEPTH = 64;
+  let index = 0;
+  const fail = (): never => { throw valueRejection([{ issue: "NAME_INVALID" }]); };
+
+  const skipWhitespace = () => {
+    while (index < source.length) {
+      const character = source[index];
+      if (character === " " || character === "\t" || character === "\n" || character === "\r") index += 1;
+      else break;
+    }
+  };
+
+  // Returns the decoded string; advancing past the closing quote.
+  const readString = (): string => {
+    if (source[index] !== '"') fail();
+    index += 1;
+    let value = "";
+    while (index < source.length) {
+      const character = source[index];
+      if (character === '"') { index += 1; return value; }
+      if (character === "\\") {
+        const escape = source[index + 1];
+        index += 2;
+        if (escape === "u") {
+          const hex = source.slice(index, index + 4);
+          if (!/^[0-9a-fA-F]{4}$/u.test(hex)) fail();
+          value += String.fromCharCode(Number.parseInt(hex, 16));
+          index += 4;
+        } else {
+          const mapped: Record<string, string> = { '"': '"', "\\": "\\", "/": "/", b: "\b", f: "\f", n: "\n", r: "\r", t: "\t" };
+          if (!(escape in mapped)) fail();
+          value += mapped[escape];
+        }
+        continue;
+      }
+      if (character < " ") fail();
+      value += character;
+      index += 1;
+    }
+    return fail();
+  };
+
+  const skipValue = (depth: number): void => {
+    if (depth > MAX_JSON_DEPTH) fail();
+    skipWhitespace();
+    const character = source[index];
+    if (character === '"') { readString(); return; }
+    if (character === "{") {
+      index += 1;
+      const keys = new Set<string>();
+      skipWhitespace();
+      if (source[index] === "}") { index += 1; return; }
+      for (;;) {
+        skipWhitespace();
+        const key = readString();
+        if (keys.has(key)) fail();
+        keys.add(key);
+        skipWhitespace();
+        if (source[index] !== ":") fail();
+        index += 1;
+        skipValue(depth + 1);
+        skipWhitespace();
+        if (source[index] === ",") { index += 1; continue; }
+        if (source[index] === "}") { index += 1; return; }
+        fail();
+      }
+    }
+    if (character === "[") {
+      index += 1;
+      skipWhitespace();
+      if (source[index] === "]") { index += 1; return; }
+      for (;;) {
+        skipValue(depth + 1);
+        skipWhitespace();
+        if (source[index] === ",") { index += 1; continue; }
+        if (source[index] === "]") { index += 1; return; }
+        fail();
+      }
+    }
+    const literal = /^(?:true|false|null|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)/u.exec(source.slice(index, index + 64));
+    if (!literal) fail();
+    index += literal?.[0].length ?? 0;
+  };
+
+  skipValue(0);
+  skipWhitespace();
+  if (index !== source.length) fail();
+}
+
+/**
+ * Reject a payload whose serialised form exceeds the transport limit.
+ *
+ * Measured with `TextEncoder` (UTF-8), not `.length` (UTF-16 code units): Arabic
+ * text is 2 bytes per code unit, so a string-length check understates the real
+ * payload by half and lets oversized requests through. (FF-10)
+ */
+export function assertFieldsPayloadSize(serialized: string) {
+  if (new TextEncoder().encode(serialized).byteLength > FORM_FIELDS_JSON_LIMIT) throw valueRejection([{ issue: "VALUE_TOO_LONG", limit: FORM_FIELDS_JSON_LIMIT }]);
+}
+
+/** UTF-8 byte length of a payload, exposed so callers can bound before parsing. */
+export function fieldsPayloadBytes(serialized: string) { return new TextEncoder().encode(serialized).byteLength; }

@@ -12,6 +12,7 @@ import { createQueueActivityLookup, resolveEvidence, unknownEvidence, type Queue
 import { openRetentionRedis, type RetentionRedisHandle } from "./queue-connection";
 import { applyExpiryPlan } from "./expiry-write";
 import { AI_JOB_QUEUE_NAME, JOB_QUEUE_NAME } from "@/lib/queue";
+import { purgeFormFields } from "@/lib/pdf/form-payload";
 
 /**
  * Job-expiry sweep: planning, queue evidence and the guarded apply write.
@@ -406,10 +407,24 @@ export async function expireStalledJobs(options: ExpireStalledJobsOptions = {}):
 
   // Apply only: the client is resolved here, never on the planning path.
   const { db } = await import("@/lib/db");
+  // FF-03: read the references *before* the guarded write, because the write
+  // only returns a count. A row that another actor changed in the meantime is
+  // skipped by the guard and its payload is simply left to the TTL — never
+  // purged for a job that did not actually expire.
+  const expiring = await db.job.findMany({ where: { id: { in: [...plan.expireIds] } }, select: { params: true } });
+  // Typed explicitly rather than inferred: without a generated Prisma client the
+  // element type degrades to `{}` and every property access becomes an error.
+  const fieldsRefs = (expiring as Array<{ params: unknown }>)
+    .map((row) => (row.params as { fieldsRef?: string } | null)?.fieldsRef)
+    .filter((reference): reference is string => Boolean(reference));
   const count = await applyExpiryPlan(
     { updateMany: (args) => db.job.updateMany(args as Parameters<typeof db.job.updateMany>[0]) },
     { expireIds: plan.expireIds, sweepStartedAt, completedAt: now },
   );
+  // Only reachable in `apply` mode, which is a scheduled retention operation the
+  // scheduler already invokes; this adds a Redis delete per expired fill job and
+  // does not change *which* jobs expire or when.
+  if (fieldsRefs.length) await Promise.all(fieldsRefs.map((reference) => purgeFormFields(reference).catch(() => undefined)));
   logger.info("jobs.expired_cleanup", {
     count,
     planned: plan.expireIds.length,

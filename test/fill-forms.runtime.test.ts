@@ -18,7 +18,7 @@
  */
 import assert from "node:assert/strict";
 import test from "node:test";
-import { PDFArray, PDFDocument, PDFName, PDFNumber, PDFString, StandardFonts } from "pdf-lib";
+import { PDFArray, PDFDict, PDFDocument, PDFName, PDFNumber, PDFString, StandardFonts } from "pdf-lib";
 import {
   FormFillError,
   assertFillableDocument,
@@ -27,6 +27,7 @@ import {
   verifyFilledForm,
 } from "../src/lib/pdf/form-schema";
 import { assertFieldsPayloadSize, parseFieldsPayload } from "../src/lib/pdf/form-validation";
+import { FORM_ERROR_MESSAGES } from "../src/lib/pdf/form-types";
 import { FORM_ENGINE, FORM_ENGINE_VERSION, fillFormPdf, inspectFormPdf } from "../src/lib/pdf/form-fill";
 
 // ------------------------------------------------------------------- fixtures
@@ -211,9 +212,19 @@ test("S2 fill-forms: fields not named in the request keep their exact previous v
 
 test("S2 fill-forms: read-only fields are refused instead of silently ignored", async () => {
   const source = await applicationForm();
+  // FF-08: the message is allowlisted and content-free, so the *reason* lives in
+  // structured detail rather than in prose that gets persisted on the job row.
   await assert.rejects(
     () => fillFormPdf(source, { declaration: "tampered" }),
-    (error: unknown) => error instanceof FormFillError && error.code === "FORM_VALUE_INVALID" && /read-only/u.test(error.message),
+    (error: unknown) => {
+      assert.ok(error instanceof FormFillError && error.code === "FORM_VALUE_INVALID");
+      assert.equal(error.message, FORM_ERROR_MESSAGES.FORM_VALUE_INVALID);
+      assert.deepEqual((error.details as { issues: unknown[] }).issues, [{ issue: "READ_ONLY_FIELD", index: 0 }]);
+      // Neither the value nor the field name may appear anywhere in the payload.
+      const serialized = JSON.stringify(error);
+      assert.doesNotMatch(serialized, /tampered|declaration/u);
+      return true;
+    },
   );
 });
 
@@ -323,24 +334,29 @@ test("S2 fill-forms: documents without a supported AcroForm are rejected, not tr
   await assert.rejects(() => inspectFormPdf(new Uint8Array([0x25, 0x50, 0x44, 0x46])), rejectionOf("FORM_UNSUPPORTED"));
 });
 
-test("S2 fill-forms: values that do not match the field contract are rejected with actionable messages", async () => {
+test("S2 fill-forms: values that do not match the field contract are rejected with a stable issue code", async () => {
   const source = await applicationForm();
-  const cases: Array<[Record<string, unknown>, RegExp]> = [
-    [{ "not.a.field": "x" }, /does not exist/u],
-    [{ "applicant.name.en": 42 }, /expects a string/u],
-    [{ consent: "yes" }, /expects a boolean/u],
-    [{ city: "Dubai" }, /does not offer/u],
-    [{ tags: ["alpha", "delta"] }, /does not offer/u],
-    [{ tags: ["alpha", "alpha"] }, /duplicate selections/u],
-    [{ "applicant.iqama": "1234567890123" }, /exceeds its 10 character limit/u],
-    [{ "applicant.name.en": "line\nbreak" }, /single-line/u],
-    [{ "applicant.name.en": "bell\u0007" }, /control character/u],
-    [{ shift: "" }, /does not offer/u],
+  // FF-08: each case asserts the *issue code* from the allowlist. Messages are
+  // now content-free and identical for every rejection, so the code — not prose —
+  // is the contract a client maps onto its own field UI.
+  const cases: Array<[Record<string, unknown>, string]> = [
+    [{ "not.a.field": "x" }, "UNKNOWN_FIELD"],
+    [{ "applicant.name.en": 42 }, "TYPE_MISMATCH"],
+    [{ consent: "yes" }, "TYPE_MISMATCH"],
+    [{ city: "Dubai" }, "OPTION_NOT_OFFERED"],
+    [{ tags: ["alpha", "delta"] }, "OPTION_NOT_OFFERED"],
+    [{ tags: ["alpha", "alpha"] }, "DUPLICATE_SELECTION"],
+    [{ "applicant.iqama": "1234567890123" }, "LENGTH_EXCEEDED"],
+    [{ "applicant.name.en": "line\nbreak" }, "LINE_BREAK_IN_SINGLE_LINE"],
+    [{ "applicant.name.en": "bell\u0007" }, "CONTROL_CHARACTER"],
+    [{ shift: "" }, "OPTION_NOT_OFFERED"],
   ];
-  for (const [values, pattern] of cases) {
+  for (const [values, issue] of cases) {
     await assert.rejects(() => fillFormPdf(source, values as Record<string, string | boolean | string[]>), (error: unknown) => {
       assert.ok(error instanceof FormFillError && error.code === "FORM_VALUE_INVALID", `${JSON.stringify(values)} was not rejected as a value error`);
-      assert.match(error.message, pattern);
+      assert.equal(error.message, FORM_ERROR_MESSAGES.FORM_VALUE_INVALID);
+      const issues = (error.details as { issues: Array<{ issue: string }> }).issues;
+      assert.ok(issues.some((entry) => entry.issue === issue), `${JSON.stringify(values)} produced ${JSON.stringify(issues)}, expected ${issue}`);
       return true;
     });
   }
@@ -412,11 +428,15 @@ test("S2 fill-forms: verification and fill failures never echo the submitted val
   assert.equal(error.code, "FORM_OUTPUT_UNVERIFIED");
   assert.doesNotMatch(error.message, /CONFIDENTIAL-IDENTIFIER-918273/u);
   assert.doesNotMatch(error.message, /different/u);
-  assert.match(error.message, /string\(\d+ chars\)/u);
+  // FF-08: the detail is a count of stable codes — no types, lengths or names.
+  assert.equal(error.message, FORM_ERROR_MESSAGES.FORM_OUTPUT_UNVERIFIED);
+  assert.deepEqual((error.details as { mismatches: unknown[] }).mismatches, [{ code: "VALUE_NOT_ROUND_TRIPPED", count: 1 }]);
+  assert.doesNotMatch(JSON.stringify(error), /applicant\.name\.en|CONFIDENTIAL|different/u);
   // Untouched-field drift is described the same way.
   const drift = await verifyFilledForm(filled.bytes, new Map(), { untouched: new Map([["reference", "WRONG-VALUE"]]) }).then(() => undefined, (thrown: unknown) => thrown);
   assert.ok(drift instanceof FormFillError);
   assert.doesNotMatch(drift.message, /WRONG-VALUE/u);
+  assert.deepEqual((drift.details as { mismatches: unknown[] }).mismatches, [{ code: "UNTOUCHED_FIELD_MODIFIED", count: 1 }]);
 });
 
 test("S2 fill-forms: values are never written to logs, metrics or audit metadata", async () => {
@@ -436,4 +456,235 @@ test("S2 fill-forms: values are never written to logs, metrics or audit metadata
     assert.doesNotMatch(line, /APPLICANT-SECRET-553311/u, "a field value reached a log line");
     assert.doesNotMatch(line, /ملاحظة سرية/u, "an Arabic field value reached a log line");
   }
+});
+
+// ------------------------------------------------- FF-02 / FF-05 / FF-09 regression
+//
+// Each test below reproduces a defect the independent review found in the
+// previous head. They are written against the *fixture shape the review used*,
+// so a regression shows up as the same wrong outcome, not as a different one.
+
+/** Add a field entry to the AcroForm `/Fields` array. */
+function pushField(document: PDFDocument, entry: unknown) {
+  const fields = document.getForm().acroForm.dict.lookup(PDFName.of("Fields"));
+  assert.ok(fields instanceof PDFArray, "fixture must have an AcroForm /Fields array");
+  const dict = document.context.obj(entry as Record<string, never>);
+  fields.push(document.context.register(dict) as unknown as Parameters<typeof fields.push>[0]);
+}
+
+test("FF-02: a signature field nested under /Kids is refused before any write", async () => {
+  // Review evidence: this document was accepted and produced an 11,289-byte
+  // filled output. Only the top level of /Fields used to be inspected.
+  const document = await PDFDocument.create();
+  const page = document.addPage([300, 300]);
+  document.getForm().createTextField("name").addToPage(page, { x: 20, y: 200, width: 200, height: 20 });
+  const signature = document.context.register(document.context.obj({ Type: "Annot", Subtype: "Widget", Rect: [20, 20, 120, 40], FT: "Sig", T: "signature1" }));
+  pushField(document, { T: "group", Kids: [signature] });
+  const bytes = new Uint8Array(await document.save({ updateFieldAppearances: false }));
+
+  await assert.rejects(() => inspectFormPdf(bytes), rejectionOf("FORM_RESTRICTED"));
+  await assert.rejects(() => fillFormPdf(bytes, { name: "x" }), rejectionOf("FORM_RESTRICTED"));
+});
+
+test("FF-02: an inherited /FT is read from the ancestor, not only from the child", async () => {
+  // `/FT` is inheritable in the PDF object model: the child has none of its own,
+  // so a scan that reads only the child's entry sees an ordinary field.
+  const document = await PDFDocument.create();
+  const page = document.addPage([300, 300]);
+  document.getForm().createTextField("name").addToPage(page, { x: 20, y: 200, width: 200, height: 20 });
+  const child = document.context.register(document.context.obj({ Type: "Annot", Subtype: "Widget", Rect: [20, 20, 120, 40], T: "child" }));
+  pushField(document, { T: "parent", FT: "Sig", Kids: [child] });
+  const bytes = new Uint8Array(await document.save({ updateFieldAppearances: false }));
+  await assert.rejects(() => inspectFormPdf(bytes), rejectionOf("FORM_RESTRICTED"));
+});
+
+test("FF-02: an unresolved /Perms entry is refused instead of read as unrestricted", async () => {
+  // Review evidence: this document was accepted and produced 11,238 bytes.
+  const document = await PDFDocument.create();
+  const page = document.addPage([300, 300]);
+  document.getForm().createTextField("name").addToPage(page, { x: 20, y: 200, width: 200, height: 20 });
+  document.catalog.set(PDFName.of("Perms"), document.context.nextRef());
+  const bytes = new Uint8Array(await document.save({ updateFieldAppearances: false }));
+  await assert.rejects(() => inspectFormPdf(bytes), rejectionOf("FORM_RESTRICTED"));
+  await assert.rejects(() => fillFormPdf(bytes, { name: "x" }), rejectionOf("FORM_RESTRICTED"));
+});
+
+test("FF-02: malformed structure fails closed, and a /Kids cycle terminates", async () => {
+  const document = await PDFDocument.create();
+  const page = document.addPage([300, 300]);
+  document.getForm().createTextField("name").addToPage(page, { x: 20, y: 200, width: 200, height: 20 });
+  // `/Fields` is not an array: the walk cannot establish the document's shape.
+  document.getForm().acroForm.dict.set(PDFName.of("Fields"), document.context.obj({ T: "not-an-array" }));
+  const bytes = new Uint8Array(await document.save({ updateFieldAppearances: false }));
+  await assert.rejects(() => inspectFormPdf(bytes), rejectionOf("FORM_RESTRICTED"));
+
+  // A `/Kids` cycle must be detected, not followed forever.
+  const cyclic = await PDFDocument.create();
+  const cyclicPage = cyclic.addPage([300, 300]);
+  cyclic.getForm().createTextField("name").addToPage(cyclicPage, { x: 20, y: 200, width: 200, height: 20 });
+  const node = cyclic.context.obj({ T: "loop" });
+  const nodeRef = cyclic.context.register(node);
+  node.set(PDFName.of("Kids"), cyclic.context.obj([nodeRef]));
+  const fields = cyclic.getForm().acroForm.dict.lookup(PDFName.of("Fields"));
+  if (fields instanceof PDFArray) fields.push(nodeRef);
+  const cyclicBytes = new Uint8Array(await cyclic.save({ updateFieldAppearances: false }));
+  // The reference walk terminates on the cycle by itself; the inventory built
+  // afterwards cannot be trusted, so the document is refused either way — and it
+  // is refused with a *coded* error, never an unclassified `RangeError`.
+  await assert.rejects(() => inspectFormPdf(cyclicBytes), (error: unknown) => {
+    assert.ok(error instanceof FormFillError, `expected a coded failure, got ${String(error)}`);
+    assert.ok(["FORM_RESTRICTED", "FORM_UNSUPPORTED"].includes(error.code));
+    return true;
+  });
+});
+
+test("FF-05: flattening leaves no unresolved or surviving widget annotations", async () => {
+  // Review evidence: a two-page, 15-widget form flattened to a document with
+  // 0 fields but 15 unresolved `/Annots` entries (pypdf) / 15 `Invalid XRef`
+  // (Poppler), while still reopening with the same page count — which is why the
+  // old gate passed it.
+  const document = await PDFDocument.create();
+  const pages = [document.addPage([300, 300]), document.addPage([300, 300])];
+  const form = document.getForm();
+  for (let index = 0; index < 15; index += 1) {
+    const field = form.createTextField(`f${index}`);
+    field.setText(`v${index}`);
+    field.addToPage(pages[index < 8 ? 0 : 1], { x: 10, y: 20 + (index % 8) * 30, width: 120, height: 18 });
+  }
+  // An unrelated (non-widget) annotation must survive the prune.
+  pages[0].node.set(PDFName.of("Annots"), document.context.obj([
+    ...(pages[0].node.Annots()?.asArray() ?? []),
+    document.context.register(document.context.obj({ Type: "Annot", Subtype: "Link", Rect: [10, 280, 80, 295] })),
+  ]));
+  const source = new Uint8Array(await document.save({ updateFieldAppearances: false }));
+  const values = Object.fromEntries(Array.from({ length: 15 }, (_, index) => [`f${index}`, "filled"]));
+  const result = await fillFormPdf(source, values, { flatten: true });
+
+  // Independent re-read with pdf-lib (no Poppler/pypdf in this sandbox).
+  const reopened = await PDFDocument.load(result.bytes);
+  assert.equal(reopened.getPageCount(), 2);
+  assert.equal(reopened.getForm().getFields().length, 0, "flattening must remove the fields");
+  let annots = 0;
+  let unresolved = 0;
+  let widgets = 0;
+  let links = 0;
+  for (const page of reopened.getPages()) {
+    const array = page.node.Annots();
+    if (!array) continue;
+    for (let index = 0; index < array.size(); index += 1) {
+      annots += 1;
+      const entry = array.get(index);
+      const target = reopened.context.lookup(entry);
+      if (target === undefined) unresolved += 1;
+      else if (target instanceof PDFDict) {
+        const subtype = String(target.get(PDFName.of("Subtype")) ?? "");
+        if (subtype === "/Widget") widgets += 1;
+        if (subtype === "/Link") links += 1;
+      }
+    }
+  }
+  assert.equal(unresolved, 0, "no dangling /Annots reference may remain");
+  assert.equal(widgets, 0, "a flattened widget must not survive as an annotation");
+  assert.equal(links, 1, "unrelated annotations must be preserved");
+  assert.equal(annots, 1);
+});
+
+test("FF-09: clearing a text field to an empty string verifies instead of failing", async () => {
+  // Review evidence: `""` produced FORM_OUTPUT_UNVERIFIED with
+  // "expected string(0 chars), found empty" — a correct write reported as an error.
+  const document = await PDFDocument.create();
+  const page = document.addPage([300, 300]);
+  const field = document.getForm().createTextField("note");
+  field.setText("something to clear");
+  field.addToPage(page, { x: 20, y: 200, width: 200, height: 20 });
+  const source = new Uint8Array(await document.save({ updateFieldAppearances: false }));
+
+  const result = await fillFormPdf(source, { note: "" });
+  assert.equal(result.report.filled.length, 1);
+  const reopened = await PDFDocument.load(result.bytes);
+  const value = reopened.getForm().getTextField("note").getText();
+  // Both empty spellings are the same value: absent `/V` and `/V ()`.
+  assert.ok(value === "" || value === undefined, `expected an empty value, got ${JSON.stringify(value)}`);
+});
+
+// ------------------------------------------------------------------ FF-07 / FF-03
+
+test("FF-07: Arabic line breaks survive layout, and an over-wide value is refused rather than clipped", async () => {
+  const { renderWidgetAppearance, AppearanceLegibilityError } = await import("../src/lib/pdf/form-appearance");
+  // Two explicit lines must stay two lines. The previous layout collapsed them
+  // into one, which is a silent content change on the page.
+  const twoLines = renderWidgetAppearance({ text: "سطر أول\nسطر ثانٍ", width: 200, height: 60, multiline: true });
+  const oneLine = renderWidgetAppearance({ text: "سطر أول سطر ثانٍ", width: 200, height: 60, multiline: true });
+  assert.ok(twoLines.byteLength > 0 && oneLine.byteLength > 0);
+  // The review's 209-character value in a 90 pt widget was clipped. It must now
+  // be rejected outright: no partial output is produced at all.
+  assert.throws(
+    () => renderWidgetAppearance({ text: "ب".repeat(209), width: 90, height: 18 }),
+    (error: unknown) => error instanceof AppearanceLegibilityError && error.reason === "VALUE_OVERFLOWS_WIDGET",
+  );
+  // The review's 18x7 pt widget cannot hold legible text at any font size. The
+  // measured rectangle includes the border, so it reaches the renderer as 19x8.
+  assert.throws(
+    () => renderWidgetAppearance({ text: "x", width: 19, height: 8 }),
+    (error: unknown) => error instanceof AppearanceLegibilityError && error.reason === "WIDGET_TOO_SMALL",
+  );
+  // Multiline overflow beyond the line budget is refused, not truncated.
+  assert.throws(
+    () => renderWidgetAppearance({ text: Array.from({ length: 40 }, () => "نص").join(" "), width: 80, height: 20, multiline: true }),
+    (error: unknown) => error instanceof AppearanceLegibilityError,
+  );
+});
+
+test("FF-07: an unrenderable value fails the whole fill and produces no output document", async () => {
+  const document = await PDFDocument.create();
+  const page = document.addPage([300, 300]);
+  // A widget too small to render Arabic legibly.
+  const field = document.getForm().createTextField("tiny");
+  field.addToPage(page, { x: 10, y: 10, width: 18, height: 7 });
+  const source = new Uint8Array(await document.save({ updateFieldAppearances: false }));
+  await assert.rejects(() => fillFormPdf(source, { tiny: "نورة" }), (error: unknown) => {
+    assert.ok(error instanceof FormFillError);
+    assert.equal(error.code, "FORM_VALUE_INVALID");
+    assert.deepEqual((error.details as { issues: Array<{ issue: string }> }).issues, [{ issue: "UNRENDERABLE_SCRIPT", reason: "WIDGET_TOO_SMALL" }]);
+    return true;
+  });
+});
+
+test("FF-03: the encrypted payload is non-destructive, tenant-bound and purged by lifecycle", async () => {
+  const { putFormFields, readFormFields, purgeFormFields, formPayloadTtlSeconds } = await import("../src/lib/pdf/form-payload");
+  // An in-memory store with the same semantics as the Redis one (`GET`, not
+  // `GETDEL`), so retry-safety is provable without a live Redis.
+  const items = new Map<string, { value: string; ttl: number }>();
+  const store = {
+    async set(key: string, value: string, ttl: number) {
+      if (items.has(key)) throw new Error("SECRET_REFERENCE_COLLISION");
+      items.set(key, { value, ttl });
+    },
+    async get(key: string) { return items.get(key)?.value ?? null; },
+    async delete(key: string) { items.delete(key); },
+  };
+  process.env.PHASE1_SECRET_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString("base64");
+
+  const values = { "applicant.name.ar": "نورة الحربي", "applicant.iqaz": "2412345678" };
+  const reference = await putFormFields({ tenantId: "tenant-a", jobId: "job-1", fields: values }, store);
+  assert.match(reference, /^[0-9a-f-]{36}$/u, "the reference must be an opaque uuid");
+  // The stored envelope must not contain the values in clear text.
+  const stored = [...items.values()][0];
+  assert.doesNotMatch(stored.value, /نورة|2412345678/u, "values must be encrypted at rest");
+  // TTL is the approved abandoned-job grace, not an arbitrary number.
+  assert.ok(stored.ttl >= 24 * 60 * 60, `ttl ${stored.ttl} must cover the retention grace`);
+
+  // Retry-safe: the same reference reads repeatedly.
+  assert.deepEqual(await readFormFields({ reference, tenantId: "tenant-a", jobId: "job-1" }, store), values);
+  assert.deepEqual(await readFormFields({ reference, tenantId: "tenant-a", jobId: "job-1" }, store), values);
+
+  // Cross-tenant and cross-job reads fail authentication rather than returning data.
+  await assert.rejects(() => readFormFields({ reference, tenantId: "tenant-b", jobId: "job-1" }, store), (error: unknown) => (error as { code?: string }).code === "FORM_PAYLOAD_INVALID");
+  await assert.rejects(() => readFormFields({ reference, tenantId: "tenant-a", jobId: "job-2" }, store), (error: unknown) => (error as { code?: string }).code === "FORM_PAYLOAD_INVALID");
+
+  // Purge is idempotent and makes the reference unusable.
+  await purgeFormFields(reference, store);
+  await purgeFormFields(reference, store);
+  await assert.rejects(() => readFormFields({ reference, tenantId: "tenant-a", jobId: "job-1" }, store), (error: unknown) => (error as { code?: string }).code === "FORM_PAYLOAD_EXPIRED");
+  assert.ok(formPayloadTtlSeconds() >= 86_400);
 });

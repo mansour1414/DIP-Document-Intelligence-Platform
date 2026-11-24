@@ -18,6 +18,7 @@
 import { PDFDocument, PDFName, PDFDict, type PDFField } from "pdf-lib";
 import { FORM_FIELD_LIMIT, FORM_OPTION_LIMIT, type FormFieldDescriptor, type FormFieldKind, type FormFillValue, type FormInventory, type UnsupportedFieldDescriptor } from "@/lib/pdf/form-types";
 import { FormFillError } from "@/lib/pdf/form-validation";
+import { FORM_ERROR_MESSAGES } from "@/lib/pdf/form-types";
 
 export type {
   FormFieldKind,
@@ -190,35 +191,56 @@ export function applyFillValues(document: PDFDocument, values: Map<string, FormF
   return applied;
 }
 
-function appearanceProblems(field: PDFField): string[] {
-  const problems: string[] = [];
+type AppearanceIssue =
+  | "WIDGET_NO_APPEARANCE"
+  | "WIDGET_NO_NORMAL_APPEARANCE"
+  | "APPEARANCE_NO_ON_STATE"
+  | "WIDGET_NO_APPEARANCE_STATE"
+  | "APPEARANCE_STATE_WITHOUT_STREAM";
+
+function appearanceProblems(field: PDFField): AppearanceIssue[] {
+  const problems: AppearanceIssue[] = [];
   for (const widget of field.acroField.getWidgets()) {
     const api = widget.AP();
-    if (!api) { problems.push("a widget has no appearance dictionary"); continue; }
+    if (!api) { problems.push("WIDGET_NO_APPEARANCE"); continue; }
     const normal = api.lookup(PDFName.of("N"));
-    if (!normal) { problems.push("a widget has no normal appearance"); continue; }
+    if (!normal) { problems.push("WIDGET_NO_NORMAL_APPEARANCE"); continue; }
     if (normal instanceof PDFDict) {
       const states = [...normal.keys()].filter((key) => String(key) !== "/Off");
-      if (!states.length) { problems.push("an appearance state map has no on-state"); continue; }
+      if (!states.length) { problems.push("APPEARANCE_NO_ON_STATE"); continue; }
       const state = widget.getAppearanceState()?.toString();
-      if (!state) { problems.push("a widget has no appearance state"); continue; }
+      if (!state) { problems.push("WIDGET_NO_APPEARANCE_STATE"); continue; }
       const entry = normal.get(PDFName.of(state.replace(/^\//u, "")));
-      if (!entry) problems.push(`appearance state ${state} has no stream`);
+      if (!entry) problems.push("APPEARANCE_STATE_WITHOUT_STREAM");
     }
   }
   return problems;
 }
 
 /**
- * Non-revealing description of a form value: its shape and size, never content.
- * Used in verification failures, which are persisted on the job and logged.
+ * Canonical value comparison for verification (FF-09).
+ *
+ * A text field has two empty spellings in a saved PDF: `/V ()` (which pdf-lib
+ * reads as `""`) and no `/V` at all (which it reads as `undefined`). The field is
+ * empty either way, so both normalise to `""`. Before this, a request that
+ * cleared a field compared `""` against `null` and was rejected as
+ * `FORM_OUTPUT_UNVERIFIED` — a *correct* write reported as a failure.
+ *
+ * Boolean and list values are compared exactly.
  */
-function describe(value: unknown): string {
-  if (value === null || value === undefined) return "empty";
-  if (typeof value === "boolean") return `boolean(${value})`;
-  if (typeof value === "string") return `string(${[...value].length} chars)`;
-  if (Array.isArray(value)) return `list(${value.length} items)`;
-  return typeof value;
+function canonicalValue(kind: FormFieldKind, value: string | boolean | string[] | null): string | boolean | string[] | null {
+  if (kind !== "text") return value;
+  return value ?? "";
+}
+
+function valuesEqual(kind: FormFieldKind, expected: string | boolean | string[] | null, actual: string | boolean | string[] | null): boolean {
+  const left = canonicalValue(kind, expected);
+  const right = canonicalValue(kind, actual);
+  if (Array.isArray(left) || Array.isArray(right)) {
+    if (!Array.isArray(left) || !Array.isArray(right)) return false;
+    return left.length === right.length && left.every((item, index) => item === right[index]);
+  }
+  return left === right;
 }
 
 export type VerifiedForm = { inventory: FormInventory; pages: number; preserved: number };
@@ -233,39 +255,39 @@ export type VerifiedForm = { inventory: FormInventory; pages: number; preserved:
  * A failure is reported as `FORM_OUTPUT_UNVERIFIED`, which the engine treats as
  * a validation failure — the output is never committed.
  */
-export async function verifyFilledForm(bytes: Uint8Array, expected: Map<string, FormFillValue>, options: { untouched?: Map<string, string | boolean | string[] | null>; verifyAppearances?: boolean } = {}): Promise<VerifiedForm> {
+export async function verifyFilledForm(bytes: Uint8Array, expected: Map<string, FormFillValue>, options: { untouched?: Map<string, string | boolean | string[] | null>; verifyAppearances?: boolean } = {}) {
   let document: PDFDocument;
   try { document = await PDFDocument.load(bytes, { ignoreEncryption: false }); }
-  catch { throw new FormFillError("FORM_OUTPUT_UNVERIFIED", "The filled output could not be reopened."); }
+  catch { throw new FormFillError("FORM_OUTPUT_UNVERIFIED", FORM_ERROR_MESSAGES.FORM_OUTPUT_UNVERIFIED); }
   const inventory = readFormInventory(document);
   const form = document.getForm();
-  const mismatches: string[] = [];
+  // Verification failures are persisted on the job and served by the status
+  // API, so they carry counts of stable codes only — no field name, no value,
+  // no submitted boolean (FF-08).
+  const mismatches = new Map<string, number>();
+  const note = (code: string) => mismatches.set(code, (mismatches.get(code) ?? 0) + 1);
   for (const [name, value] of expected) {
-    const field = form.getField(name);
+    const field = form.getFieldMaybe(name);
+    if (!field) { note("FIELD_DISAPPEARED"); continue; }
     const kind = classify(field);
     const actual = typeof kind === "string" ? currentValue(field, kind) : null;
-    const equal = typeof value === "string" ? actual === value
-      : typeof value === "boolean" ? actual === value
-        : Array.isArray(value) ? Array.isArray(actual) && actual.length === value.length && actual.every((item, index) => item === value[index])
-          : false;
-    // Field *values* never enter the message: it is persisted on the job row and
-    // reproduced in logs and API error bodies. A value mismatch is reported as a
-    // type and length pair, which is enough to debug and useless as a leak.
-    if (!equal) mismatches.push(`${name} did not round-trip (expected ${describe(value)}, found ${describe(actual)})`);
-    if (options.verifyAppearances !== false) for (const problem of appearanceProblems(field)) mismatches.push(`${name}: ${problem}`);
+    if (typeof kind !== "string" || !valuesEqual(kind, value, actual)) note("VALUE_NOT_ROUND_TRIPPED");
+    if (options.verifyAppearances !== false) for (const problem of appearanceProblems(field)) note(problem);
   }
   let preserved = 0;
   for (const [name, previous] of options.untouched ?? []) {
     if (expected.has(name)) continue;
     const field = form.getFieldMaybe(name);
-    if (!field) { mismatches.push(`${name} disappeared from the output`); continue; }
+    if (!field) { note("UNTOUCHED_FIELD_DISAPPEARED"); continue; }
     const kind = classify(field);
     const actual = typeof kind === "string" ? currentValue(field, kind) : null;
-    const equal = JSON.stringify(actual) === JSON.stringify(previous);
-    if (!equal) mismatches.push(`${name} was modified unexpectedly (was ${describe(previous)}, now ${describe(actual)})`);
+    if (typeof kind !== "string" || !valuesEqual(kind, previous, actual)) note("UNTOUCHED_FIELD_MODIFIED");
     else preserved += 1;
   }
-  if (mismatches.length) throw new FormFillError("FORM_OUTPUT_UNVERIFIED", `The filled output could not be verified: ${mismatches.slice(0, 10).join("; ")}.`, { mismatches });
+  if (mismatches.size) {
+    throw new FormFillError("FORM_OUTPUT_UNVERIFIED", FORM_ERROR_MESSAGES.FORM_OUTPUT_UNVERIFIED, {
+      mismatches: [...mismatches].map(([code, count]) => ({ code, count })),
+    });
+  }
   return { inventory, pages: document.getPageCount(), preserved };
 }
-

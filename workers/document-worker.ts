@@ -19,7 +19,10 @@ export const documentWorker = new Worker<QueuedJob>(JOB_QUEUE_NAME, async (messa
   recordMetric("queue_wait_ms", Math.max(0, Date.now() - message.timestamp), "ms", { tool_id: message.data.toolId, queue: "document" });
   // An infected output is deterministic, so it is escalated to an unrecoverable
   // queue error instead of burning the three configured attempts.
-  try { return await processDocumentJob(message.data); } catch (error) { throw toDocumentQueueError(error); }
+  // `attemptsMade` is BullMQ's count of attempts already started before this one;
+  // the pipeline needs it to tell a retry (keep the encrypted payload) from a
+  // final failure (purge it) — see FF-03 in `document-pipeline.ts`.
+  try { return await processDocumentJob(message.data, { attemptsMade: message.attemptsMade, maxAttempts: message.opts.attempts ?? 1 }); } catch (error) { throw toDocumentQueueError(error); }
 }, { connection: getQueueConnection(), concurrency: runtimeLimits.documentConcurrency, stalledInterval: runtimeLimits.stalledIntervalMs, maxStalledCount: runtimeLimits.maxStalledCount, lockDuration: Math.min(runtimeLimits.jobTimeoutMs, 10 * 60_000) });
 async function advanceWorkflow(message: QueuedJob) { if (message.workflowRunId && message.userId) await (await import("@/lib/workflows/service")).advanceWorkflowRun(message.workflowRunId, message.userId); }
 async function recordTerminalFailure(message: QueuedJob) {

@@ -12,8 +12,9 @@ import { isAuthorizedFileStorageAccess } from "@/lib/storage/metadata";
 import { getPublicTool } from "./tools";
 import { PublicApiError } from "./errors";
 import { deletePhase1Secret, phase1SecretsFromForm, type Phase1SecretPayload } from "@/lib/secrets/phase1";
+import { purgeFormFields } from "@/lib/pdf/form-payload";
 import { requiresDedicatedJobParameters } from "@/lib/tools/options";
-import { assertFieldsPayloadSize, parseFieldsPayload } from "@/lib/pdf/form-validation";
+import { FormFillError, assertFieldsPayloadSize, assertNoDuplicateJsonKeys, parseFieldsPayload } from "@/lib/pdf/form-validation";
 
 type PublicUpload = { filename: string; mimeType: string; bytes: Uint8Array };
 export type PublicJobInput = { toolId: string; uploads: PublicUpload[]; options: Record<string, string | number | boolean>; fields?: Record<string, unknown>; secrets?: Phase1SecretPayload; idempotencyKey: string };
@@ -28,11 +29,26 @@ export async function parsePublicJobRequest(request: Request): Promise<PublicJob
   // their input as flat options (Stage 2 `fill-forms`). It is bounded and
   // shape-checked here so a malformed request never reaches an upload read.
   const rawFields = form.get("fields"); let fields: Record<string, unknown> | undefined;
-  if (typeof rawFields === "string" && rawFields) {
+  if (rawFields !== null) {
+    // FF-10: exactly one `fields` part. `form.get()` returns the first of
+    // several parts without saying so, which made a repeated part first-wins.
+    if (form.getAll("fields").length !== 1 || typeof rawFields !== "string") throw new PublicApiError("VALIDATION_ERROR", "fields must be sent exactly once, as a JSON string.", 400);
+    if (rawFields) {
+    // `assertFieldsPayloadSize` measures UTF-8 bytes (FF-10), so 35,121 Arabic
+    // characters are correctly rejected as 70,121 bytes.
     try { assertFieldsPayloadSize(rawFields); } catch { throw new PublicApiError("VALIDATION_ERROR", "fields exceeds the 64 KB limit.", 400); }
     let parsed: unknown;
-    try { parsed = JSON.parse(rawFields) as unknown; } catch { throw new PublicApiError("VALIDATION_ERROR", "fields must be a JSON object.", 400); }
-    try { fields = parseFieldsPayload(parsed); } catch (error) { throw new PublicApiError("VALIDATION_ERROR", error instanceof Error ? error.message : "fields is invalid.", 400); }
+    // Duplicate object keys are rejected before `JSON.parse` can keep only the
+    // last one and silently reinterpret the request (FF-10).
+    try { assertNoDuplicateJsonKeys(rawFields); parsed = JSON.parse(rawFields) as unknown; }
+    catch (error) {
+      const duplicate = error instanceof FormFillError;
+      throw new PublicApiError("VALIDATION_ERROR", duplicate ? "fields must not repeat a field name." : "fields must be a JSON object.", 400);
+    }
+    // The rejection message is the allowlisted, content-free one (FF-08); the
+    // structured detail stays server-side.
+    try { fields = parseFieldsPayload(parsed); } catch (error) { throw new PublicApiError("VALIDATION_ERROR", error instanceof FormFillError ? error.message : "fields is invalid.", 400); }
+    }
   }
   if (requiresDedicatedJobParameters(toolId) && !fields) throw new PublicApiError("VALIDATION_ERROR", "This tool requires a fields payload.", 400);
   if (!requiresDedicatedJobParameters(toolId) && fields) throw new PublicApiError("VALIDATION_ERROR", "This tool does not accept a fields payload.", 400);
@@ -63,11 +79,15 @@ export async function getPublicJob(principal: ApiPrincipal, jobId: string) { ret
 export async function cancelPublicJob(principal: ApiPrincipal, jobId: string) {
   const cancelled = await withApiTenant(principal, async (tx) => {
     const job = await tx.job.findFirst({ where: { id: jobId, organizationId: principal.organizationId, apiClientId: principal.apiClientId }, select: { id: true, status: true, params: true } }); if (!job) throw new PublicApiError("NOT_FOUND", "The requested job was not found.", 404);
-    if (["SUCCEEDED", "FAILED", "CANCELLED", "EXPIRED"].includes(job.status)) return { result: { id: job.id, status: job.status.toLowerCase() }, secretRef: undefined };
+    if (["SUCCEEDED", "FAILED", "CANCELLED", "EXPIRED"].includes(job.status)) return { result: { id: job.id, status: job.status.toLowerCase() }, secretRef: undefined, fieldsRef: undefined };
     if (job.status === "RUNNING") throw new PublicApiError("CONFLICT", "A running job can no longer be cancelled safely.", 409);
-    await tx.job.update({ where: { id: job.id }, data: { status: "CANCELLED", completedAt: new Date(), errorCode: "API_CANCELLED" } }); await tx.jobStep.updateMany({ where: { jobId: job.id, status: { in: ["QUEUED", "RETRYING"] } }, data: { status: "CANCELLED", completedAt: new Date(), errorCode: "API_CANCELLED" } }); await writeBusinessAudit(tx, { organizationId: principal.organizationId, action: "api_job.cancelled", resource: "job", resourceId: job.id, details: { apiClientId: principal.apiClientId } }); return { result: { id: job.id, status: "cancelled" }, secretRef: (job.params as { secretRef?: string }).secretRef };
+    await tx.job.update({ where: { id: job.id }, data: { status: "CANCELLED", completedAt: new Date(), errorCode: "API_CANCELLED" } }); await tx.jobStep.updateMany({ where: { jobId: job.id, status: { in: ["QUEUED", "RETRYING"] } }, data: { status: "CANCELLED", completedAt: new Date(), errorCode: "API_CANCELLED" } }); await writeBusinessAudit(tx, { organizationId: principal.organizationId, action: "api_job.cancelled", resource: "job", resourceId: job.id, details: { apiClientId: principal.apiClientId } }); return { result: { id: job.id, status: "cancelled" }, secretRef: (job.params as { secretRef?: string }).secretRef, fieldsRef: (job.params as { fieldsRef?: string }).fieldsRef };
   });
-  await deletePhase1Secret(cancelled.secretRef).catch(() => undefined); return cancelled.result;
+  // FF-03: cancellation is terminal, so the encrypted values are removed with the
+  // rest of the job's sensitive material. The TTL is only the backstop for a
+  // cancellation that never reaches this line.
+  await Promise.all([deletePhase1Secret(cancelled.secretRef).catch(() => undefined), purgeFormFields(cancelled.fieldsRef).catch(() => undefined)]);
+  return cancelled.result;
 }
 
 async function scopedResult(principal: ApiPrincipal, jobId: string, client: PrismaClient = db) {

@@ -7,6 +7,10 @@
  *   inspectFormPdf(bytes)                  read-only inventory for the UI
  *   fillFormPdf(bytes, fields, options)    the bounded, all-or-nothing write
  *
+ * `inspectFormPdf` and the restriction probes live in `form-inspection.ts`, a
+ * renderer-free module, because the inspect route must not import the rasteriser
+ * (FF-01). This module owns the write path only.
+ *
  * `fillFormPdf` refuses before the first write when the document is encrypted,
  * signed/certified, XFA-based, has ambiguous (duplicated) field names, or has
  * no supported fields at all. It then re-opens its own output and verifies the
@@ -14,7 +18,7 @@
  * verification failure throws and the pipeline never stores the bytes.
  */
 import { PDFArray, PDFDict, PDFDocument, PDFName, PDFRef, StandardFonts } from "pdf-lib";
-import type { PDFFont } from "pdf-lib";
+import type { PDFFont, PDFObject } from "pdf-lib";
 import {
   applyFillValues,
   assertFillableDocument,
@@ -27,7 +31,13 @@ import {
   type RawFieldMap,
 } from "@/lib/pdf/form-schema";
 import { FormFillError, validateFillValues, valueSnapshot } from "@/lib/pdf/form-validation";
-import { canRasterise, fontCanEncode, installRasterAppearance } from "@/lib/pdf/form-appearance";
+import { FORM_ERROR_MESSAGES } from "@/lib/pdf/form-types";
+import { AppearanceLegibilityError, canRasterise, fontCanEncode, installRasterAppearance } from "@/lib/pdf/form-appearance";
+// The restriction probes live in a renderer-free module (FF-01); they are
+// re-exported here so the worker keeps one entry point.
+import { assertFillableRestrictions, probeRestrictions, scanBytes } from "@/lib/pdf/form-inspection";
+
+export { inspectFormPdf } from "@/lib/pdf/form-inspection";
 
 export const FORM_ENGINE = "pdf-lib";
 export const FORM_ENGINE_VERSION = "1.17.1";
@@ -45,115 +55,105 @@ export type FillReport = {
   engineVersion: string;
 };
 
-/**
- * Restriction probes.
- *
- * Two layers, on purpose:
- *
- *   1. **Structural** (authoritative). The document's own object graph is walked
- *      — catalog → `/AcroForm`, `/Perms`, every field's `/FT` — so XFA packets,
- *      signature fields and certification signatures are found even when they
- *      live inside a compressed object stream (`/ObjStm`), which no raw-byte
- *      scan can see. `pdf-lib` cannot enumerate these for us: `getForm()`
- *      *deletes* a `/XFA` entry and only logs a warning, so anything that must
- *      survive detection is read from the graph before that happens.
- *
- *   2. **Byte** (defence in depth). A literal scan for `/ByteRange`, `/Encrypt`,
- *      `/XFA` and friends still runs, because a damaged-but-parseable file may
- *      keep the marker outside the objects we can reach, and because an unsigned
- *      revision of a previously signed file keeps its old `/ByteRange`.
- *
- * A document is rejected when *either* layer fires.
- */
-type Restrictions = { encrypted: boolean; signed: boolean; xfa: boolean };
-
-const signatureType = (value: unknown) => String((value as { toString?: () => string } | undefined)?.toString?.() ?? "");
-
-function scanBytes(bytes: Uint8Array) {
-  const text = new TextDecoder("latin1").decode(bytes);
-  return {
-    encrypted: /\/Encrypt\s+\d+\s+\d+\s+R/u.test(text) || /\/Encrypt\s*<</u.test(text),
-    xfa: /\/XFA\b/u.test(text),
-    signed: /\/ByteRange\s*\[/u.test(text) || /\/FT\s*\/Sig\b/u.test(text) || /\/DocMDP\b/u.test(text),
-  };
-}
-
-/**
- * Walk the parsed object graph.
- *
- * `lookup(key, Type)` *throws* when the entry is absent, so plain `lookup(key)`
- * plus an `instanceof` check is used: an earlier version asserted the type and
- * swallowed the exception, which made every uncompressed document look
- * "uninspectable" and silently disabled this whole layer.
- */
-async function scanStructure(bytes: Uint8Array): Promise<Omit<Restrictions, "encrypted"> | undefined> {
-  let document: PDFDocument;
-  try { document = await PDFDocument.load(bytes, { ignoreEncryption: false, updateMetadata: false }); }
-  catch { return undefined; }
-  try {
-    const catalog = document.catalog;
-    const acro = catalog.lookup(PDFName.of("AcroForm"));
-    const form = acro instanceof PDFDict ? acro : undefined;
-    const perms = catalog.lookup(PDFName.of("Perms"));
-    // `/Perms /DocMDP` is how a certified document records its policy; it exists
-    // independently of any signature-dictionary text.
-    const certified = perms instanceof PDFDict && Boolean(perms.lookup(PDFName.of("DocMDP")));
-    if (!form) return { xfa: false, signed: certified };
-    if (form.has(PDFName.of("XFA"))) return { xfa: true, signed: true };
-    // SigFlags bit 1 ("SignaturesExist") and bit 2 ("AppendOnly") both mean the
-    // producer knows signatures are present — possibly in a field this walk did
-    // not reach. A false positive here only refuses a fill that was never safe
-    // to perform; a false negative would write into a signed document.
-    const sigFlags = Number(signatureType(form.lookup(PDFName.of("SigFlags"))) || "0");
-    const flagsSigned = (sigFlags & 1) === 1 || (sigFlags & 2) === 2;
-    const fields = form.lookup(PDFName.of("Fields"));
-    const hasSignatureField = (fields instanceof PDFArray ? fields.asArray() : []).some((entry) => {
-      const field = entry instanceof PDFRef ? document.context.lookup(entry) : entry;
-      // Signature fields may be nested under non-terminal parents; `getFields()`
-      // flattens them, but that is exactly the call which deletes /XFA, so the
-      // top-level list is combined with the byte layer instead.
-      return field instanceof PDFDict && signatureType(field.lookup(PDFName.of("FT"))) === "/Sig";
-    });
-    return { xfa: false, signed: certified || hasSignatureField || flagsSigned };
-  } catch {
-    // An unreadable graph is not "safe": the byte layer still decides, and the
-    // parse in `loadUnencrypted` will reject anything genuinely broken.
-    return undefined;
-  }
-}
-
-/** Read every restriction signal that applies to these bytes. */
-async function probeRestrictions(bytes: Uint8Array): Promise<Restrictions> {
-  const bytesView = scanBytes(bytes);
-  const structural = await scanStructure(bytes);
-  return {
-    encrypted: bytesView.encrypted,
-    xfa: bytesView.xfa || structural?.xfa === true,
-    signed: bytesView.signed || structural?.signed === true,
-  };
-}
-
 async function loadUnencrypted(bytes: Uint8Array) {
   try { return await PDFDocument.load(bytes, { ignoreEncryption: false }); }
   catch (error) {
-    if (scanBytes(bytes).encrypted || /encrypted/iu.test(error instanceof Error ? error.message : "")) throw new FormFillError("FORM_RESTRICTED", "Encrypted PDFs cannot be filled by this tool.");
-    throw new FormFillError("FORM_UNSUPPORTED", "The PDF could not be parsed as a fillable document.");
+    if (scanBytes(bytes).encrypted || /encrypted/iu.test(error instanceof Error ? error.message : "")) throw new FormFillError("FORM_RESTRICTED", FORM_ERROR_MESSAGES.FORM_RESTRICTED);
+    throw new FormFillError("FORM_UNSUPPORTED", FORM_ERROR_MESSAGES.FORM_UNSUPPORTED);
   }
 }
 
-function assertFillableRestrictions(restrictions: Restrictions) {
-  if (restrictions.encrypted) throw new FormFillError("FORM_RESTRICTED", "Encrypted PDFs cannot be filled by this tool.");
-  if (restrictions.xfa) throw new FormFillError("FORM_UNSUPPORTED", "XFA forms are not supported; only AcroForm fields can be filled.");
-  if (restrictions.signed) throw new FormFillError("FORM_RESTRICTED", "Signed or certified PDFs cannot be modified safely.");
+/**
+ * Reference identities of every widget of every field (FF-05).
+ *
+ * Collected *before* flattening, because afterwards the fields that own them no
+ * longer exist. The identity is the widget dictionary's indirect reference,
+ * which survives flattening — that is exactly what stays behind in `/Annots`.
+ *
+ * pdf-lib exposes no `.ref` on `PDFObject`, and an earlier version of this
+ * helper silently collected nothing because it read one. The reference is
+ * therefore recovered from the context's indirect-object table by **object
+ * identity**: a widget that came from the file is the very object registered
+ * under its reference. A widget written inline (a direct dictionary) has no
+ * reference and cannot dangle.
+ */
+function flattenedWidgetRefs(document: PDFDocument): Set<string> {
+  const widgets = new Set<PDFObject>();
+  for (const field of document.getForm().getFields()) {
+    for (const widget of field.acroField.getWidgets()) widgets.add((widget as unknown as { dict: PDFObject }).dict);
+  }
+  const references = new Set<string>();
+  if (!widgets.size) return references;
+  for (const [ref, object] of document.context.enumerateIndirectObjects()) {
+    if (widgets.has(object)) references.add(ref.toString());
+  }
+  return references;
 }
 
-/** Read-only inventory. Never mutates the document and never writes bytes. */
-export async function inspectFormPdf(bytes: Uint8Array): Promise<FormInventory> {
-  if (scanBytes(bytes).encrypted) throw new FormFillError("FORM_RESTRICTED", "Encrypted PDFs cannot be inspected by this tool.");
-  const restrictions = await probeRestrictions(bytes);
-  assertFillableRestrictions(restrictions);
-  const document = await loadUnencrypted(bytes);
-  return readFormInventory(document);
+/**
+ * Remove the given references from every page's `/Annots`, keeping everything
+ * else and preserving the array's order.
+ *
+ * An `/Annots` entry that is a direct dictionary (not a reference) is never a
+ * flattened widget and is kept. `/Annots` itself may be an indirect reference;
+ * it is resolved and written back in place.
+ */
+function pruneAnnotations(document: PDFDocument, references: Set<string>): { removed: number; pages: number } {
+  let removed = 0;
+  let pages = 0;
+  for (const page of document.getPages()) {
+    const raw = (page.node as unknown as { Annots?: () => PDFArray | undefined }).Annots?.();
+    if (!raw) continue;
+    // `Annots()` may return an indirect reference wrapper; `context.lookup`
+    // resolves it so the array can be rewritten in place.
+    const resolved = (raw instanceof PDFArray ? raw : document.context.lookup(raw as unknown as PDFRef)) as PDFArray | undefined;
+    if (!(resolved instanceof PDFArray)) continue;
+    const kept: PDFObject[] = [];
+    let changed = false;
+    for (let position = 0; position < resolved.size(); position += 1) {
+      const entry = resolved.get(position);
+      if (entry instanceof PDFRef && references.has(entry.toString())) { removed += 1; changed = true; continue; }
+      if (entry !== undefined) kept.push(entry as PDFObject);
+    }
+    if (!changed) continue;
+    // An empty `/Annots` array is dropped entirely rather than written back as
+    // `[]`: readers and validators both treat a missing entry as "no
+    // annotations", while an empty array is legal but noisy.
+    if (kept.length) page.node.set(PDFName.of("Annots"), document.context.obj(kept) as PDFArray);
+    else (page.node as unknown as { delete: (key: PDFName) => void }).delete(PDFName.of("Annots"));
+    pages += 1;
+  }
+  return { removed, pages };
+}
+
+/**
+ * Count page annotations that no longer resolve, and annotation entries that are
+ * still form widgets. Both are zero in a correctly flattened document: a widget
+ * that survives in `/Annots` is either a dangling reference (its field is gone)
+ * or a form control that was supposed to be flattened away.
+ */
+function danglingAnnotations(document: PDFDocument): { unresolved: number; widgets: number; annots: number } {
+  let unresolved = 0;
+  let widgets = 0;
+  let annots = 0;
+  for (const page of document.getPages()) {
+    const array = (page.node as unknown as { Annots?: () => PDFArray | undefined }).Annots?.();
+    if (!array) continue;
+    for (let position = 0; position < array.size(); position += 1) {
+      const entry = array.get(position);
+      annots += 1;
+      let target: PDFObject | undefined = entry;
+      if (entry instanceof PDFRef) {
+        target = document.context.lookup(entry) as PDFObject | undefined;
+        if (target === undefined) { unresolved += 1; continue; }
+      }
+      if (target instanceof PDFDict) {
+        const subtype = target.get(PDFName.of("Subtype"));
+        if (String(subtype ?? "") === "/Widget") widgets += 1;
+      }
+    }
+  }
+  return { unresolved, widgets, annots };
 }
 
 type AppearancePlan = { name: string; value: string; multiline: boolean };
@@ -193,7 +193,22 @@ export async function fillFormPdf(bytes: Uint8Array, fields: RawFieldMap, option
       (field as unknown as { defaultUpdateAppearances: (font: PDFFont) => void }).defaultUpdateAppearances(helvetica);
       continue;
     }
-    const text = Array.isArray(item.next) ? item.next.join(", ") : String(item.next);
+    // FF-07: an option list is a *set*, not a sentence. pdf-lib's own appearance
+    // provider draws every option and highlights the selected ones, which is
+    // correct — but the raster fallback below can only paint one string, and
+    // joining the selection with commas misrepresents the field on the page. An
+    // Arabic selection therefore cannot use the raster path and is rejected
+    // explicitly rather than shown as "أ, ب". Latin selections keep the vector
+    // provider, so `/V` stays a real array and the rendering stays accurate.
+    if (Array.isArray(item.next)) {
+      const raster = (field as unknown as { defaultUpdateAppearances: (font: PDFFont) => void });
+      const options = inventory.fields.find((candidate) => candidate.name === item.name)?.options ?? [];
+      const allEncodable = item.next.every((option) => fontCanEncode(helvetica, option)) && (options.length === 0 || fontCanEncode(helvetica, options.join(" ")));
+      if (!allEncodable) throw new FormFillError("FORM_VALUE_INVALID", FORM_ERROR_MESSAGES.FORM_VALUE_INVALID, { issues: [{ issue: "UNRENDERABLE_SCRIPT" }] });
+      raster.defaultUpdateAppearances(helvetica);
+      continue;
+    }
+    const text = String(item.next);
     const descriptor = inventory.fields.find((candidate) => candidate.name === item.name);
     if (!fontCanEncode(helvetica, text)) {
       // WinAnsi cannot carry the value. Arabic (and Latin text with Arabic
@@ -206,7 +221,15 @@ export async function fillFormPdf(bytes: Uint8Array, fields: RawFieldMap, option
     (field as unknown as { defaultUpdateAppearances: (font: PDFFont) => void }).defaultUpdateAppearances(helvetica);
   }
   for (const plan of plans) {
-    await installRasterAppearance(document, form.getField(plan.name), plan.value, { multiline: plan.multiline });
+    // FF-07: an unrenderable value must fail the whole request, never produce a
+    // document that silently clips or omits part of it. The error is a rejection
+    // with no partial output; the message stays content-free, and the reason is
+    // structured.
+    try { await installRasterAppearance(document, form.getField(plan.name), plan.value, { multiline: plan.multiline }); }
+    catch (error) {
+      if (error instanceof AppearanceLegibilityError) throw new FormFillError("FORM_VALUE_INVALID", FORM_ERROR_MESSAGES.FORM_VALUE_INVALID, { issues: [{ issue: "UNRENDERABLE_SCRIPT", reason: error.reason }] });
+      throw error;
+    }
     rasterAppearances.push(plan.name);
   }
 
@@ -220,13 +243,25 @@ export async function fillFormPdf(bytes: Uint8Array, fields: RawFieldMap, option
 
   if (options.flatten === true) {
     const reopened = await PDFDocument.load(firstPass, { ignoreEncryption: false });
+    const widgets = flattenedWidgetRefs(reopened);
     try { reopened.getForm().flatten({ updateFieldAppearances: false }); }
-    catch { throw new FormFillError("FORM_UNSUPPORTED", "This form cannot be flattened safely."); }
+    catch { throw new FormFillError("FORM_UNSUPPORTED", FORM_ERROR_MESSAGES.FORM_UNSUPPORTED, { flatten: "FAILED" }); }
+    // FF-05: `flatten()` removes the widgets' *fields* and paints their
+    // appearance onto the page, but it leaves the widget references behind in
+    // `/Page /Annots`. Every one of those is a dangling reference: pypdf counts
+    // 15 unresolved `/Annots` and Poppler reports 15 `Invalid XRef entry`, even
+    // though the document re-opens and the page count is unchanged. A reopen and
+    // a page-count check cannot see that.
+    const pruned = pruneAnnotations(reopened, widgets);
     const flattened = await reopened.save({ useObjectStreams: true, updateFieldAppearances: false });
-    // Flattening removes the fields, so values can no longer be read back; the
-    // page count and re-openability are what remain verifiable.
+    if (pruned.removed !== widgets.size) throw new FormFillError("FORM_OUTPUT_UNVERIFIED", FORM_ERROR_MESSAGES.FORM_OUTPUT_UNVERIFIED, { flatten: "ANNOTATION_COUNT_MISMATCH" });
     const check = await PDFDocument.load(flattened, { ignoreEncryption: false });
-    if (check.getPageCount() !== inventory.pages) throw new FormFillError("FORM_OUTPUT_UNVERIFIED", "Flattening changed the page count.");
+    if (check.getPageCount() !== inventory.pages) throw new FormFillError("FORM_OUTPUT_UNVERIFIED", FORM_ERROR_MESSAGES.FORM_OUTPUT_UNVERIFIED, { flatten: "PAGE_COUNT_CHANGED" });
+    // Structural post-condition: no page may reference a widget that no longer
+    // exists. Checked on the re-read bytes, not on the in-memory document, so a
+    // serialisation regression cannot hide behind an unsaved edit.
+    const dangling = danglingAnnotations(check);
+    if (dangling.unresolved || dangling.widgets) throw new FormFillError("FORM_OUTPUT_UNVERIFIED", FORM_ERROR_MESSAGES.FORM_OUTPUT_UNVERIFIED, { flatten: "DANGLING_ANNOTATIONS", ...dangling });
     return {
       name: "filled-form.pdf", mimeType: "application/pdf", bytes: flattened,
       report: { filled: applied, untouched: inventory.fields.length - applied.length, pages: inventory.pages, flatten: true, rasterAppearances, engine: FORM_ENGINE, engineVersion: FORM_ENGINE_VERSION },

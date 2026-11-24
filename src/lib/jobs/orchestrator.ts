@@ -12,8 +12,22 @@ import { requireCleanUpload } from "@/lib/malware";
 import { requiresDedicatedJobParameters, validateToolOptions } from "@/lib/tools/options";
 import { deletePhase1Secret, enforceUnlockRateLimit, phase1SecretToolIds, putPhase1Secret, type Phase1SecretPayload, type Phase1SecretPurpose } from "@/lib/secrets/phase1";
 import { parseFieldsPayload } from "@/lib/pdf/form-schema";
+import { inspectFormPdf } from "@/lib/pdf/form-inspection";
+import { purgeFormFields, putFormFields } from "@/lib/pdf/form-payload";
 
 type Upload = { filename: string; mimeType: string; bytes: Uint8Array };
+
+/**
+ * Restriction preflight for `fill-forms` (FF-06).
+ *
+ * Uses the same renderer-free inspection path as the browser-facing route, so
+ * the API and the worker cannot disagree about what "restricted" means. The
+ * error is a `FormFillError`, which the route already maps to a coded 422 with
+ * an allowlisted, content-free message.
+ */
+async function assertFillableInput(bytes: Uint8Array) {
+  await inspectFormPdf(bytes, { budgetMs: 20_000 });
+}
 function minimumFilesFor(toolId: string) { return ["merge-pdf", "alternate-mix"].includes(toolId) ? 2 : 1; }
 export async function createToolJob(input: { userId: string; toolId: string; uploads: Upload[]; options?: Record<string, string | number | boolean>; fields?: Record<string, unknown>; secrets?: Phase1SecretPayload; idempotencyKey: string; correlationId?: string; organizationId?: string; apiClientId?: string }) {
   const apiStarted = performance.now();
@@ -42,17 +56,36 @@ export async function createToolJob(input: { userId: string; toolId: string; upl
     const malwareScan = await requireCleanUpload(upload.bytes);
     return { upload, validation, malwareScan };
   }));
+  // FF-06: prove the document is fillable *before* billing, storage and the
+  // queue. The review found that a restricted input still created a document,
+  // file and file-version row, a job row and a billing attempt, and only then
+  // failed in the worker — leaving durable artifacts and a charge for work that
+  // could never succeed.
+  //
+  // This runs after `requireCleanUpload` (so screening is never skipped or
+  // reordered ahead of the malware gate) and before `enforceJobCreation` (so no
+  // charge is attempted). The worker keeps its own recheck: these bytes are
+  // screened and inspected here, but the worker re-reads them from storage and
+  // must not trust the API's decision.
+  if (tool.toolId === "fill-forms") await assertFillableInput(prepared[0].upload.bytes);
   const monetization = await enforceJobCreation({ userId: input.userId, toolId: tool.toolId, idempotencyKey: input.idempotencyKey, correlationId, options, files: prepared.map(({upload,validation})=>({size:upload.bytes.byteLength,pageCount:validation.pageCount})) });
   const stored: Array<{ key: string; bucket: string; upload: Upload; validation: Awaited<ReturnType<typeof validateUpload>> }> = [];
   let secretRef: string | undefined;
+  let fieldsRef: string | undefined;
   try {
     for (const item of prepared) { const key = storage.createUploadKey({ userId: input.userId, filename: item.upload.filename }); const object = await storage.put({ key, bytes: item.upload.bytes, contentType: item.validation.mimeType, checksum: item.validation.checksum }); stored.push({ key: object.key, bucket: object.bucket, upload: item.upload, validation: item.validation }); }
     const jobId = randomUUID();
     if (input.secrets) secretRef = await putPhase1Secret({ tenantId: input.userId, jobId, purpose: tool.toolId as Phase1SecretPurpose, payload: input.secrets });
+    // FF-03: submitted values are encrypted under a tenant+job-bound reference.
+    // `Job.params` receives the opaque reference, never the values, so no
+    // terminal state (SUCCEEDED/FAILED/CANCELLED/EXPIRED) can leave them in a
+    // durable JSON column. The reference is created after the job id exists so
+    // it can be bound into the envelope's AAD.
+    if (fields) fieldsRef = await putFormFields({ tenantId: input.userId, jobId, fields });
     const job = await withTenantScope(executionScope, async (tx) => {
       const document = await tx.document.create({ data: { userId: input.userId, organizationId: input.organizationId, title: `${tool.name} input` } });
       const files = await Promise.all(stored.map(async (item) => { const file = await tx.file.create({ data: { document: { connect: { id: document.id } }, originalName: item.upload.filename.slice(0, 255), mimeType: item.validation.mimeType, size: BigInt(item.upload.bytes.byteLength), storageKey: item.key, checksum: item.validation.checksum, pageCount: item.validation.pageCount, storageObject: buildStorageObjectConnectOrCreate(executionScope, { provider: "s3", bucket: item.bucket, objectKey: item.key, size: BigInt(item.upload.bytes.byteLength), checksum: item.validation.checksum }) } }); await tx.fileVersion.create({ data: { fileId: file.id, ownerId: input.userId, version: 1, storageKey: item.key, checksum: item.validation.checksum } }); return file; }));
-      return tx.job.create({ data: { id: jobId, toolId: tool.toolId, idempotencyKey: input.idempotencyKey, requesterId: input.userId, organizationId: input.organizationId, apiClientId: input.apiClientId, inputFileId: files[0].id, status: "QUEUED", params: { inputFileIds: files.map((file) => file.id), options, ...(fields ? { fields } : {}), ...(secretRef ? { secretRef } : {}) }, correlationId, steps: { create: { name: tool.toolId, idempotencyKey: `${input.idempotencyKey}:${tool.toolId}`, status: "QUEUED", correlationId } } }, select: { id: true, status: true } });
+      return tx.job.create({ data: { id: jobId, toolId: tool.toolId, idempotencyKey: input.idempotencyKey, requesterId: input.userId, organizationId: input.organizationId, apiClientId: input.apiClientId, inputFileId: files[0].id, status: "QUEUED", params: { inputFileIds: files.map((file) => file.id), options, ...(fieldsRef ? { fieldsRef } : {}), ...(secretRef ? { secretRef } : {}) }, correlationId, steps: { create: { name: tool.toolId, idempotencyKey: `${input.idempotencyKey}:${tool.toolId}`, status: "QUEUED", correlationId } } }, select: { id: true, status: true } });
     });
     const queuedJob = { jobId: job.id, toolId: tool.toolId, idempotencyKey: input.idempotencyKey, correlationId, userId: input.userId };
     const queueOptions = { priority: monetization.entitlements.processingPriority === "high" ? 1 : 5, ...(secretRef ? { attempts: 1 } : {}) };
@@ -61,7 +94,12 @@ export async function createToolJob(input: { userId: string; toolId: string; upl
     recordMetric("api_job_creation_latency_ms", performance.now() - apiStarted, "ms", { tool_id: tool.toolId });
     recordMetric("jobs_total", 1, "count", { tool_id: tool.toolId });
     return { ...job, reused: false };
-  } catch (error) { await Promise.all([deletePhase1Secret(secretRef).catch(() => undefined), ...stored.map((object) => storage.deleteObject(object.key).catch(() => undefined))]); throw error; }
+  } catch (error) {
+    // Enqueue failure, transaction failure and every other creation-path failure
+    // remove the encrypted payload too: nothing will ever read it.
+    await Promise.all([deletePhase1Secret(secretRef).catch(() => undefined), purgeFormFields(fieldsRef).catch(() => undefined), ...stored.map((object) => storage.deleteObject(object.key).catch(() => undefined))]);
+    throw error;
+  }
 }
 
 export function createMergePdfJob(input: { userId: string; uploads: Upload[]; idempotencyKey: string; correlationId?: string }) {

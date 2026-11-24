@@ -104,6 +104,10 @@ jobs:
           REDIS_URL: redis://localhost:6379
       - run: npm test
         env:
+          # FF-11: the mandatory suite must run the pipeline cases, never skip
+          # them. `prisma generate` has already run in this job, so a missing
+          # client is a real failure here, not an environment quirk.
+          DIP_REQUIRE_PIPELINE: "1"
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dip_test
           REDIS_URL: redis://localhost:6379
           DIP_RLS_TEST_OWNER_URL: postgresql://postgres:postgres@localhost:5432/dip_test
@@ -277,6 +281,7 @@ jobs:
       - name: Run real processing integrations
         run: npm test
         env:
+          DIP_REQUIRE_PIPELINE: "1"
           STORAGE_ENDPOINT: http://localhost:9000
           STORAGE_BUCKET: dip-test
           STORAGE_ACCESS_KEY: minioadmin

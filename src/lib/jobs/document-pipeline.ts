@@ -15,6 +15,7 @@ import { buildStorageObjectConnectOrCreate, isAuthorizedFileStorageAccess } from
 import type { QueuedJob } from "@/lib/queue";
 import { validateToolOptions } from "@/lib/tools/options";
 import { deletePhase1Secret, takePhase1Secret, type Phase1SecretPurpose } from "@/lib/secrets/phase1";
+import { purgeFormFields, readFormFields } from "@/lib/pdf/form-payload";
 import { APPROVED_QPDF_VERSION, runQpdfTool } from "@/lib/pdf/qpdf";
 import { FORM_ENGINE, FORM_ENGINE_VERSION, fillFormPdf } from "@/lib/pdf/form-fill";
 import { parseFieldsPayload } from "@/lib/pdf/form-schema";
@@ -46,10 +47,71 @@ export type DocumentPipelineDeps = {
   client?: PrismaClient;
   /** Test seam only: pins the attempt id that scopes output keys. Production uses a fresh uuid. */
   attemptId?: string;
+  /**
+   * BullMQ attempt accounting, passed by the worker so a terminal failure can be
+   * told apart from one that will be retried (FF-03): the encrypted form payload
+   * must survive a retry and be purged on the last attempt.
+   */
+  attemptsMade?: number;
+  maxAttempts?: number;
 };
 
 /** Job states in which no attempt may (re)enter the pipeline. */
 const CLOSED_JOB_STATES = ["SUCCEEDED", "CANCELLED", "EXPIRED"] as const;
+
+/**
+ * The job's id, typed explicitly.
+ *
+ * Prisma's row type degrades to `{}` when the generated client is unavailable, so
+ * a direct `job.id` becomes a type error in that setup. Reading it through a
+ * narrow view keeps the module type-clean in both environments.
+ */
+const jobIdOf = (job: unknown) => (job as { id: string }).id;
+
+/** Narrow, explicit view of the loaded job row (see `jobIdOf`). */
+type LoadedJob = {
+  id: string;
+  requesterId: string | null;
+  organizationId: string | null;
+  apiClientId: string | null;
+  toolId: string;
+  correlationId: string | null;
+  status: string;
+  startedAt: Date | null;
+  outputFileId: string | null;
+  params: unknown;
+  steps: Array<{ id: string; name: string; status: string; startedAt: Date | null }>;
+};
+const asJob = (row: unknown) => row as unknown as LoadedJob;
+
+/** Every state a job can never leave; a scrub is only safe once it is here. */
+const TERMINAL_JOB_STATES = ["SUCCEEDED", "FAILED", "CANCELLED", "EXPIRED"] as const;
+
+/**
+ * Remove legacy plaintext `fields` from a job row (FF-03).
+ *
+ * Before the encrypted payload existed, values were written into `Job.params`
+ * verbatim. Rows created then still exist, and they must not keep the caller's
+ * data any longer than the job needs it. This scrubs such a row once it reaches a
+ * terminal state.
+ *
+ * Written as a `updateMany` **guarded on the terminal states** rather than a
+ * plain `update`: job state is never written unconditionally in this module (see
+ * `test/pr1-output-screening.structure.test.ts`), and the guard also means a row
+ * that is still live — and may still need its values — is left alone.
+ */
+async function scrubLegacyFields(
+  tenant: <T>(operation: Parameters<typeof withTenant<T>>[1]) => Promise<T>,
+  jobId: string,
+  params: Record<string, unknown> | undefined,
+) {
+  const { fields: _discarded, ...rest } = (params ?? {}) as Record<string, unknown>;
+  void _discarded;
+  await tenant((tx) => tx.job.updateMany({
+    where: { id: jobId, status: { in: [...TERMINAL_JOB_STATES] } },
+    data: { params: rest },
+  })).catch(() => undefined);
+}
 
 export async function processDocumentJob(message: QueuedJob, deps: DocumentPipelineDeps = {}) {
   if (!message.userId) throw Object.assign(new Error("Worker job requires a tenant identity"), { code: "TENANT_CONTEXT_REQUIRED" });
@@ -61,9 +123,13 @@ export async function processDocumentJob(message: QueuedJob, deps: DocumentPipel
   const scopedTenant = <T>(operation: Parameters<typeof withTenantScope<T>>[1]) => withTenantScope(jobExecutionScope, operation, deps.client);
   const attemptId = deps.attemptId ?? randomUUID();
   const context = { job_id: job.id, correlation_id: job.correlationId ?? message.correlationId, tool_id: job.toolId, attempt_id: attemptId };
-  const rawParams = job.params as { inputFileIds?: string[]; options?: Record<string, unknown>; secretRef?: string; fields?: unknown };
+  const rawParams = job.params as { inputFileIds?: string[]; options?: Record<string, unknown>; secretRef?: string; fieldsRef?: string; fields?: unknown };
+  // Legacy rows created before FF-03 still carry plaintext `fields`. They are
+  // readable for exactly one reason — an already-queued job must not fail on
+  // deploy — and are scrubbed from the row on their next terminal transition.
+  const legacyFields = rawParams.fields;
   if (job.status === "SUCCEEDED" || job.outputFileId) { logger.info("job.idempotent_skip", context); return; }
-  if (job.status === "CANCELLED" || job.status === "EXPIRED") { await deletePhase1Secret(rawParams.secretRef).catch(() => undefined); return; }
+  if (job.status === "CANCELLED" || job.status === "EXPIRED") { await Promise.all([deletePhase1Secret(rawParams.secretRef).catch(() => undefined), purgeFormFields(rawParams.fieldsRef).catch(() => undefined)]); return; }
   const step = job.steps.find((item) => item.name === job.toolId);
   try {
     // Atomic run claim: the fast idempotency read above is not enough on its own,
@@ -100,7 +166,10 @@ export async function processDocumentJob(message: QueuedJob, deps: DocumentPipel
       // `fields` is a dedicated job parameter, validated here with the same
       // schema module the browser uses. Options remain flat and versioned.
       if (ids.length !== 1) throw Object.assign(new Error("Fill PDF Forms accepts exactly one PDF."), { code: "INPUT_FILE_COUNT_INVALID" });
-      const fields = parseFieldsPayload(rawParams.fields);
+      // FF-03: the values come from the encrypted payload, not from `params`.
+      const fields = parseFieldsPayload(rawParams.fieldsRef
+        ? await readFormFields({ reference: rawParams.fieldsRef, tenantId: asJob(job).requesterId ?? "", jobId: jobIdOf(job) })
+        : legacyFields);
       const filled = await withTimeout(job.toolId, timeoutFor("pdf"), fillFormPdf(bytes[0], fields, { flatten: options.flatten === true }));
       outputs = [{ name: filled.name, mimeType: filled.mimeType, bytes: filled.bytes }];
       engine = FORM_ENGINE; engineVersion = FORM_ENGINE_VERSION;
@@ -149,6 +218,12 @@ export async function processDocumentJob(message: QueuedJob, deps: DocumentPipel
       if (error instanceof OutputCommitSupersededError) { logger.info("job.output_commit_superseded", context); return; }
       throw error;
     }
+    // FF-03: the payload has served its purpose the moment the output is
+    // committed. Purged here, after the commit, so a failed commit (which will
+    // be retried) still has its values. Failure to purge is logged, not fatal:
+    // the TTL backstop is the guarantee, this is the immediate path.
+    await purgeFormFields(rawParams.fieldsRef).catch(() => logger.warn("fill_forms.payload_purge_failed", { ...context, reason: "SUCCESS" }));
+    if (legacyFields !== undefined) await scrubLegacyFields(tenant, jobIdOf(job), rawParams as Record<string, unknown>);
     const durationMs = Date.now() - started;
     recordMetric("job_duration_ms", durationMs, "ms", { tool_id: job.toolId, engine, engine_version: engineVersion, status: "succeeded" });
     recordMetric("tool_execution_duration_ms", durationMs, "ms", { tool_id: job.toolId, engine, engine_version: engineVersion, status: "succeeded" });
@@ -163,6 +238,13 @@ export async function processDocumentJob(message: QueuedJob, deps: DocumentPipel
     // cancellation or expiry that arrived while the job was running must survive:
     // every terminal state is guarded, not just SUCCEEDED.
     const failed = await tenant((tx) => tx.job.updateMany({ where: { id: job.id, outputFileId: null, status: { notIn: [...CLOSED_JOB_STATES] } }, data: { status: "FAILED", errorCode, error: { message: error instanceof Error ? error.message : "Processing failed" }, completedAt: new Date() } }));
+    // FF-03: a retry still needs the values, so the payload is only removed when
+    // no further attempt can run. `message.attemptsMade` counts the attempts
+    // BullMQ has already started before this one; `maxAttempts` is what the job
+    // was enqueued with (1 when a secret is bound, 3 otherwise).
+    const attemptsUsed = (deps.attemptsMade ?? 0) + 1;
+    const lastAttempt = attemptsUsed >= (deps.maxAttempts ?? 1);
+    if (lastAttempt) await purgeFormFields(rawParams.fieldsRef).catch(() => logger.warn("fill_forms.payload_purge_failed", { ...context, reason: "FINAL_FAILURE" }));
     if (failed.count === 0) {
       // Either another attempt committed, the job was cancelled/expired mid-run, or
       // the row is gone (retention). All mean "do not write"; the log says which.
@@ -174,5 +256,15 @@ export async function processDocumentJob(message: QueuedJob, deps: DocumentPipel
     if (step && failed.count === 1) await tenant((tx) => tx.jobStep.updateMany({ where: { id: step.id, status: { notIn: [...CLOSED_JOB_STATES] } }, data: { status: "FAILED", errorCode, error: { message: error instanceof Error ? error.message : "Processing failed" }, completedAt: new Date() } }));
     recordMetric("jobs_failure_total", 1, "count", { tool_id: job.toolId, status: "failed" });
     logger.error("job.failed", { ...context, error_code: errorCode, status: "failed" }); throw error;
-  } finally { await deletePhase1Secret(rawParams.secretRef).catch(() => undefined); }
+  } finally {
+    await deletePhase1Secret(rawParams.secretRef).catch(() => undefined);
+    // The encrypted payload is *not* deleted here: a `finally` cannot tell a
+    // retryable failure from a final one, and deleting on a retry would break the
+    // retry. Terminal paths purge it explicitly (success, CANCELLED/EXPIRED,
+    // final failure); the TTL is the backstop for anything else.
+    if (legacyFields !== undefined) {
+      const state = await Promise.resolve(tenant((tx) => tx.job.findUnique({ where: { id: jobIdOf(job) }, select: { status: true } }))).catch(() => undefined);
+      if (state && (TERMINAL_JOB_STATES as readonly string[]).includes(String((state as { status?: string }).status))) await scrubLegacyFields(tenant, jobIdOf(job), rawParams as Record<string, unknown>);
+    }
+  }
 }

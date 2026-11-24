@@ -9,6 +9,7 @@
  * the payload rather than trusting the caller.
  */
 import assert from "node:assert/strict";
+import { FormFillError } from "../src/lib/pdf/form-validation";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import { isPublicApiTool, toolRegistry, workerToolIds } from "../src/lib/tools/registry";
@@ -92,7 +93,18 @@ test("S2 fill-forms boundary: the job route bounds the payload before it is read
 test("S2 fill-forms worker: the engine is invoked by the pipeline, never by a route or by the client bundle", () => {
   const pipeline = read("src/lib/jobs/document-pipeline.ts");
   assert.match(pipeline, /job\.toolId === "fill-forms"/u);
-  assert.match(pipeline, /parseFieldsPayload\(rawParams\.fields\)/u, "the worker must re-validate the stored payload");
+  // FF-03: the worker reads the values from the encrypted, tenant+job-bound
+  // reference and re-validates them there. Plaintext `fields` in `params` is
+  // exactly what this changed, so the assertion now pins the new invariant: the
+  // reference is read, the payload is re-validated, and no raw `fields` is
+  // trusted as the primary source.
+  assert.match(pipeline, /parseFieldsPayload\(/u, "the worker must re-validate the stored payload");
+  assert.match(pipeline, /readFormFields\(\{ reference: rawParams\.fieldsRef/u, "the worker must read values from the encrypted payload reference");
+  // The *creation* site is where plaintext used to be persisted; the orchestrator
+  // must write the reference only.
+  const orchestrator = read("src/lib/jobs/orchestrator.ts");
+  assert.match(orchestrator, /params: \{ inputFileIds: files\.map\(\(file\) => file\.id\), options, \.\.\.\(fieldsRef \? \{ fieldsRef \} : \{\}\)/u, "job params must carry the encrypted reference, not raw values");
+  assert.doesNotMatch(orchestrator, /\{ fields \} : \{\}/u, "raw fields must never be written into job params");
   assert.match(pipeline, /fillFormPdf\(bytes\[0\]/u);
   assert.match(pipeline, /"fill-forms"/u);
   // The output screening step must run for the filled PDF like any other tool.
@@ -148,4 +160,169 @@ test("S2 fill-forms public API: /v1/jobs accepts the bounded fields part and bin
   assert.match(source, /requestHash/u);
   // The payload reaches the orchestrator as data, alongside options.
   assert.match(source, /createToolJob\(\{[^}]*fields: input\.fields/u);
+});
+
+// ----------------------------------------------------------------- FF-10 / FF-01
+
+test("FF-10: the 64 KiB fields limit is measured in UTF-8 bytes, not UTF-16 code units", async () => {
+  const { assertFieldsPayloadSize, fieldsPayloadBytes, parseFieldsPart } = await import("../src/lib/pdf/form-validation");
+  // Review evidence: 35,121 Arabic characters (70,121 UTF-8 bytes) were accepted
+  // because the old check compared `.length`, which counts code units.
+  const arabic = "م".repeat(35_121);
+  assert.equal(arabic.length, 35_121);
+  assert.equal(fieldsPayloadBytes(arabic), 70_242, "Arabic is two bytes per code unit in UTF-8");
+  assert.throws(() => assertFieldsPayloadSize(arabic), (error: unknown) => error instanceof FormFillError && error.code === "FORM_VALUE_INVALID");
+  // The same payload in ASCII is comfortably inside the limit, so the check is
+  // about bytes rather than about the string being large.
+  assert.doesNotThrow(() => assertFieldsPayloadSize("a".repeat(35_121)));
+  // A payload just over the boundary is rejected; just under is accepted.
+  assert.doesNotThrow(() => assertFieldsPayloadSize("a".repeat(64 * 1024)));
+  assert.throws(() => assertFieldsPayloadSize("a".repeat(64 * 1024 + 1)));
+  // Arabic inside an otherwise small document still counts correctly through the
+  // same helper the API routes use.
+  assert.equal(fieldsPayloadBytes("{\"a\":\"نورة\"}"), Buffer.byteLength("{\"a\":\"نورة\"}", "utf8"));
+  void parseFieldsPart;
+});
+
+test("FF-10: duplicate JSON keys are rejected before JSON.parse can collapse them", async () => {
+  const { assertNoDuplicateJsonKeys, parseFieldsPart } = await import("../src/lib/pdf/form-validation");
+  // Review evidence: duplicate keys were last-wins.
+  assert.throws(() => assertNoDuplicateJsonKeys('{"a":1,"a":2}'), (error: unknown) => error instanceof FormFillError);
+  assert.throws(() => assertNoDuplicateJsonKeys('{"a":{"x":1,"x":2}}'), (error: unknown) => error instanceof FormFillError);
+  // Escapes are decoded first, so `"a\u0062"` and `"ab"` are the same key.
+  assert.throws(() => assertNoDuplicateJsonKeys('{"a\\u0062":1,"ab":2}'), (error: unknown) => error instanceof FormFillError);
+  // A repeated name in *different* objects is legitimate.
+  assert.doesNotThrow(() => assertNoDuplicateJsonKeys('{"a":{"x":1},"b":{"x":2}}'));
+  assert.doesNotThrow(() => assertNoDuplicateJsonKeys('{"a":["x","y"],"b":"x"}'));
+  // Trailing content after the document is not JSON and is refused.
+  assert.throws(() => assertNoDuplicateJsonKeys('{"a":1}x'), (error: unknown) => error instanceof FormFillError);
+  // And the `fields` part parser applies both the byte bound and the key check.
+  assert.throws(() => parseFieldsPart('{"a":1,"a":2}'), (error: unknown) => error instanceof FormFillError && error.code === "FORM_VALUE_INVALID");
+  assert.deepEqual(parseFieldsPart('{"a":"x"}'), { a: "x" });
+});
+
+test("FF-10: the Web API and the Public API each require exactly one `fields` part", () => {
+  const webRoute = read("src/app/api/jobs/[tool]/route.ts");
+  const publicApi = read("src/lib/public-api/jobs.ts");
+  for (const [name, source] of [["web route", webRoute], ["public API", publicApi]] as const) {
+    // `form.get()` returns the first of several parts without saying so, so the
+    // count must be asserted rather than assumed.
+    assert.match(source, /form\.getAll\("fields"\)\.length !== 1/u, `${name} must reject repeated parts`);
+    assert.match(source, /assertNoDuplicateJsonKeys/u, `${name} must reject duplicate keys`);
+    // And both must measure bytes, not code units.
+    assert.match(source, /fieldsPayloadBytes|assertFieldsPayloadSize/u, `${name} must bound the payload in UTF-8 bytes`);
+    assert.doesNotMatch(source, /rawFields\.length > 64 \* 1024/u, `${name} must not measure the payload in code units`);
+  }
+});
+
+test("FF-01: the inspect route's import graph contains no renderer and no module-scope font resolution", () => {
+  // The build failure was `dirname(require.resolve(...))` receiving Turbopack's
+  // numeric module id while the app route was evaluated. The route therefore
+  // must not reach the appearance module at all, directly or transitively.
+  const inspection = read("src/lib/pdf/form-inspection.ts");
+  // Only `import`/`require` statements matter: the module's doc comment explains
+  // which dependencies it deliberately avoids, and that prose must not trip the
+  // check.
+  const imports = inspection.split("\n").filter((line) => /^\s*(import|export .* from|const .* = require\()/u.test(line)).join("\n");
+  assert.doesNotMatch(imports, /form-appearance/u, "inspection must not import the renderer");
+  assert.doesNotMatch(imports, /napi-rs/u, "inspection must not import the rasteriser");
+  assert.doesNotMatch(imports, /fontsource/u, "inspection must not import font assets");
+  assert.doesNotMatch(imports, /node:module|createRequire/u, "inspection must not resolve modules at run time");
+
+  const route = read("src/app/api/fill-forms/inspect/route.ts");
+  assert.match(route, /from "@\/lib\/pdf\/form-inspection"/u, "the route must import the renderer-free module");
+  assert.doesNotMatch(route, /@\/lib\/pdf\/form-fill"/u, "the route must not import the fill engine");
+  assert.doesNotMatch(route, /@\/lib\/pdf\/form-appearance/u);
+
+  // And the renderer itself must not resolve fonts while the module is evaluated.
+  const appearance = read("src/lib/pdf/form-appearance.ts");
+  // Module scope is *top-level* code: a `require()` inside a function body is
+  // lazy and fine, however early in the file that function is declared. Track
+  // brace depth over code only (comments stripped) and keep depth-0 lines.
+  let depth = 0;
+  const topLevel: string[] = [];
+  let inBlockComment = false;
+  for (const line of appearance.split("\n")) {
+    const trimmed = line.trim();
+    if (inBlockComment) { if (trimmed.includes("*/")) inBlockComment = false; continue; }
+    if (trimmed.startsWith("/*")) { if (!trimmed.includes("*/")) inBlockComment = true; continue; }
+    if (trimmed.startsWith("//") || trimmed.startsWith("*")) continue;
+    if (depth === 0) topLevel.push(line);
+    for (const character of line) {
+      if (character === "{") depth += 1;
+      else if (character === "}") depth = Math.max(0, depth - 1);
+    }
+  }
+  const moduleCode = topLevel.join("\n");
+  // `createRequire(import.meta.url)` itself touches no filesystem and is fine at
+  // module scope. What must not happen there is *resolution*: `require.resolve`,
+  // `require(...)` or `dirname(...)` against a bundled specifier.
+  assert.doesNotMatch(moduleCode, /require\.resolve\(|\brequire\(\s*[A-Za-z"'\[]|dirname\(/u, "font resolution must not run at module scope");
+  assert.match(appearance, /function fontDirectory\(\)/u, "font resolution must live behind a lazy accessor");
+  assert.match(appearance, /if \(fontSource === undefined\)/u, "resolution must be memoised on first use");
+  // The guard against a non-path id is what turns a build failure into a coded
+  // render-time error if a bundler ever rewrites the specifier again.
+  assert.ok(appearance.includes("package\\.json$/u"), "a non-path resolve result must be rejected explicitly");
+});
+
+test("FF-04: the inspect route bounds the request before buffering and screens before parsing", () => {
+  const route = read("src/app/api/fill-forms/inspect/route.ts");
+  // Measure inside `POST` only: the prose above it legitimately mentions
+  // `request.formData()` while explaining why it used to be wrong.
+  const body = route.slice(route.indexOf("export async function POST"));
+  // The size guard is a helper defined above `POST`; what matters is that it is
+  // *called* inside `POST` before `formData()` buffers the body.
+  const declaredAt = body.indexOf("declaredLength(request)");
+  const formDataAt = body.indexOf("request.formData()");
+  const screeningAt = body.indexOf("requireCleanUpload(bytes)");
+  const parseAt = body.indexOf("inspectFormPdf(");
+  const cheapAt = body.indexOf("assertCheapPdfShape(bytes)");
+  assert.ok(declaredAt > 0 && declaredAt < formDataAt, "the declared length must be checked before formData()");
+  assert.ok(cheapAt > 0 && cheapAt < screeningAt, "cheap shape checks must precede screening");
+  assert.ok(screeningAt > 0 && screeningAt < parseAt, "malware screening must precede the PDF parse");
+  const admissionAt = body.indexOf("admitFormInspection");
+  assert.ok(admissionAt > 0 && admissionAt < formDataAt, "per-tenant admission must run before the body is read");
+});
+
+test("FF-03: no raw field value reaches `Job.params`, and every terminal path purges the reference", () => {
+  const orchestrator = read("src/lib/jobs/orchestrator.ts");
+  const pipeline = read("src/lib/jobs/document-pipeline.ts");
+  const publicApi = read("src/lib/public-api/jobs.ts");
+  const payload = read("src/lib/pdf/form-payload.ts");
+
+  // Creation persists only the reference.
+  assert.match(orchestrator, /putFormFields\(\{ tenantId: input\.userId, jobId, fields \}\)/u);
+  assert.match(orchestrator, /fieldsRef \? \{ fieldsRef \} : \{\}/u);
+  // Enqueue/transaction failure purges it.
+  assert.match(orchestrator, /purgeFormFields\(fieldsRef\)/u);
+
+  // The worker reads by reference and never trusts plaintext as the first source.
+  assert.match(pipeline, /readFormFields\(\{ reference: rawParams\.fieldsRef/u);
+
+  // Every terminal transition the pipeline owns purges it.
+  assert.match(pipeline, /purgeFormFields\(rawParams\.fieldsRef\)\.catch\(\(\) => logger\.warn\("fill_forms\.payload_purge_failed", \{ \.\.\.context, reason: "SUCCESS" \}\)/u);
+  assert.match(pipeline, /reason: "FINAL_FAILURE"/u);
+  assert.ok(pipeline.indexOf('job.status === "CANCELLED" || job.status === "EXPIRED"') >= 0);
+  // …and so does API cancellation.
+  assert.match(publicApi, /purgeFormFields\(cancelled\.fieldsRef\)/u);
+
+  // The read must be non-destructive: a retry has to find the payload again.
+  assert.doesNotMatch(payload, /getdel/u, "the payload read must not be destructive");
+  assert.match(payload, /async get\(key\) \{ return \(await getReadyQueueConnection\(\)\)\.get\(key\); \}/u);
+  // Tenant and job are bound into the AAD, not just into the key name.
+  assert.match(payload, /const aad = \(tenantId: string, jobId: string\) => Buffer\.from\(`v1\\0\$\{tenantId\}\\0\$\{jobId\}\\0\$\{PURPOSE\}`\)/u);
+});
+
+test("FF-06: `fill-forms` is inspected after screening and before billing/storage/enqueue", () => {
+  const orchestrator = read("src/lib/jobs/orchestrator.ts");
+  const screeningAt = orchestrator.indexOf("await requireCleanUpload(upload.bytes)");
+  const preflightAt = orchestrator.indexOf("await assertFillableInput(prepared[0].upload.bytes)");
+  const billingAt = orchestrator.indexOf("await enforceJobCreation(");
+  const storageAt = orchestrator.indexOf("await storage.put(");
+  const enqueueAt = orchestrator.indexOf("await enqueueJob(queuedJob, queueOptions)");
+  assert.ok(preflightAt > 0, "the preflight must exist");
+  assert.ok(screeningAt > 0 && preflightAt > screeningAt, "the preflight must follow malware screening");
+  assert.ok(preflightAt < billingAt, "the preflight must precede any billing attempt");
+  assert.ok(preflightAt < storageAt, "the preflight must precede object storage");
+  assert.ok(preflightAt < enqueueAt, "the preflight must precede queueing");
 });

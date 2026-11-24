@@ -207,26 +207,95 @@ regression; no change to `layout.tsx` is included in this branch.
 
 ## Evidence
 
+Counts below are stated **for the commit that carries this document** and are
+the only current figures. Earlier figures from the first Stage 2 push are kept in
+their own subsection and labelled as historical (FF-11).
+
 * Environment: Node 22.22.3, `node --import ./scripts/node-platform-compat.mjs
   --import tsx --test`, sandbox without `prisma generate` (see below).
-* `test/fill-forms.runtime.test.ts` — 17 cases, 17 pass. Real engine, real
+* `test/fill-forms.runtime.test.ts` — **26 cases, 26 pass**. Real engine, real
   documents, outputs reopened independently.
-* `test/fill-forms.pipeline.test.ts` — 4 cases, **4 skipped** in this
-  environment (no generated Prisma client; CI runs them).
-* `test/fill-forms.contract.test.ts` — 8 cases, 8 pass (registry, options,
+* `test/fill-forms.contract.test.ts` — **16 cases, 16 pass** (registry, options,
   workflow/Agent rejection, API surface, worker wiring, browser safety,
-  transport contract).
-* Combined focused run: **29 tests — 25 pass, 0 fail, 4 skipped.**
-* Whole local `test/*.test.ts` suite: 370 tests — 322 pass, 13 fail, 35 skipped.
-  The same 13 files fail on the untouched base commit (verified by stashing),
-  all for environment reasons (missing generated Prisma client, no
-  Postgres/Redis/Groq/clamd). No new failure, and 4 skips are the pipeline
-  cases above.
-* No `2026-11-23` evidence ledger, no `DIP-CR-006` document and no
-  `test/fixtures/processing/` corpus exist in this repository. This report
-  therefore cites no ledger rows and every fixture is generated in-code rather
-  than referenced from a missing source.
+  transport contract, plus one structural case per remediation finding).
+* `test/fill-forms.pipeline.test.ts` — **4 cases, 4 skipped** in this
+  environment. CI runs them: `npx prisma generate` precedes `npm test` in
+  `ci.yml`, and `DIP_REQUIRE_PIPELINE=1` turns a skip into a failure there.
+* Combined focused run: **46 tests — 42 pass, 0 fail, 4 skipped.**
+* Whole local `test/*.test.ts` suite: **489 tests — 431 pass, 15 fail, 43
+  skipped.** The same 15 files fail on the untouched base commit (473 / 415 / 15
+  / 43), all for environment reasons (missing generated Prisma client, no
+  Postgres/Redis/Groq/clamd). The delta is +16 tests and +16 passes with an
+  identical failure set.
+
+### Historical results (superseded — do not cite as current)
+
+The first Stage 2 push reported **29 focused tests — 25 pass, 4 skipped**
+(17 runtime, 8 contract, 4 pipeline) and **370 whole-suite tests — 322 pass, 13
+fail, 35 skipped**. The independent review ran **30** focused cases (17 runtime,
+9 contract, 4 pipeline, 0 skipped) against that head and found them all passing.
+
+Those numbers no longer describe the repository. They are recorded only so that
+the earlier report and the review can be read against what was actually measured
+at the time, per DIP-CR-006 test sequencing.
+
 * `prisma generate` cannot run in this sandbox (`binaries.prisma.sh` is
   unreachable), so `tsc`/tests that need the generated client report as skipped
   or are filtered by path. This is a pre-existing environment limitation, not a
   result of this change.
+
+## Remediation round (independent review, FF-01 … FF-12)
+
+An independent review of the first Stage 2 head returned **NO-GO** with
+5 HIGH / 5 MEDIUM / 2 LOW findings. The table below states, per finding, what
+changed and how far it is verified. A finding is only "verified" when a
+regression test reproduces the reviewed defect and the fix is exercised by it.
+
+| Finding | Change | Status |
+| --- | --- | --- |
+| FF-01 | Inspection moved to `src/lib/pdf/form-inspection.ts`, which imports `pdf-lib` only. The inspect route no longer reaches the rasteriser; font resolution in `form-appearance.ts` is lazy and validates the resolved specifier. | **FIXED AND VERIFIED** — production build completes (compile, page-data collection, 111/111 static pages, finalization) and the built route answers `401 AUTH_REQUIRED` under `next start`. |
+| FF-02 | Bounded recursive `/Kids` walk with inherited `/FT`, indirect-reference following, cycle/depth/node/hop budgets. Any structural anomaly is `FORM_RESTRICTED`; only unparseable bytes remain `FORM_UNSUPPORTED`. | **FIXED AND VERIFIED** — nested signature, inherited `/FT`, dangling and non-dict `/Perms`, non-array `/Fields`, and a `/Kids` cycle all rejected; a library stack overflow is converted to a coded refusal. |
+| FF-03 | Values encrypt to Redis under a tenant+job-bound AAD reference (`form-payload.ts`), non-destructive read for retries, purged on success, final failure, cancel, expiry and enqueue failure; TTL backstop = `abandonedGraceMs()`. `Job.params` carries `fieldsRef` only. | **IMPLEMENTED BUT UNVERIFIED end-to-end** — unit-tested against an in-memory store (retry-safe, cross-tenant/cross-job rejected, purge idempotent); **no live Redis** in this sandbox, so the TTL and the sweep path are not proven against the real store. |
+| FF-04 | `Content-Length` pre-check before `formData()`, cheap signature/trailer/page-marker checks, screening before parse, bounded parse budget, per-tenant rate and concurrency admission. | **IMPLEMENTED BUT UNVERIFIED** — ordering is asserted structurally and the route builds and runs; no load test was possible, and in-process parse CPU cannot be interrupted (see limitations). |
+| FF-05 | Flattened widget references are removed from every page `/Annots`; the output is re-read and all remaining annotations must resolve, with zero surviving widgets and unrelated annotations preserved. | **FIXED AND VERIFIED** — the reviewed 15-widget/two-page fixture now flattens to 0 unresolved, 0 widgets, 1 preserved link. Verified with pdf-lib; **pypdf and Poppler are unavailable here**. |
+| FF-06 | Restriction preflight in `createToolJob` after `requireCleanUpload`, before billing, storage and enqueue. | **IMPLEMENTED BUT UNVERIFIED** — position is asserted against the real source; no live billing/DB to prove absence of a charge or row. |
+| FF-07 | Arabic line breaks preserved; overflow and illegible geometry rejected with no partial output; Arabic option-list selections rejected rather than comma-joined; Latin option lists keep pdf-lib's correct provider. | **PARTIALLY FIXED AND VERIFIED** — line breaks, clipping, tiny widgets and the joined-selection string are covered by tests. **Rotated text, border/background loss and mixed-direction shaping remain unresolved.** |
+| FF-08 | Allowed content-free messages plus stable issue codes; no field names or booleans in errors, details or verification mismatches. | **FIXED AND VERIFIED** — text, Arabic, checkbox and unexpected-library-exception paths assert the allowlist and assert that neither value nor field name is serialised. |
+| FF-09 | Empty text compares canonically (`undefined` and `""` both mean empty). | **FIXED AND VERIFIED** — clearing to `""` round-trips. |
+| FF-10 | 64 KiB measured in UTF-8 bytes; duplicate JSON keys rejected before `JSON.parse`; exactly one `fields` part; both the Web API and the Public API apply all three. | **FIXED AND VERIFIED** — 70,121-byte payload rejected, duplicate keys rejected (including escape-decoded collisions), repeated parts rejected. |
+| FF-11 | `loadPipeline` skips only on a genuine missing Prisma client and rethrows anything else; CI sets `DIP_REQUIRE_PIPELINE=1`; counts reconciled in this section. | **FIXED AND VERIFIED** — counts above are measured on the final commit; CI enforcement cannot be exercised here. |
+| FF-12 | Trailing blank line removed from `form-schema.ts`. | **FIXED AND VERIFIED** — `git diff --check` is clean for the commit. |
+
+### Limitations that remain
+
+* **Real-service verification is absent.** RLS, Redis, S3 and ClamAV are not
+  available in this environment. The ClamAV R1/R2 limitations recorded earlier
+  are unchanged and are **not** closed by this round.
+* **Independent readers are limited to pdf-lib.** The review used pypdf and
+  Poppler; neither is installed here, so the FF-05 evidence is a structural
+  re-read with pdf-lib plus annotation-graph assertions, not a second engine.
+* **Parse budgets are advisory in-process.** `pdf-lib` cannot be interrupted
+  mid-parse on the main thread. Size, shape, page count and elapsed time are
+  bounded; a genuine CPU-time cap needs a worker thread, which is an
+  architectural change.
+* **Rasterised Arabic is pixels.** Values keep Unicode `/V` and the widget stays
+  interactive, but the glyphs inside that widget are not selectable text.
+* **Rotated widgets and raster border/background are not fixed.** Rotation is
+  still cropped; the raster appearance still paints over the widget's original
+  border and background.
+
+### Architectural decisions needing owner approval
+
+1. **Payload reference (FF-03).** Encryption reuses `PHASE1_SECRET_ENCRYPTION_KEY`
+   with a distinct AAD purpose, and the TTL is tied to
+   `abandonedGraceMs()` (≥ 24 h). This avoids a new secret and a policy change,
+   but it does mean a second purpose shares the Phase 1 key, and that the payload
+   lifetime is coupled to retention policy. A dedicated key and an explicitly
+   approved TTL would each be a deployment/policy change.
+2. **Expiry purge (FF-03).** The scheduled expiry sweep now also deletes the
+   Redis payload for jobs it expires. That is a new side effect inside an
+   approved retention operation; it does not change which jobs expire or when,
+   but it should be acknowledged before release.
+3. **Per-tenant admission for inspection (FF-04).** Fixed limits (30/min, 4
+   concurrent) are new operational parameters. They are not yet configurable via
+   the environment.

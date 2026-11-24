@@ -54,12 +54,32 @@ function rasteriser(): RasterModule {
 const RASTER_MODULE = ["@napi-rs", "canvas"].join("/");
 
 /**
- * Fonts are located by path, not by a static `require.resolve()` of a `.woff`
- * specifier: the bundler treats that resolved asset as a build input and fails
- * the build on it. `require.resolve("@fontsource/noto-sans-arabic/package.json")`
- * stays inside JavaScript and is analysable without side effects.
+ * Fonts are resolved **lazily, once, on first use** (FF-01).
+ *
+ * The previous version did this at module scope. In a production build Turbopack
+ * rewrites `require.resolve` to return a numeric module id for a bundled
+ * dependency, so `dirname(7)` threw during page-data collection and the build
+ * failed for every route that imported this module — including the read-only
+ * inspect route, which never renders anything.
+ *
+ * Doing it here means:
+ *   - nothing is resolved while a route module is evaluated,
+ *   - the cost is paid once, by the worker, when a value actually needs raster
+ *     text,
+ *   - and a resolution failure becomes a `FORM_UNSUPPORTED` at render time
+ *     (no partial output) rather than a build failure.
  */
-const FONT_SOURCE = dirname(require.resolve("@fontsource/noto-sans-arabic/package.json"));
+let fontSource: string | undefined;
+function fontDirectory(): string {
+  if (fontSource === undefined) {
+    const modulePath = require.resolve("@fontsource/noto-sans-arabic/package.json");
+    // Fail loudly and legibly if a bundler ever hands back a non-path again,
+    // instead of producing `dirname(7)` somewhere deep inside the call.
+    if (typeof modulePath !== "string" || !/[\\/]package\.json$/u.test(modulePath)) throw Object.assign(new Error("Form fonts could not be located"), { code: "FONT_UNAVAILABLE" });
+    fontSource = dirname(modulePath);
+  }
+  return fontSource;
+}
 
 /** Pure render scale: a widget is rasterised at this multiple of its PDF size. */
 const RASTER_SCALE = 4;
@@ -68,8 +88,8 @@ const RASTER_MAX_AREA = 12_000_000;
 
 export function registerFormFonts() {
   if (fontsReady) return;
-  const arabic = join(FONT_SOURCE, "files/noto-sans-arabic-arabic-400-normal.woff");
-  const latin = join(FONT_SOURCE, "files/noto-sans-arabic-latin-400-normal.woff");
+  const arabic = join(fontDirectory(), "files/noto-sans-arabic-arabic-400-normal.woff");
+  const latin = join(fontDirectory(), "files/noto-sans-arabic-latin-400-normal.woff");
   const { GlobalFonts } = rasteriser();
   if (!GlobalFonts.registerFromPath(arabic, "DIP Form Arabic") || !GlobalFonts.registerFromPath(latin, "DIP Form Latin")) throw Object.assign(new Error("Unable to register form fonts"), { code: "FONT_UNAVAILABLE" });
   fontsReady = true;
@@ -109,8 +129,17 @@ export function canRasterise(text: string) { return rasterisable.test(text); }
 /** True when the value contains Arabic script and needs bidi-aware rendering. */
 export function hasArabicScript(text: string) { return arabicScript.test(text); }
 
-function wrapLines(context: SKRSContext2D, text: string, maxWidth: number, maxLines: number) {
-  const words = text.split(/\s+/u).filter(Boolean);
+/**
+ * Wrap one paragraph into `maxWidth`.
+ *
+ * FF-07: an explicit line break in the submitted value is a *typo-invisible*
+ * defect when it disappears. The previous implementation split the whole value
+ * on whitespace, so `"أحمد\nمحمد"` was laid out as `"أحمد محمد"` — a different
+ * string on the page from the one in the field. Breaks are now structural:
+ * `wrapTextBlock` splits on them first and wraps each paragraph independently.
+ */
+function wrapParagraph(context: SKRSContext2D, text: string, maxWidth: number) {
+  const words = text.split(/[ \t]+/u).filter(Boolean);
   const lines: string[] = [];
   let current = "";
   for (const word of words) {
@@ -118,17 +147,56 @@ function wrapLines(context: SKRSContext2D, text: string, maxWidth: number, maxLi
     if (context.measureText(candidate).width <= maxWidth || !current) { current = candidate; continue; }
     lines.push(current);
     current = word;
-    if (lines.length >= maxLines) break;
   }
-  if (current && lines.length < maxLines) lines.push(current);
+  if (current) lines.push(current);
+  return lines;
+}
+
+/** Layout a whole value, honouring explicit line breaks and a line budget. */
+function wrapLines(context: SKRSContext2D, text: string, maxWidth: number, maxLines: number) {
+  const paragraphs = text.split(/\r\n|\r|\n/u);
+  const lines: string[] = [];
+  for (const paragraph of paragraphs) {
+    for (const line of wrapParagraph(context, paragraph, maxWidth)) {
+      if (lines.length >= maxLines) return lines;
+      lines.push(line);
+    }
+  }
   return lines;
 }
 
 export type RasterAppearanceOptions = { text: string; width: number; height: number; multiline?: boolean };
 
 /** Render `text` into a PNG sized to the widget rectangle in device pixels. */
+/**
+ * Smallest value height that stays legible, in PDF points (FF-07).
+ *
+ * The review produced an 18x7 pt widget in which 6 px text is unreadable. A
+ * value that cannot be drawn legibly is *rejected* — with no partial output —
+ * rather than shrunk until it fits. 8 pt is the usual minimum readable size for
+ * a printed form value; below it the tool refuses and says why.
+ */
+const MIN_LEGIBLE_VALUE_HEIGHT_PT = 8;
+/** Smallest width that can hold a few glyphs plus padding at that height. */
+const MIN_LEGIBLE_VALUE_WIDTH_PT = 16;
+
+export class AppearanceLegibilityError extends Error {
+  constructor(readonly reason: "WIDGET_TOO_SMALL" | "VALUE_OVERFLOWS_WIDGET" | "VALUE_NEEDS_MORE_LINES") {
+    super(reason);
+  }
+}
+
 export function renderWidgetAppearance(options: RasterAppearanceOptions) {
   registerFormFonts();
+  // FF-07: refuse geometry that cannot render a legible value, instead of
+  // producing a widget with microscopic or clipped text.
+  //
+  // Measured on the rectangle *as reported*, which already includes the widget's
+  // border/padding (~1 pt each side in practice): the review's 18x7 pt widget
+  // arrives here as 19x8, so a threshold compared against the requested size
+  // would let it through. The floor is therefore the legible text height plus the
+  // padding the renderer itself adds below.
+  if (options.height < MIN_LEGIBLE_VALUE_HEIGHT_PT + 2 || options.width < MIN_LEGIBLE_VALUE_WIDTH_PT) throw new AppearanceLegibilityError("WIDGET_TOO_SMALL");
   const width = Math.max(16, Math.min(RASTER_MAX_DIMENSION, Math.round(options.width * RASTER_SCALE)));
   const height = Math.max(16, Math.min(RASTER_MAX_DIMENSION, Math.round(options.height * RASTER_SCALE)));
   if (width * height > RASTER_MAX_AREA) throw Object.assign(new Error("Widget appearance exceeds the raster area limit."), { code: "APPEARANCE_LIMIT_EXCEEDED" });
@@ -153,17 +221,18 @@ export function renderWidgetAppearance(options: RasterAppearanceOptions) {
     if (fits) break;
     fontSize = Math.round(fontSize * 0.88);
   }
-  if (!options.multiline && context.measureText(options.text).width > maxWidth) {
-    // Single-line overflow: clip horizontally rather than pretending it fits.
-    context.save();
-    context.beginPath();
-    context.rect(padding, 0, maxWidth, height);
-    context.clip();
-    context.fillText(options.text, hasArabic ? width - padding : padding, padding);
-    context.restore();
-  } else {
-    lines.forEach((line, index) => context.fillText(line, hasArabic ? width - padding : padding, padding + index * fontSize * 1.25));
+  // FF-07: never clip. The review found a 209-character value silently cut off
+  // inside a 90 pt widget: the field *value* was correct and the visible output
+  // was not. Overflow is now an explicit rejection with no partial output, so the
+  // caller learns the value does not fit instead of shipping a document that
+  // hides part of it.
+  if (!options.multiline) {
+    if (context.measureText(options.text).width > maxWidth) throw new AppearanceLegibilityError("VALUE_OVERFLOWS_WIDGET");
+  } else if (lines.join("").length < options.text.replace(/[ \t\r\n]+/gu, "").length) {
+    // `wrapLines` stopped at the line budget: some of the value would be lost.
+    throw new AppearanceLegibilityError("VALUE_NEEDS_MORE_LINES");
   }
+  lines.forEach((line, index) => context.fillText(line, hasArabic ? width - padding : padding, padding + index * fontSize * 1.25));
   return canvas.toBuffer("image/png");
 }
 
