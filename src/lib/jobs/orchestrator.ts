@@ -40,7 +40,7 @@ type Upload = { filename: string; mimeType: string; bytes: Uint8Array };
  * `assertFillableRestrictions` → inventory) in the child, with the deadline, heap
  * cap and minimal environment that the route already relies on.
  */
-async function assertFillableInput(bytes: Uint8Array) {
+async function assertFillableInput(bytes: Uint8Array): Promise<number> {
   const result = await processPdfBounded(bytes, formWorkerLimits({ timeoutMs: runtimeLimits.formWorkerTimeoutMs, maxHeapMb: runtimeLimits.formWorkerMaxHeapMb, concurrency: runtimeLimits.formWorkerConcurrency }));
   // The child's verdict is data, and data from a subprocess is not trusted: a
   // malformed reply is a boundary failure, never an implicit "the document is fine".
@@ -54,6 +54,11 @@ async function assertFillableInput(bytes: Uint8Array) {
   if (!result.inventory || !Array.isArray((result.inventory as { fields?: unknown }).fields)) {
     throw new FormFillError("FORM_UNSUPPORTED", FORM_ERROR_MESSAGES.FORM_UNSUPPORTED, { boundary: "INVALID_INVENTORY" });
   }
+  // `processPdfBounded` has already rejected a non-integer or negative `pages`, so
+  // this is the document's authoritative page count: it is what plan enforcement and
+  // the file row receive. It is never taken from the client or from a page-marker
+  // estimate.
+  return result.pages;
 }
 function minimumFilesFor(toolId: string) { return ["merge-pdf", "alternate-mix"].includes(toolId) ? 2 : 1; }
 export async function createToolJob(input: { userId: string; toolId: string; uploads: Upload[]; options?: Record<string, string | number | boolean>; fields?: Record<string, unknown>; secrets?: Phase1SecretPayload; idempotencyKey: string; correlationId?: string; organizationId?: string; apiClientId?: string }) {
@@ -98,22 +103,31 @@ export async function createToolJob(input: { userId: string; toolId: string; upl
     const looksPdf = upload.mimeType === "application/pdf" || upload.filename.toLowerCase().endsWith(".pdf");
     if (looksPdf && !controlledPreflightToolIds.has(tool.toolId)) assertCheapPdfShape(upload.bytes);
     const malwareScan = await requireCleanUpload(upload.bytes);
-    const validation = await validateUpload({ toolId: tool.toolId, declaredMime: upload.mimeType, bytes: upload.bytes });
-    return { upload, validation, malwareScan };
+    return { upload, malwareScan };
   }));
-  const prepared = screened;
-  // FF-06: prove the document is fillable *before* billing, storage and the
-  // queue. The review found that a restricted input still created a document,
-  // file and file-version row, a job row and a billing attempt, and only then
-  // failed in the worker — leaving durable artifacts and a charge for work that
-  // could never succeed.
+  // B31-01: Fill Forms must not parse in this process. Its structural verdict and
+  // page count come from the bounded child, and the child must run *before*
+  // `validateUpload` — otherwise the generic parse happens first and the isolation is
+  // decorative, which is exactly what the review found. Malware screening above still
+  // precedes it, so no document reaches the inspector unscanned. This runs once per
+  // job for a single-file tool, so the document is inspected exactly once.
+  const inspectionPages = tool.toolId === "fill-forms" ? await assertFillableInput(screened[0].upload.bytes) : undefined;
+  const prepared = await Promise.all(screened.map(async ({ upload, malwareScan }) => ({
+    upload,
+    malwareScan,
+    validation: await validateUpload({ toolId: tool.toolId, declaredMime: upload.mimeType, bytes: upload.bytes, inspectionPages }),
+  })));
+  // FF-06 / B31-01: prove the document is fillable *before* billing, storage and
+  // the queue, and do it in the bounded child rather than in this process. A
+  // restricted input previously still created a document, file and file-version row,
+  // a job row and a billing attempt, and only then failed in the worker — leaving
+  // durable artifacts and a charge for work that could never succeed.
   //
-  // This runs after `requireCleanUpload` (so screening is never skipped or
-  // reordered ahead of the malware gate) and before `enforceJobCreation` (so no
-  // charge is attempted). The worker keeps its own recheck: these bytes are
-  // screened and inspected here, but the worker re-reads them from storage and
-  // must not trust the API's decision.
-  if (tool.toolId === "fill-forms") await assertFillableInput(prepared[0].upload.bytes);
+  // Ordering is fixed and deliberate: `requireCleanUpload` (above) → isolated
+  // inspection (above) → this. Screening is never skipped or reordered ahead of the
+  // malware gate, and no charge is attempted until a page count exists. The worker
+  // keeps its own recheck: these bytes are screened and inspected here, but the
+  // worker re-reads them from storage and must not trust the API's decision.
   const monetization = await enforceJobCreation({ userId: input.userId, toolId: tool.toolId, idempotencyKey: input.idempotencyKey, correlationId, options, files: prepared.map(({upload,validation})=>({size:upload.bytes.byteLength,pageCount:validation.pageCount})) });
   const stored: Array<{ key: string; bucket: string; upload: Upload; validation: Awaited<ReturnType<typeof validateUpload>> }> = [];
   let secretRef: string | undefined;

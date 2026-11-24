@@ -53,6 +53,22 @@ export const toolRegistry = Object.fromEntries(toolsConfig.map((tool) => [tool.i
  */
 export const controlledPreflightToolIds: ReadonlySet<string> = new Set(["unlock-pdf", "repair-pdf"]);
 
+/**
+ * Tools whose PDF parsing happens in the bounded inspection child, not in the API.
+ *
+ * Fill Forms is the only tool with a dedicated isolated inspector
+ * (`processPdfBounded`). Its job-submission path previously still parsed the same
+ * document in the API process — `validateUpload` → `PDFDocument.load` — *before*
+ * reaching that child, so the isolation it appeared to have was not real: an
+ * attacker-supplied PDF was loaded once with web-server privileges and once in the
+ * child. This set is what lets `validateUpload` decline to parse for it.
+ *
+ * The authoritative page count therefore comes from the child's reply, which is
+ * shape-validated before being trusted, and is carried into plan enforcement rather
+ * than dropped.
+ */
+export const isolatedInspectionToolIds: ReadonlySet<string> = new Set(["fill-forms"]);
+
 /** Tools enabled on the unified runtime workers. */
 export const workerToolIds = new Set([
   "merge-pdf", "split-pdf", "organize-pdf", "rotate-pdf", "delete-pages", "extract-pages", "jpg-to-pdf",

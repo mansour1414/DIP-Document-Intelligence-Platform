@@ -333,7 +333,15 @@ test("FF-03: no raw field value reaches `Job.params`, and every terminal path pu
 test("FF-06: `fill-forms` is inspected after screening and before billing/storage/enqueue", () => {
   const orchestrator = read("src/lib/jobs/orchestrator.ts");
   const screeningAt = orchestrator.indexOf("await requireCleanUpload(upload.bytes)");
-  const preflightAt = orchestrator.indexOf("await assertFillableInput(prepared[0].upload.bytes)");
+  // B31-01 moved the preflight *earlier* — ahead of `validateUpload`, so the API does
+  // not parse the document in-process before reaching this boundary. Locate the call
+  // site by name rather than by one exact argument expression, so the invariant
+  // (screened, and before any durable effect) is what is asserted and a further move
+  // within those bounds does not produce a false red.
+  // The definition and the call both match `/assertFillableInput\(/`; the call is the
+  // one that is preceded by `await`.
+  const callPattern = /await assertFillableInput\(/u;
+  const preflightAt = callPattern.test(orchestrator) ? orchestrator.search(callPattern) : -1;
   const billingAt = orchestrator.indexOf("await enforceJobCreation(");
   const storageAt = orchestrator.indexOf("await storage.put(");
   const enqueueAt = orchestrator.indexOf("await enqueueJob(queuedJob, queueOptions)");

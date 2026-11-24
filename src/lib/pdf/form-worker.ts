@@ -278,6 +278,20 @@ export async function processPdfBounded(bytes: Uint8Array, limits: WorkerLimits 
         finish(new FormWorkerError("WORKER_PROTOCOL_ERROR", "The document processor returned an unexpected result."));
         return;
       }
+      // A successful reply is only trusted as far as it is shaped. `pages` in
+      // particular becomes the authoritative page count for Fill Forms — it is fed
+      // to plan enforcement and persisted on the file row — so a non-numeric or
+      // nonsense value must be a boundary failure, never an implicit pass. Without
+      // this check a malformed `{ ok: true }` would carry `undefined` pages into
+      // `pageCount`, and a negative or fractional value would slip past a limit
+      // comparison.
+      if ((parsed as { ok?: unknown }).ok === true) {
+        const pages = (parsed as { pages?: unknown }).pages;
+        if (typeof pages !== "number" || !Number.isInteger(pages) || pages < 0) {
+          finish(new FormWorkerError("WORKER_PROTOCOL_ERROR", "The document processor returned an invalid page count."));
+          return;
+        }
+      }
       finish(undefined, parsed as WorkerResult);
     });
 

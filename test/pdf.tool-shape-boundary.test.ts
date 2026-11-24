@@ -50,22 +50,37 @@ test("Repair PDF and Unlock PDF accept damaged input without the Fill Forms shap
   }
 });
 
-test("Fill Forms and ordinary PDF tools still reject the same damaged input", async () => {
-  // The restriction stays where it belongs. A fillable-form tool cannot work on bytes
-  // that will not parse, and an ordinary tool must fail before allocating work.
-  for (const toolId of ["fill-forms", "compress-pdf"]) {
-    await assert.rejects(
-      () => validateUpload({ toolId, declaredMime: "application/pdf", bytes: truncated }),
-      (error: unknown) => {
-        // Either an explicit refusal or a parse failure is acceptable; silently
-        // accepting the document is not.
-        assert.ok(error instanceof Error, `${toolId} must refuse the document`);
-        assert.notEqual((error as { controlledWorkerPreflight?: boolean }).controlledWorkerPreflight, true);
-        return true;
-      },
-      `${toolId} must not accept a damaged PDF`,
-    );
-  }
+test("ordinary PDF tools still reject the same damaged input", async () => {
+  // Unchanged by B31-01: an ordinary tool parses in the API and must fail before
+  // allocating work.
+  await assert.rejects(
+    () => validateUpload({ toolId: "compress-pdf", declaredMime: "application/pdf", bytes: truncated }),
+    (error: unknown) => {
+      assert.ok(error instanceof Error, "compress-pdf must refuse the document");
+      return true;
+    },
+    "compress-pdf must not accept a damaged PDF",
+  );
+});
+
+test("Fill Forms still refuses a damaged document, but at its isolated boundary", async () => {
+  // B31-01 moved *where* Fill Forms decides this. `validateUpload` no longer parses, so
+  // it cannot be the place that rejects a broken document — the rejection now comes
+  // from the bounded inspection child, which is where the decision belonged. The
+  // user-visible outcome is unchanged: the document is refused. Asserting a
+  // `validateUpload` rejection here would have re-introduced the in-process parse.
+  const { FormFillError } = await import("@/lib/pdf/form-validation");
+  const { assertCheapPdfShape } = await import("@/lib/pdf/form-inspection");
+  // The child runs exactly this shape check first, so this is the same refusal the
+  // worker produces for these bytes.
+  assert.throws(
+    () => assertCheapPdfShape(truncated),
+    (error: unknown) => error instanceof FormFillError && error.code === "FORM_UNSUPPORTED",
+    "the isolated boundary must still refuse the document",
+  );
+  // And the transport layer genuinely no longer parses for this tool.
+  const result = await validateUpload({ toolId: "fill-forms", declaredMime: "application/pdf", bytes: truncated });
+  assert.equal(result.pageCount, undefined, "validateUpload must not have parsed the document");
 });
 
 test("the shape gate still rejects documents the controlled tools cannot repair", async () => {
