@@ -2,6 +2,7 @@ import { randomUUID } from "crypto";
 import { BodyTooLargeError, UploadDeadlineError, boundedMultipartRequest, multipartBudget } from "@/lib/http/bounded-body";
 import { requireUser } from "@/lib/auth/user";
 import { createToolJob } from "@/lib/jobs/orchestrator";
+import { FORM_FIELDS_JSON_LIMIT } from "@/lib/pdf/form-types";
 import { FormFillError, assertNoDuplicateJsonKeys, fieldsPayloadBytes } from "@/lib/pdf/form-validation";
 import { getToolDefinition, workerToolIds } from "@/lib/tools/registry";
 import { UploadValidationError } from "@/lib/uploads/validation";
@@ -28,7 +29,16 @@ export async function POST(request: Request, { params }: { params: Promise<{ too
     // actual bytes as the parser pulls them, so a missing (chunked), false or
     // absent `Content-Length` cannot raise it.
     const toolLimit = getToolDefinition(tool).limits.maxBytes;
-    const bounded = boundedMultipartRequest(request, { limitBytes: multipartBudget(toolLimit), deadlineMs: UPLOAD_DEADLINE_MS });
+    // This endpoint accepts a *separate* `fields` part beside the files, and that
+    // part has its own 64 KiB contract (`FORM_FIELDS_JSON_LIMIT`). Reserving for it
+    // here is what makes a valid maximum-size request fit: before, the transport
+    // budget was `fileLimit + 16 KiB` and could refuse a request the validator would
+    // have accepted. The reserved allowance is a ceiling on the *fields* part; the
+    // validator still enforces the precise rule, and the total stays bounded.
+    const bounded = boundedMultipartRequest(request, {
+      limitBytes: multipartBudget(toolLimit, { fieldsBytes: FORM_FIELDS_JSON_LIMIT }),
+      deadlineMs: UPLOAD_DEADLINE_MS,
+    });
     const form = await bounded.formData(); const files = form.getAll("files").filter((value): value is File => value instanceof File);
     // Exactly one part per scalar field: `form.get()` silently takes the first of
     // several, which would make a repeated `fields`/`options`/`secrets` part

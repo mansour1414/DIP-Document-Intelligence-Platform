@@ -90,11 +90,17 @@ async function withSchema(run: (client: pg.Client) => Promise<void>): Promise<vo
     await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
     await client.query(`DROP TYPE IF EXISTS ${SCHEMA}.expiry_race_status`);
     await client.query(`CREATE TYPE ${SCHEMA}.expiry_race_status AS ENUM ('QUEUED','RUNNING','RETRYING','SUCCEEDED','FAILED','CANCELLED','EXPIRED')`);
+    // `params` is present because the expiry write's RETURNING clause reads it: the
+    // purge follows the *transitioned rows* and needs their payload references to
+    // decide what to destroy. Omitting it made this fixture diverge from production
+    // and the statement fail with 42703 (undefined column). The type matches
+    // `Job.params Json @default("{}")` in prisma/schema.prisma.
     await client.query(`
       CREATE TABLE ${TABLE} (
         id UUID PRIMARY KEY,
         tool_id VARCHAR(50) NOT NULL,
         status ${SCHEMA}.expiry_race_status NOT NULL DEFAULT 'QUEUED',
+        params JSONB NOT NULL DEFAULT '{}'::jsonb,
         error_code VARCHAR(100),
         started_at TIMESTAMP(3),
         completed_at TIMESTAMP(3),

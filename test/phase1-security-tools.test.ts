@@ -50,7 +50,39 @@ test("security tools use v1 contracts, remain public/direct, and secret-bearing 
 
 test("persisted and queued job contracts carry only opaque secret references", () => {
   const orchestrator = readFileSync(new URL("../src/lib/jobs/orchestrator.ts", import.meta.url), "utf8"); const queue = readFileSync(new URL("../src/lib/queue/index.ts", import.meta.url), "utf8"); const worker = readFileSync(new URL("../workers/document-worker.ts", import.meta.url), "utf8"); const pipeline = readFileSync(new URL("../src/lib/jobs/document-pipeline.ts", import.meta.url), "utf8"); const publicJobs = readFileSync(new URL("../src/lib/public-api/jobs.ts", import.meta.url), "utf8"); const qpdf = readFileSync(new URL("../src/lib/pdf/qpdf.ts", import.meta.url), "utf8");
-  assert.match(orchestrator, /params:\s*\{ inputFileIds:[^}]+options,[^}]+secretRef/u); assert.doesNotMatch(orchestrator, /params:\s*\{[^}]*secrets/u); assert.doesNotMatch(queue, /password|secretRef|secrets/u);
+  // Only opaque references may be persisted. The previous assertion pinned the
+  // *order* of keys inside the params literal (`options,` immediately followed by
+  // `secretRef`), which broke the moment a second reference (`fieldsRef`) was added
+  // between them — a false red that said nothing about security. The guarantee is
+  // order-independent, so it is asserted that way: every spread into `params` must
+  // be a `...Ref` reference, and no plaintext secret or field value may appear.
+  // Extract each `params: { ... }` literal with brace balancing, because the value
+  // itself contains braces: `...(fieldsRef ? { fieldsRef } : {})`.
+  const paramsLiterals: string[] = [];
+  for (const start of [...orchestrator.matchAll(/params:\s*\{/gu)].map((match) => match.index + match[0].length)) {
+    let depth = 1;
+    let index = start;
+    while (index < orchestrator.length && depth > 0) {
+      if (orchestrator[index] === "{") depth += 1;
+      else if (orchestrator[index] === "}") depth -= 1;
+      index += 1;
+    }
+    paramsLiterals.push(orchestrator.slice(start, index - 1));
+  }
+  assert.ok(paramsLiterals.length > 0, "the job params literal must exist");
+  for (const literal of paramsLiterals) {
+    const spreads = [...literal.matchAll(/\.\.\.\(?([A-Za-z]+)/gu)].map((match) => match[1]);
+    for (const spread of spreads) {
+      // `fieldsRef` / `secretRef` are opaque handles; `fields` / `secrets` are values.
+      assert.match(spread, /Ref$/u, `params may only spread opaque references, found "${spread}" in: ${literal.slice(0, 120)}`);
+    }
+  }
+  assert.doesNotMatch(orchestrator, /params:\s*\{[^}]*\bsecrets\b/u, "raw secrets must never be persisted");
+  // Raw field values and raw secrets share one rule: neither may be spread or
+  // assigned into `params`. Asserting on the spread names above already covers it,
+  // because a value would have to arrive as `...fields` or `fields:`.
+  assert.doesNotMatch(orchestrator, /params:\s*\{[^}]*\bfields\s*[,}]/u, "raw field values must never be persisted");
+  assert.doesNotMatch(queue, /password|secretRef|secrets/u);
   // Phase 1 secret cleanup now lives in the document pipeline module the worker runs.
   assert.match(worker, /processDocumentJob/, "the worker must delegate to the document pipeline");
   assert.match(pipeline, /job\.status === "CANCELLED" \|\| job\.status === "EXPIRED"[^}]+deletePhase1Secret/u);

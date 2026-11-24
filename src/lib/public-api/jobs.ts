@@ -15,6 +15,7 @@ import { deletePhase1Secret, phase1SecretsFromForm, type Phase1SecretPayload } f
 import { purgeFormFields } from "@/lib/pdf/form-payload";
 import { requiresDedicatedJobParameters } from "@/lib/tools/options";
 import { FormFillError, assertFieldsPayloadSize, assertNoDuplicateJsonKeys, parseFieldsPayload } from "@/lib/pdf/form-validation";
+import { FORM_FIELDS_JSON_LIMIT } from "@/lib/pdf/form-types";
 import { BodyTooLargeError, UploadDeadlineError, boundedMultipartRequest, multipartBudget } from "@/lib/http/bounded-body";
 import { getToolDefinition } from "@/lib/tools/registry";
 
@@ -41,7 +42,12 @@ export async function parsePublicJobRequest(request: Request): Promise<PublicJob
   // request carries a bounded stream, so the limit applies whether or not a
   // declaration is present or truthful.
   const declaredTool = String(request.headers.get("x-dip-tool") ?? "").trim();
-  const bodyBudget = multipartBudget(declaredTool ? getToolDefinition(declaredTool).limits.maxBytes : MAX_PUBLIC_BODY_BYTES);
+  // Same split contract as the session endpoint: this path also reads a separate
+  // `fields` part, so its 64 KiB contract is reserved rather than charged to framing.
+  const bodyBudget = multipartBudget(
+    declaredTool ? getToolDefinition(declaredTool).limits.maxBytes : MAX_PUBLIC_BODY_BYTES,
+    { fieldsBytes: FORM_FIELDS_JSON_LIMIT },
+  );
   let form: FormData;
   try {
     const bounded = boundedMultipartRequest(request, { limitBytes: bodyBudget, deadlineMs: PUBLIC_UPLOAD_DEADLINE_MS });

@@ -70,11 +70,48 @@ export type BoundableRequest = {
  * itself become a way to smuggle more bytes past a file limit. It is *additive* to
  * the documented per-field payload allowance, never a substitute for it.
  */
+/**
+ * Framing overhead: boundaries, part headers, `Content-Disposition` parameters and
+ * the closing delimiter. This is what multipart itself costs, and it is not
+ * something a caller can spend on content.
+ *
+ * 16 KiB clears a realistic maximum: a long filename plus every header for a short
+ * parts list. The exact figure matters only as long as it is comfortably above the
+ * real boundary bytes; it is not a limit on anything a user supplies.
+ */
 export const MULTIPART_OVERHEAD_BYTES = 16 * 1024;
 
-/** Total body budget for a request expected to carry `fileBudget` bytes of files. */
-export function multipartBudget(fileBudget: number) {
-  return fileBudget + MULTIPART_OVERHEAD_BYTES;
+export type MultipartBudgetOptions = {
+  /**
+   * Bytes reserved for a JSON `fields` part. Defaults to zero: a tool that takes no
+   * fields payload must not be given an allowance it cannot use.
+   */
+  fieldsBytes?: number;
+};
+
+/**
+ * Total body budget for a request expected to carry `fileBudget` bytes of files.
+ *
+ * The parts of a request are accounted for separately — files, the optional fields
+ * payload, and framing — so that a valid maximum-size request fits and an invalid
+ * one is still refused at a single bounded total. Every caller passes this to
+ * `boundedMultipartRequest` as `limitBytes`, which remains the hard ceiling on the
+ * whole body and is still enforced against actual streamed bytes, not the
+ * `Content-Length` header.
+ *
+ * `fieldsBytes` stays a caller-supplied number on purpose: this module is transport,
+ * and importing a PDF-domain constant here would invert the dependency. The owner of
+ * the fields contract (`FORM_FIELDS_JSON_LIMIT` in `@/lib/pdf/form-types`) passes its
+ * own limit in, so the number still has exactly one definition.
+ *
+ * Why this exists: the previous contract was `fileBudget + 16 KiB`, which
+ * under-counted a request carrying both a maximum-size PDF and a maximum-size fields
+ * payload by roughly 64 KiB — a *valid* request could be refused by the transport
+ * before the form validator ever saw it.
+ */
+export function multipartBudget(fileBudget: number, options: MultipartBudgetOptions = {}) {
+  const { fieldsBytes = 0 } = options;
+  return fileBudget + fieldsBytes + MULTIPART_OVERHEAD_BYTES;
 }
 
 export type BuildBoundedOptions = {

@@ -518,3 +518,95 @@ HKDF/TTL remains proposed only. `RETENTION_APPLY` remains disabled.
 | `eslint src/ workers/ test/` | 0 errors, 0 warnings |
 | `prisma generate` | still blocked (TLS); the `TS2322` fix is verified against a faithful mock of Prisma's JSON input types, not the generated client |
 | CI logs | **unavailable** (storage host unreachable); annotations only |
+
+## Open blockers — recorded, not closed (round 4)
+
+> **Status: none of these gates is closed.** This section exists because each item was
+> reported as done or nearly-done in earlier rounds. It records what is *actually*
+> still unproven. A source assertion is not evidence, and a simulated test is not
+> evidence that a real dependency behaved correctly. Nothing below may be marked
+> resolved without the evidence named beside it.
+
+### 1. `validateUpload` still parses the PDF inside the API process
+
+The upload validator inspects the document (structure, page count, encryption) in the
+request-handling process, before any queue admission. That means a hostile or merely
+malformed PDF is parsed with the API's privileges and its memory, not the worker's.
+Bounded body reading limits *bytes*, not parser time or parser memory. Requiring the
+cheap shape check first narrows the window; it does not remove the parsing.
+**Would close with:** validation moved behind the same containment as the worker, or a
+parser with hard resource limits, proven under a hostile corpus.
+
+### 2. The fill engine is an ordinary timeout wrapper in the worker
+
+`form-worker.ts` bounds a child by wall-clock and byte volume over IPC. A timeout kills
+a process that is still doing work; it does not bound how fast that process can allocate
+or how many children can exist at once beyond the configured pool. This is a timeout,
+not engine-level resource control.
+**Would close with:** engine-enforced limits, or measurements showing the timeout and
+byte bounds hold under adversarial documents.
+
+### 3. Child containment is a process boundary, not an OS sandbox
+
+Whatever isolation the child gets is inherited from the parent process. It is not a
+seccomp/namespace/VM boundary: a compromised child has the same filesystem and network
+reach as the worker. The byte-bounded IPC and the slot-until-exit rule prevent a wedged
+child from wedging the pool; they do not contain a *malicious* one.
+**Would close with:** a real sandbox (namespace, seccomp, or VM) and an escape test.
+
+### 4. Standalone packaging emits no child entry, and authenticated child invocation is unverified
+
+`outputFileTracingIncludes` was added so the child entry is copied into a standalone
+build, but no build has been shown to contain it, and no test invokes the child the way
+the packaged worker would. The child hand-off is therefore verified only in the
+repository's own module layout.
+**Would close with:** a standalone build artefact listing the child entry, plus a test
+that invokes it from that artefact.
+
+### 5. Definite vs ambiguous enqueue recovery is unresolved
+
+`committedJobId` distinguishes a failure *before* commit (release the charge, delete the
+inputs) from a failure *after* commit (keep both, log `job.enqueue_failed_after_commit`,
+count `jobs_enqueue_unconfirmed`, leave the row `QUEUED` for expiry reconciliation). What
+is unresolved is the case where the enqueue outcome is *unknown*: the row is left for
+reconciliation, but nothing proves reconciliation converges, and a row that stays
+`QUEUED` silently is indistinguishable from one that is genuinely pending.
+**Would close with:** a reconciliation pass with a bound on how long a row may stay
+`QUEUED` unclaimed, and a test for the unknown-outcome path.
+
+### 6. Shared billing and usage-event compensation are incomplete
+
+Charges are released on pre-commit failure, but the usage-event side is not
+compensated symmetrically, and the charge and the usage event are not written in one
+unit of work. A crash between them leaves the two records disagreeing.
+**Would close with:** a single compensating transaction, or a documented, tested
+reconciliation for the mismatch.
+
+### 7. HKDF / TTL / expiry purge have no owner
+
+The key-derivation change, the payload TTL and the expiry purge remain **proposed**.
+There is no owner approval, no schedule, and `RETENTION_APPLY` is off (CR-005
+unapproved). Nothing about this is applied; it is a design note.
+**Would close with:** an owner decision, not an implementation.
+
+### 8. Arabic appearance fidelity is unaccepted
+
+RTL field appearance — shaping, bidi ordering and font coverage — has been measured for
+*limits*, not accepted for *fidelity*. No reviewer has signed off that a filled Arabic
+form renders as a native tool would render it.
+**Would close with:** owner acceptance on a reviewed sample, not automated assertions.
+
+### 9. Workflow and Agent typed-input integration is pending
+
+Workflow and Agent tools are not yet wired to the typed-input contract this stage
+introduced; `WORKFLOW_TYPED_INPUT_UNSUPPORTED` remains a live refusal. That is the
+correct behaviour today, but it means the contract is proven only for Fill Forms.
+**Would close with:** integration of a second tool, or an explicit decision to keep the
+contract Fill-Forms-only.
+
+### Why this list is here
+
+Round 3's report described several of these as verified. They were verified *as source
+structure* — that the right call appears in the right order — which is not the same
+claim as "the gate is closed". Recording them plainly is the point: an open gate with a
+named missing evidence item is safer than a closed gate whose proof is a `grep`.

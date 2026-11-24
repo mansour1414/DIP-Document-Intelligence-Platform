@@ -122,20 +122,35 @@ test("the pipeline no longer persists a raw message (synthetic-canary source che
 });
 
 test("every code the processing paths actually raise is preserved, not collapsed", () => {
-  // A closed vocabulary is only useful if it does not blind support. These are
-  // collected from the modules that feed the pipeline; if one is missing from the
-  // allowlist it would silently become PROCESSING_FAILED and the specific condition
-  // would be lost from the job row.
-  const operational = [
-    "APPEARANCE_LIMIT_EXCEEDED", "EMBEDDED_IMAGE_FORMAT_UNSUPPORTED", "FONT_UNAVAILABLE",
-    "FORM_FILL_FAILED", "FORM_PAYLOAD_EXPIRED", "FORM_PAYLOAD_INVALID", "FORM_PAYLOAD_UNAVAILABLE",
-    "IMAGE_DIMENSION_LIMIT_EXCEEDED", "NO_SUPPORTED_EMBEDDED_IMAGES", "OUTPUT_LIMIT_EXCEEDED",
-    "PAGE_DIMENSION_LIMIT_EXCEEDED", "PDF_RENDER_FAILED", "SECRET_HANDOFF_UNAVAILABLE",
-    "SECRET_INPUT_INVALID", "SECRET_REFERENCE_EXPIRED", "SECRET_REFERENCE_INVALID",
-    "UNLOCK_RATE_LIMITED", "VALIDATION_ERROR", "WORKER_TIMEOUT", "INPUT_FILE_COUNT_INVALID",
-    "TOTAL_SIZE_LIMIT_EXCEEDED", "PDF_INVALID", "MIME_NOT_ALLOWED", "MAGIC_BYTES_INVALID",
-  ];
-  const lost = operational.filter((code) => !isPublicErrorCode(code));
+  // A closed vocabulary is only useful if it does not blind support. Rather than
+  // listing codes by hand — which is what let `SCANNER_UNAVAILABLE` and
+  // `PDF_PASSWORD_INVALID` silently collapse to `PROCESSING_FAILED` — this reads the
+  // authoritative declarations and requires every member to survive the boundary.
+  const formTypes = readFileSync(new URL("../src/lib/pdf/form-types.ts", import.meta.url), "utf8");
+  const malwareTypes = readFileSync(new URL("../src/lib/malware/types.ts", import.meta.url), "utf8");
+
+  const declared = new Set<string>();
+  // MalwareScanResultCode: "CLEAN" | "INFECTED" | ... ; CLEAN is not an error.
+  const scanUnion = malwareTypes.slice(malwareTypes.indexOf("MalwareScanResultCode =")); 
+  for (const match of scanUnion.slice(0, scanUnion.indexOf(";")).matchAll(/"([A-Z_]+)"/gu)) {
+    if (match[1] !== "CLEAN") declared.add(match[1]);
+  }
+  // FORM_VALUE_ISSUES and FORM_FILL_ERROR_CODES.
+  for (const block of ["FORM_VALUE_ISSUES", "FORM_FILL_ERROR_CODES"]) {
+    const start = formTypes.indexOf(`${block}`);
+    const body = formTypes.slice(start, formTypes.indexOf("]", start) + 1);
+    for (const match of body.matchAll(/"([A-Z][A-Z0-9_]+)"/gu)) declared.add(match[1]);
+  }
+
+  // PDF refusals have no union — `QpdfError.code` is an unconstrained string — so
+  // they are read from the throw sites that produce them.
+  const qpdf = readFileSync(new URL("../src/lib/pdf/qpdf.ts", import.meta.url), "utf8");
+  for (const match of qpdf.matchAll(/new QpdfError\("([A-Z_]+)"/gu)) declared.add(match[1]);
+
+  assert.ok(declared.has("SCANNER_UNAVAILABLE"), "the scanner union must be found");
+  assert.ok(declared.has("PDF_PASSWORD_INVALID"), "the PDF refusal must be represented");
+
+  const lost = [...declared].filter((code) => !isPublicErrorCode(code)).sort();
   assert.deepEqual(lost, [], `these established codes would be collapsed to PROCESSING_FAILED: ${lost.join(", ")}`);
 });
 

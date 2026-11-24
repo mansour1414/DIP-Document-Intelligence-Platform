@@ -18,6 +18,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { FORM_FIELDS_JSON_LIMIT } from "../src/lib/pdf/form-types";
 import {
   MULTIPART_OVERHEAD_BYTES,
   BodyTooLargeError,
@@ -139,9 +140,68 @@ test("an accepted body at exactly the ceiling passes", async () => {
 });
 
 test("the multipart overhead allowance is separate and explicit", () => {
-  // The documented 64 KiB fields payload is not reduced by framing overhead.
+  // Framing is not charged to a caller that sends no fields payload.
   assert.equal(multipartBudget(64 * 1024), 64 * 1024 + MULTIPART_OVERHEAD_BYTES);
   assert.ok(MULTIPART_OVERHEAD_BYTES >= 8 * 1024, "framing overhead must clear realistic boundaries and filenames");
+});
+
+test("the file allowance, the fields allowance and framing are budgeted separately", () => {
+  // Regression: the budget used to be `fileBudget + 16 KiB` for every endpoint, so a
+  // Fill Forms request carrying both a maximum PDF and a maximum `fields` payload was
+  // ~64 KiB over budget and rejected by the transport — a *valid* request refused
+  // before the form validator ran. Each part is now accounted for on its own.
+  const fileBytes = 64 * 1024;
+  const fieldsBytes = FORM_FIELDS_JSON_LIMIT;
+  const total = multipartBudget(fileBytes, { fieldsBytes });
+
+  assert.equal(total, fileBytes + fieldsBytes + MULTIPART_OVERHEAD_BYTES);
+  // The old contract could not have fitted this request at all.
+  assert.ok(total > fileBytes + MULTIPART_OVERHEAD_BYTES, "the fields payload must not be paid for out of the file allowance");
+  assert.ok(fieldsBytes >= 64 * 1024, "the documented fields contract is 64 KiB");
+  // And a tool that takes no fields payload is not handed an allowance it cannot use.
+  assert.equal(multipartBudget(fileBytes), fileBytes + MULTIPART_OVERHEAD_BYTES);
+});
+
+test("a maximum-size fields payload with realistic framing still parses", async () => {
+  // The end-to-end version of the regression above: build a real multipart body whose
+  // `fields` part is a genuine JSON document at the limit, plus a separate file part
+  // with a long filename, and require the real consumer to accept it. The budget must
+  // be computed the way the route computes it — `FORM_FIELDS_JSON_LIMIT` reserved.
+  const fields = JSON.stringify(
+    Object.fromEntries(Array.from({ length: 400 }, (_, index) => [
+      `field_${index}`,
+      { value: "x".repeat(120), type: "text" },
+    ])),
+  );
+  const fieldsBytes = new TextEncoder().encode(fields).byteLength;
+  assert.ok(fieldsBytes <= FORM_FIELDS_JSON_LIMIT, `fixture must be within the contract (${fieldsBytes} bytes)`);
+
+  const request = multipartRequest({ fields, file: { bytes: 64, name: `${"a".repeat(180)}.pdf` } });
+  const actualBytes = (await new Request(request.url, { method: "POST", body: await request.arrayBuffer() }).arrayBuffer()).byteLength;
+  // Real framing for two parts with a maximum-length filename, not a guessed constant.
+  const framingBytes = actualBytes - fieldsBytes - 64;
+  assert.ok(framingBytes > 0 && framingBytes < MULTIPART_OVERHEAD_BYTES,
+    `framing must be real (${framingBytes}) and must fit the allowance (${MULTIPART_OVERHEAD_BYTES})`);
+
+  const bounded = boundedMultipartRequest(
+    multipartRequest({ fields, file: { bytes: 64, name: `${"a".repeat(180)}.pdf` } }),
+    { limitBytes: multipartBudget(64, { fieldsBytes: FORM_FIELDS_JSON_LIMIT }) },
+  );
+  const parsed = await bounded.formData();
+  assert.equal(typeof parsed.get("fields"), "string");
+  assert.equal((parsed.get("fields") as string).length, fields.length);
+  assert.ok(parsed.get("file") instanceof File);
+});
+
+test("a body over the combined budget is still refused", async () => {
+  // The split must not turn into an unbounded total: the same body minus the fields
+  // reservation is still rejected, so the ceiling remains real.
+  // 40 KiB of content against a budget of `1 KiB + framing` — comfortably over, so the
+  // rejection is about the ceiling and not about framing noise.
+  const fields = "x".repeat(4096);
+  const request = multipartRequest({ fields, file: { bytes: 40 * 1024, name: "a.pdf" } });
+  const bounded = boundedMultipartRequest(request, { limitBytes: multipartBudget(1024) });
+  await assert.rejects(() => bounded.formData(), (error: unknown) => error instanceof BodyTooLargeError);
 });
 
 test("a body that is already consumed is refused rather than silently empty", async () => {
