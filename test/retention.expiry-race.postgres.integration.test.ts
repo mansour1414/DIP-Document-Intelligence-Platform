@@ -199,9 +199,14 @@ void integration("the retention role can select params and run UPDATE ... RETURN
   await withSchema(async (client) => {
     const id = randomUUID();
     const stale = new Date(Date.now() - 48 * HOUR);
+    // Every NOT NULL column the table declares is supplied here, as production's own
+    // rows are: `tool_id` is `String @map("tool_id") @db.VarChar(50)` with no default
+    // and no nullable marker, so omitting it is not a fixture quirk — it is a row the
+    // real schema could never hold. (The previous version left it out and failed with
+    // 23502 before reaching the statement under test.)
     await client.query(
-      `INSERT INTO ${TABLE} (id, status, params, updated_at) VALUES ($1, 'QUEUED', $2::jsonb, $3)`,
-      [id, JSON.stringify({ fieldsRef: "ref-probe" }), stale],
+      `INSERT INTO ${TABLE} (id, tool_id, status, params, created_at, updated_at) VALUES ($1, $2, 'QUEUED', $3::jsonb, $4, $4)`,
+      [id, "fill-forms", JSON.stringify({ fieldsRef: "ref-probe" }), stale],
     );
     // The exact statement shape the scheduler now issues. If `params` were not
     // readable by this role, or the column grants did not cover the SET list, this

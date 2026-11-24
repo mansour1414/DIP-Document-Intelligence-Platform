@@ -21,6 +21,29 @@ class MemoryStore implements SecretStore {
   async delete(key: string) { this.deleted += this.values.delete(key) ? 1 : 0; }
 }
 
+/**
+ * Extract a balanced `{ … }` block whose opening brace the given pattern matches.
+ *
+ * Structural assertions must not depend on how a block happens to be wrapped:
+ * `finally { await x() }` and a multi-line body are the same guarantee. Counting
+ * braces is enough here because the regions involved contain no string literal
+ * with an unbalanced brace.
+ */
+function extractBlock(source: string, opening: RegExp): string | undefined {
+  const match = opening.exec(source);
+  if (!match) return undefined;
+  let depth = 1;
+  let index = match.index + match[0].length;
+  while (index < source.length) {
+    const character = source[index];
+    if (character === "{") depth += 1;
+    else if (character === "}") depth -= 1;
+    if (depth === 0) return source.slice(match.index, index + 1);
+    index += 1;
+  }
+  return undefined;
+}
+
 const key = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
 test("ephemeral secrets are encrypted, bound, short-lived, one-time, and cleanable", async () => {
   const previous = process.env.PHASE1_SECRET_ENCRYPTION_KEY; process.env.PHASE1_SECRET_ENCRYPTION_KEY = key;
@@ -85,9 +108,21 @@ test("persisted and queued job contracts carry only opaque secret references", (
   assert.doesNotMatch(queue, /password|secretRef|secrets/u);
   // Phase 1 secret cleanup now lives in the document pipeline module the worker runs.
   assert.match(worker, /processDocumentJob/, "the worker must delegate to the document pipeline");
-  assert.match(pipeline, /job\.status === "CANCELLED" \|\| job\.status === "EXPIRED"[^}]+deletePhase1Secret/u);
   assert.match(pipeline, /takePhase1Secret/);
-  assert.match(pipeline, /finally \{ await deletePhase1Secret/); assert.match(publicJobs, /cancelPublicJob[\s\S]+deletePhase1Secret\(cancelled\.secretRef\)/u); assert.match(qpdf, /spawn\([^,]+, \[`@\$\{argumentFile\}`\]/u); assert.match(qpdf, /--suppress-password-recovery/u); assert.doesNotMatch(qpdf, /--force-R6/u); assert.match(qpdf, /"--json=1", "--json-key=objects", "--decode-level=none", json/u); assert.doesNotMatch(qpdf, /--json-output=\$\{json\}/u); assert.match(qpdf, /shell:\s*false/u); assert.doesNotMatch(qpdf, /exec\(|execSync|shell:\s*true/u);
+  // Phase 1 cleanup: secrets must be deleted on every exit path, including failure.
+  //
+  // This used to be asserted as `/finally \{ await deletePhase1Secret/` — a
+  // *formatting* assertion that broke when the call moved onto its own line,
+  // which says nothing about whether cleanup actually runs. The guarantee is
+  // structural, so it is asserted that way: find the `finally` block, extract it
+  // with brace balancing, and require the deletion to happen inside it.
+  const finallyBlock = extractBlock(pipeline, /finally\s*\{/u);
+  assert.ok(finallyBlock, "the pipeline must have a `finally` block so cleanup survives failure");
+  assert.match(finallyBlock, /deletePhase1Secret\s*\(/u, "the finally block must delete the phase 1 secret, or a failed job leaves it live");
+  // Not bypassed: a terminal-path purge alone would leave the secret behind on a
+  // throw, because those branches run *before* the error propagates.
+  assert.match(pipeline, /job\.status === "CANCELLED" \|\| job\.status === "EXPIRED"/u);
+  assert.match(pipeline, /deletePhase1Secret\s*\(\s*rawParams\.secretRef\s*\)/u, "cleanup must target the job's own secret reference"); assert.match(publicJobs, /cancelPublicJob[\s\S]+deletePhase1Secret\(cancelled\.secretRef\)/u); assert.match(qpdf, /spawn\([^,]+, \[`@\$\{argumentFile\}`\]/u); assert.match(qpdf, /--suppress-password-recovery/u); assert.doesNotMatch(qpdf, /--force-R6/u); assert.match(qpdf, /"--json=1", "--json-key=objects", "--decode-level=none", json/u); assert.doesNotMatch(qpdf, /--json-output=\$\{json\}/u); assert.match(qpdf, /shell:\s*false/u); assert.doesNotMatch(qpdf, /exec\(|execSync|shell:\s*true/u);
 });
 
 test("Public API transports passwords outside options and excludes them from the request hash and observability", async () => {

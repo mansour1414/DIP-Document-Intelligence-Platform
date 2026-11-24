@@ -37,6 +37,22 @@ export const toolRegistry = Object.fromEntries(toolsConfig.map((tool) => [tool.i
   ...(toolsWithDedicatedJobParameters.has(tool.id) ? { fieldsParameter: "fields" } : {}),
 }])) as Record<string, ToolDefinition>;
 
+/**
+ * Tools whose *legitimate input* is a PDF that a parser would reject.
+ *
+ * `unlock-pdf` takes an undecryptable file and `repair-pdf` takes a damaged one, so
+ * generic structural parsing cannot be a gate for them — the repair tool exists
+ * precisely because the document is broken. They are validated by cheap, parser-free
+ * signature checks and by malware screening, and the authoritative structural work
+ * happens inside the contained worker.
+ *
+ * This is the single source of that fact: `validateUpload` already refused to parse
+ * for these two, and the orchestrator's shape pre-filter consults the same set
+ * instead of deciding independently. Keeping one list is what stops the two from
+ * disagreeing — which is exactly how a Fill Forms restriction leaked into Repair PDF.
+ */
+export const controlledPreflightToolIds: ReadonlySet<string> = new Set(["unlock-pdf", "repair-pdf"]);
+
 /** Tools enabled on the unified runtime workers. */
 export const workerToolIds = new Set([
   "merge-pdf", "split-pdf", "organize-pdf", "rotate-pdf", "delete-pages", "extract-pages", "jpg-to-pdf",

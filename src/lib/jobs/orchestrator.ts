@@ -1,7 +1,7 @@
 import { randomUUID } from "crypto";
 import { enqueueAiJob, enqueueJob } from "@/lib/queue";
 import { getStorage } from "@/lib/storage";
-import { getToolDefinition } from "@/lib/tools/registry";
+import { controlledPreflightToolIds, getToolDefinition } from "@/lib/tools/registry";
 import { validateUpload } from "@/lib/uploads/validation";
 import { logger } from "@/lib/logging";
 import { enforceJobCreation } from "@/lib/usage/enforcement";
@@ -85,8 +85,18 @@ export async function createToolJob(input: { userId: string; toolId: string; upl
   const screened = await Promise.all(input.uploads.map(async (upload) => {
     // Parser-free shape checks apply only to documents declared as PDF; other
     // accepted formats go straight to screening.
+    //
+    // The check is a *substitute* for the generic parse that follows, not an extra
+    // gate in front of it, so it must be scoped exactly as broadly as that parse is.
+    // `validateUpload` deliberately does not parse for the controlled-preflight tools
+    // (Repair PDF and Unlock PDF), because a document they are meant to accept — a
+    // damaged or undecryptable one — would fail a shape check for precisely the
+    // reason the tool exists. Applying `assertCheapPdfShape` to them anyway leaked a
+    // Fill Forms verdict into unrelated tools: a truncated PDF handed to Repair PDF
+    // was refused with `FORM_UNSUPPORTED` instead of being repaired. The predicate is
+    // therefore the same one `validateUpload` uses, imported rather than restated.
     const looksPdf = upload.mimeType === "application/pdf" || upload.filename.toLowerCase().endsWith(".pdf");
-    if (looksPdf) assertCheapPdfShape(upload.bytes);
+    if (looksPdf && !controlledPreflightToolIds.has(tool.toolId)) assertCheapPdfShape(upload.bytes);
     const malwareScan = await requireCleanUpload(upload.bytes);
     const validation = await validateUpload({ toolId: tool.toolId, declaredMime: upload.mimeType, bytes: upload.bytes });
     return { upload, validation, malwareScan };
