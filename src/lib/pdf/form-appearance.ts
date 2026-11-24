@@ -211,16 +211,26 @@ export function renderWidgetAppearance(options: RasterAppearanceOptions) {
   context.fillStyle = "#111827";
   const padding = Math.round(Math.min(width, height) * 0.12) + 2;
   const family = hasArabic ? '"DIP Form Arabic", "DIP Form Latin"' : '"DIP Form Latin", "DIP Form Arabic"';
-  let fontSize = Math.max(6, Math.round(height * (options.multiline ? 0.28 : 0.5)));
+  // FF-07 round 2: the shrink loop used to walk down to 6 *device pixels*, which is
+  // 1.5 pt at the 4x raster scale — far below the 8 pt minimum the same file
+  // documents. A value could therefore pass the geometry gate and still be drawn
+  // illegibly, which is the silent-truncation problem in a different form. The
+  // floor is now expressed in points and converted to pixels once.
+  const minFontPx = Math.ceil(MIN_LEGIBLE_VALUE_HEIGHT_PT * RASTER_SCALE);
+  let fontSize = Math.max(minFontPx, Math.round(height * (options.multiline ? 0.28 : 0.5)));
   const maxWidth = width - padding * 2;
   let lines: string[] = [];
-  for (let attempt = 0; attempt < 12 && fontSize >= 6; attempt += 1) {
+  for (let attempt = 0; attempt < 12 && fontSize >= minFontPx; attempt += 1) {
     context.font = `400 ${fontSize}px ${family}`;
     lines = options.multiline ? wrapLines(context, options.text, maxWidth, Math.max(1, Math.floor((height - padding * 2) / (fontSize * 1.25)))) : [options.text];
     const fits = lines.every((line) => context.measureText(line).width <= maxWidth) && lines.length * fontSize * 1.25 <= height - padding * 2;
     if (fits) break;
     fontSize = Math.round(fontSize * 0.88);
   }
+  // FF-07 round 2: the *final* font size must honour the floor too. Checking only
+  // the loop's last iteration let a value fit at an illegible size and print
+  // microscopic text; that is now the same explicit rejection as clipping.
+  if (fontSize < minFontPx) throw new AppearanceLegibilityError("VALUE_OVERFLOWS_WIDGET");
   // FF-07: never clip. The review found a 209-character value silently cut off
   // inside a 90 pt widget: the field *value* was correct and the visible output
   // was not. Overflow is now an explicit rejection with no partial output, so the
@@ -237,7 +247,7 @@ export function renderWidgetAppearance(options: RasterAppearanceOptions) {
 }
 
 /** Read the appearance bounding box of a widget, falling back to its rectangle. */
-function appearanceBox(widget: { AP(): PDFDict | undefined; getRectangle(): { width: number; height: number } }) {
+export function appearanceBox(widget: { AP(): PDFDict | undefined; getRectangle(): { width: number; height: number } }) {
   try {
     const normal = widget.AP()?.lookup(PDFName.of("N"));
     const stream = normal instanceof PDFRawStream ? normal : normal instanceof PDFDict ? normal.lookup(PDFName.of("Off")) : undefined;
@@ -259,6 +269,48 @@ function appearanceBox(widget: { AP(): PDFDict | undefined; getRectangle(): { wi
  * dictionary only for reference (`/DIPOriginalBBox`); the original bytes are
  * not retained, because they no longer describe the widget's value.
  */
+/**
+ * Prove that `value` fits the widget's visible box at a legible size.
+ *
+ * This is the *measurement* half of the FF-07 gate, split out from
+ * `renderWidgetAppearance` so that vector (WinAnsi) values can be checked without
+ * being converted to a raster image. Before this existed, the fit check only ran
+ * on the raster path, so exactly the values that were later drawn as vector text
+ * were the ones never measured — and pdf-lib's `defaultUpdateAppearances` clips
+ * them without complaint.
+ *
+ * Throws `AppearanceLegibilityError` with the same reasons the raster path uses, so
+ * callers see one vocabulary regardless of which face ends up rendering the value.
+ */
+export function assertValueFitsWidget(value: string, options: { width: number; height: number; multiline: boolean }) {
+  // Geometry floor, in points, identical to the raster path's.
+  if (options.height < MIN_LEGIBLE_VALUE_HEIGHT_PT + 2 || options.width < MIN_LEGIBLE_VALUE_WIDTH_PT) throw new AppearanceLegibilityError("WIDGET_TOO_SMALL");
+  const width = Math.max(16, Math.round(options.width * RASTER_SCALE));
+  const height = Math.max(16, Math.round(options.height * RASTER_SCALE));
+  const measure = rasteriser().createCanvas(8, 8).getContext("2d");
+  const hasArabic = arabicScript.test(value);
+  measure.direction = hasArabic ? "rtl" : "ltr";
+  const padding = Math.round(Math.min(width, height) * 0.12) + 2;
+  const family = hasArabic ? '"DIP Form Arabic", "DIP Form Latin"' : '"DIP Form Latin", "DIP Form Arabic"';
+  const minFontPx = Math.ceil(MIN_LEGIBLE_VALUE_HEIGHT_PT * RASTER_SCALE);
+  let fontSize = Math.max(minFontPx, Math.round(height * (options.multiline ? 0.28 : 0.5)));
+  const maxWidth = width - padding * 2;
+  let lines: string[] = [];
+  for (let attempt = 0; attempt < 12 && fontSize >= minFontPx; attempt += 1) {
+    measure.font = `400 ${fontSize}px ${family}`;
+    lines = options.multiline ? wrapLines(measure, value, maxWidth, Math.max(1, Math.floor((height - padding * 2) / (fontSize * 1.25)))) : [value];
+    const fits = lines.every((line) => measure.measureText(line).width <= maxWidth) && lines.length * fontSize * 1.25 <= height - padding * 2;
+    if (fits) break;
+    fontSize = Math.round(fontSize * 0.88);
+  }
+  if (fontSize < minFontPx) throw new AppearanceLegibilityError("VALUE_OVERFLOWS_WIDGET");
+  if (!options.multiline) {
+    if (measure.measureText(value).width > maxWidth) throw new AppearanceLegibilityError("VALUE_OVERFLOWS_WIDGET");
+  } else if (lines.join("").length < value.replace(/[ \t\r\n]+/gu, "").length) {
+    throw new AppearanceLegibilityError("VALUE_NEEDS_MORE_LINES");
+  }
+}
+
 export async function installRasterAppearance(document: PDFDocument, field: PDFField, value: string, options: { multiline?: boolean } = {}) {
   const widgets = field.acroField.getWidgets();
   if (!widgets.length) throw Object.assign(new Error("The field has no widget to paint."), { code: "FORM_FILL_FAILED" });

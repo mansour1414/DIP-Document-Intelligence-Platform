@@ -13,6 +13,8 @@ import { withTenant, withTenantScope } from "@/lib/db/tenant";
 import { isAuthorizedFileStorageAccess } from "@/lib/storage/metadata";
 import { isUnrecoverableAiQueueError, toAiQueueError } from "@/lib/ai/gateway/retry";
 import { isUnrecoverableQueueError, toDocumentQueueError } from "@/lib/jobs/queue-errors";
+import { classifyAttemptOutcome, retryTransitionTarget } from "@/lib/jobs/payload-lifecycle";
+import { purgeFormFields } from "@/lib/pdf/form-payload";
 import { processDocumentJob } from "@/lib/jobs/document-pipeline";
 
 export const documentWorker = new Worker<QueuedJob>(JOB_QUEUE_NAME, async (message) => {
@@ -24,6 +26,21 @@ export const documentWorker = new Worker<QueuedJob>(JOB_QUEUE_NAME, async (messa
   // final failure (purge it) — see FF-03 in `document-pipeline.ts`.
   try { return await processDocumentJob(message.data, { attemptsMade: message.attemptsMade, maxAttempts: message.opts.attempts ?? 1 }); } catch (error) { throw toDocumentQueueError(error); }
 }, { connection: getQueueConnection(), concurrency: runtimeLimits.documentConcurrency, stalledInterval: runtimeLimits.stalledIntervalMs, maxStalledCount: runtimeLimits.maxStalledCount, lockDuration: Math.min(runtimeLimits.jobTimeoutMs, 10 * 60_000) });
+/**
+ * Destroy the encrypted payload of a job the queue has finished with.
+ *
+ * Best-effort and idempotent: the TTL is the backstop, but ordinary terminal
+ * cleanup must not rely on it (FF-03).
+ */
+async function purgeTerminalPayload(message: QueuedJob) {
+  if (!message.userId) return;
+  await withTenant({ userId: message.userId }, async (tx) => {
+    const job = await tx.job.findUnique({ where: { id: message.jobId }, select: { params: true } });
+    const reference = (job as { params?: { fieldsRef?: string } } | null)?.params?.fieldsRef;
+    if (reference) await purgeFormFields(reference).catch(() => undefined);
+  }).catch(() => undefined);
+}
+
 async function advanceWorkflow(message: QueuedJob) { if (message.workflowRunId && message.userId) await (await import("@/lib/workflows/service")).advanceWorkflowRun(message.workflowRunId, message.userId); }
 async function recordTerminalFailure(message: QueuedJob) {
   if (!message.userId) return;
@@ -39,11 +56,39 @@ documentWorker.on("failed", async (message, error) => {
   if (!message) return;
   // Unrecoverable errors are terminal on the first attempt: without this the job
   // would be parked in RETRYING with no retry ever scheduled.
-  const terminal = isUnrecoverableQueueError(error) || message.attemptsMade >= (message.opts.attempts ?? 1);
-  if (!terminal) {
+  const outcome = classifyAttemptOutcome({
+    attemptsMade: message.attemptsMade,
+    maxAttempts: message.opts.attempts ?? 1,
+    unrecoverable: isUnrecoverableQueueError(error),
+  });
+  if (!outcome.terminal) {
     recordMetric("retry_total", 1, "count", { tool_id: message.data.toolId, status: "retrying" });
-    if (message.data.userId) await withTenant({ userId: message.data.userId }, (tx) => tx.job.update({ where: { id: message.data.jobId }, data: { status: "RETRYING" } }));
-  } else { await recordTerminalFailure(message.data); await advanceWorkflow(message.data); }
+    if (message.data.userId) {
+      await withTenant({ userId: message.data.userId }, async (tx) => {
+        const current = await tx.job.findUnique({ where: { id: message.data.jobId }, select: { status: true } });
+        const target = current ? retryTransitionTarget((current as { status: string }).status) : undefined;
+        // FF-03 / architect round 2: a retry must never revive a job another actor
+        // already finished. `update()` here rewrote CANCELLED/EXPIRED/SUCCEEDED
+        // rows back to RETRYING; the write is now guarded on the same status set
+        // the decision was made from, so a concurrent terminal transition wins.
+        if (target) {
+          await tx.job.updateMany({
+            where: { id: message.data.jobId, status: { in: ["QUEUED", "RUNNING", "RETRYING", "FAILED"] } },
+            data: { status: target },
+          });
+        }
+      });
+    }
+  } else {
+    await recordTerminalFailure(message.data);
+    // A terminal failure is the last moment this job will ever be seen by the
+    // queue, so it is where the payload must go. Done here as well as in the
+    // pipeline: an `UnrecoverableError` is raised *after* the pipeline already
+    // recorded the failure, and the worker is the only actor that knows the queue
+    // will not retry.
+    await purgeTerminalPayload(message.data);
+    await advanceWorkflow(message.data);
+  }
 });
 documentWorker.on("stalled", () => recordMetric("stalled_jobs_total", 1, "count", { status: "stalled" }));
 documentWorker.on("error", (error) => { captureOperationalError(error, { worker: "document" }); logger.error("worker.error", { error: error.message }); });

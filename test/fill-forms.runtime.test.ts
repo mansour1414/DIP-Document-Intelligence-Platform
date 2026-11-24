@@ -645,7 +645,10 @@ test("FF-07: an unrenderable value fails the whole fill and produces no output d
   await assert.rejects(() => fillFormPdf(source, { tiny: "نورة" }), (error: unknown) => {
     assert.ok(error instanceof FormFillError);
     assert.equal(error.code, "FORM_VALUE_INVALID");
-    assert.deepEqual((error.details as { issues: Array<{ issue: string }> }).issues, [{ issue: "UNRENDERABLE_SCRIPT", reason: "WIDGET_TOO_SMALL" }]);
+    // Round 2: the rejection now names the *geometry* problem directly instead of
+    // reporting it as a script-encoding failure, so a caller can tell "the widget
+    // is too small" from "the script has no face".
+    assert.deepEqual((error.details as { issues: Array<{ issue: string; field: string }> }).issues, [{ issue: "WIDGET_TOO_SMALL", field: "tiny" }]);
     return true;
   });
 });

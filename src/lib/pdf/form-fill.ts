@@ -32,7 +32,7 @@ import {
 } from "@/lib/pdf/form-schema";
 import { FormFillError, validateFillValues, valueSnapshot } from "@/lib/pdf/form-validation";
 import { FORM_ERROR_MESSAGES } from "@/lib/pdf/form-types";
-import { AppearanceLegibilityError, canRasterise, fontCanEncode, installRasterAppearance } from "@/lib/pdf/form-appearance";
+import { AppearanceLegibilityError, appearanceBox, assertValueFitsWidget, canRasterise, fontCanEncode, installRasterAppearance } from "@/lib/pdf/form-appearance";
 // The restriction probes live in a renderer-free module (FF-01); they are
 // re-exported here so the worker keeps one entry point.
 import { assertFillableRestrictions, probeRestrictions, scanBytes } from "@/lib/pdf/form-inspection";
@@ -156,7 +156,7 @@ function danglingAnnotations(document: PDFDocument): { unresolved: number; widge
   return { unresolved, widgets, annots };
 }
 
-type AppearancePlan = { name: string; value: string; multiline: boolean };
+type AppearancePlan = { name: string; value: string; multiline: boolean; vector: boolean };
 
 /**
  * Fill the form and produce the output bytes.
@@ -210,24 +210,52 @@ export async function fillFormPdf(bytes: Uint8Array, fields: RawFieldMap, option
     }
     const text = String(item.next);
     const descriptor = inventory.fields.find((candidate) => candidate.name === item.name);
-    if (!fontCanEncode(helvetica, text)) {
-      // WinAnsi cannot carry the value. Arabic (and Latin text with Arabic
-      // neighbours) is rendered through the approved canvas rasteriser; any
-      // other script has no vendored face and would render as tofu.
-      if (!canRasterise(text)) throw new FormFillError("FORM_UNSUPPORTED", `Field "${item.name}" uses a script this tool cannot render. Only Latin, Arabic and their punctuation are supported.`, { field: item.name });
-      plans.push({ name: item.name, value: text, multiline: descriptor?.multiline === true });
-      continue;
+    // FF-07 round 2 — the silent-clipping bug, exactly.
+    //
+    // This branch used to split on *encodability*: Latin values that WinAnsi could
+    // carry took pdf-lib's `defaultUpdateAppearances`, which draws a single line
+    // and clips whatever does not fit, with no fit check at all. Only non-WinAnsi
+    // (Arabic) values reached `installRasterAppearance` and therefore the
+    // legibility gate. The result was that the one case the review reported — a
+    // long value truncated inside its widget — was the case that bypassed the
+    // check, while the case nobody complained about was protected.
+    //
+    // Every text value now goes through the same legibility gate. Encodability
+    // only decides *which face* renders it, never whether it is measured.
+    if (!fontCanEncode(helvetica, text) && !canRasterise(text)) {
+      // No vendored face covers this script; rendering it would produce tofu.
+      throw new FormFillError("FORM_UNSUPPORTED", `Field "${item.name}" uses a script this tool cannot render. Only Latin, Arabic and their punctuation are supported.`, { field: item.name });
     }
-    (field as unknown as { defaultUpdateAppearances: (font: PDFFont) => void }).defaultUpdateAppearances(helvetica);
+    // Whether or not this value needs the raster face, it is measured first. A
+    // value that cannot be shown legibly is rejected here, before any appearance
+    // is written, so a partially-painted document can never be produced.
+    const widget = field.acroField.getWidgets()[0];
+    const box = widget ? appearanceBox(widget) : undefined;
+    if (box) {
+      try { assertValueFitsWidget(text, { width: box.width, height: box.height, multiline: descriptor?.multiline === true }); }
+      catch (error) {
+        if (error instanceof AppearanceLegibilityError) throw new FormFillError("FORM_VALUE_INVALID", FORM_ERROR_MESSAGES.FORM_VALUE_INVALID, { issues: [{ issue: error.reason, field: item.name }] });
+        throw error;
+      }
+    }
+    plans.push({ name: item.name, value: text, multiline: descriptor?.multiline === true, vector: fontCanEncode(helvetica, text) });
   }
   for (const plan of plans) {
     // FF-07: an unrenderable value must fail the whole request, never produce a
     // document that silently clips or omits part of it. The error is a rejection
     // with no partial output; the message stays content-free, and the reason is
     // structured.
+    if (plan.vector) {
+      // Latin stays vector/selectable text — the check above proved it fits, which
+      // is what `defaultUpdateAppearances` never did.
+      (form.getField(plan.name) as unknown as { defaultUpdateAppearances: (font: PDFFont) => void }).defaultUpdateAppearances(helvetica);
+      continue;
+    }
     try { await installRasterAppearance(document, form.getField(plan.name), plan.value, { multiline: plan.multiline }); }
     catch (error) {
-      if (error instanceof AppearanceLegibilityError) throw new FormFillError("FORM_VALUE_INVALID", FORM_ERROR_MESSAGES.FORM_VALUE_INVALID, { issues: [{ issue: "UNRENDERABLE_SCRIPT", reason: error.reason }] });
+      // The rejection keeps its own identity: a geometry failure is not a script
+      // failure, and a caller must be able to tell them apart.
+      if (error instanceof AppearanceLegibilityError) throw new FormFillError("FORM_VALUE_INVALID", FORM_ERROR_MESSAGES.FORM_VALUE_INVALID, { issues: [{ issue: error.reason }] });
       throw error;
     }
     rasterAppearances.push(plan.name);

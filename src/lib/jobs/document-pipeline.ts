@@ -16,6 +16,7 @@ import type { QueuedJob } from "@/lib/queue";
 import { validateToolOptions } from "@/lib/tools/options";
 import { deletePhase1Secret, takePhase1Secret, type Phase1SecretPurpose } from "@/lib/secrets/phase1";
 import { purgeFormFields, readFormFields } from "@/lib/pdf/form-payload";
+import { jobErrorRecord, publicErrorCode } from "@/lib/jobs/error-boundary";
 import { APPROVED_QPDF_VERSION, runQpdfTool } from "@/lib/pdf/qpdf";
 import { FORM_ENGINE, FORM_ENGINE_VERSION, fillFormPdf } from "@/lib/pdf/form-fill";
 import { parseFieldsPayload } from "@/lib/pdf/form-schema";
@@ -54,6 +55,15 @@ export type DocumentPipelineDeps = {
    */
   attemptsMade?: number;
   maxAttempts?: number;
+  /**
+   * The worker's own verdict on whether the queue will retry this attempt.
+   *
+   * Only the worker can compute this correctly — it has the thrown error and
+   * `attemptsMade`/`opts.attempts` at the same time, which is exactly what BullMQ
+   * uses to decide. When supplied it replaces the attempts arithmetic entirely;
+   * the arithmetic remains the fallback for direct callers (tests).
+   */
+  classifyTerminal?: (error: unknown) => boolean;
 };
 
 /** Job states in which no attempt may (re)enter the pipeline. */
@@ -233,17 +243,25 @@ export async function processDocumentJob(message: QueuedJob, deps: DocumentPipel
     recordMetric("cost_per_successful_job", estimatedCost.costPerSuccessfulJob ?? 0, "ratio", { tool_id: job.toolId, engine, engine_version: engineVersion, status: "succeeded" });
     logger.info("job.succeeded", { ...context, engine, engine_version: engineVersion, duration_ms: durationMs, status: "succeeded" });
   } catch (error) {
-    const errorCode = typeof error === "object" && error && "code" in error ? String(error.code) : "PROCESSING_FAILED";
+    // FF-07 / architect round 2: only an allowlisted code is persisted. The raw
+    // `error.message` used to be written into both `Job.error` and `JobStep.error`,
+    // which made every native, Redis and parser message durable and user-visible.
+    // The detail stays in the log line below, which is access-controlled.
+    const errorCode = publicErrorCode(error);
     // A losing attempt must never fail a job that another attempt committed, and a
     // cancellation or expiry that arrived while the job was running must survive:
     // every terminal state is guarded, not just SUCCEEDED.
-    const failed = await tenant((tx) => tx.job.updateMany({ where: { id: job.id, outputFileId: null, status: { notIn: [...CLOSED_JOB_STATES] } }, data: { status: "FAILED", errorCode, error: { message: error instanceof Error ? error.message : "Processing failed" }, completedAt: new Date() } }));
+    const failed = await tenant((tx) => tx.job.updateMany({ where: { id: job.id, outputFileId: null, status: { notIn: [...CLOSED_JOB_STATES] } }, data: { status: "FAILED", errorCode, error: jobErrorRecord(error), completedAt: new Date() } }));
     // FF-03: a retry still needs the values, so the payload is only removed when
     // no further attempt can run. `message.attemptsMade` counts the attempts
     // BullMQ has already started before this one; `maxAttempts` is what the job
     // was enqueued with (1 when a secret is bound, 3 otherwise).
     const attemptsUsed = (deps.attemptsMade ?? 0) + 1;
-    const lastAttempt = attemptsUsed >= (deps.maxAttempts ?? 1);
+    // FF-03 / architect round 2: the worker's classification wins when present.
+    // Attempt arithmetic alone missed the `UnrecoverableError` case (attempt 1 of
+    // 3 is terminal, but `1 >= 3` is false), leaving a payload that no attempt
+    // would ever use again.
+    const lastAttempt = deps.classifyTerminal ? deps.classifyTerminal(error) : attemptsUsed >= (deps.maxAttempts ?? 1);
     if (lastAttempt) await purgeFormFields(rawParams.fieldsRef).catch(() => logger.warn("fill_forms.payload_purge_failed", { ...context, reason: "FINAL_FAILURE" }));
     if (failed.count === 0) {
       // Either another attempt committed, the job was cancelled/expired mid-run, or
@@ -253,7 +271,7 @@ export async function processDocumentJob(message: QueuedJob, deps: DocumentPipel
     }
     // The step may only follow the job: a terminal job's step is never rewritten,
     // and a terminal step is never revived.
-    if (step && failed.count === 1) await tenant((tx) => tx.jobStep.updateMany({ where: { id: step.id, status: { notIn: [...CLOSED_JOB_STATES] } }, data: { status: "FAILED", errorCode, error: { message: error instanceof Error ? error.message : "Processing failed" }, completedAt: new Date() } }));
+    if (step && failed.count === 1) await tenant((tx) => tx.jobStep.updateMany({ where: { id: step.id, status: { notIn: [...CLOSED_JOB_STATES] } }, data: { status: "FAILED", errorCode, error: jobErrorRecord(error), completedAt: new Date() } }));
     recordMetric("jobs_failure_total", 1, "count", { tool_id: job.toolId, status: "failed" });
     logger.error("job.failed", { ...context, error_code: errorCode, status: "failed" }); throw error;
   } finally {

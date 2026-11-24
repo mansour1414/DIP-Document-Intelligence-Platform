@@ -145,9 +145,14 @@ async function seed(client: pg.Client, rows: Seed[]): Promise<void> {
  */
 function port(client: pg.Client) {
   return {
-    async updateMany(args: {
+    // `RETURNING` is what makes the payload purge race-free: the statement reports
+    // exactly the rows it transitioned, so nothing has to be re-read (and possibly
+    // re-read differently) afterwards. Round 2 changed the port from a bare count to
+    // this result set for precisely that reason.
+    async updateManyAndReturn(args: {
       where: { id: { in: string[] }; status: { in: readonly string[] }; updatedAt: { lte: Date } };
       data: { status: "EXPIRED"; errorCode: string; completedAt: Date };
+      select: { id: true; params: true };
     }) {
       const result = await client.query(
         `UPDATE ${TABLE}
@@ -156,10 +161,11 @@ function port(client: pg.Client) {
                 completed_at = $3
           WHERE id = ANY($4::uuid[])
             AND status = ANY($5::${SCHEMA}.expiry_race_status[])
-            AND updated_at <= $6`,
+            AND updated_at <= $6
+        RETURNING id, params`,
         [args.data.status, args.data.errorCode, args.data.completedAt, args.where.id.in, args.where.status.in, args.where.updatedAt.lte],
       );
-      return { count: result.rowCount ?? 0 };
+      return result.rows.map((row: { id: string; params: unknown }) => ({ id: row.id, params: row.params }));
     },
   };
 }
@@ -194,14 +200,14 @@ void integration("a job claimed during the sweep is not expired, while an abando
     assert.equal(afterClaim.rows[0].status, "RUNNING");
     assert.ok(afterClaim.rows[0].updated_at > sweepStartedAt, "the claim must bump updated_at, or the guard cannot work");
 
-    const expired = await applyExpiryPlan(port(client), {
+    const { expired } = await applyExpiryPlan(port(client), {
       expireIds: planned,
       sweepStartedAt,
       completedAt: new Date(),
     });
 
     const final = await statuses(client, planned);
-    assert.equal(expired, 1, "exactly one row may be expired");
+    assert.equal(expired.length, 1, "exactly one row may be expired");
     assert.equal(final[claimed], "RUNNING", "a job claimed mid-sweep must survive in the database");
     assert.equal(final[abandoned], "EXPIRED", "a genuinely abandoned job must still be reclaimed");
 
@@ -222,8 +228,8 @@ void integration("the guard is applied by the database in a single statement", a
     ]);
     const sweepStartedAt = new Date();
     // Nothing changes, so all three are legitimate candidates.
-    const expired = await applyExpiryPlan(port(client), { expireIds: rows, sweepStartedAt, completedAt: new Date() });
-    assert.equal(expired, 3);
+    const { expired } = await applyExpiryPlan(port(client), { expireIds: rows, sweepStartedAt, completedAt: new Date() });
+    assert.equal(expired.length, 3);
     const final = await statuses(client, rows);
     for (const id of rows) assert.equal(final[id], "EXPIRED");
   });
@@ -239,12 +245,12 @@ void integration("terminal states are never rewritten even with stale timestamps
       { id: ids.expired, status: "EXPIRED", updatedAt: stale },
     ]);
     const sweepStartedAt = new Date();
-    const expired = await applyExpiryPlan(port(client), {
+    const { expired } = await applyExpiryPlan(port(client), {
       expireIds: Object.values(ids),
       sweepStartedAt,
       completedAt: new Date(),
     });
-    assert.equal(expired, 0, "terminal rows must not match the status guard");
+    assert.equal(expired.length, 0, "terminal rows must not match the status guard");
     const final = await statuses(client, Object.values(ids));
     assert.equal(final[ids.succeeded], "SUCCEEDED");
     assert.equal(final[ids.cancelled], "CANCELLED");
@@ -267,13 +273,13 @@ void integration("a row touched by any write during the sweep is skipped", async
     // metadata change, not a status change. It must still be enough to skip.
     await client.query(`UPDATE ${TABLE} SET error_code = 'PROGRESS_HEARTBEAT' WHERE id = $1`, [touched]);
 
-    const expired = await applyExpiryPlan(port(client), {
+    const { expired } = await applyExpiryPlan(port(client), {
       expireIds: [touched, untouched],
       sweepStartedAt,
       completedAt: new Date(),
     });
     const final = await statuses(client, [touched, untouched]);
-    assert.equal(expired, 1);
+    assert.equal(expired.length, 1);
     assert.equal(final[touched], "RETRYING", "any write during the sweep must protect the row");
     assert.equal(final[untouched], "EXPIRED");
   });
@@ -281,8 +287,8 @@ void integration("a row touched by any write during the sweep is skipped", async
 
 void integration("an empty plan issues no write", async () => {
   await withSchema(async (client) => {
-    const expired = await applyExpiryPlan(port(client), { expireIds: [], sweepStartedAt: new Date(), completedAt: new Date() });
-    assert.equal(expired, 0);
+    const { expired } = await applyExpiryPlan(port(client), { expireIds: [], sweepStartedAt: new Date(), completedAt: new Date() });
+    assert.equal(expired.length, 0);
   });
 });
 
@@ -313,11 +319,11 @@ void integration("an explicitly supplied updatedAt is persisted verbatim on an @
     assert.equal(persisted.rows[0].updated_at.toISOString(), stale.toISOString());
 
     // And that stale value must be what makes the guarded write match.
-    const expired = await applyExpiryPlan(port(client), {
+    const { expired } = await applyExpiryPlan(port(client), {
       expireIds: [id],
       sweepStartedAt: new Date(),
       completedAt: new Date(),
     });
-    assert.equal(expired, 1, "a genuinely backdated row must be expirable");
+    assert.equal(expired.length, 1, "a genuinely backdated row must be expirable");
   });
 });

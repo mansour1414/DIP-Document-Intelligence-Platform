@@ -46,7 +46,7 @@ import { FORM_ERROR_MESSAGES } from "@/lib/pdf/form-types";
  *
  * A document is rejected when *either* layer fires.
  */
-type Restrictions = { encrypted: boolean; signed: boolean; xfa: boolean };
+export type Restrictions = { encrypted: boolean; signed: boolean; xfa: boolean };
 
 export function scanBytes(bytes: Uint8Array) {
   const text = new TextDecoder("latin1").decode(bytes);
@@ -58,17 +58,30 @@ export function scanBytes(bytes: Uint8Array) {
 }
 
 /**
- * Structural budgets (FF-02).
+ * Structural budgets (FF-02, architect round 2).
  *
  * The walk below is recursive over `/Fields → /Kids`, and both the depth and the
- * number of nodes are attacker-controlled. Each bound is therefore explicit, and
+ * number of nodes are attacker-controlled. Each bound is explicit, and
  * *exhausting* a bound is a rejection, never an "assume safe".
+ *
+ * The budgets are checked **before** a child is queued, not after it is popped:
+ * a single `/Kids` array with a million entries would otherwise allocate a
+ * million-element pending stack before the first bound was consulted.
  */
-const STRUCTURE_MAX_DEPTH = 64;
-const STRUCTURE_MAX_NODES = 5_000;
-const STRUCTURE_MAX_REF_HOPS = 32;
+export const STRUCTURE_BUDGETS = {
+  maxDepth: 64,
+  maxNodes: 5_000,
+  maxRefHops: 32,
+  /** Total indirect-reference resolutions across the whole walk. */
+  maxTotalHops: 50_000,
+  /** Entries accepted from a single `/Kids` or `/Fields` array before refusal. */
+  maxChildrenPerNode: 5_000,
+} as const;
 
-class StructureFailure extends Error {
+/** The only field types the PDF form model defines. Anything else is malformed. */
+const KNOWN_FIELD_TYPES = new Set(["/Tx", "/Btn", "/Ch", "/Sig"]);
+
+export class StructureFailure extends Error {
   constructor(readonly reason: string) { super(reason); }
 }
 
@@ -76,16 +89,25 @@ type ScanContext = {
   document: PDFDocument;
   hops: number;
   nodes: number;
-  visited: Set<string>;
+  /**
+   * References already **resolved**, mapped to how many times they were reached.
+   *
+   * Revisiting a reference is not by itself an error: a legitimate PDF may share
+   * a field subtree, and a `/Kids` cycle is a malformed graph that pdf-lib would
+   * otherwise follow until the stack overflows. The difference must be decided
+   * *here*, structurally, rather than by catching a `RangeError` later.
+   */
+  /** How many times each reference was resolved; used to report shared subtrees. */
+  resolved: Map<string, number>;
 };
 
 /**
  * Resolve one object-graph entry.
  *
  * Returns `undefined` only when the entry is genuinely **absent**. A present but
- * unresolvable entry (a dangling indirect reference, an indirect chain longer
- * than the budget, or a cycle) throws: that is precisely the case the review
- * showed was being treated as "no restriction" (FF-02).
+ * unresolvable entry (a dangling indirect reference, a chain longer than the
+ * budget, or a reference cycle) throws: that is precisely the case the review
+ * showed was being treated as "no restriction".
  */
 function resolveEntry(context: ScanContext, owner: PDFDict, key: PDFName): PDFObject | undefined {
   if (!owner.has(key)) return undefined;
@@ -93,11 +115,11 @@ function resolveEntry(context: ScanContext, owner: PDFDict, key: PDFName): PDFOb
   const seen = new Set<string>();
   while (value instanceof PDFRef) {
     context.hops += 1;
-    if (context.hops > STRUCTURE_MAX_REF_HOPS * STRUCTURE_MAX_NODES) throw new StructureFailure("REFERENCE_BUDGET_EXCEEDED");
+    if (context.hops > STRUCTURE_BUDGETS.maxTotalHops) throw new StructureFailure("REFERENCE_BUDGET_EXCEEDED");
     const refKey = value.toString();
     if (seen.has(refKey)) throw new StructureFailure("REFERENCE_CYCLE");
     seen.add(refKey);
-    if (seen.size > STRUCTURE_MAX_REF_HOPS) throw new StructureFailure("REFERENCE_CHAIN_TOO_LONG");
+    if (seen.size > STRUCTURE_BUDGETS.maxRefHops) throw new StructureFailure("REFERENCE_CHAIN_TOO_LONG");
     const next = context.document.context.lookup(value);
     if (next === undefined) throw new StructureFailure("UNRESOLVED_REFERENCE");
     value = next as PDFObject | undefined;
@@ -109,35 +131,72 @@ function resolveEntry(context: ScanContext, owner: PDFDict, key: PDFName): PDFOb
 const typeName = (value: PDFObject | undefined) => String((value as { toString?: () => string } | undefined)?.toString?.() ?? "");
 
 /**
+ * `/FT` must be a *name* from the field-type vocabulary.
+ *
+ * The previous walk accepted whatever `/FT` string it found and only compared it
+ * to `/Sig`. A malformed `/FT` (a dictionary, a number, an empty string, an
+ * unknown name) therefore produced a document that looked "clean" while pdf-lib
+ * would go on to interpret it some other way. An unreadable type is not
+ * "not a signature" — it is a document whose structure cannot be established.
+ */
+function assertFieldType(value: PDFObject | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  const name = typeName(value);
+  if (!KNOWN_FIELD_TYPES.has(name)) throw new StructureFailure("FT_MALFORMED");
+  return name;
+}
+
+/**
+ * `/SigFlags` must be a number, and only the two defined bits are meaningful.
+ *
+ * A non-numeric `/SigFlags` used to coerce to `NaN`, and `NaN & 1 === 0`, so a
+ * malformed value silently read as "no signatures". It is now a rejection.
+ */
+function assertSigFlags(value: PDFObject | undefined): number {
+  if (value === undefined) return 0;
+  const raw = typeName(value);
+  if (!/^\d{1,6}$/u.test(raw)) throw new StructureFailure("SIGFLAGS_MALFORMED");
+  return Number(raw);
+}
+
+/**
  * Walk the parsed object graph.
  *
- * Two things the previous top-level-only scan got wrong (FF-02):
+ * Corrections after the architect review:
  *
- *   1. A signature field can live **under `/Kids`**, one or more levels below
- *      `/AcroForm /Fields`. Only the top-level array was inspected, so a nested
- *      `/Sig` field was silently accepted and then written into.
- *   2. `/FT` is **inheritable** in the PDF object model. A field with no `/FT` of
- *      its own takes its ancestor's type, so reading only the own entry misses
- *      nested signatures in a second way.
- *
- * The walk therefore carries the inherited `/FT` down, follows indirect
- * references, and treats *every* anomaly — dangling reference, `/Perms` that is
- * not a dictionary, `/Kids` that is not an array, a cycle, a budget overrun — as
- * `FORM_RESTRICTED`. That direction is deliberate: a document whose structure
- * cannot be fully established must never be modified, because a false positive
- * only refuses a fill that was never provably safe, while a false negative
- * writes into a signed document.
+ *   1. A previously **visited** reference used to be skipped silently. Skipping is
+ *      correct for a shared subtree, but *wrong* for a cycle, and the two were
+ *      indistinguishable. A reference that reappears on the current descent path
+ *      is now `FIELD_GRAPH_CYCLE`; one that reappears elsewhere is a shared node
+ *      and is skipped after being counted.
+ *   2. `/FT`, `/SigFlags`, `/Perms`, `/Fields` and `/Kids` are type-checked rather
+ *      than coerced. A malformed `/FT` or `/SigFlags` used to read as "no
+ *      signature".
+ *   3. Budgets are enforced *before* children are queued, and each `/Kids` array
+ *      is capped, so no attacker-controlled array sizes the pending stack.
+ *   4. A malformed graph is rejected here, before any later pdf-lib call walks the
+ *      same `/Fields` tree and overflows the native stack.
  */
 async function scanStructure(bytes: Uint8Array): Promise<{ xfa: boolean; signed: boolean }> {
   let document: PDFDocument;
   try { document = await PDFDocument.load(bytes, { ignoreEncryption: false, updateMetadata: false }); }
   catch (error) {
     // A file the parser rejects outright is *unsupported*, not restricted: there
-    // is no object graph to be unsure about. (This stays FORM_UNSUPPORTED so a
-    // four-byte "PDF" is not reported as a signed document.)
+    // is no object graph to be unsure about.
     throw new StructureFailure(/encrypted/iu.test(error instanceof Error ? error.message : "") ? "DOCUMENT_ENCRYPTED" : "DOCUMENT_UNREADABLE");
   }
-  const context: ScanContext = { document, hops: 0, nodes: 0, visited: new Set() };
+  return scanStructureInDocument(document);
+}
+
+/**
+ * Run the structural walk against a document that is **already loaded**.
+ *
+ * The bounded child parses once and then calls this, so the restriction decision
+ * and the inventory describe the same object graph instead of two separately
+ * timed parses of the same bytes.
+ */
+export function scanStructureInDocument(document: PDFDocument): { xfa: boolean; signed: boolean } {
+  const context: ScanContext = { document, hops: 0, nodes: 0, resolved: new Map() };
   let catalog: PDFDict;
   try { catalog = document.catalog; }
   catch { throw new StructureFailure("CATALOG_UNREADABLE"); }
@@ -149,8 +208,6 @@ async function scanStructure(bytes: Uint8Array): Promise<{ xfa: boolean; signed:
   const perms = resolveEntry(context, catalog, PDFName.of("Perms"));
   if (perms !== undefined) {
     if (!(perms instanceof PDFDict)) throw new StructureFailure("PERMS_NOT_A_DICTIONARY");
-    // Any well-formed entry under /Perms is a usage-rights or certification
-    // signature; both make the document unsafe to rewrite.
     for (const key of perms.keys()) {
       if (resolveEntry(context, perms, key) === undefined) throw new StructureFailure("PERMS_ENTRY_UNRESOLVED");
       certified = true;
@@ -162,52 +219,71 @@ async function scanStructure(bytes: Uint8Array): Promise<{ xfa: boolean; signed:
   if (!(acro instanceof PDFDict)) throw new StructureFailure("ACROFORM_NOT_A_DICTIONARY");
   if (acro.has(PDFName.of("XFA"))) return { xfa: true, signed: true };
 
-  // SigFlags bit 1 ("SignaturesExist") and bit 2 ("AppendOnly") both mean the
-  // producer knows signatures are present — possibly in a field this walk did
-  // not reach.
-  const sigFlagsEntry = resolveEntry(context, acro, PDFName.of("SigFlags"));
-  const sigFlags = Number(typeName(sigFlagsEntry) || "0");
-  const flagsSigned = (sigFlags & 1) === 1 || (sigFlags & 2) === 2;
+  const flagsSigned = (() => {
+    const flags = assertSigFlags(resolveEntry(context, acro, PDFName.of("SigFlags")));
+    // Bit 1 = SignaturesExist, bit 2 = AppendOnly. Both mean signatures are
+    // present somewhere the walk may not reach.
+    return (flags & 1) === 1 || (flags & 2) === 2;
+  })();
 
   const fields = resolveEntry(context, acro, PDFName.of("Fields"));
   if (fields === undefined) return { xfa: false, signed: certified || flagsSigned };
   if (!(fields instanceof PDFArray)) throw new StructureFailure("FIELDS_NOT_AN_ARRAY");
+  if (fields.size() > STRUCTURE_BUDGETS.maxChildrenPerNode) throw new StructureFailure("FIELDS_ARRAY_TOO_LARGE");
 
   let signed = certified || flagsSigned;
-  type Pending = { ref: PDFObject; depth: number; inherited: string | undefined };
-  const stack: Pending[] = fields.asArray().map((entry) => ({ ref: entry, depth: 0, inherited: undefined }));
+  // `path` is the chain of references from the root to this node. Carrying it on
+  // the pending entry is what lets an explicit (non-recursive) stack distinguish
+  // a cycle from a legitimately shared subtree: a repeat *within* one path is a
+  // cycle, a repeat across sibling paths is not.
+  type Pending = { ref: PDFObject; depth: number; inherited: string | undefined; path: ReadonlySet<string> };
+  const stack: Pending[] = [];
+  const queueChildren = (entries: PDFObject[], depth: number, inherited: string | undefined, path: ReadonlySet<string>) => {
+    // Budget first, allocation second.
+    if (context.nodes + stack.length + entries.length > STRUCTURE_BUDGETS.maxNodes) throw new StructureFailure("FIELD_BUDGET_EXCEEDED");
+    for (const entry of entries) stack.push({ ref: entry, depth, inherited, path });
+  };
+  queueChildren(fields.asArray(), 0, undefined, new Set());
+
   while (stack.length) {
     const pending = stack.pop() as Pending;
     context.nodes += 1;
-    if (context.nodes > STRUCTURE_MAX_NODES) throw new StructureFailure("FIELD_BUDGET_EXCEEDED");
-    if (pending.depth > STRUCTURE_MAX_DEPTH) throw new StructureFailure("FIELD_DEPTH_EXCEEDED");
+    if (context.nodes > STRUCTURE_BUDGETS.maxNodes) throw new StructureFailure("FIELD_BUDGET_EXCEEDED");
+    if (pending.depth > STRUCTURE_BUDGETS.maxDepth) throw new StructureFailure("FIELD_DEPTH_EXCEEDED");
 
+    // Follow a chain of indirect references, refusing any that loops back onto
+    // itself. `chain` is local: a shared node reached from a sibling is not a
+    // cycle, only a repeat *within one resolution* is.
     let node = pending.ref;
-    // Follow an indirect reference, remembering it so a `/Kids` cycle terminates
-    // instead of repeating forever.
+    const chain: string[] = [];
     while (node instanceof PDFRef) {
       const key = node.toString();
-      if (context.visited.has(key)) break;
-      context.visited.add(key);
+      // A reference that repeats inside one resolution cannot terminate at all.
+      if (chain.includes(key)) throw new StructureFailure("REFERENCE_CYCLE");
+      // A reference that reappears on the path from the root is a `/Kids` cycle.
+      if (pending.path.has(key)) throw new StructureFailure("FIELD_GRAPH_CYCLE");
+      chain.push(key);
+      if (chain.length > STRUCTURE_BUDGETS.maxRefHops) throw new StructureFailure("REFERENCE_CHAIN_TOO_LONG");
       context.hops += 1;
-      if (context.hops > STRUCTURE_MAX_REF_HOPS * STRUCTURE_MAX_NODES) throw new StructureFailure("REFERENCE_BUDGET_EXCEEDED");
+      if (context.hops > STRUCTURE_BUDGETS.maxTotalHops) throw new StructureFailure("REFERENCE_BUDGET_EXCEEDED");
       const next = context.document.context.lookup(node);
       if (next === undefined) throw new StructureFailure("UNRESOLVED_FIELD_REFERENCE");
+      context.resolved.set(key, (context.resolved.get(key) ?? 0) + 1);
       node = next as PDFObject;
     }
-    if (node instanceof PDFRef) continue; // already visited: a shared or cyclic subtree
     if (!(node instanceof PDFDict)) throw new StructureFailure("FIELD_NOT_A_DICTIONARY");
 
-    // `/FT` is inherited: absent means "same type as my parent".
-    const ownType = resolveEntry(context, node, PDFName.of("FT"));
-    const inheritedType = ownType === undefined ? pending.inherited : typeName(ownType);
+    const inheritedType = assertFieldType(resolveEntry(context, node, PDFName.of("FT"))) ?? pending.inherited;
     if (inheritedType === "/Sig") signed = true;
 
     const kids = resolveEntry(context, node, PDFName.of("Kids"));
     if (kids === undefined) continue;
     if (!(kids instanceof PDFArray)) throw new StructureFailure("KIDS_NOT_AN_ARRAY");
-    for (const kid of kids.asArray()) stack.push({ ref: kid, depth: pending.depth + 1, inherited: inheritedType });
-    if (signed && stack.length > STRUCTURE_MAX_NODES) throw new StructureFailure("FIELD_BUDGET_EXCEEDED");
+    if (kids.size() > STRUCTURE_BUDGETS.maxChildrenPerNode) throw new StructureFailure("KIDS_ARRAY_TOO_LARGE");
+    // Extend the path with everything traversed to reach this node, so a child
+    // that points back at any ancestor is detected immediately.
+    const childPath = chain.length ? new Set([...pending.path, ...chain]) : pending.path;
+    queueChildren(kids.asArray(), pending.depth + 1, inheritedType, childPath);
   }
   return { xfa: false, signed };
 }
@@ -244,6 +320,11 @@ export function assertFillableRestrictions(restrictions: Restrictions) {
   if (restrictions.encrypted) throw new FormFillError("FORM_RESTRICTED", FORM_ERROR_MESSAGES.FORM_RESTRICTED, { restriction: "ENCRYPTED" });
   if (restrictions.xfa) throw new FormFillError("FORM_UNSUPPORTED", FORM_ERROR_MESSAGES.FORM_UNSUPPORTED, { restriction: "XFA" });
   if (restrictions.signed) throw new FormFillError("FORM_RESTRICTED", FORM_ERROR_MESSAGES.FORM_RESTRICTED, { restriction: "SIGNED" });
+}
+
+/** True when the bytes carry an `/Encrypt` marker. Exported for the bounded child. */
+export function scanEncryptionMarkers(bytes: Uint8Array) {
+  return scanBytes(bytes).encrypted;
 }
 
 /**

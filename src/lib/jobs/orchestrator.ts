@@ -88,7 +88,7 @@ export async function createToolJob(input: { userId: string; toolId: string; upl
       return tx.job.create({ data: { id: jobId, toolId: tool.toolId, idempotencyKey: input.idempotencyKey, requesterId: input.userId, organizationId: input.organizationId, apiClientId: input.apiClientId, inputFileId: files[0].id, status: "QUEUED", params: { inputFileIds: files.map((file) => file.id), options, ...(fieldsRef ? { fieldsRef } : {}), ...(secretRef ? { secretRef } : {}) }, correlationId, steps: { create: { name: tool.toolId, idempotencyKey: `${input.idempotencyKey}:${tool.toolId}`, status: "QUEUED", correlationId } } }, select: { id: true, status: true } });
     });
     const queuedJob = { jobId: job.id, toolId: tool.toolId, idempotencyKey: input.idempotencyKey, correlationId, userId: input.userId };
-    const queueOptions = { priority: monetization.entitlements.processingPriority === "high" ? 1 : 5, ...(secretRef ? { attempts: 1 } : {}) };
+    const queueOptions = { priority: monetization.plan.entitlements.processingPriority === "high" ? 1 : 5, ...(secretRef ? { attempts: 1 } : {}) };
     if (tool.aiFlag) await enqueueAiJob(queuedJob, queueOptions); else await enqueueJob(queuedJob, queueOptions);
     logger.info("job.queued", { job_id: job.id, correlation_id: correlationId, tool_id: tool.toolId });
     recordMetric("api_job_creation_latency_ms", performance.now() - apiStarted, "ms", { tool_id: tool.toolId });
@@ -97,7 +97,9 @@ export async function createToolJob(input: { userId: string; toolId: string; upl
   } catch (error) {
     // Enqueue failure, transaction failure and every other creation-path failure
     // remove the encrypted payload too: nothing will ever read it.
-    await Promise.all([deletePhase1Secret(secretRef).catch(() => undefined), purgeFormFields(fieldsRef).catch(() => undefined), ...stored.map((object) => storage.deleteObject(object.key).catch(() => undefined))]);
+    // A failure here means no job row exists, so nothing will consume the credit
+    // that authorization already took. Release it alongside the other artifacts.
+    await Promise.all([deletePhase1Secret(secretRef).catch(() => undefined), purgeFormFields(fieldsRef).catch(() => undefined), ...stored.map((object) => storage.deleteObject(object.key).catch(() => undefined)), monetization.charge?.release().catch(() => undefined)]);
     throw error;
   }
 }
@@ -159,7 +161,7 @@ export async function createToolJobFromFiles(input: { userId: string; toolId: st
   const monetization = await enforceJobCreation({ userId: input.userId, toolId: tool.toolId, idempotencyKey: input.idempotencyKey, correlationId: input.correlationId, options, files: files.map((file) => ({ size: Number(file.size), pageCount: file.pageCount ?? undefined })) });
   const job = await withTenant({ userId: input.userId }, (tx) => tx.job.create({ data: { toolId: tool.toolId, idempotencyKey: input.idempotencyKey, requesterId: input.userId, inputFileId: input.fileIds[0], status: "QUEUED", params: { inputFileIds: input.fileIds, options }, correlationId: input.correlationId, workflowRunId: input.workflowRunId, workflowNodeId: input.workflowNodeId, steps: { create: { name: tool.toolId, idempotencyKey: `${input.idempotencyKey}:${tool.toolId}`, status: "QUEUED", correlationId: input.correlationId } } }, select: { id: true, status: true } }));
   const queued = { jobId: job.id, toolId: tool.toolId, idempotencyKey: input.idempotencyKey, correlationId: input.correlationId, userId: input.userId, workflowRunId: input.workflowRunId };
-  const queueOptions = { priority: monetization.entitlements.processingPriority === "high" ? 1 : 5 };
+  const queueOptions = { priority: monetization.plan.entitlements.processingPriority === "high" ? 1 : 5 };
   if (tool.aiFlag) await enqueueAiJob(queued, queueOptions); else await enqueueJob(queued, queueOptions);
   logger.info("workflow.node.queued", { workflow_run_id: input.workflowRunId, workflow_node_id: input.workflowNodeId, job_id: job.id, correlation_id: input.correlationId, tool_id: tool.toolId });
   return { ...job, reused: false };

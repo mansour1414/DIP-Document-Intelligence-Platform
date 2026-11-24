@@ -15,14 +15,34 @@ import { deletePhase1Secret, phase1SecretsFromForm, type Phase1SecretPayload } f
 import { purgeFormFields } from "@/lib/pdf/form-payload";
 import { requiresDedicatedJobParameters } from "@/lib/tools/options";
 import { FormFillError, assertFieldsPayloadSize, assertNoDuplicateJsonKeys, parseFieldsPayload } from "@/lib/pdf/form-validation";
+import { BodyTooLargeError, multipartBudget, withBodyLimit } from "@/lib/http/bounded-body";
+import { getToolDefinition } from "@/lib/tools/registry";
 
 type PublicUpload = { filename: string; mimeType: string; bytes: Uint8Array };
+/**
+ * Fallback body budget for the Public API when the tool is not declared ahead of
+ * the body. It is the largest per-tool file limit the registry allows plus framing
+ * overhead, so a legitimate single-file request is never refused here; the exact
+ * per-tool limit still applies once `toolId` is known.
+ */
+const MAX_PUBLIC_BODY_BYTES = Math.max(...["fill-forms"].map((id) => getToolDefinition(id).limits.maxBytes));
+
 export type PublicJobInput = { toolId: string; uploads: PublicUpload[]; options: Record<string, string | number | boolean>; fields?: Record<string, unknown>; secrets?: Phase1SecretPayload; idempotencyKey: string };
 
 export async function parsePublicJobRequest(request: Request): Promise<PublicJobInput & { bytesIn: number; requestHash: string }> {
   const contentType = request.headers.get("content-type") ?? ""; if (!contentType.toLowerCase().includes("multipart/form-data")) throw new PublicApiError("VALIDATION_ERROR", "multipart/form-data is required.", 400);
   const key = request.headers.get("idempotency-key")?.trim(); if (!key) throw new PublicApiError("VALIDATION_ERROR", "Idempotency-Key is required.", 400);
-  const form = await request.formData(); const toolId = String(form.get("toolId") ?? "").trim(); if (!toolId) throw new PublicApiError("VALIDATION_ERROR", "toolId is required.", 400);
+  // FF-04: bound the body *before* the framework buffers it. The Public API is
+  // unauthenticated-by-cookie and machine-callable, so a header-only check is even
+  // weaker here: `Content-Length` may be absent (chunked) or false, and the whole
+  // multipart body would still be buffered. The counting stream aborts the read at
+  // the ceiling regardless.
+  const declaredTool = String(request.headers.get("x-dip-tool") ?? "").trim();
+  const bodyBudget = multipartBudget(declaredTool ? getToolDefinition(declaredTool).limits.maxBytes : MAX_PUBLIC_BODY_BYTES);
+  let bounded: Request;
+  try { bounded = withBodyLimit(request, bodyBudget); }
+  catch (error) { if (error instanceof BodyTooLargeError) throw new PublicApiError("SIZE_LIMIT_EXCEEDED", "The request body exceeds the size limit.", 413); throw error; }
+  const form = await (async () => { try { return await bounded.formData(); } catch (error) { if (error instanceof BodyTooLargeError) throw new PublicApiError("SIZE_LIMIT_EXCEEDED", "The request body exceeds the size limit.", 413); throw error; } })(); const toolId = String(form.get("toolId") ?? "").trim(); if (!toolId) throw new PublicApiError("VALIDATION_ERROR", "toolId is required.", 400);
   let options: Record<string, string | number | boolean> = {}; const rawOptions = form.get("options");
   if (typeof rawOptions === "string" && rawOptions) { try { const parsed = JSON.parse(rawOptions) as unknown; if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || Object.values(parsed).some((value) => !["string", "number", "boolean"].includes(typeof value))) throw new Error(); options = parsed as Record<string, string | number | boolean>; } catch { throw new PublicApiError("VALIDATION_ERROR", "options must be a flat JSON object.", 400); } }
   // `fields` is the typed per-field payload used by tools that cannot express

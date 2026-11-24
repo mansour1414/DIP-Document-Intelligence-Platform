@@ -255,11 +255,11 @@ regression test reproduces the reviewed defect and the fix is exercised by it.
 | --- | --- | --- |
 | FF-01 | Inspection moved to `src/lib/pdf/form-inspection.ts`, which imports `pdf-lib` only. The inspect route no longer reaches the rasteriser; font resolution in `form-appearance.ts` is lazy and validates the resolved specifier. | **FIXED AND VERIFIED** — production build completes (compile, page-data collection, 111/111 static pages, finalization) and the built route answers `401 AUTH_REQUIRED` under `next start`. |
 | FF-02 | Bounded recursive `/Kids` walk with inherited `/FT`, indirect-reference following, cycle/depth/node/hop budgets. Any structural anomaly is `FORM_RESTRICTED`; only unparseable bytes remain `FORM_UNSUPPORTED`. | **FIXED AND VERIFIED** — nested signature, inherited `/FT`, dangling and non-dict `/Perms`, non-array `/Fields`, and a `/Kids` cycle all rejected; a library stack overflow is converted to a coded refusal. |
-| FF-03 | Values encrypt to Redis under a tenant+job-bound AAD reference (`form-payload.ts`), non-destructive read for retries, purged on success, final failure, cancel, expiry and enqueue failure; TTL backstop = `abandonedGraceMs()`. `Job.params` carries `fieldsRef` only. | **IMPLEMENTED BUT UNVERIFIED end-to-end** — unit-tested against an in-memory store (retry-safe, cross-tenant/cross-job rejected, purge idempotent); **no live Redis** in this sandbox, so the TTL and the sweep path are not proven against the real store. |
-| FF-04 | `Content-Length` pre-check before `formData()`, cheap signature/trailer/page-marker checks, screening before parse, bounded parse budget, per-tenant rate and concurrency admission. | **IMPLEMENTED BUT UNVERIFIED** — ordering is asserted structurally and the route builds and runs; no load test was possible, and in-process parse CPU cannot be interrupted (see limitations). |
+| FF-03 | Values encrypt to Redis under a tenant+job-bound AAD reference (`form-payload.ts`), non-destructive read for retries, purged on success, final failure, cancel, expiry and enqueue failure; TTL backstop = `abandonedGraceMs()`. `Job.params` carries `fieldsRef` only. | **PARTIALLY FIXED — reassessed in round 2 below.** The payload, AAD binding and purge sites are unit-verified; round 2 found the *lifecycle* and *expiry race* defects listed in that section, and fixed them. Key derivation and TTL remain blocked on owner authorization. |
+| FF-04 | `Content-Length` pre-check before `formData()`, cheap signature/trailer/page-marker checks, screening before parse, bounded parse budget, per-tenant rate and concurrency admission. | **SUPERSEDED BY ROUND 2** — the header-only bound was bypassable (chunked, false header), and in-process parsing could not be interrupted. Round 2 replaces both with a counting stream and a hard-bounded child process; see priority 2 and 3 below. |
 | FF-05 | Flattened widget references are removed from every page `/Annots`; the output is re-read and all remaining annotations must resolve, with zero surviving widgets and unrelated annotations preserved. | **FIXED AND VERIFIED** — the reviewed 15-widget/two-page fixture now flattens to 0 unresolved, 0 widgets, 1 preserved link. Verified with pdf-lib; **pypdf and Poppler are unavailable here**. |
 | FF-06 | Restriction preflight in `createToolJob` after `requireCleanUpload`, before billing, storage and enqueue. | **IMPLEMENTED BUT UNVERIFIED** — position is asserted against the real source; no live billing/DB to prove absence of a charge or row. |
-| FF-07 | Arabic line breaks preserved; overflow and illegible geometry rejected with no partial output; Arabic option-list selections rejected rather than comma-joined; Latin option lists keep pdf-lib's correct provider. | **PARTIALLY FIXED AND VERIFIED** — line breaks, clipping, tiny widgets and the joined-selection string are covered by tests. **Rotated text, border/background loss and mixed-direction shaping remain unresolved.** |
+| FF-07 | Arabic line breaks preserved; overflow and illegible geometry rejected with no partial output; Arabic option-list selections rejected rather than comma-joined; Latin option lists keep pdf-lib's correct provider. | **PARTIALLY FIXED — root cause found in round 2.** The gate only ran on the raster (non-WinAnsi) path, so long Latin values were accepted and clipped silently. Round 2 measures every value; see priority 6 below. Border reproduction remains open. |
 | FF-08 | Allowed content-free messages plus stable issue codes; no field names or booleans in errors, details or verification mismatches. | **FIXED AND VERIFIED** — text, Arabic, checkbox and unexpected-library-exception paths assert the allowlist and assert that neither value nor field name is serialised. |
 | FF-09 | Empty text compares canonically (`undefined` and `""` both mean empty). | **FIXED AND VERIFIED** — clearing to `""` round-trips. |
 | FF-10 | 64 KiB measured in UTF-8 bytes; duplicate JSON keys rejected before `JSON.parse`; exactly one `fields` part; both the Web API and the Public API apply all three. | **FIXED AND VERIFIED** — 70,121-byte payload rejected, duplicate keys rejected (including escape-decoded collisions), repeated parts rejected. |
@@ -269,33 +269,72 @@ regression test reproduces the reviewed defect and the fix is exercised by it.
 ### Limitations that remain
 
 * **Real-service verification is absent.** RLS, Redis, S3 and ClamAV are not
-  available in this environment. The ClamAV R1/R2 limitations recorded earlier
-  are unchanged and are **not** closed by this round.
-* **Independent readers are limited to pdf-lib.** The review used pypdf and
-  Poppler; neither is installed here, so the FF-05 evidence is a structural
-  re-read with pdf-lib plus annotation-graph assertions, not a second engine.
-* **Parse budgets are advisory in-process.** `pdf-lib` cannot be interrupted
-  mid-parse on the main thread. Size, shape, page count and elapsed time are
-  bounded; a genuine CPU-time cap needs a worker thread, which is an
-  architectural change.
+  available in this environment, so those paths are exercised against behavioural
+  fakes and the exact gap is recorded per finding.
+* **Independent readers are limited to pdf-lib.** pypdf and Poppler are not
+  installed here, so the flatten evidence is a structural re-read with pdf-lib
+  plus annotation-graph assertions, not a second engine.
+* **The PDF boundary is process containment, not a kernel sandbox.** The child
+  runs as the same OS user with the same filesystem visibility; it has a minimal
+  environment, a heap cap and a hard deadline, but it is not a container.
 * **Rasterised Arabic is pixels.** Values keep Unicode `/V` and the widget stays
   interactive, but the glyphs inside that widget are not selectable text.
-* **Rotated widgets and raster border/background are not fixed.** Rotation is
-  still cropped; the raster appearance still paints over the widget's original
-  border and background.
+* **Raster border/background.** An Arabic raster appearance paints its own white
+  background and does not reproduce the widget's original border.
 
-### Architectural decisions needing owner approval
+---
 
-1. **Payload reference (FF-03).** Encryption reuses `PHASE1_SECRET_ENCRYPTION_KEY`
-   with a distinct AAD purpose, and the TTL is tied to
-   `abandonedGraceMs()` (≥ 24 h). This avoids a new secret and a policy change,
-   but it does mean a second purpose shares the Phase 1 key, and that the payload
-   lifetime is coupled to retention policy. A dedicated key and an explicitly
-   approved TTL would each be a deployment/policy change.
-2. **Expiry purge (FF-03).** The scheduled expiry sweep now also deletes the
-   Redis payload for jobs it expires. That is a new side effect inside an
-   approved retention operation; it does not change which jobs expire or when,
-   but it should be acknowledged before release.
-3. **Per-tenant admission for inspection (FF-04).** Fixed limits (30/min, 4
-   concurrent) are new operational parameters. They are not yet configurable via
-   the environment.
+## Remediation round 2 (architect review of `32285ca`)
+
+A second review returned **NO-GO** with seven priorities. Table below: what
+changed, and what is actually proven. Claims are limited to what the evidence in
+this repository supports.
+
+| # | Priority | Change | Status |
+| --- | --- | --- | --- |
+| 1A | Expiry purge race | `applyExpiryPlan` now issues `updateManyAndReturn` and returns the rows it transitioned; the sweep purges payloads from that result set, never from `plan.expireIds`. Dry-run remains non-mutating. No new DB privilege (column `UPDATE` + `SELECT` only) and no migration. | **FIXED AND VERIFIED (behavioural)** — two-planned/one-claimed regression, unique-ownership and "purge follows the write" cases in `test/retention.expiry-race.test.ts` (11/11). Postgres port updated to `UPDATE … RETURNING`. |
+| 1B | Queue lifecycle | Terminal decision extracted to `src/lib/jobs/payload-lifecycle.ts`; the worker passes its verdict to the pipeline, so a first-attempt `UnrecoverableError` purges immediately. RETRYING write is now a guarded `updateMany` that cannot revive CANCELLED/EXPIRED/SUCCEEDED. | **FIXED AND VERIFIED (behavioural)** — 14 cases covering success-after-commit, retry success, unrecoverable-first, exhaustion, stalled, crash-after-commit, duplicate delivery, cancel-vs-claim, enqueue failure, expiration and Redis-cleanup failure. |
+| 1C | HKDF + bounded TTL | **Not implemented — proposal only** (`docs/payload-key-proposal.md`). Changes the operational guarantee, so it needs owner authorization. | **BLOCKED ON OWNER AUTHORIZATION.** Today's behaviour is unchanged and described honestly. |
+| 2 | Isolated PDF boundary | `src/lib/pdf/form-worker.ts` spawns `form-worker-child.ts` per document: minimal `env` (PATH + NODE_ENV only), `--max-old-space-size`, hard deadline → SIGKILL, bounded stdout, bounded input, concurrency cap, guaranteed kill. The child does shape checks → one parse → structural walk → inventory, so the route and the boundary no longer parse twice. | **FIXED AND VERIFIED (behavioural)** — happy path, coded rejection, oversize refusal, deadline kill (4 ms), concurrency refusal; a 400 k-node page-tree bomb rejected in ~850 ms with host RSS flat; heap-bomb child dies SIGABRT with OOM detected at 64 MB and 128 MB; spinning child killed at 1 510 ms. |
+| 3 | Request-byte enforcement | `src/lib/http/bounded-body.ts` re-wraps the request body in a counting stream; missing (chunked), false and duplicate-part bodies are all cut off before buffering. Applied to the inspect route, `POST /api/jobs/[tool]` and the Public API. Admission replaced by an atomic single-`EVAL` lease set with unique ids, expiry recovery, per-tenant **and** global ceilings and configurable defaults. | **FIXED AND VERIFIED (behavioural)** — 8 byte-bound cases (all three bypass shapes), 8 lease cases including outage fail-open. Redis is not live here, so atomicity is Redis's documented `EVAL` guarantee, not measured. |
+| 4 | Typed structural validation | `assertFieldType` / `assertSigFlags` / budget-before-queueing in the walk; `StructureFailure` carries a typed reason. | **FIXED AND VERIFIED** — 10-case pdf-lib probe: cycle, malformed `/FT`, malformed `/SigFlags`, oversized `/Kids`, unresolved reference all rejected with distinct reasons; shared subtrees and 10-level nesting accepted. |
+| 5 | Preflight before billing | Ordering was already correct (screening → preflight → billing → storage → job). The remaining hole was an orphan **charge**: a failure after authorization left a consumed credit and a `job.created` event with no job. `enforceJobCreation` now returns an idempotent release handle used by the creation-failure path. | **FIXED AND VERIFIED (structural + behavioural)** — ordering and release invariants in `fill-forms.contract.test.ts`; the ledger reversal itself is not exercised against a live database. |
+| 6 | FF-07 fidelity | **Root cause found and fixed:** Latin values that WinAnsi could encode bypassed the legibility gate entirely (pdf-lib's `defaultUpdateAppearances` clips silently), so the exact reported defect was the one case never measured. Every text value is now measured before any appearance is written; Latin stays vector text, Arabic still rasterises; the shrink loop's floor is expressed in points, not device pixels; geometry rejections carry their own issue codes. | **FIXED AND VERIFIED** — 9 behavioural cases: rotation preserved at 0/90/180/270, option semantics, interactive-vs-flattened agreement, Latin overflow rejection, Latin-stays-vector, Arabic and mixed direction, point-based floors, blank values. Border reproduction remains open (see limitations). |
+| 7 | Content-free errors | `src/lib/jobs/error-boundary.ts`: `Job.error`/`JobStep.error` carry `{ code }` only, from a closed vocabulary; anything else collapses to `PROCESSING_FAILED`. The pipeline's `error.message` writes are gone. | **FIXED AND VERIFIED** — 13-case synthetic canary: native, Redis, filesystem, parser and non-Error throws all fail to leak, plus a source check that the pipeline uses the boundary. |
+
+### Approval still required
+
+1. **Payload key and lifetime (priority 1C)** — see `docs/payload-key-proposal.md`.
+   Not applied. Two independent decisions: purpose-derived keys, and a bounded
+   TTL ceiling.
+2. **Expiry purge side effect (priority 1A)** — the sweep deletes the Redis
+   payload of jobs it actually expired. This does not change *which* jobs expire
+   or *when*, but it is a new side effect inside an approved retention operation.
+3. **Admission and boundary defaults (priorities 2 and 3)** — the numbers below
+   are proposed operational defaults, all environment-configurable, and none is
+   an approved product quota.
+
+### Operator configuration (all optional)
+
+| Variable | Default | Bounds | Meaning |
+| --- | --- | --- | --- |
+| `FORM_WORKER_TIMEOUT_MS` | 20 000 | 1 000 – 120 000 | Hard deadline before SIGKILL |
+| `FORM_WORKER_MAX_HEAP_MB` | 256 | 64 – 2 048 | `--max-old-space-size` for the child |
+| `FORM_WORKER_CONCURRENCY` | 2 | 1 – 16 | Simultaneous child processes |
+| `FORM_INSPECT_CONCURRENCY` | 2 | 1 – 16 | Per-tenant open inspections |
+| `FORM_INSPECT_GLOBAL_CONCURRENCY` | 8 | 1 – 64 | Open inspections per process |
+| `FORM_INSPECT_RATE_PER_MINUTE` | 30 | 1 – 600 | Per-tenant inspections per minute |
+
+### Verification for this round
+
+* Focused suites: `fill-forms.*` + `retention.*` + `jobs.error-boundary` +
+  `http.bounded-body` + `inspection-lease` = 171 tests, **167 pass, 0 fail**
+  (4 skips are the Prisma-gated pipeline tests).
+* Full suite `npm test`: **545 tests, 487 pass, 15 fail, 43 skipped.** The 15
+  failing files are identical to the commit this branch was cut from, and are
+  environment failures (no Prisma client, no Redis, no Postgres, no ClamAV).
+* `npx tsc --noEmit`: 447 errors, **identical to baseline** (all Prisma-absence).
+* `npx eslint src/ workers/ test/`: 0 errors.
+* `npx prisma generate`: **still blocked** (TLS to the binary host). FF-01
+  therefore remains *pending clean-build verification* and no later claim rests
+  on a stubbed build.

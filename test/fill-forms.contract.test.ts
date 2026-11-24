@@ -115,10 +115,13 @@ test("S2 fill-forms worker: the engine is invoked by the pipeline, never by a ro
   }
   // Inspection is the one read-only engine entry point a route may use, and only
   // to describe the form — never to produce a document.
-  assert.doesNotMatch(read("src/app/api/fill-forms/inspect/route.ts"), /inspectFormPdf[\s\S]{0,400}fillFormPdf/u);
-  // The inspect route is read-only: no job, no storage, no queue.
+  assert.doesNotMatch(read("src/app/api/fill-forms/inspect/route.ts"), /processPdfBounded[\s\S]{0,400}fillFormPdf/u);
+  // The inspect route is read-only: no job, no storage, no queue — and, since
+  // FF-04 round 2, it no longer parses the PDF in the web process at all. The
+  // route hands the bytes to the bounded child and receives an inventory.
   const inspect = read("src/app/api/fill-forms/inspect/route.ts");
-  assert.match(inspect, /inspectFormPdf/u);
+  assert.match(inspect, /processPdfBounded\(/u, "the route must delegate parsing to the bounded boundary");
+  assert.doesNotMatch(inspect, /inspectFormPdf\(|PDFDocument\.load/u, "the web process must never parse a PDF itself");
   assert.doesNotMatch(inspect, /createToolJob|enqueueJob|getStorage|tx\.job/u);
 });
 
@@ -272,16 +275,25 @@ test("FF-04: the inspect route bounds the request before buffering and screens b
   const body = route.slice(route.indexOf("export async function POST"));
   // The size guard is a helper defined above `POST`; what matters is that it is
   // *called* inside `POST` before `formData()` buffers the body.
+  // Round 2: the header check survives as an early exit, but enforcement moved to a
+  // counting stream. Both must precede the buffering call.
   const declaredAt = body.indexOf("declaredLength(request)");
-  const formDataAt = body.indexOf("request.formData()");
+  const boundedAt = body.indexOf("withBodyLimit(request");
+  const formDataAt = Math.max(body.indexOf("bounded.formData()"), body.indexOf("request.formData()"));
   const screeningAt = body.indexOf("requireCleanUpload(bytes)");
-  const parseAt = body.indexOf("inspectFormPdf(");
+  const parseAt = body.indexOf("processPdfBounded(");
   const cheapAt = body.indexOf("assertCheapPdfShape(bytes)");
   assert.ok(declaredAt > 0 && declaredAt < formDataAt, "the declared length must be checked before formData()");
+  assert.ok(boundedAt > 0 && boundedAt < formDataAt, "the body must be bounded by a counting stream before formData()");
   assert.ok(cheapAt > 0 && cheapAt < screeningAt, "cheap shape checks must precede screening");
   assert.ok(screeningAt > 0 && screeningAt < parseAt, "malware screening must precede the PDF parse");
-  const admissionAt = body.indexOf("admitFormInspection");
-  assert.ok(admissionAt > 0 && admissionAt < formDataAt, "per-tenant admission must run before the body is read");
+  // Round 2: admission is an atomic Lua lease with per-tenant AND global ceilings,
+  // and it must still happen before the body is read.
+  const admissionAt = body.indexOf("acquireInspectionLease(user.id)");
+  assert.ok(admissionAt > 0 && admissionAt < formDataAt, "admission must run before the body is read");
+  const admission = read("src/lib/http/inspection-lease.ts");
+  assert.match(admission, /redis\.eval\(/u, "admission must be one atomic script, not INCR+EXPIRE");
+  assert.match(admission, /global/u, "a global ceiling must exist alongside the per-tenant one");
 });
 
 test("FF-03: no raw field value reaches `Job.params`, and every terminal path purges the reference", () => {
@@ -325,4 +337,20 @@ test("FF-06: `fill-forms` is inspected after screening and before billing/storag
   assert.ok(preflightAt < billingAt, "the preflight must precede any billing attempt");
   assert.ok(preflightAt < storageAt, "the preflight must precede object storage");
   assert.ok(preflightAt < enqueueAt, "the preflight must precede queueing");
+});
+
+test("FF-06: a failed creation releases the authorization charge (no orphan charge)", () => {
+  const enforcement = read("src/lib/usage/enforcement.ts");
+  const orchestrator = read("src/lib/jobs/orchestrator.ts");
+  // Authorization still happens where it always did — before storage — but it now
+  // hands back a release handle that the creation-failure path uses.
+  assert.match(enforcement, /charge: creditReused \? undefined : \{ release:/u, "authorization must return a release handle");
+  assert.match(enforcement, /reverseCredits\(/u, "the release must reverse the ledger entry");
+  assert.match(enforcement, /job-release:\$\{input\.toolId\}:\$\{input\.idempotencyKey\}/u, "the reversal must be idempotent per idempotency key");
+  const creationCatch = orchestrator.slice(orchestrator.indexOf("Enqueue failure, transaction failure"));
+  assert.match(creationCatch, /monetization\.charge\?\.release\(\)/u, "the creation-failure path must release the charge");
+  // The ordering the previous test pins must not have moved.
+  const preflightAt = orchestrator.indexOf("await assertFillableInput(prepared[0].upload.bytes)");
+  const billingAt = orchestrator.indexOf("await enforceJobCreation(");
+  assert.ok(preflightAt > 0 && preflightAt < billingAt, "preflight must still precede billing");
 });

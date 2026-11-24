@@ -1,8 +1,9 @@
 import { randomUUID } from "crypto";
+import { BodyTooLargeError, multipartBudget, withBodyLimit } from "@/lib/http/bounded-body";
 import { requireUser } from "@/lib/auth/user";
 import { createToolJob } from "@/lib/jobs/orchestrator";
 import { FormFillError, assertNoDuplicateJsonKeys, fieldsPayloadBytes } from "@/lib/pdf/form-validation";
-import { workerToolIds } from "@/lib/tools/registry";
+import { getToolDefinition, workerToolIds } from "@/lib/tools/registry";
 import { UploadValidationError } from "@/lib/uploads/validation";
 import { ToolOptionsValidationError } from "@/lib/tools/options";
 import { phase1SecretsFromForm } from "@/lib/secrets/phase1";
@@ -12,7 +13,14 @@ export async function POST(request: Request, { params }: { params: Promise<{ too
   const { tool } = await params;
   if (!workerToolIds.has(tool)) return Response.json({ code: "TOOL_NOT_WORKER_ENABLED", message: "This tool has not moved to the worker pipeline yet." }, { status: 409 });
   try {
-    const user = await requireUser(); const form = await request.formData(); const files = form.getAll("files").filter((value): value is File => value instanceof File);
+    const user = await requireUser();
+    // FF-04: the same stream-level bound as the inspect route. This path had no
+    // byte check at all before `formData()`, so the full multipart body was
+    // buffered whatever its size; a chunked or misdeclared body is now cut off by
+    // the counting stream rather than by a header that may be absent or false.
+    const toolLimit = getToolDefinition(tool).limits.maxBytes;
+    const bounded = withBodyLimit(request, multipartBudget(toolLimit));
+    const form = await bounded.formData(); const files = form.getAll("files").filter((value): value is File => value instanceof File);
     const rawOptions = form.get("options"); let options: Record<string, string | number | boolean> = {};
     if (typeof rawOptions === "string" && rawOptions) { const parsed = JSON.parse(rawOptions) as unknown; if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("INVALID_OPTIONS"); options = parsed as Record<string, string | number | boolean>; }
     // `fields` is a typed per-field payload (see tools/options.ts). It is parsed
@@ -46,6 +54,9 @@ export async function POST(request: Request, { params }: { params: Promise<{ too
     return Response.json({ jobId: job.id, status: job.status.toLowerCase(), correlationId, reused: job.reused }, { status: job.reused ? 200 : 202 });
   } catch (error) {
     const auth = error instanceof Error && error.message === "AUTH_REQUIRED"; const upload = error instanceof UploadValidationError; const options = error instanceof ToolOptionsValidationError;
+    // 413, not 400/422: the body itself was refused, and the message says nothing
+    // about the contents.
+    if (error instanceof BodyTooLargeError) return Response.json({ code: "SIZE_LIMIT_EXCEEDED", message: "The upload exceeds the size limit." }, { status: 413 });
     const coded = typeof error === "object" && error && "code" in error ? String(error.code) : undefined;
     const formError = coded === "FIELDS_INPUT_INVALID" || coded === "FORM_VALUE_INVALID" || coded === "FORM_UNSUPPORTED" || coded === "FORM_NOT_FOUND" || coded === "FORM_RESTRICTED";
     const message = formError && error instanceof Error ? error.message : auth ? "Sign in to process documents." : upload || options ? error.message : "Unable to queue tool job.";

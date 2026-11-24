@@ -22,6 +22,16 @@ export const runtimeLimits = {
   ocrTimeoutMs: boundedInteger("OCR_TIMEOUT_MS", 300_000, 5_000, 30 * 60_000),
   storageTimeoutMs: boundedInteger("STORAGE_TIMEOUT_MS", 30_000, 1_000, 5 * 60_000),
   aiTimeoutMs: boundedInteger("AI_PROVIDER_TIMEOUT_MS", 60_000, 1_000, 10 * 60_000),
+  // --- fill-forms untrusted-PDF boundary (FF-04) ---------------------------
+  // Proposed operational defaults, NOT approved product quotas: every value is
+  // bounded and overridable, and the ones that describe the isolation boundary
+  // (deadline, heap) cannot be disabled by configuration — only tightened.
+  formWorkerTimeoutMs: boundedInteger("FORM_WORKER_TIMEOUT_MS", 20_000, 1_000, 120_000),
+  formWorkerMaxHeapMb: boundedInteger("FORM_WORKER_MAX_HEAP_MB", 256, 64, 2_048),
+  formWorkerConcurrency: boundedInteger("FORM_WORKER_CONCURRENCY", 2, 1, 16),
+  formInspectConcurrency: boundedInteger("FORM_INSPECT_CONCURRENCY", 2, 1, 16),
+  formInspectRatePerMinute: boundedInteger("FORM_INSPECT_RATE_PER_MINUTE", 30, 1, 600),
+  formInspectGlobalConcurrency: boundedInteger("FORM_INSPECT_GLOBAL_CONCURRENCY", 8, 1, 64),
 } as const;
 
 export type TimeoutClass = "pdf" | "office" | "ocr" | "ai";

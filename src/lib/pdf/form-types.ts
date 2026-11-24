@@ -81,6 +81,12 @@ export const FORM_VALUE_ISSUES = [
   "TOO_MANY_VALUES",
   "NO_VALUES",
   "UNRENDERABLE_SCRIPT",
+  // FF-07 round 2: geometry rejections are distinct issues, not a rendering
+  // script problem. A caller needs to tell "this widget is too small to be
+  // legible" from "this value does not fit" from "this script has no face".
+  "WIDGET_TOO_SMALL",
+  "VALUE_OVERFLOWS_WIDGET",
+  "VALUE_NEEDS_MORE_LINES",
 ] as const;
 export type FormValueIssue = (typeof FORM_VALUE_ISSUES)[number];
 
