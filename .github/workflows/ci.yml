@@ -614,6 +614,13 @@ jobs:
           # own `node_modules` and the check could pass on an incomplete artifact. From
           # an unrelated directory there is no fallback, so a package the artifact does
           # not actually contain is a failure.
+          #
+          # R6.4: this step also proves the *packaged* runtime closure. The launcher is
+          # `node --import ./scripts/node-platform-compat.mjs --import tsx <child>`, so the
+          # artifact must contain `tsx`, its `esbuild` driver and the `@esbuild/linux-x64`
+          # binary — none of which Next's tracer can see, because nothing imports them.
+          # The first isolated run failed with "Cannot find package 'tsx'" for exactly that
+          # reason.
           node scripts/smoke-pdf-worker-artifact.mjs .next/standalone
           nohup node scripts/start-browser-e2e.mjs >/tmp/dip-release-b-web.log 2>&1 &
           echo $! >/tmp/dip-release-b-web.pid

@@ -151,6 +151,42 @@ test("the traced file list and the artifact verifier cannot drift apart", async 
   for (const file of extraPackaged) {
     assert.ok(verified.includes(file), `${file} is packaged but the verifier does not check for it`);
   }
+
+  // R6.4: the route keys must match the real filesystem routes.
+  //
+  // `outputFileTracingIncludes` is keyed by the *route path on disk*. The Public API route
+  // is `src/app/v1/jobs/route.ts`; keying it `/api/v1/jobs` matches nothing, so that build
+  // silently shipped without the child while this list looked complete. A wrong key is
+  // invisible in every file-based check, so it is asserted directly.
+  const routeKeys = [...config.matchAll(/^\s*"([^"]+)":\s*\[\.\.\.PDF_WORKER_ARTIFACT\]/gmu)].map((match) => match[1]);
+  assert.deepEqual(routeKeys.sort(), ["/api/fill-forms/inspect", "/api/jobs/[tool]", "/v1/jobs"],
+    "the packaged routes must be the real filesystem routes");
+  assert.doesNotMatch(config, /"\/api\/v1\/jobs"\s*:/u,
+    "the Public API route is /v1/jobs on disk; /api/v1/jobs matches nothing");
+
+  // R6.4: and every declared runtime package must correspond to something the verifier
+  // demands. Without this, a package could be added to the build and never checked, or the
+  // verifier could demand a package the build does not include.
+  const packagesBlock = config.slice(
+    config.indexOf("const PDF_WORKER_RUNTIME_PACKAGES = ["),
+    config.indexOf("] as const;", config.indexOf("const PDF_WORKER_RUNTIME_PACKAGES = [")),
+  );
+  const packages = [...packagesBlock.matchAll(/"\.\/node_modules\/([^/"]+)(?:\/([^/"]+))?\/\*\*\/\*"/gu)]
+    .map((match) => (match[2] && match[1].startsWith("@") ? `${match[1]}/${match[2]}` : match[1]));
+  assert.ok(packages.length >= 10, `the runtime package list looks truncated: ${packages.join(", ")}`);
+  // Scoped to the *assets* array: comments elsewhere in the verifier quote package names
+  // (failure messages), and a whole-file scrape would treat those as declarations.
+  const assetsBlock = verifier.slice(
+    verifier.indexOf("export const REQUIRED_PDF_WORKER_ASSETS = ["),
+    verifier.indexOf("];", verifier.indexOf("export const REQUIRED_PDF_WORKER_ASSETS = [")),
+  );
+  const assets = [...assetsBlock.matchAll(/"([^"]+)"/gu)].map((match) => match[1]);
+  for (const name of packages) {
+    assert.ok(assets.some((file) => file.startsWith(`node_modules/${name}/`)),
+      `${name} is packaged but the verifier never checks for it`);
+  }
+  // The launcher's own entry point is the thing that was missing from the first artifact.
+  assert.ok(assets.includes("node_modules/tsx/package.json"), "tsx must be verified: the launcher starts with --import tsx");
   // Every transitive source the child needs must be declared, not just the entry.
   for (const file of ["src/lib/pdf/form-worker-child.ts", "src/lib/pdf/worker-protocol.ts", "src/lib/pdf/form-types.ts", "scripts/node-platform-compat.mjs"]) {
     assert.ok(verified.includes(file), `${file} must be verified`);

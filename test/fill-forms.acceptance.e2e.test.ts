@@ -196,16 +196,42 @@ integration("R6.3-4/5/6: the production worker fills, flattens and renders Arabi
     const arabicDoc = await PDFDocument.load(await storage.get(arabicOutput.storageKey));
     assert.equal(arabicDoc.getForm().getTextField("applicant.name").getText(), "نورة الحربي", "the Arabic value must round-trip through the worker");
 
-    // Rejection side: a form-less document must fail *before* durable, billing, usage or
-    // queue effects. The orchestrator inspects before any charge or write.
-    const before = { usage: await db.usageEvent.count({ where: { userId } }), files: await db.file.count({ where: { document: { userId } } }), jobs: await db.job.count({ where: { requesterId: userId } }) };
+    // Rejection side. Two distinct cases, deliberately:
+    //
+    //   (a) an empty upload — proves the *byte* gate rejects before anything is written;
+    //   (b) a structurally valid PDF with no form — proves *isolated form inspection*
+    //       rejects it. The R6.3 version only had (a), which a byte check satisfies, so it
+    //       said nothing about the inspection path that this release changed.
+    const before = {
+      usage: await db.usageEvent.count({ where: { userId } }),
+      files: await db.file.count({ where: { document: { userId } } }),
+      jobs: await db.job.count({ where: { requesterId: userId } }),
+      queued: await getJobQueue().getJobCounts("wait", "active", "delayed"),
+    };
+
     await assert.rejects(
-      () => createToolJob({ userId, toolId: "fill-forms", idempotencyKey: "r63-reject", correlationId: randomUUID(), uploads: [{ filename: "plain.pdf", mimeType: "application/pdf", bytes: new Uint8Array(0) }], fields: { "applicant.name": "x" } }),
-      "an unusable document must be rejected",
+      () => createToolJob({ userId, toolId: "fill-forms", idempotencyKey: "r63-reject-empty", correlationId: randomUUID(), uploads: [{ filename: "plain.pdf", mimeType: "application/pdf", bytes: new Uint8Array(0) }], fields: { "applicant.name": "x" } }),
+      "an empty upload must be rejected",
     );
+
+    // A real, parseable PDF that simply has no form: the rejection must come from
+    // inspection, not from the byte gate.
+    const formless = await formlessPdf();
+    await assert.rejects(
+      () => createToolJob({ userId, toolId: "fill-forms", idempotencyKey: "r63-reject-formless", correlationId: randomUUID(), uploads: [{ filename: "plain.pdf", mimeType: "application/pdf", bytes: formless }], fields: { "applicant.name": "x" } }),
+      (error: unknown) => {
+        // Typed rejection, not an internal failure: a 500 here would mean the inspection
+        // path collapsed rather than refused.
+        const code = (error as { code?: string }).code;
+        assert.equal(code, "FORM_NOT_FOUND", `a form-less PDF must be refused by inspection, saw ${String(code)}`);
+        return true;
+      },
+    );
+
     assert.equal(await db.usageEvent.count({ where: { userId } }), before.usage, "a rejected submission must not write usage");
     assert.equal(await db.file.count({ where: { document: { userId } } }), before.files, "a rejected submission must not write files");
     assert.equal(await db.job.count({ where: { requesterId: userId } }), before.jobs, "a rejected submission must not create a job");
+    assert.deepEqual(await getJobQueue().getJobCounts("wait", "active", "delayed"), before.queued, "a rejected submission must not enqueue work");
   } finally {
     await db.user.delete({ where: { id: userId } }).catch(() => undefined);
     await getJobQueue().close().catch(() => undefined);

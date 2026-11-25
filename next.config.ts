@@ -18,7 +18,63 @@ const PDF_WORKER_TRACING = [
   "./src/lib/pdf/form-fill.ts",
   "./src/lib/pdf/form-appearance.ts",
   "./scripts/node-platform-compat.mjs",
+  // R6.4: the launcher. `/api/fill-forms/inspect` imports it, so the tracer normally
+  // reaches it — but "normally" is doing a lot of work there. The Public API route key was
+  // wrong until this round (see below), which means that build traced nothing at all, and
+  // the smoke scenario imports this module directly. Declaring it makes the artifact's
+  // contents independent of which route happens to import it.
+  "./src/lib/pdf/form-worker.ts",
+  // `tsconfig.json` is a **runtime file**, not a build input: `tsx` reads `paths` from it
+  // to resolve `@/` inside the child. The launcher's own requirement was therefore never
+  // packaged by tracing.
+  "./tsconfig.json",
 ] as const;
+
+/**
+ * The child's runtime dependencies, as packages.
+ *
+ * This is the *complete* legitimate closure of the production launcher
+ * (`node --import ./scripts/node-platform-compat.mjs --import tsx <child>`), established
+ * by execution rather than inference: each entry below was removed from a working
+ * artifact in turn and the smoke suite failed with a distinct, attributable error. The
+ * inverse also holds — `tslib` and `detect-libc` are transitive in the lockfile but are
+ * not part of this closure, and removing them leaves all six scenarios passing. Copying
+ * `node_modules` wholesale would hide any future omission, so the list is explicit.
+ *
+ * The path aliases and `tsx`'s own resolution chain are invisible to Next's tracer:
+ *
+ *   - `tsx` is loaded by `--import`, so nothing imports it statically.
+ *   - `esbuild` is a dependency of `tsx`, loaded from `node_modules` at run time.
+ *   - `@esbuild/linux-x64` is the platform binary esbuild spawns; without it esbuild
+ *     reports "no native binary executable".
+ *   - `@napi-rs/canvas` is a *runtime `require`* (deliberately, so no route bundles the
+ *     addon), and `@napi-rs/canvas-linux-x64-gnu` is its platform binary.
+ *   - `@fontsource/noto-sans-arabic` is resolved through `require.resolve` at render
+ *     time; only the Arabic appearance path exercises it.
+ *
+ * `pdf-lib` and its `@pdf-lib/*`/`pako` dependencies are normally traced through the
+ * child, but are declared here too: they are also reached through the dynamic `require`
+ * in the child, and a standalone artifact that is missing them fails every scenario.
+ */
+const PDF_WORKER_RUNTIME_PACKAGES = [
+  "./node_modules/tsx/**/*",
+  "./node_modules/esbuild/**/*",
+  "./node_modules/@esbuild/linux-x64/**/*",
+  "./node_modules/pdf-lib/**/*",
+  "./node_modules/@pdf-lib/standard-fonts/**/*",
+  "./node_modules/@pdf-lib/upng/**/*",
+  "./node_modules/pako/**/*",
+  "./node_modules/@napi-rs/canvas/**/*",
+  "./node_modules/@napi-rs/canvas-linux-x64-gnu/**/*",
+  "./node_modules/@fontsource/noto-sans-arabic/**/*",
+] as const;
+
+/**
+ * Every artefact the launcher needs in the standalone tree.
+ *
+ * One list, so the build and the verifier cannot disagree.
+ */
+const PDF_WORKER_ARTIFACT = [...PDF_WORKER_TRACING, ...PDF_WORKER_RUNTIME_PACKAGES] as const;
 
 const nextConfig: NextConfig = {
   output: "standalone",
@@ -33,10 +89,13 @@ const nextConfig: NextConfig = {
   //      `form-types.ts`. Neither is reachable from an app route's own import graph,
   //      so tracing the entry alone leaves them behind.
   //   2. The closure also crosses into `@/lib/pdf/form-*` (the real engine and the
-  //      structural probes) and — through `form-inspection.ts`'s admission control —
-  //      into `@/lib/queue`, which drags in the Redis client. A missing module here is
-  //      not a degraded feature: the child fails to start and every Fill Forms job
-  //      reports WORKER_CRASHED.
+  //      structural probes). A missing module here is not a degraded feature: the child
+  //      fails to start and every Fill Forms job reports WORKER_CRASHED.
+  //
+  //      R6.3 removed the one edge that made this list dangerous: `form-inspection.ts`
+  //      used to import `@/lib/queue` for a superseded admission counter, which dragged
+  //      Redis and BullMQ into a PDF parser. The child's closure is now free of all
+  //      application infrastructure, and a test asserts it stays that way.
   //
   // `scripts/verify-pdf-worker-artifact.mjs` resolves this same list from the built
   // output and fails the build if any entry is absent, so the declaration and the
@@ -44,26 +103,27 @@ const nextConfig: NextConfig = {
   // included because the child is launched with `--import` of that file; it is not
   // importable TypeScript, so no bundler would ever infer it.
   outputFileTracingIncludes: {
-    // R6.2: the child's launcher needs `tsconfig.json` *as a runtime file*.
+    // The child is *spawned*, never imported, so the bundler cannot see it or anything
+    // it resolves at run time. What follows is therefore the complete artifact contract:
+    // the child's sources, the launcher that runs them, `tsconfig.json` (which `tsx`
+    // reads to resolve `@/`), and the runtime packages.
     //
-    // `childLaunch()` starts the child with `--import tsx`, and tsx resolves the `@/`
-    // path alias by reading `paths` from `tsconfig.json` relative to the child's
-    // working directory. That file is a build input, so Next does not copy it into the
-    // standalone tree — the launcher's own requirement was therefore never packaged.
-    // The worker image copies it explicitly and has always worked; a standalone
-    // deployment would have failed at the first Fill Forms job with WORKER_CRASHED
-    // while `verify-pdf-worker-artifact.mjs` reported every source file present.
-    //
-    // This is a packaging declaration, not a test convenience: the shipped artifact
-    // gains the file the shipped launcher already reads, and the smoke test verifies
-    // exactly that artifact with no injected configuration.
+    // Each entry is a packaging declaration, not a test convenience: the shipped
+    // artifact gains only what the shipped launcher already requires, and the smoke
+    // test verifies exactly that artifact with no injected configuration.
     //
     // Declared on the same routes as the child, because those are the routes that start
     // it. `outputFileTracingIncludes` is an object of route → globs; a bare string in
     // this position would be a syntax error, which is how this was caught.
-    "/api/fill-forms/inspect": [...PDF_WORKER_TRACING, "./tsconfig.json"],
-    "/api/jobs/[tool]": [...PDF_WORKER_TRACING, "./tsconfig.json"],
-    "/api/v1/jobs": [...PDF_WORKER_TRACING, "./tsconfig.json"],
+    //
+    // R6.4: the Public API key is the **filesystem** route, `/v1/jobs`, not the public
+    // URL prefix `/api/v1/jobs`. The route lives at `src/app/v1/jobs/route.ts`, so the
+    // previous key matched nothing and the Public API standalone build silently shipped
+    // without the child — the one deployment path where Fill Forms would fail with
+    // WORKER_CRASHED while the verifier reported every file present.
+    "/api/fill-forms/inspect": [...PDF_WORKER_ARTIFACT],
+    "/api/jobs/[tool]": [...PDF_WORKER_ARTIFACT],
+    "/v1/jobs": [...PDF_WORKER_ARTIFACT],
   },
   images: {
     remotePatterns: [],

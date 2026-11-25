@@ -31,8 +31,8 @@
  *   node scripts/smoke-pdf-worker-artifact.mjs [artifact-root]
  */
 import { spawn } from "node:child_process";
-import { cpSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { cpSync, existsSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { join, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 
@@ -43,6 +43,14 @@ import { pathToFileURL } from "node:url";
  * because it must be resolvable before anything from the artifact has loaded.
  */
 export const SEARCH_ROOTS = ["", "src/lib/pdf", ".next/standalone/src/lib/pdf", ".next/standalone"];
+
+/**
+ * The shipped launcher-exercise module.
+ *
+ * It lives under `scripts/` at the artifact root in both layout shapes (standalone tree
+ * and worker image `/app`), so one relative path works for all of them.
+ */
+export const RUNNER_MODULE = "scripts/pdf-worker-runner-smoke.ts";
 
 export function findEntry(root) {
   for (const prefix of SEARCH_ROOTS) {
@@ -55,12 +63,51 @@ export function findEntry(root) {
 }
 
 /**
- * A preload that teaches the child to resolve the `@/` alias without `tsconfig.json`.
+ * Bounded, sanitized diagnostics.
  *
+ * A failing child can print any amount of text, including absolute paths of the machine
+ * that produced the artifact. CI logs are long-lived and widely readable, so the harness
+ * reports a bounded excerpt with the artifact root collapsed to a placeholder — enough to
+ * identify the failing import, not enough to leak the environment.
+ */
+export function sanitize(text, root, limit = 1200) {
+  const collapsed = root ? text.split(root).join("<artifact>") : text;
+  // Prefer the line that names the failure. A Node crash prints the offending frame and
+  // its stack in that order, so taking the head of the output reports "package_json_reader"
+  // and drops "Cannot find package 'tsx'", which is the entire finding.
+  const lines = collapsed.split("\n").map((line) => line.trim()).filter(Boolean);
+  // Ordered: the message node prints ("Cannot find package 'tsx' imported from …"), then a
+  // bare ERR_ code, then anything error-shaped. A stack frame mentioning
+  // `package_json_reader` matched first and told the reader nothing.
+  const informative =
+    lines.find((line) => /^Cannot find (package|module)/i.test(line)) ??
+    lines.find((line) => /^(Error|error):/i.test(line)) ??
+    lines.find((line) => /ERR_[A-Z_]+|EACCES|EROFS/i.test(line));
+  const excerpt = informative && !collapsed.startsWith(informative) ? `${informative} | ${collapsed}` : collapsed;
+  return excerpt.length > limit ? `${excerpt.slice(0, limit)}… (${excerpt.length} bytes)` : excerpt;
+}
+
+/**
+ * Lead with the line that names a child failure, then a bounded tail for context.
+ *
+ * A Node crash prints the message before the stack, so taking a fixed slice of the output
+ * routinely reports a stack frame and drops the actual cause.
+ */
+export function describeChildFailure(stderr, limit = 800) {
+  const lines = stderr.split("\n").map((line) => line.trim()).filter(Boolean);
+  const message = lines.find((line) => /^Cannot find (package|module)/i.test(line)) ??
+    lines.find((line) => /^Error|^\w*Error:/i.test(line));
+  const tail = stderr.slice(-limit).trim();
+  return message && !tail.includes(message) ? `${message} | …${tail}` : tail;
+}
+
+/**
  * The child is launched with exactly the arguments the production launcher uses
  * (`childLaunch()` in `src/lib/pdf/form-worker.ts`): `--import ./scripts/node-platform-compat.mjs`
  * followed by `--import tsx`, and only `PATH`/`NODE_ENV` in the environment. Anything the
  * real launcher supplies must come from the artifact itself; nothing is injected here.
+ * The alias resolution the preload would otherwise provide comes from the packaged
+ * `tsconfig.json`, which is why its absence is a scenario failure rather than a repair.
  */
 const u32 = (value) => { const buffer = Buffer.alloc(4); buffer.writeUInt32BE(value, 0); return buffer; };
 
@@ -109,7 +156,10 @@ function runChild(entry, control, pdf, root, timeoutMs = 120_000) {
       settled = true; clearTimeout(timer);
       const meta = Buffer.concat(out);
       if (meta.length < 4) {
-        rejectPromise(new Error(`the child produced no reply (exit ${code}): ${Buffer.concat(err).toString("utf8").slice(-800)}`));
+        // The tail is a stack trace; the line that names the failure comes first. Report
+        // that line ahead of a bounded tail, or the caller sees "package_json_reader" and
+        // not "Cannot find package 'tsx'".
+        rejectPromise(new Error(`the child produced no reply (exit ${code}): ${describeChildFailure(Buffer.concat(err).toString("utf8"))}`));
         return;
       }
       const metaLength = meta.readUInt32BE(0);
@@ -255,61 +305,50 @@ scenario("an Arabic value renders through the artifact's canvas and font", async
 });
 
 scenario("the production runner executes the child inside the artifact", async ({ root }) => {
-  // This is the strongest of the checks: it imports the artifact's **own**
-  // `form-worker.ts` and calls `processPdfBounded()` / `fillPdfBounded()`, so the real
-  // `childEntry()` resolution, the real `childLaunch()` argument list, the real framing
-  // and the real decoder all run. A hand-rolled spawn could agree with production by
-  // coincidence; this cannot.
+  // The strongest of the checks: it imports the artifact's **own** `form-worker.ts` and
+  // calls `processPdfBounded()` / `fillPdfBounded()`, so the real `childEntry()`
+  // resolution, the real `childLaunch()` argument list, the real framing and the real
+  // decoder all run. A hand-rolled spawn could agree with production by coincidence;
+  // this cannot.
   //
-  // Run as a subprocess with `cwd` = artifact root because `childLaunch()` spawns the
+  // R6.4: the module being executed is **shipped**, not written at test time. The
+  // previous version composed it into the artifact root, which worked in a checkout and
+  // failed inside the production worker image with
+  //
+  //   EROFS: read-only file system, open '/app/dip-smoke-runner-….mjs'
+  //
+  // The image's read-only root filesystem is intentional security configuration, so the
+  // harness adapts rather than the container. Nothing is written anywhere: the packaged
+  // module is executed in place, from the artifact, under the same `--import` preloads
+  // and the same working directory that production uses.
+  const runner = join(root, RUNNER_MODULE);
+  if (!existsSync(runner)) throw new Error(`${RUNNER_MODULE} is missing from ${root}; the launcher cannot be exercised`);
+  const launcher = join(root, "src/lib/pdf/form-worker.ts");
+  if (!existsSync(launcher)) throw new Error(`the production launcher is missing from ${root}`);
+
+  // `cwd` = artifact root, exactly as production runs it: `childLaunch()` spawns the
   // child with `--import ./scripts/node-platform-compat.mjs`, a *relative* path resolved
-  // against the working directory. Production has cwd = the app root, so the harness
-  // must too, or it would be testing a different launch.
-  const runner = join(root, "src/lib/pdf/form-worker.ts");
-  if (!existsSync(runner)) throw new Error(`the production runner is missing from ${root}`);
-  // Written INSIDE the artifact: the script itself imports `pdf-lib`, and a file in
-  // `tmpdir()` would resolve that package from wherever the harness happens to run
-  // rather than from the artifact under test.
-  const script = join(root, `dip-smoke-runner-${process.pid}-${Math.random().toString(36).slice(2)}.mjs`);
-  writeFileSync(script, [
-    `const worker = await import(${JSON.stringify(pathToFileURL(runner).href)});`,
-    'const { PDFDocument } = await import("pdf-lib");',
-    'const doc = await PDFDocument.create();',
-    'const page = doc.addPage([595, 842]);',
-    'doc.getForm().createTextField("applicant.name").addToPage(page, { x: 72, y: 700, width: 328, height: 22 });',
-    'const input = new Uint8Array(await doc.save());',
-    'const limits = { ...worker.DEFAULT_WORKER_LIMITS, concurrency: 1 };',
-    'const inspected = await worker.processPdfBounded(input, limits);',
-    'if (inspected.ok !== true || inspected.pages !== 1) throw new Error("runner inspect failed: " + JSON.stringify(inspected));',
-    'const filled = await worker.fillPdfBounded(input, { "applicant.name": "Runner" }, { flatten: true }, limits);',
-    'if (!filled.bytes || !filled.bytes.byteLength) throw new Error("runner fill produced no bytes");',
-    'const reopened = await PDFDocument.load(filled.bytes);',
-    'if (reopened.getForm().getFields().length !== 0) throw new Error("runner flatten left a form");',
-    'if (reopened.getPageCount() !== 1) throw new Error("runner flatten changed the page count");',
-    'await worker.shutdownFormWorkers();',
-    'console.log("ok");',
-  ].join("\n"));
-  try {
-    await new Promise((resolvePromise, rejectPromise) => {
-      const child = spawn(process.execPath, ["--import", "./scripts/node-platform-compat.mjs", "--import", "tsx", script], {
-        cwd: root,
-        shell: false,
-        stdio: ["ignore", "pipe", "pipe"],
-        env: { PATH: process.env.PATH ?? "", NODE_ENV: "production" },
-      });
-      const err = [];
-      child.stdout.on("data", () => {});
-      child.stderr.on("data", (chunk) => err.push(chunk));
-      child.on("error", rejectPromise);
-      child.on("close", (code) => {
-        if (code === 0) resolvePromise(undefined);
-        else rejectPromise(new Error(`the production runner could not execute the child: ${Buffer.concat(err).toString("utf8").slice(0, 1200)}`));
-      });
+  // against the working directory. A relocated copy has no ancestor `node_modules`, so
+  // `tsx`, `esbuild`, `pdf-lib` and the canvas addon must all come from the artifact.
+  await new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn(process.execPath, ["--import", "./scripts/node-platform-compat.mjs", "--import", "tsx", runner], {
+      cwd: root,
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { PATH: process.env.PATH ?? "", NODE_ENV: "production" },
     });
-  } finally {
-    rmSync(script, { force: true });
-  }
-  return "runner ok (real childEntry + childLaunch + decode; inspect and flatten fill)";
+    const err = [];
+    const out = [];
+    child.stdout.on("data", (chunk) => out.push(chunk));
+    child.stderr.on("data", (chunk) => err.push(chunk));
+    child.on("error", rejectPromise);
+    child.on("close", (code) => {
+      if (code === 0 && Buffer.concat(out).toString("utf8").includes("ok")) return resolvePromise(undefined);
+      const diagnostic = sanitize(Buffer.concat(err).toString("utf8"));
+      rejectPromise(new Error(`the production runner could not execute the child (exit ${code}): ${diagnostic}`));
+    });
+  });
+  return "runner ok (shipped module, real childEntry + childLaunch + decode; inspect and flatten fill)";
 });
 
 scenario("the artifact's protocol module loads and round-trips a frame", async ({ root }) => {
@@ -386,7 +425,42 @@ export function isolateArtifact(root) {
   return isolated;
 }
 
+/**
+ * Fail if the relocated copy contains a symlink that leaves it.
+ *
+ * The point of relocating is that *nothing* the artifact needs may come from outside it.
+ * A symlink to the checkout — pnpm-style `node_modules` layouts, or a stray link in a
+ * traced tree — would silently restore that fallback: the scenarios would pass while the
+ * shipped artifact was still incomplete. `verbatimSymlinks` copies links as links rather
+ * than dereferencing them, so this check sees what the artifact actually ships.
+ */
+export function findEscapingSymlinks(root) {
+  const escaping = [];
+  const walk = (directory) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const full = join(directory, entry.name);
+      if (entry.isSymbolicLink()) {
+        const target = realpathSync(full);
+        if (!target.startsWith(root + sep) && target !== root) escaping.push(`${full} -> ${target}`);
+      } else if (entry.isDirectory()) {
+        walk(full);
+      }
+    }
+  };
+  walk(root);
+  return escaping;
+}
+
 const root = resolve(process.argv[2] ?? process.cwd());
+
+/** Wall-clock ceiling for the whole suite, so a wedged child cannot hang CI. */
+const SUITE_TIMEOUT_MS = Number(process.env.SMOKE_TIMEOUT_MS ?? 600_000);
+const suiteTimer = setTimeout(() => {
+  console.error(`\nArtifact smoke timed out after ${SUITE_TIMEOUT_MS}ms. A scenario did not return;`);
+  console.error("the child it spawned may be wedged rather than slow.");
+  process.exit(1);
+}, SUITE_TIMEOUT_MS);
+suiteTimer.unref();
 
 // The scenario list runs only when this file is executed directly. Importing it (a
 // test, or a future caller) must not spawn children or exit the process.
@@ -397,12 +471,28 @@ if (invokedDirectly) {
   // outside the repository; it is not used by CI.
   const inPlace = process.argv.includes("--in-place");
   const artifactRoot = inPlace ? root : isolateArtifact(root);
+  // The relocated copy is a full artifact (megabytes, sometimes hundreds of them). Leaving
+  // it behind leaks disk on every CI run, so it is removed whether the suite passes or
+  // fails; `--in-place` copies nothing and therefore cleans nothing.
+  if (!inPlace) {
+    process.on("exit", () => rmSync(artifactRoot, { recursive: true, force: true }));
+  }
+  if (!inPlace) {
+    const escaping = findEscapingSymlinks(artifactRoot);
+    if (escaping.length) {
+      console.error("The artifact contains symlinks that resolve outside it, so the isolation");
+      console.error("this run claims would be false. Missing packages would be satisfied from");
+      console.error("their targets instead of from the artifact:");
+      for (const link of escaping.slice(0, 10)) console.error(`  - ${link}`);
+      process.exit(1);
+    }
+  }
   const entry = findEntry(artifactRoot);
   if (!entry) {
     console.error(`No PDF worker child entry found under ${artifactRoot}. Searched: ${SEARCH_ROOTS.join(", ")}`);
     process.exit(1);
   }
-  console.log(`Artifact root: ${root}`);
+  console.log(`Artifact root: ${sanitize(root, null)}`);
   if (!inPlace) console.log(`Executing from: ${artifactRoot} (isolated from the checkout)`);
   console.log(`Child entry:   ${entry}`);
 
@@ -413,7 +503,7 @@ if (invokedDirectly) {
       console.log(`  PASS  ${name} — ${detail}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      console.log(`  FAIL  ${name} — ${message}`);
+      console.log(`  FAIL  ${name} — ${sanitize(message, artifactRoot)}`);
       failures.push(name);
     }
   }

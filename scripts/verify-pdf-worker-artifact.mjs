@@ -52,15 +52,47 @@ export const REQUIRED_PDF_WORKER_FILES = [
   // invisible to a source-file check alone. (Written without quoting a specifier so a
   // list-scraping test cannot mistake this comment for a declared file.)
   "tsconfig.json",
+  // R6.4: the launcher itself. The production-runner smoke scenario imports this file from
+  // the artifact and calls the real bounded API, so it is a runtime requirement in its own
+  // right — not merely something a route happens to import. It is declared in the tracing
+  // list; a source-file check that omitted it would pass an artifact in which the runner
+  // could not be exercised at all.
+  "src/lib/pdf/form-worker.ts",
 ];
 
 /** Non-source assets the child needs at runtime. */
 export const REQUIRED_PDF_WORKER_ASSETS = [
+  // R6.4: the production launcher is `node --import node-platform-compat --import tsx`.
+  // `tsx` is loaded by `--import`, so nothing imports it statically and Next's tracer
+  // cannot see it. Without these three the child cannot start *at all* — the standalone
+  // artifact previously shipped none of them, which is what failed CI with
+  // "Cannot find package 'tsx' imported from /tmp/dip-artifact-…".
+  "node_modules/tsx/package.json",
+  "node_modules/tsx/dist/cli.mjs",
+  "node_modules/esbuild/package.json",
+  // esbuild spawns the platform binary resolved from its optional dependency; with the
+  // package installed but the binary absent it reports "no native binary executable".
+  "node_modules/@esbuild/linux-x64/bin/esbuild",
   // The Arabic appearance path rasterises with a native canvas and a bundled font.
   "node_modules/@napi-rs/canvas/package.json",
+  "node_modules/@napi-rs/canvas-linux-x64-gnu/package.json",
   "node_modules/@fontsource/noto-sans-arabic/package.json",
-  "node_modules/tsx/package.json",
+  // `pdf-lib` is imported by the child and by the runner's verification of its output.
+  "node_modules/pdf-lib/package.json",
+  "node_modules/@pdf-lib/standard-fonts/package.json",
+  "node_modules/@pdf-lib/upng/package.json",
+  "node_modules/pako/package.json",
 ];
+
+/**
+ * Assets that must additionally be *executable*.
+ *
+ * `esbuild` is a native binary that tsx spawns. A copy that loses its mode bits — a
+ * naive archive, a `COPY` from a Windows filesystem, or a tar without permissions —
+ * leaves every file present and the artifact dead. Presence checks alone cannot see
+ * that, so this is asserted separately.
+ */
+export const REQUIRED_PDF_WORKER_EXECUTABLES = ["node_modules/@esbuild/linux-x64/bin/esbuild"];
 
 /** Roots the launcher searches, in its order. */
 const SEARCH_ROOTS = ["", "src/lib/pdf", ".next/standalone"];
@@ -74,6 +106,14 @@ function missingIn(root) {
     const candidates = SEARCH_ROOTS.map((prefix) => join(root, prefix, relative));
     const found = candidates.some((candidate) => existsSync(candidate) && statSync(candidate).isFile());
     if (!found) missing.push(relative);
+  }
+  for (const relative of REQUIRED_PDF_WORKER_EXECUTABLES) {
+    const candidates = SEARCH_ROOTS.map((prefix) => join(root, prefix, relative));
+    const executable = candidates.some((candidate) => {
+      if (!existsSync(candidate)) return false;
+      return (statSync(candidate).mode & 0o111) !== 0;
+    });
+    if (!executable) missing.push(`${relative} (present, but not executable)`);
   }
   return missing;
 }
