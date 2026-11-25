@@ -22,12 +22,12 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { PDFDocument } from "pdf-lib";
+import { PDFDocument, PDFName, PDFString } from "pdf-lib";
 import { createToolJob } from "../src/lib/jobs/orchestrator";
 import { setMalwareScannerForTests } from "../src/lib/malware";
 import { setStorageForTests, type ObjectStorage } from "../src/lib/storage";
 import { setTenantClientForTests } from "../src/lib/db/tenant";
-import { activeFormWorkers, resetFormWorkersForTest } from "../src/lib/pdf/form-worker";
+import { DEFAULT_WORKER_LIMITS, activeFormWorkers, processPdfBounded, resetFormWorkersForTest } from "../src/lib/pdf/form-worker";
 
 /**
  * The generated Prisma client is a precondition of importing the orchestrator at all:
@@ -57,7 +57,7 @@ async function requirePrismaClient(context: { skip: (message?: string) => void }
 import type { MalwareScanner, MalwareScanResultCode } from "../src/lib/malware/types";
 
 /** Counts every collaborator the orchestrator can reach. */
-type Observed = { scans: number; puts: number; transactions: number; childRuns: number };
+type Observed = { scans: number; puts: number; transactions: number };
 
 function recordingScanner(result: MalwareScanResultCode, observed: Observed): MalwareScanner {
   return {
@@ -129,7 +129,7 @@ function txDouble(observed: Observed) {
 }
 
 function observedCounters(): Observed {
-  return { scans: 0, puts: 0, transactions: 0, childRuns: 0 };
+  return { scans: 0, puts: 0, transactions: 0 };
 }
 
 async function realPdf(pages = 1) {
@@ -284,7 +284,24 @@ test("a PDF with no AcroForm fields is refused before billing, storage, job and 
       },
     );
     assert.equal(observed.scans, 1, "a clean document must still be screened exactly once");
-    assert.equal(observed.childRuns + activeFormWorkers(), 1, "the document must be inspected exactly once");
+    // The R6.5 version wrote `observed.childRuns + activeFormWorkers() === 1`. Both halves
+    // were wrong: `childRuns` was never incremented anywhere, and `activeFormWorkers()` is
+    // *current occupancy*, which is 0 once the child has exited — always, by the time this
+    // runs. It passed locally only because the assertion it replaced was never exercised
+    // with a generated client. No exact invocation count is observable here, so none is
+    // claimed.
+    //
+    // What is observable, and what actually establishes the boundary: `FORM_NOT_FOUND` is
+    // raised in exactly one place — `assertFillableDocument` — which the admission gate
+    // reaches only *after* `processPdfBounded` returns a real inventory. No in-process parse
+    // can produce it. It is in the `FORM_FILL_ERROR_CODES` allowlist, so a child *could* in
+    // principle return it, but the child raises it nowhere (verified: no occurrence in
+    // `form-worker-child`, `form-worker`, `form-fill` or `form-inspection`), and a malformed
+    // or crashed reply collapses to `FORM_UNSUPPORTED` with a `boundary` detail before it is
+    // ever forwarded. The rejection is therefore evidence that an inspection round-trip
+    // completed; the pool is asserted drained, not counted — no invocation count is
+    // observable here, so none is claimed.
+    assert.equal(activeFormWorkers(), 0, "the child must be retired by the time admission rejects");
     assert.equal(observed.puts, 0, "a form-less document must never be stored");
     assert.ok(observed.transactions <= 1, `at most the idempotency read, saw ${observed.transactions}`);
   } finally { uninstall(); }
@@ -299,13 +316,35 @@ test("duplicate field names are refused at admission, not only in the worker", a
     // empty-only check would admit this even though the values cannot be addressed
     // unambiguously. `assertFillableDocument` rejects it (FORM_UNSUPPORTED) — the same
     // contract the fill engine applies — so the two boundaries cannot disagree.
+    //
+    // pdf-lib **refuses** a second field with the same name through its API
+    // ("A field already exists with the specified name"), so the fixture cannot be built
+    // that way: the R6.5 version threw before reaching the orchestrator at all. The second
+    // field is therefore created under a distinct name and then renamed in the AcroForm
+    // dictionary — the same technique, and the same shape a hostile or legacy generator
+    // produces, as the existing `fill-forms.runtime` fixture for this restriction.
+    //
+    // The names are deliberately **flat**. Dotted names create a field *hierarchy* in
+    // pdf-lib: a twin created as `applicant.name-twin` beside an existing
+    // `applicant.name` becomes its child and resolves to `applicant.applicant.name`, so
+    // the duplicate never materialises and the fixture silently proves nothing.
     const document = await PDFDocument.create();
     const page = document.addPage([200, 200]);
-    document.getForm().createTextField("applicant.name").addToPage(page, { x: 10, y: 10, width: 80, height: 20 });
-    document.getForm().createTextField("applicant.name").addToPage(page, { x: 10, y: 50, width: 80, height: 20 });
+    const form = document.getForm();
+    form.createTextField("dup").addToPage(page, { x: 10, y: 10, width: 80, height: 20 });
+    const twin = form.createTextField("dup-twin");
+    twin.addToPage(page, { x: 10, y: 50, width: 80, height: 20 });
+    twin.acroField.dict.set(PDFName.of("T"), PDFString.of("dup"));
     const duplicated = new Uint8Array(await document.save({ updateFieldAppearances: false }));
+
+    // Prove the fixture *is* what the test needs before asserting anything about admission:
+    // a fixture that quietly produced one field would make the refusal below prove nothing.
+    const inspected = await processPdfBounded(duplicated, { ...DEFAULT_WORKER_LIMITS, concurrency: 1 });
+    assert.equal(inspected.ok, true, "the fixture must be structurally inspectable");
+    assert.deepEqual(inspected.inventory?.duplicates, ["dup"],
+      "the bounded inspector must detect the duplicate the fixture encodes");
     await assert.rejects(
-      () => createToolJob({ userId: USER, toolId: "fill-forms", uploads: [{ filename: "dup.pdf", mimeType: "application/pdf", bytes: duplicated }], fields: { "applicant.name": "x" }, idempotencyKey: "r65-duplicate" }),
+      () => createToolJob({ userId: USER, toolId: "fill-forms", uploads: [{ filename: "dup.pdf", mimeType: "application/pdf", bytes: duplicated }], fields: { dup: "x" }, idempotencyKey: "r65-duplicate" }),
       (error: unknown) => {
         assert.equal((error as { code?: string }).code, "FORM_UNSUPPORTED", "duplicates must be refused as FORM_UNSUPPORTED");
         return true;

@@ -87,13 +87,16 @@ async function formlessPdf() {
  * database is tolerable, but a silent one hides a schema change that will break the next
  * run.
  */
-async function removeFixtureTenant(userId: string, options: { storage?: { deleteObject(key: string): Promise<void> } } = {}) {
+async function removeFixtureTenant(userId: string, options: { storage?: { deleteObject(key: string): Promise<void> }; organizations?: string[] } = {}) {
   const { db } = await import("../src/lib/db/index");
-  // Explicit types: without a generated Prisma client these queries infer `{}`, and the
-  // annotations keep that pre-existing environment gap from adding avoidable errors here.
-  const files = await db.file.findMany({ where: { document: { userId } }, select: { storageKey: true } }) as Array<{ storageKey: string }>;
+  // Types annotate only the *shape the generator does not produce*, not the client itself:
+  // the query, its result and the transaction callback are all inferred from `db`. The
+  // R6.5 version hand-declared the callback parameter as a `Record`, which is not
+  // assignable to `Prisma.TransactionClient` — `TS2769: No overload matches this call`
+  // in CI, where the client is actually generated.
+  const files = await db.file.findMany({ where: { document: { userId } }, select: { storageKey: true } });
   if (options.storage) {
-    await Promise.all(files.map((file: { storageKey: string }) => options.storage!.deleteObject(file.storageKey).catch((error: unknown) => {
+    await Promise.all(files.map((file) => options.storage!.deleteObject(file.storageKey).catch((error: unknown) => {
       throw new Error(`fixture storage cleanup failed for ${file.storageKey}: ${String(error)}`);
     })));
   }
@@ -102,7 +105,7 @@ async function removeFixtureTenant(userId: string, options: { storage?: { delete
   // `Job.inputFile/outputFile`, `AuditLog.organization` — and a few carry `Restrict`
   // (`Workflow.owner`, `AgentRun.owner`, `ApiClient.createdByUser`). Deleting the user first
   // is what produced `documents_user_id_fkey`.
-  await db.$transaction(async (tx: Record<string, { deleteMany: (args: unknown) => Promise<unknown>; findMany: (args: unknown) => Promise<unknown>; delete: (args: unknown) => Promise<unknown> }>) => {
+  await db.$transaction(async (tx) => {
     // Job rows reference files, so they go first.
     await tx.job.deleteMany({ where: { requesterId: userId } });
     await tx.file.deleteMany({ where: { document: { userId } } });
@@ -115,10 +118,13 @@ async function removeFixtureTenant(userId: string, options: { storage?: { delete
     await tx.workflow.deleteMany({ where: { ownerId: userId } });
     await tx.agentRun.deleteMany({ where: { ownerId: userId } });
     await tx.apiClient.deleteMany({ where: { createdByUserId: userId } });
-    // Organization-owned rows. `createOrganization` writes an audit entry, and `AuditLog`
-    // references `Organization` without a cascade, so it must be removed first.
-    const organizations = await tx.organization.findMany({ where: { memberships: { some: { userId } } }, select: { id: true } }) as Array<{ id: string }>;
-    const organizationIds = organizations.map((organization: { id: string }) => organization.id);
+    // Only organizations this fixture *created*, passed in explicitly. Inferring them from
+    // "the user is a member" would make the cleanup delete a shared organization the user
+    // was merely added to — a fixture is not entitled to remove state it did not create.
+    //
+    // `createOrganization` writes an audit entry, and `AuditLog` references `Organization`
+    // without a cascade, so it must be removed first.
+    const organizationIds = options.organizations ?? [];
     if (organizationIds.length) {
       await tx.auditLog.deleteMany({ where: { organizationId: { in: organizationIds } } });
       await tx.membership.deleteMany({ where: { organizationId: { in: organizationIds } } });
@@ -228,7 +234,9 @@ integration("R6.3-3: authenticated Public API submission is accepted for fill-fo
     assert.equal(input.pageCount, 1, "the API path must persist the authoritative page count too");
     assert.ok(jobId);
   } finally {
-    await removeFixtureTenant(userId, { storage: getStorage() });
+    // The organization was created by this fixture, so it is named explicitly. Nothing is
+    // deleted on the basis of membership.
+    await removeFixtureTenant(userId, { storage: getStorage(), organizations: [organization.id] });
   }
 });
 
