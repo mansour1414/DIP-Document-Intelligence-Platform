@@ -45,10 +45,12 @@ const PDF_WORKER_TRACING = [
  *
  *   - `tsx` is loaded by `--import`, so nothing imports it statically.
  *   - `esbuild` is a dependency of `tsx`, loaded from `node_modules` at run time.
- *   - `@esbuild/linux-x64` is the platform binary esbuild spawns; without it esbuild
- *     reports "no native binary executable".
+ *   - `@esbuild/linux-<cpu>` is the platform binary esbuild spawns; without it esbuild
+ *     reports "no native binary executable". esbuild publishes one *static*,
+ *     libc-independent binary per CPU, so there is no musl variant and none is listed.
  *   - `@napi-rs/canvas` is a *runtime `require`* (deliberately, so no route bundles the
- *     addon), and `@napi-rs/canvas-linux-x64-gnu` is its platform binary.
+ *     addon), and `@napi-rs/canvas-linux-<cpu>-<libc>` is its platform binary. Unlike
+ *     esbuild this one is libc-specific: a glibc build cannot load on Alpine.
  *   - `@fontsource/noto-sans-arabic` is resolved through `require.resolve` at render
  *     time; only the Arabic appearance path exercises it.
  *
@@ -59,13 +61,40 @@ const PDF_WORKER_TRACING = [
 const PDF_WORKER_RUNTIME_PACKAGES = [
   "./node_modules/tsx/**/*",
   "./node_modules/esbuild/**/*",
+  // R7C: native packages are listed for **every supported target**, not for the
+  // build machine. They were x64-only, which is why an ARM64 worker image could
+  // not build and an emitted ARM64 standalone artifact shipped without its own
+  // natives. Next evaluates this config on the *build* host, so a computed
+  // `process.arch` here would bake that host's CPU into an artifact that may be
+  // built for another one — and a cross-build (the usual `docker buildx --platform`
+  // case) would then trace the wrong packages silently.
+  //
+  // The globs are harmless when a package is absent: a source image only installs
+  // the platform optional dependency matching its own libc/CPU, and Next skips a
+  // glob that matches nothing. The artifact verifier is what turns "the right one
+  // is missing" into a failure, and it checks the target it is told to check.
+  //
+  // The two axes are independent, which is why this is not four symmetric rows:
+  // esbuild ships one static libc-independent binary per CPU, while canvas ships
+  // real gnu/musl builds. Enumerated below so the matrix is auditable rather than
+  // inferred.
+  //
+  //   CPU x libc      esbuild            canvas
+  //   x64 / glibc     linux-x64          linux-x64-gnu
+  //   x64 / musl      linux-x64          linux-x64-musl
+  //   arm64 / glibc   linux-arm64        linux-arm64-gnu
+  //   arm64 / musl    linux-arm64        linux-arm64-musl
   "./node_modules/@esbuild/linux-x64/**/*",
+  "./node_modules/@esbuild/linux-arm64/**/*",
+  "./node_modules/@napi-rs/canvas-linux-x64-gnu/**/*",
+  "./node_modules/@napi-rs/canvas-linux-x64-musl/**/*",
+  "./node_modules/@napi-rs/canvas-linux-arm64-gnu/**/*",
+  "./node_modules/@napi-rs/canvas-linux-arm64-musl/**/*",
   "./node_modules/pdf-lib/**/*",
   "./node_modules/@pdf-lib/standard-fonts/**/*",
   "./node_modules/@pdf-lib/upng/**/*",
   "./node_modules/pako/**/*",
   "./node_modules/@napi-rs/canvas/**/*",
-  "./node_modules/@napi-rs/canvas-linux-x64-gnu/**/*",
   "./node_modules/@fontsource/noto-sans-arabic/**/*",
 ] as const;
 

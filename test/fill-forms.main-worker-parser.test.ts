@@ -174,14 +174,40 @@ test("the traced file list and the artifact verifier cannot drift apart", async 
   const packages = [...packagesBlock.matchAll(/"\.\/node_modules\/([^/"]+)(?:\/([^/"]+))?\/\*\*\/\*"/gu)]
     .map((match) => (match[2] && match[1].startsWith("@") ? `${match[1]}/${match[2]}` : match[1]));
   assert.ok(packages.length >= 10, `the runtime package list looks truncated: ${packages.join(", ")}`);
-  // Scoped to the *assets* array: comments elsewhere in the verifier quote package names
-  // (failure messages), and a whole-file scrape would treat those as declarations.
+  // R7C: the native packages are no longer literal strings in the verifier — they are
+  // derived per target from `scripts/pdf-worker-platform.mjs`, because a literal list was
+  // correct on x64 and silently wrong on ARM64. So the agreement is asserted against that
+  // module instead of against a hardcoded array in each file: every native package the
+  // build traces must be one the verifier can demand, for every supported target.
+  const platform = await import("../scripts/pdf-worker-platform.mjs") as {
+    supportedPlatformMatrix: () => Array<{ cpu: string; libc: string; esbuild: string; canvas: string }>;
+    platformArtifactPaths: (target: { cpu: string; libc: string }) => { files: string[] };
+  };
+  const runtimePackages = new Set(packages);
+  for (const combination of platform.supportedPlatformMatrix()) {
+    // The build must trace it...
+    assert.ok(runtimePackages.has(combination.esbuild),
+      `${combination.cpu}/${combination.libc} needs ${combination.esbuild}, which the build does not trace`);
+    assert.ok(runtimePackages.has(combination.canvas),
+      `${combination.cpu}/${combination.libc} needs ${combination.canvas}, which the build does not trace`);
+    // ...and the verifier must demand it, including the esbuild *binary* rather than the
+    // package metadata: with the package present and the binary absent, esbuild reports
+    // "no native binary executable" and every job fails.
+    const required = platform.platformArtifactPaths({ cpu: combination.cpu, libc: combination.libc }).files;
+    assert.ok(required.includes(`node_modules/${combination.esbuild}/bin/esbuild`),
+      `the verifier must check the ${combination.cpu} esbuild binary`);
+    assert.ok(required.includes(`node_modules/${combination.canvas}/package.json`),
+      `the verifier must check the ${combination.cpu}/${combination.libc} canvas package`);
+  }
+  // Non-native packages keep the original literal agreement: they have no platform axis,
+  // so a plain string scrape is still exactly the right check for them.
+  const NATIVE = /^(@esbuild\/|@napi-rs\/canvas-linux-)/u;
   const assetsBlock = verifier.slice(
     verifier.indexOf("export const REQUIRED_PDF_WORKER_ASSETS = ["),
     verifier.indexOf("];", verifier.indexOf("export const REQUIRED_PDF_WORKER_ASSETS = [")),
   );
   const assets = [...assetsBlock.matchAll(/"([^"]+)"/gu)].map((match) => match[1]);
-  for (const name of packages) {
+  for (const name of packages.filter((entry) => !NATIVE.test(entry))) {
     assert.ok(assets.some((file) => file.startsWith(`node_modules/${name}/`)),
       `${name} is packaged but the verifier never checks for it`);
   }

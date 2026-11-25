@@ -66,6 +66,10 @@ COPY --chown=dipworker:dipworker scripts/node-platform-compat.mjs ./scripts/node
 # The child is launched with `tsx` and `--import ./scripts/node-platform-compat.mjs`;
 # neither is visible to a bundler, so nothing except this check would notice their
 # absence until the first Fill Forms job failed in production.
+# R7C: the verifier selects native packages per target, so it needs the selection module
+# beside it. Three small, dependency-free ESM files.
+COPY --chown=dipworker:dipworker scripts/pdf-worker-platform.mjs ./scripts/pdf-worker-platform.mjs
+COPY --chown=dipworker:dipworker scripts/write-pdf-worker-target.mjs ./scripts/write-pdf-worker-target.mjs
 COPY --chown=dipworker:dipworker scripts/verify-pdf-worker-artifact.mjs ./scripts/verify-pdf-worker-artifact.mjs
 
 # B31-04: presence is necessary and not sufficient. This script *runs* the child inside
@@ -81,7 +85,15 @@ COPY --chown=dipworker:dipworker scripts/smoke-pdf-worker-artifact.mjs ./scripts
 # configuration intact instead of trading one for the other.
 COPY --chown=dipworker:dipworker scripts/pdf-worker-runner-smoke.ts ./scripts/pdf-worker-runner-smoke.ts
 
-RUN node scripts/verify-pdf-worker-artifact.mjs /app \
+# R7C: the native packages are selected per target now, so the check must state which
+# target it is checking. When the image is built for another CPU (`docker buildx
+# --platform`) the verifier would otherwise default to the *builder's* architecture and
+# report a foreign artifact complete while its own natives were missing — the ARM64
+# defect. TARGETARCH is BuildKit's own value for the *output* platform. The image is
+# Debian bookworm, so libc is always glibc here; TARGETVARIANT is irrelevant.
+ARG TARGETARCH
+RUN node scripts/write-pdf-worker-target.mjs --root /app --libc glibc \
+ && node scripts/verify-pdf-worker-artifact.mjs /app \
  && node scripts/smoke-pdf-worker-artifact.mjs /app --in-place \
  && python3 scripts/verify-ocr-runtime.py \
  && soffice --version \
