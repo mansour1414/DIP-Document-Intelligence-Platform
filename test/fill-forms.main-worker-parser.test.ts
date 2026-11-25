@@ -219,3 +219,49 @@ test("a page-count change in the actual output is rejected, not reported as succ
     writeFileSync(path, original);
   }
 });
+
+test("R6.3: the child's dependency closure contains no application infrastructure", async () => {
+  // The standalone failure this guards against was not a missing file: it was an
+  // *orphaned import*. `form-inspection.ts` exported `admitFormInspection()`, which
+  // pulled `@/lib/queue` → `ioredis`/`bullmq` into a PDF parser that has no use for
+  // either. Nothing failed in the repository, because the repository has every package
+  // installed; the standalone tree — which only contains what is actually needed —
+  // failed at the first Fill Forms job.
+  //
+  // The admission that caused it was the superseded non-atomic v1 counter, superseded by
+  // the atomic lease in `src/lib/http/inspection-lease.ts`. This test pins both facts:
+  // the child's closure is infrastructure-free, and document processing never reaches
+  // the queue module.
+  const childFiles = [
+    "src/lib/pdf/form-worker-child.ts",
+    "src/lib/pdf/worker-protocol.ts",
+    "src/lib/pdf/form-types.ts",
+    "src/lib/pdf/form-schema.ts",
+    "src/lib/pdf/form-validation.ts",
+    "src/lib/pdf/form-inspection.ts",
+    "src/lib/pdf/form-fill.ts",
+    "src/lib/pdf/form-appearance.ts",
+  ];
+  const infrastructure = /from\s+["'](?:@\/lib\/(?:queue|db|storage|billing|usage|auth|retention|observability)|ioredis|bullmq|@aws-sdk\/[^"']*|@prisma\/[^"']*)["']/u;
+  for (const file of childFiles) {
+    const source = readFileSync(new URL(`../${file}`, import.meta.url), "utf8");
+    assert.doesNotMatch(source, infrastructure, `${file} must not import application infrastructure`);
+  }
+  // The queue module is the specific edge that failed, so assert it directly.
+  //
+  // Matched as an *import specifier*, not as a bare substring: the module's docblock
+  // explains this history and names the queue module in prose. A substring match would
+  // forbid documenting the fix, which is exactly what the first version of this test did.
+  const inspection = readFileSync(new URL("../src/lib/pdf/form-inspection.ts", import.meta.url), "utf8");
+  assert.doesNotMatch(inspection, /from\s+["']@\/lib\/queue["']/u, "document inspection must not import the queue");
+  // And the removed admission must stay removed: it was dead (no callers) and
+  // non-atomic.
+  //
+  // Comments are stripped first. Every previous version of this assertion matched the
+  // module's own docblock — which necessarily explains the removal and names the
+  // function — so the test forbade documenting the very fix it protects. Asserting on
+  // code only is the correct scope.
+  const codeOnly = inspection
+    .replace(/\/\*[\s\S]*?\*\//gu, "")
+    .replace(/^\s*\/\/.*$/gmu, "");
+  assert.doesNotMatch(codeOnly, /admitFormInspection/u, "the superseded v1 admission must not return");});

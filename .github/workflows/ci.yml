@@ -322,7 +322,7 @@ jobs:
             --read-only \
             --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777 \
             --tmpfs /tmp/dip:rw,nosuid,nodev,noexec,size=256m,uid=10001,gid=10001,mode=0700 \
-            --entrypoint node dip-document-worker:release-a scripts/smoke-pdf-worker-artifact.mjs /app
+            --entrypoint node dip-document-worker:release-a scripts/smoke-pdf-worker-artifact.mjs /app --in-place
       - name: Verify qpdf security capabilities in the production worker
         run: |
           mkdir -p "$RUNNER_TEMP/qpdf-sbom"
@@ -607,6 +607,13 @@ jobs:
           # from the repository's: traced files land elsewhere and `@/` aliases resolve
           # through it. Running here proves the deployed layout can actually start the
           # child, which no file-presence check can establish.
+          #
+          # The script relocates `.next/standalone` to a temp directory before running
+          # it. That is not cosmetic: `.next/standalone` sits *inside* the checkout, so
+          # Node's resolution walk would satisfy any missing package from the checkout's
+          # own `node_modules` and the check could pass on an incomplete artifact. From
+          # an unrelated directory there is no fallback, so a package the artifact does
+          # not actually contain is a failure.
           node scripts/smoke-pdf-worker-artifact.mjs .next/standalone
           nohup node scripts/start-browser-e2e.mjs >/tmp/dip-release-b-web.log 2>&1 &
           echo $! >/tmp/dip-release-b-web.pid
@@ -658,6 +665,31 @@ jobs:
           CLAMD_HOST: 127.0.0.1
           CLAMD_PORT: "3310"
           API_KEY_PEPPER: release-b-ci-only-pepper
+      - name: Run Fill Forms acceptance through authenticated HTTP and the worker image
+        # R6.3: the artifact smoke script executes the child directly, which proves the
+        # artifact can run the child but says nothing about whether an authenticated
+        # request reaches it, whether plan enforcement sees the real page count, or
+        # whether the BullMQ worker image picks the job up. These are the six scenarios
+        # that only the running stack can answer. The worker container is already up in
+        # this job (`EXTERNAL_WORKER_E2E=1`), so jobs are claimed by the image rather
+        # than by an in-process worker.
+        run: node --import ./scripts/node-platform-compat.mjs --import tsx --test test/fill-forms.acceptance.e2e.test.ts
+        env:
+          FILL_FORMS_ACCEPTANCE_E2E: "1"
+          ACCEPTANCE_BASE_URL: http://127.0.0.1:3000
+          EXTERNAL_WORKER_E2E: "1"
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/dip_release_b
+          REDIS_URL: redis://127.0.0.1:6379
+          STORAGE_ENDPOINT: http://127.0.0.1:9000
+          STORAGE_BUCKET: dip-release-b
+          STORAGE_ACCESS_KEY: minioadmin
+          STORAGE_SECRET_KEY: minioadmin
+          STORAGE_REGION: us-east-1
+          CLAMD_HOST: 127.0.0.1
+          CLAMD_PORT: "3310"
+          AUTH_SECRET: release-b-ci-only-secret
+          API_KEY_PEPPER: release-b-ci-only-pepper
+          PHASE1_SECRET_ENCRYPTION_KEY: MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
       - name: Stop standalone Public API cleanly
         if: always()
         run: |

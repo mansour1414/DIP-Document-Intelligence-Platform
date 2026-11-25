@@ -17,7 +17,6 @@ const PDF_WORKER_TRACING = [
   "./src/lib/pdf/form-inspection.ts",
   "./src/lib/pdf/form-fill.ts",
   "./src/lib/pdf/form-appearance.ts",
-  "./src/lib/runtime/config.ts",
   "./scripts/node-platform-compat.mjs",
 ] as const;
 

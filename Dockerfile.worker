@@ -76,7 +76,7 @@ COPY --chown=dipworker:dipworker scripts/verify-pdf-worker-artifact.mjs ./script
 COPY --chown=dipworker:dipworker scripts/smoke-pdf-worker-artifact.mjs ./scripts/smoke-pdf-worker-artifact.mjs
 
 RUN node scripts/verify-pdf-worker-artifact.mjs /app \
- && node scripts/smoke-pdf-worker-artifact.mjs /app \
+ && node scripts/smoke-pdf-worker-artifact.mjs /app --in-place \
  && python3 scripts/verify-ocr-runtime.py \
  && soffice --version \
  && qpdf --version \

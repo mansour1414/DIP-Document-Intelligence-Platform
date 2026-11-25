@@ -43,7 +43,6 @@ export const REQUIRED_PDF_WORKER_FILES = [
   "src/lib/pdf/form-inspection.ts",
   "src/lib/pdf/form-fill.ts",
   "src/lib/pdf/form-appearance.ts",
-  "src/lib/runtime/config.ts",
   "scripts/node-platform-compat.mjs",
   // R6.2: the launcher starts the child with `--import tsx`, and tsx resolves the `@/`
   // path alias from `tsconfig.json` in the child's working directory. It is a build

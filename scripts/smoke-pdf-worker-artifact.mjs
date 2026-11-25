@@ -31,7 +31,7 @@
  *   node scripts/smoke-pdf-worker-artifact.mjs [artifact-root]
  */
 import { spawn } from "node:child_process";
-import { existsSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
@@ -57,14 +57,10 @@ export function findEntry(root) {
 /**
  * A preload that teaches the child to resolve the `@/` alias without `tsconfig.json`.
  *
- * The child is launched with `tsx`, which reads `paths` from `tsconfig.json`. A Next
- * standalone tree does not contain that file — it is a build input, not build output —
- * so inside that artifact every `import "@/lib/..."` fails with MODULE_NOT_FOUND even
- * though the files are present. The worker image does ship `tsconfig.json`, and there
- * this preload is simply redundant.
- *
- * It is generated into a temp directory rather than committed: it exists only for the
- * duration of a smoke run and is not part of the shipped product.
+ * The child is launched with exactly the arguments the production launcher uses
+ * (`childLaunch()` in `src/lib/pdf/form-worker.ts`): `--import ./scripts/node-platform-compat.mjs`
+ * followed by `--import tsx`, and only `PATH`/`NODE_ENV` in the environment. Anything the
+ * real launcher supplies must come from the artifact itself; nothing is injected here.
  */
 const u32 = (value) => { const buffer = Buffer.alloc(4); buffer.writeUInt32BE(value, 0); return buffer; };
 
@@ -83,7 +79,10 @@ function runChild(entry, control, pdf, root, timeoutMs = 120_000) {
     // `--import tsx` and its `node_modules` relative to the working directory, so
     // inheriting the caller's would silently test a different installation, or in CI the
     // checkout instead of the built image.
-    const child = spawn(process.execPath, ["--import", "tsx", entry], {
+    // Identical to `childLaunch()`. `node-platform-compat.mjs` is a production
+    // preload (it repairs `geteuid` on locked-down Windows runners); omitting it here
+    // would make the smoke test exercise a launch contract the product never uses.
+    const child = spawn(process.execPath, ["--import", "./scripts/node-platform-compat.mjs", "--import", "tsx", entry], {
       cwd: root,
       shell: false,
       stdio: ["pipe", "pipe", "pipe", "pipe"],
@@ -186,6 +185,12 @@ export function rawPageCount(pdf) {
  * product.
  */
 export async function buildFormPdf() {
+  // Resolved by the *harness*, from wherever the harness runs — not from the artifact.
+  // That is deliberate: the artifact's own `pdf-lib` is proven by the child scenarios
+  // themselves, because the child imports it from the artifact and cannot start without
+  // it. Using a separate copy here keeps fixture generation and output verification
+  // independent of the thing under test, so a broken artifact cannot also break (and
+  // thereby excuse) its own fixture.
   const { PDFDocument } = await import("pdf-lib");
   const document = await PDFDocument.create();
   const page = document.addPage([595, 842]);
@@ -249,6 +254,64 @@ scenario("an Arabic value renders through the artifact's canvas and font", async
   return "Arabic ok (value preserved through the appearance path)";
 });
 
+scenario("the production runner executes the child inside the artifact", async ({ root }) => {
+  // This is the strongest of the checks: it imports the artifact's **own**
+  // `form-worker.ts` and calls `processPdfBounded()` / `fillPdfBounded()`, so the real
+  // `childEntry()` resolution, the real `childLaunch()` argument list, the real framing
+  // and the real decoder all run. A hand-rolled spawn could agree with production by
+  // coincidence; this cannot.
+  //
+  // Run as a subprocess with `cwd` = artifact root because `childLaunch()` spawns the
+  // child with `--import ./scripts/node-platform-compat.mjs`, a *relative* path resolved
+  // against the working directory. Production has cwd = the app root, so the harness
+  // must too, or it would be testing a different launch.
+  const runner = join(root, "src/lib/pdf/form-worker.ts");
+  if (!existsSync(runner)) throw new Error(`the production runner is missing from ${root}`);
+  // Written INSIDE the artifact: the script itself imports `pdf-lib`, and a file in
+  // `tmpdir()` would resolve that package from wherever the harness happens to run
+  // rather than from the artifact under test.
+  const script = join(root, `dip-smoke-runner-${process.pid}-${Math.random().toString(36).slice(2)}.mjs`);
+  writeFileSync(script, [
+    `const worker = await import(${JSON.stringify(pathToFileURL(runner).href)});`,
+    'const { PDFDocument } = await import("pdf-lib");',
+    'const doc = await PDFDocument.create();',
+    'const page = doc.addPage([595, 842]);',
+    'doc.getForm().createTextField("applicant.name").addToPage(page, { x: 72, y: 700, width: 328, height: 22 });',
+    'const input = new Uint8Array(await doc.save());',
+    'const limits = { ...worker.DEFAULT_WORKER_LIMITS, concurrency: 1 };',
+    'const inspected = await worker.processPdfBounded(input, limits);',
+    'if (inspected.ok !== true || inspected.pages !== 1) throw new Error("runner inspect failed: " + JSON.stringify(inspected));',
+    'const filled = await worker.fillPdfBounded(input, { "applicant.name": "Runner" }, { flatten: true }, limits);',
+    'if (!filled.bytes || !filled.bytes.byteLength) throw new Error("runner fill produced no bytes");',
+    'const reopened = await PDFDocument.load(filled.bytes);',
+    'if (reopened.getForm().getFields().length !== 0) throw new Error("runner flatten left a form");',
+    'if (reopened.getPageCount() !== 1) throw new Error("runner flatten changed the page count");',
+    'await worker.shutdownFormWorkers();',
+    'console.log("ok");',
+  ].join("\n"));
+  try {
+    await new Promise((resolvePromise, rejectPromise) => {
+      const child = spawn(process.execPath, ["--import", "./scripts/node-platform-compat.mjs", "--import", "tsx", script], {
+        cwd: root,
+        shell: false,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { PATH: process.env.PATH ?? "", NODE_ENV: "production" },
+      });
+      const err = [];
+      child.stdout.on("data", () => {});
+      child.stderr.on("data", (chunk) => err.push(chunk));
+      child.on("error", rejectPromise);
+      child.on("close", (code) => {
+        if (code === 0) resolvePromise(undefined);
+        else rejectPromise(new Error(`the production runner could not execute the child: ${Buffer.concat(err).toString("utf8").slice(0, 1200)}`));
+      });
+    });
+  } finally {
+    rmSync(script, { force: true });
+  }
+  return "runner ok (real childEntry + childLaunch + decode; inspect and flatten fill)";
+});
+
 scenario("the artifact's protocol module loads and round-trips a frame", async ({ root }) => {
   // Loaded in a subprocess because the alias environment must be in place before the
   // module graph loads. Nothing is injected: `tsconfig.json` is a *packaged* requirement
@@ -276,7 +339,7 @@ scenario("the artifact's protocol module loads and round-trips a frame", async (
   ].join("\n"));
   try {
     await new Promise((resolvePromise, rejectPromise) => {
-      const child = spawn(process.execPath, ["--import", "tsx", script], {
+      const child = spawn(process.execPath, ["--import", "./scripts/node-platform-compat.mjs", "--import", "tsx", script], {
         cwd: root,
         shell: false,
         stdio: ["ignore", "pipe", "pipe"],
@@ -297,24 +360,56 @@ scenario("the artifact's protocol module loads and round-trips a frame", async (
   return "protocol ok (encode + decode + packaged tsconfig)";
 });
 
+/**
+ * Execute the artifact from a directory outside the checkout's dependency ancestry.
+ *
+ * ## Why this exists
+ *
+ * Node resolves a bare specifier by walking `node_modules` up the directory chain. A
+ * Next standalone tree lives at `<repo>/.next/standalone`, so running it *in place* lets
+ * every missing package be satisfied by `<repo>/node_modules` — the very installation
+ * the artifact is supposed to replace. Verified directly: a file in
+ * `<repo>/.next/probe/` resolves `tsx` from `<repo>/node_modules`, while the same file
+ * in an unrelated temp directory fails with `ERR_MODULE_NOT_FOUND`.
+ *
+ * That makes an in-place smoke run unable to tell "the artifact is complete" from "the
+ * checkout was complete". Copying the artifact to a temp directory outside the checkout
+ * removes the fallback: nothing is added to the copy, so anything it cannot find is
+ * genuinely missing from the artifact.
+ *
+ * The copy is byte-identical — no dependencies are installed into it, no configuration
+ * is generated for it. It is the shipped artifact, moved.
+ */
+export function isolateArtifact(root) {
+  const isolated = mkdtempSync(join(tmpdir(), "dip-artifact-"));
+  cpSync(root, isolated, { recursive: true, verbatimSymlinks: true, dereference: false });
+  return isolated;
+}
+
 const root = resolve(process.argv[2] ?? process.cwd());
 
 // The scenario list runs only when this file is executed directly. Importing it (a
 // test, or a future caller) must not spawn children or exit the process.
 const invokedDirectly = Boolean(process.argv[1]) && import.meta.url === `file://${resolve(process.argv[1])}`;
 if (invokedDirectly) {
-  const entry = findEntry(root);
+  // Relocate before executing, so no scenario can be satisfied by the checkout's
+  // `node_modules`. `--in-place` exists only for running against a tree that is already
+  // outside the repository; it is not used by CI.
+  const inPlace = process.argv.includes("--in-place");
+  const artifactRoot = inPlace ? root : isolateArtifact(root);
+  const entry = findEntry(artifactRoot);
   if (!entry) {
-    console.error(`No PDF worker child entry found under ${root}. Searched: ${SEARCH_ROOTS.join(", ")}`);
+    console.error(`No PDF worker child entry found under ${artifactRoot}. Searched: ${SEARCH_ROOTS.join(", ")}`);
     process.exit(1);
   }
   console.log(`Artifact root: ${root}`);
+  if (!inPlace) console.log(`Executing from: ${artifactRoot} (isolated from the checkout)`);
   console.log(`Child entry:   ${entry}`);
 
   const failures = [];
   for (const { name, run } of scenarios) {
     try {
-      const detail = await run({ entry, root });
+      const detail = await run({ entry, root: artifactRoot });
       console.log(`  PASS  ${name} — ${detail}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -330,4 +425,7 @@ if (invokedDirectly) {
     process.exit(1);
   }
   console.log(`\nAll ${scenarios.length} artifact smoke scenarios passed.`);
+  if (!inPlace) {
+    console.log(`Executed from ${artifactRoot} with no access to the checkout's node_modules.`);
+  }
 }

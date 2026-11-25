@@ -18,9 +18,25 @@
  *
  * The probes below are unchanged in behaviour and are re-exported by
  * `form-fill.ts`, so the worker and the route still share one implementation.
+ *
+ * ## No admission here (R6.3)
+ *
+ * This module previously also exported `admitFormInspection()`, a Redis-backed
+ * per-tenant counter. It had no callers — the route uses the atomic lease in
+ * `src/lib/http/inspection-lease.ts` — but the import alone pulled `@/lib/queue`,
+ * `ioredis` and `bullmq` into the PDF child's dependency closure. The child is executed
+ * as a subprocess, so that edge was invisible in the repository (where every package is
+ * installed) and fatal in a standalone deployment, where the closure is only what is
+ * actually needed: four of five artifact smoke scenarios failed with MODULE_NOT_FOUND
+ * on `ioredis`.
+ *
+ * Admission is an HTTP concern: it must happen *before* a body byte is read, which is
+ * exactly where the route calls it. Nothing in this module should reach Redis, BullMQ,
+ * a database client, object storage or an auth helper. A test asserts this
+ * (`fill-forms.main-worker-parser`, "the child's dependency closure contains no
+ * application infrastructure").
  */
 import { PDFArray, PDFDict, PDFDocument, PDFName, PDFRef } from "pdf-lib";
-import { getReadyQueueConnection } from "@/lib/queue";
 import type { PDFObject } from "pdf-lib";
 import { readFormInventory, type FormInventory } from "@/lib/pdf/form-schema";
 import { FormFillError } from "@/lib/pdf/form-validation";
@@ -382,55 +398,6 @@ async function loadUnencryptedForInspection(bytes: Uint8Array) {
     if (/encrypted/iu.test(error instanceof Error ? error.message : "")) throw new FormFillError("FORM_RESTRICTED", FORM_ERROR_MESSAGES.FORM_RESTRICTED);
     throw new FormFillError("FORM_UNSUPPORTED", FORM_ERROR_MESSAGES.FORM_UNSUPPORTED);
   }
-}
-
-/**
- * Per-tenant inspection admission (FF-04).
- *
- * Two independent budgets, both enforced *before* a byte of the body is read:
- *
- *   - **rate**: requests per minute per tenant, so one caller cannot monopolise
- *     the parser pool;
- *   - **concurrency**: simultaneously open inspections per tenant, so N slow
- *     documents from one tenant cannot starve every other tenant.
- *
- * The concurrency budget is a counter with a short TTL rather than a mutex: the
- * TTL is the crash recovery. If a worker dies mid-inspection the counter expires
- * instead of wedging the tenant permanently.
- *
- * Both keys are scoped by tenant id only. Job ids are not available before the
- * body is parsed, and a per-request key would not bound anything.
- */
-const INSPECT_RATE_PER_MINUTE = 30;
-const INSPECT_CONCURRENCY = 4;
-const INSPECT_LEASE_SECONDS = 120;
-
-export type InspectAdmission = { release: () => Promise<void> };
-
-export async function admitFormInspection(tenantId: string): Promise<InspectAdmission> {
-  const redis = await getReadyQueueConnection();
-  const rateKey = `dip:fill-forms-inspect-rate:v1:${tenantId}`;
-  const count = await redis.incr(rateKey);
-  if (count === 1) await redis.expire(rateKey, 60);
-  if (count > INSPECT_RATE_PER_MINUTE) throw new FormFillError("FORM_UNSUPPORTED", FORM_ERROR_MESSAGES.FORM_UNSUPPORTED, { admission: "RATE_LIMITED" });
-  const concurrencyKey = `dip:fill-forms-inspect-open:v1:${tenantId}`;
-  const open = await redis.incr(concurrencyKey);
-  if (open === 1) await redis.expire(concurrencyKey, INSPECT_LEASE_SECONDS);
-  if (open > INSPECT_CONCURRENCY) {
-    await redis.decr(concurrencyKey);
-    throw new FormFillError("FORM_UNSUPPORTED", FORM_ERROR_MESSAGES.FORM_UNSUPPORTED, { admission: "CONCURRENCY_LIMITED" });
-  }
-  let released = false;
-  return {
-    async release() {
-      // Idempotent: the route releases in a `finally`, and a double decrement
-      // would silently raise the tenant's ceiling.
-      if (released) return;
-      released = true;
-      const remaining = await redis.decr(concurrencyKey).catch(() => 0);
-      if (remaining <= 0) await redis.del(concurrencyKey).catch(() => undefined);
-    },
-  };
 }
 
 /** Read-only inventory. Never mutates the document and never writes bytes. */
