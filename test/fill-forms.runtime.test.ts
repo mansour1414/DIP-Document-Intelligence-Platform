@@ -18,6 +18,7 @@
  */
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFile } from "node:fs/promises";
 import { PDFArray, PDFDict, PDFDocument, PDFName, PDFNumber, PDFString, StandardFonts } from "pdf-lib";
 import {
   FormFillError,
@@ -690,4 +691,37 @@ test("FF-03: the encrypted payload is non-destructive, tenant-bound and purged b
   await purgeFormFields(reference, store);
   await assert.rejects(() => readFormFields({ reference, tenantId: "tenant-a", jobId: "job-1" }, store), (error: unknown) => (error as { code?: string }).code === "FORM_PAYLOAD_EXPIRED");
   assert.ok(formPayloadTtlSeconds() >= 86_400);
+});
+
+/**
+ * R6.5 — job admission must apply the *same* fillability contract as the fill engine.
+ *
+ * The defect: `assertFillableInput()` accepted any inventory whose `fields` was an array,
+ * and `[]` is an array. A form-less PDF was therefore admitted as a Fill Forms job — credit
+ * consumed, usage written, bytes stored, job created, work enqueued — and only the worker
+ * refused it.
+ *
+ * The behavioural proof that the refusal precedes every effect lives in
+ * `fill-forms.orchestration-behaviour.test.ts`, which drives the real `createToolJob()` and
+ * needs a generated Prisma client. This assertion runs everywhere, including environments
+ * without one, and pins the *cause*: admission must call the shared domain contract rather
+ * than re-deriving the rule. The engine side is covered above
+ * ("documents without a supported AcroForm are rejected").
+ */
+test("R6.5: fill-forms admission applies the shared fillability contract", async () => {
+  const source = await readFile(new URL("../src/lib/jobs/orchestrator.ts", import.meta.url), "utf8");
+  const gate = source.slice(source.indexOf("async function assertFillableInput("), source.indexOf("function minimumFilesFor("));
+  assert.match(gate, /assertFillableDocument\(/u,
+    "admission must call assertFillableDocument, not restate it");
+  assert.match(source, /import \{[^}]*assertFillableDocument[^}]*\} from "@\/lib\/pdf\/form-schema"/u,
+    "the shared contract must be imported from the schema module");
+  // The shape check is still required — it guards the *boundary* (untrusted subprocess
+  // data) and must not be replaced by the domain check.
+  assert.match(gate, /Array\.isArray/u, "the untrusted-inventory shape check must survive");
+  // And the gate must run before any durable effect is reachable.
+  const gateCall = source.indexOf('await assertFillableInput(');
+  for (const effect of ["enforceJobCreation(", "enqueueJob(", "enqueueAiJob("]) {
+    const at = source.indexOf(effect);
+    assert.ok(gateCall > 0 && (at < 0 || gateCall < at), `${effect} must not be reachable before admission`);
+  }
 });

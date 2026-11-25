@@ -11,12 +11,12 @@ import { buildStorageObjectConnectOrCreate, isAuthorizedFileStorageAccess } from
 import { requireCleanUpload } from "@/lib/malware";
 import { requiresDedicatedJobParameters, validateToolOptions } from "@/lib/tools/options";
 import { deletePhase1Secret, enforceUnlockRateLimit, phase1SecretToolIds, putPhase1Secret, type Phase1SecretPayload, type Phase1SecretPurpose } from "@/lib/secrets/phase1";
-import { parseFieldsPayload } from "@/lib/pdf/form-schema";
+import { assertFillableDocument, parseFieldsPayload } from "@/lib/pdf/form-schema";
 import { assertCheapPdfShape } from "@/lib/pdf/form-inspection";
 import { purgeFormFields, putFormFields } from "@/lib/pdf/form-payload";
 import { formWorkerLimits, processPdfBounded } from "@/lib/pdf/form-worker";
 import { FormFillError } from "@/lib/pdf/form-validation";
-import { FORM_ERROR_MESSAGES, isFormFillErrorCode } from "@/lib/pdf/form-types";
+import { FORM_ERROR_MESSAGES, isFormFillErrorCode, type FormInventory } from "@/lib/pdf/form-types";
 import { runtimeLimits } from "@/lib/runtime/config";
 
 type Upload = { filename: string; mimeType: string; bytes: Uint8Array };
@@ -54,6 +54,21 @@ async function assertFillableInput(bytes: Uint8Array): Promise<number> {
   if (!result.inventory || !Array.isArray((result.inventory as { fields?: unknown }).fields)) {
     throw new FormFillError("FORM_UNSUPPORTED", FORM_ERROR_MESSAGES.FORM_UNSUPPORTED, { boundary: "INVALID_INVENTORY" });
   }
+  // R6.5: a well-formed inventory is not the same as a *fillable* document.
+  //
+  // The child returns `ok: true` for any structurally valid PDF, including one with no
+  // AcroForm fields at all — that is correct for inspection, which is read-only and must
+  // report "no fields" so the workspace can say so. Admission is the opposite question,
+  // and answering it with a shape check admitted form-less documents: they consumed
+  // credit, wrote usage and storage, created a job and were enqueued, then the worker
+  // rejected them. Everything the rejection was supposed to precede had already happened.
+  //
+  // `assertFillableDocument` is the domain contract the fill engine already applies
+  // (`form-fill.ts`), reused here rather than restated: empty inventory
+  // (FORM_NOT_FOUND), duplicate field names, XFA, and the signed/encrypted flags — the
+  // last two are already settled by the child's restrictions probe, so passing them as
+  // false keeps this gate to what the inventory can still prove.
+  assertFillableDocument(result.inventory as FormInventory, { encrypted: false, signed: false });
   // `processPdfBounded` has already rejected a non-integer or negative `pages`, so
   // this is the document's authoritative page count: it is what plan enforcement and
   // the file row receive. It is never taken from the client or from a page-marker

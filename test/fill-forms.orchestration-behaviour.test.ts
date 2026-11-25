@@ -28,6 +28,32 @@ import { setMalwareScannerForTests } from "../src/lib/malware";
 import { setStorageForTests, type ObjectStorage } from "../src/lib/storage";
 import { setTenantClientForTests } from "../src/lib/db/tenant";
 import { activeFormWorkers, resetFormWorkersForTest } from "../src/lib/pdf/form-worker";
+
+/**
+ * The generated Prisma client is a precondition of importing the orchestrator at all:
+ * `orchestrator → usage/enforcement → billing/credits → db` loads `@prisma/client`, which
+ * throws at module scope when `.prisma/client` has not been generated.
+ *
+ * That is an environment problem, not a test result, and the R6.5 regressions below must
+ * not be silently converted into a skip by some *other* import failure — so exactly one
+ * cause is tolerated, and a CI environment can require it outright with
+ * `DIP_REQUIRE_PIPELINE=1`. The R6.5 assertions live in this file because they need the
+ * orchestrator; locally, without a generated client, they are BLOCKED rather than
+ * skipped for convenience.
+ */
+const PRISMA_MISSING = /Cannot find module ['"]\.prisma\/client\/default|@prisma\/client['"] did not initialize yet/iu;
+async function requirePrismaClient(context: { skip: (message?: string) => void }) {
+  try {
+    await import("../src/lib/db/index");
+    return true;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!PRISMA_MISSING.test(message)) throw error;
+    if (process.env.DIP_REQUIRE_PIPELINE === "1") throw new Error(`The generated Prisma client is required in this environment: ${message}`);
+    context.skip("the generated Prisma client is not available in this environment");
+    return false;
+  }
+}
 import type { MalwareScanner, MalwareScanResultCode } from "../src/lib/malware/types";
 
 /** Counts every collaborator the orchestrator can reach. */
@@ -226,5 +252,66 @@ test("the scanner runs before isolated inspection, which runs before any durable
     const putIndex = order.log.indexOf("put");
     assert.ok(scanIndex >= 0, "the scanner must have been consulted");
     if (putIndex >= 0) assert.ok(scanIndex < putIndex, "screening must precede any object write");
+  } finally { uninstall(); }
+});
+
+/**
+ * R6.5 — admission must refuse a document that cannot be filled.
+ *
+ * The child returns `ok: true` for any structurally valid PDF, including one with no
+ * AcroForm fields: inspection is read-only and must be able to report "no fields". The
+ * orchestrator then checked only that `inventory.fields` was an *array*, which is true of
+ * `[]`. A form-less PDF was therefore admitted — credit consumed, usage written, bytes
+ * stored, job row created, work enqueued — and only the worker rejected it.
+ *
+ * These tests drive the real `createToolJob()` and observe every collaborator, so they
+ * prove the refusal precedes each effect rather than merely that a refusal happened.
+ */
+test("a PDF with no AcroForm fields is refused before billing, storage, job and queue", async (t) => {
+  if (!await requirePrismaClient(t)) return;
+  const observed = observedCounters();
+  install(observed);
+  try {
+    // A real, parseable PDF with a page and no form at all. Not a malformed upload: it
+    // must reach the bounded inspector, which is the point — the refusal has to come from
+    // the inventory gate, not from an earlier shape or malware check.
+    const passthrough = await realPdf();
+    await assert.rejects(
+      () => createToolJob({ userId: USER, toolId: "fill-forms", uploads: [{ filename: "plain.pdf", mimeType: "application/pdf", bytes: passthrough }], fields: { a: "b" }, idempotencyKey: "r65-formless" }),
+      (error: unknown) => {
+        assert.equal((error as { code?: string }).code, "FORM_NOT_FOUND", "the refusal must be the typed FORM_NOT_FOUND");
+        return true;
+      },
+    );
+    assert.equal(observed.scans, 1, "a clean document must still be screened exactly once");
+    assert.equal(observed.childRuns + activeFormWorkers(), 1, "the document must be inspected exactly once");
+    assert.equal(observed.puts, 0, "a form-less document must never be stored");
+    assert.ok(observed.transactions <= 1, `at most the idempotency read, saw ${observed.transactions}`);
+  } finally { uninstall(); }
+});
+
+test("duplicate field names are refused at admission, not only in the worker", async (t) => {
+  if (!await requirePrismaClient(t)) return;
+  const observed = observedCounters();
+  install(observed);
+  try {
+    // Two AcroForm fields with the same name: `inventory.fields` is non-empty, so an
+    // empty-only check would admit this even though the values cannot be addressed
+    // unambiguously. `assertFillableDocument` rejects it (FORM_UNSUPPORTED) — the same
+    // contract the fill engine applies — so the two boundaries cannot disagree.
+    const document = await PDFDocument.create();
+    const page = document.addPage([200, 200]);
+    document.getForm().createTextField("applicant.name").addToPage(page, { x: 10, y: 10, width: 80, height: 20 });
+    document.getForm().createTextField("applicant.name").addToPage(page, { x: 10, y: 50, width: 80, height: 20 });
+    const duplicated = new Uint8Array(await document.save({ updateFieldAppearances: false }));
+    await assert.rejects(
+      () => createToolJob({ userId: USER, toolId: "fill-forms", uploads: [{ filename: "dup.pdf", mimeType: "application/pdf", bytes: duplicated }], fields: { "applicant.name": "x" }, idempotencyKey: "r65-duplicate" }),
+      (error: unknown) => {
+        assert.equal((error as { code?: string }).code, "FORM_UNSUPPORTED", "duplicates must be refused as FORM_UNSUPPORTED");
+        return true;
+      },
+    );
+    assert.equal(observed.puts, 0, "a document with duplicate fields must never be stored");
+    assert.ok(observed.transactions <= 1, `at most the idempotency read, saw ${observed.transactions}`);
   } finally { uninstall(); }
 });

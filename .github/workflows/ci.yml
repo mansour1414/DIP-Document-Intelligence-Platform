@@ -504,6 +504,9 @@ jobs:
 
   release-b-e2e:
     name: Full Release B E2E
+    # R6.5: a backstop for the whole job. Individual steps are bounded, but a step that
+    # never returns previously left the job running indefinitely.
+    timeout-minutes: 60
     runs-on: ubuntu-24.04
     env:
       AI_PROVIDER: groq
@@ -673,6 +676,14 @@ jobs:
           CLAMD_PORT: "3310"
           API_KEY_PEPPER: release-b-ci-only-pepper
       - name: Run Fill Forms acceptance through authenticated HTTP and the worker image
+        # R6.5: an explicit ceiling. The four scenarios declare 15 minutes of per-test
+        # timeouts in total; this allows for service setup and teardown on top, and it
+        # exists because the previous run stayed *active* for ~50 minutes after its
+        # assertion had already failed — an abandoned child process held the step open and
+        # nothing bounded it. The ceiling is a backstop, not the fix: the suite now closes
+        # its queues, storage client and database connection in an `after` hook, and a
+        # runaway child is a bug to report rather than something to wait out.
+        timeout-minutes: 25
         # R6.3: the artifact smoke script executes the child directly, which proves the
         # artifact can run the child but says nothing about whether an authenticated
         # request reaches it, whether plan enforcement sees the real page count, or

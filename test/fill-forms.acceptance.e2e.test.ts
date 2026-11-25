@@ -23,11 +23,36 @@
  * Locally this is BLOCKED: it needs Postgres, Redis, object storage and a running server.
  */
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { after } from "node:test";
 import { randomUUID } from "node:crypto";
 import { PDFDocument } from "pdf-lib";
 
 const integration = process.env.FILL_FORMS_ACCEPTANCE_E2E === "1" ? test : test.skip;
+
+/**
+ * Close every resource this suite opens, once, after the last test.
+ *
+ * The R6.3 version closed only `getJobQueue()`. The process then stayed alive — the CI log
+ * showed the acceptance step still running ~50 minutes after its assertion failed — because
+ * a BullMQ `Queue.close()` leaves the shared ioredis connection that the *worker* path and
+ * `closeQueueResources()` own, and the storage and Prisma clients were never closed at all.
+ * The existing Public API HTTP test already solves exactly this, so the same helpers are
+ * reused rather than a second convention invented.
+ *
+ * `Promise.allSettled` so one failing close cannot prevent the others; the results are then
+ * inspected and rethrown, because a cleanup that fails silently is how the leak survived.
+ */
+after(async () => {
+  if (process.env.FILL_FORMS_ACCEPTANCE_E2E !== "1") return;
+  const { closeQueueResources } = await import("../src/lib/queue/index");
+  const { closeStorage } = await import("../src/lib/storage/index");
+  const { db } = await import("../src/lib/db/index");
+  const results = await Promise.allSettled([closeQueueResources(), closeStorage(), db.$disconnect()]);
+  const failed = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+  if (failed.length) {
+    throw new AggregateError(failed.map((result) => result.reason), "acceptance suite resource cleanup failed");
+  }
+});
 const base = process.env.ACCEPTANCE_BASE_URL ?? "http://127.0.0.1:3000";
 
 /** A one-page AcroForm with a real text field, so inspection accepts it. */
@@ -43,6 +68,65 @@ async function formlessPdf() {
   const document = await PDFDocument.create();
   document.addPage([300, 300]);
   return new Uint8Array(await document.save());
+}
+
+/**
+ * Remove a fixture tenant and everything it owns, in dependency order.
+ *
+ * `User → Document` has **no** `onDelete: Cascade`, so deleting the user while the
+ * submission's documents still exist raises `documents_user_id_fkey`. The previous
+ * version called `db.user.delete()` directly and swallowed the error with
+ * `.catch(() => undefined)` — a cleanup failure that looked like a clean run.
+ *
+ * Order matters and is taken from the schema, not guessed: files reference documents,
+ * job rows reference files, then the tenant rows that carry a `Restrict` relation
+ * (workflows, agent runs, API clients) go before the user. Objects in storage are
+ * removed first, because a database row is the only record of where they are.
+ *
+ * Cleanup failures are **reported**, never swallowed: a leaked fixture in a disposable
+ * database is tolerable, but a silent one hides a schema change that will break the next
+ * run.
+ */
+async function removeFixtureTenant(userId: string, options: { storage?: { deleteObject(key: string): Promise<void> } } = {}) {
+  const { db } = await import("../src/lib/db/index");
+  // Explicit types: without a generated Prisma client these queries infer `{}`, and the
+  // annotations keep that pre-existing environment gap from adding avoidable errors here.
+  const files = await db.file.findMany({ where: { document: { userId } }, select: { storageKey: true } }) as Array<{ storageKey: string }>;
+  if (options.storage) {
+    await Promise.all(files.map((file: { storageKey: string }) => options.storage!.deleteObject(file.storageKey).catch((error: unknown) => {
+      throw new Error(`fixture storage cleanup failed for ${file.storageKey}: ${String(error)}`);
+    })));
+  }
+  // Order is taken from the foreign keys in `prisma/schema.prisma`, not from intuition.
+  // Several relations have no `onDelete: Cascade` at all — `Document.user`, `File.document`,
+  // `Job.inputFile/outputFile`, `AuditLog.organization` — and a few carry `Restrict`
+  // (`Workflow.owner`, `AgentRun.owner`, `ApiClient.createdByUser`). Deleting the user first
+  // is what produced `documents_user_id_fkey`.
+  await db.$transaction(async (tx: Record<string, { deleteMany: (args: unknown) => Promise<unknown>; findMany: (args: unknown) => Promise<unknown>; delete: (args: unknown) => Promise<unknown> }>) => {
+    // Job rows reference files, so they go first.
+    await tx.job.deleteMany({ where: { requesterId: userId } });
+    await tx.file.deleteMany({ where: { document: { userId } } });
+    await tx.document.deleteMany({ where: { userId } });
+    // Tenant-scoped records.
+    await tx.usageEvent.deleteMany({ where: { userId } });
+    await tx.creditLedger.deleteMany({ where: { userId } });
+    await tx.aiUsage.deleteMany({ where: { userId } });
+    // `Restrict` relations must go before the user.
+    await tx.workflow.deleteMany({ where: { ownerId: userId } });
+    await tx.agentRun.deleteMany({ where: { ownerId: userId } });
+    await tx.apiClient.deleteMany({ where: { createdByUserId: userId } });
+    // Organization-owned rows. `createOrganization` writes an audit entry, and `AuditLog`
+    // references `Organization` without a cascade, so it must be removed first.
+    const organizations = await tx.organization.findMany({ where: { memberships: { some: { userId } } }, select: { id: true } }) as Array<{ id: string }>;
+    const organizationIds = organizations.map((organization: { id: string }) => organization.id);
+    if (organizationIds.length) {
+      await tx.auditLog.deleteMany({ where: { organizationId: { in: organizationIds } } });
+      await tx.membership.deleteMany({ where: { organizationId: { in: organizationIds } } });
+    }
+    await tx.membership.deleteMany({ where: { userId } });
+    await tx.organization.deleteMany({ where: { id: { in: organizationIds } } });
+    await tx.user.delete({ where: { id: userId } });
+  });
 }
 
 integration("R6.3-1: authenticated web session reaches isolated inspection", { timeout: 120_000 }, async (t) => {
@@ -70,14 +154,21 @@ integration("R6.3-1: authenticated web session reaches isolated inspection", { t
     const denied = await fetch(`${base}/api/fill-forms/inspect`, { method: "POST", body: anonymous });
     assert.ok([401, 403].includes(denied.status), `an anonymous request must be refused, saw ${denied.status}`);
 
-    // A PDF with no form must be a typed rejection, not a 500.
+    // A PDF with no form is **inspectable**: the route is documented as inventory-only and
+    // must be able to report "no fields" so the workspace can say so. R6.5 deliberately did
+    // not change this. Asserting a rejection here would have conflated the read-only
+    // inspector with job admission — the distinction this round exists to establish.
+    //
+    // The refusal that matters is at admission, and it is asserted separately below.
     const empty = new FormData();
     empty.set("file", new File([await formlessPdf() as BlobPart], "plain.pdf", { type: "application/pdf" }));
     const noForm = await fetch(`${base}/api/fill-forms/inspect`, { method: "POST", headers: { cookie }, body: empty });
-    assert.equal(noForm.status, 422, "a form-less PDF must be a typed rejection");
-    assert.equal((await noForm.json() as { code: string }).code, "FORM_NOT_FOUND");
+    assert.equal(noForm.status, 200, "inspection is read-only and must report an empty inventory, not refuse the document");
+    const emptyInventory = await noForm.json() as { inventory?: { pages?: number; fields?: unknown[] } };
+    assert.equal(emptyInventory.inventory?.pages, 1, "the page count must still be reported");
+    assert.deepEqual(emptyInventory.inventory?.fields, [], "the inventory must be empty rather than absent");
   } finally {
-    await db.user.delete({ where: { id: userId } }).catch(() => undefined);
+    await removeFixtureTenant(userId);
   }
 });
 
@@ -85,6 +176,7 @@ integration("R6.3-2: authenticated web submission reaches plan enforcement with 
   const { db } = await import("../src/lib/db/index");
   const { createSessionToken } = await import("../src/lib/auth/session");
   const { getJobQueue } = await import("../src/lib/queue/index");
+  const { getStorage } = await import("../src/lib/storage/index");
   const userId = randomUUID();
   const proPlan = await db.planCatalog.findUniqueOrThrow({ where: { code: "PRO" }, select: { id: true } });
   await db.user.create({ data: { id: userId, email: `${userId}@example.invalid`, status: "ACTIVE", subscriptions: { create: { planId: proPlan.id, status: "ACTIVE" } }, creditLedger: { create: { type: "BONUS", amount: 100, balance: 100, idempotencyKey: "r63-web-seed", reason: "PROMOTIONAL_GRANT" } } } });
@@ -109,7 +201,7 @@ integration("R6.3-2: authenticated web submission reaches plan enforcement with 
     const queued = await getJobQueue().getJob(jobId);
     assert.ok(queued, "the job must be submitted to the document queue");
   } finally {
-    await db.user.delete({ where: { id: userId } }).catch(() => undefined);
+    await removeFixtureTenant(userId, { storage: getStorage() });
   }
 });
 
@@ -117,6 +209,7 @@ integration("R6.3-3: authenticated Public API submission is accepted for fill-fo
   const { db } = await import("../src/lib/db/index");
   const { createOrganization } = await import("../src/lib/business/organizations");
   const { createApiClient, createApiKey } = await import("../src/lib/api-platform/clients");
+  const { getStorage } = await import("../src/lib/storage/index");
   const userId = randomUUID();
   await db.user.create({ data: { id: userId, email: `${userId}@example.invalid`, creditLedger: { create: { type: "BONUS", amount: 100, balance: 100, idempotencyKey: "r63-api-seed", reason: "PROMOTIONAL_GRANT" } } } });
   const organization = await createOrganization(userId, "R6.3 API");
@@ -135,7 +228,7 @@ integration("R6.3-3: authenticated Public API submission is accepted for fill-fo
     assert.equal(input.pageCount, 1, "the API path must persist the authoritative page count too");
     assert.ok(jobId);
   } finally {
-    await db.user.delete({ where: { id: userId } }).catch(() => undefined);
+    await removeFixtureTenant(userId, { storage: getStorage() });
   }
 });
 
@@ -205,9 +298,17 @@ integration("R6.3-4/5/6: the production worker fills, flattens and renders Arabi
     const before = {
       usage: await db.usageEvent.count({ where: { userId } }),
       files: await db.file.count({ where: { document: { userId } } }),
-      jobs: await db.job.count({ where: { requesterId: userId } }),
-      queued: await getJobQueue().getJobCounts("wait", "active", "delayed"),
+      // Tenant-specific evidence, not a global depth reading: the document queue is
+      // shared, and any other suite (or the worker image draining its own jobs) changes
+      // global counts between two samples. What must not change is this tenant's own set
+      // of job rows and queue entries.
+      jobsBefore: (await db.job.findMany({ where: { requesterId: userId }, select: { id: true } })).map((job: { id: string }) => job.id),
     };
+    // The earlier scenarios legitimately enqueued jobs, so "no queue entry" is not the
+    // invariant — *unchanged* is. Snapshot which of this tenant's jobs are on the queue,
+    // then require exactly the same answer after the rejections.
+    const queuedBefore = new Set<string>();
+    for (const id of before.jobsBefore) if (await getJobQueue().getJob(id)) queuedBefore.add(id);
 
     await assert.rejects(
       () => createToolJob({ userId, toolId: "fill-forms", idempotencyKey: "r63-reject-empty", correlationId: randomUUID(), uploads: [{ filename: "plain.pdf", mimeType: "application/pdf", bytes: new Uint8Array(0) }], fields: { "applicant.name": "x" } }),
@@ -230,10 +331,19 @@ integration("R6.3-4/5/6: the production worker fills, flattens and renders Arabi
 
     assert.equal(await db.usageEvent.count({ where: { userId } }), before.usage, "a rejected submission must not write usage");
     assert.equal(await db.file.count({ where: { document: { userId } } }), before.files, "a rejected submission must not write files");
-    assert.equal(await db.job.count({ where: { requesterId: userId } }), before.jobs, "a rejected submission must not create a job");
-    assert.deepEqual(await getJobQueue().getJobCounts("wait", "active", "delayed"), before.queued, "a rejected submission must not enqueue work");
+    // The tenant's job set must be byte-identical: no new row, and no row removed.
+    const jobsAfter = (await db.job.findMany({ where: { requesterId: userId }, select: { id: true } })).map((job: { id: string }) => job.id);
+    assert.deepEqual([...jobsAfter].sort(), [...before.jobsBefore].sort(), "a rejected submission must not create a job row");
+    // And no *new* queue entry may exist for this tenant. Scoped to the tenant's own job
+    // ids, so a concurrently running suite cannot make this flaky.
+    for (const id of jobsAfter) {
+      const queued = await getJobQueue().getJob(id);
+      assert.equal(Boolean(queued), queuedBefore.has(id), `the queue state of job ${id} changed during a rejected submission`);
+    }
   } finally {
-    await db.user.delete({ where: { id: userId } }).catch(() => undefined);
-    await getJobQueue().close().catch(() => undefined);
+    // Not `getJobQueue().close()`: that closed only the document queue and left the
+    // shared connection open, which is why the process outlived the suite. The suite-level
+    // `after` hook calls `closeQueueResources()`, which is the supported teardown.
+    await removeFixtureTenant(userId, { storage });
   }
 });
