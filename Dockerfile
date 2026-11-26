@@ -83,6 +83,24 @@ COPY --chown=nextjs:nodejs scripts/pdf-worker-platform.mjs ./scripts/pdf-worker-
 COPY --chown=nextjs:nodejs scripts/write-pdf-worker-target.mjs ./scripts/write-pdf-worker-target.mjs
 RUN node scripts/write-pdf-worker-target.mjs --root /app --libc musl
 
+# R7C.3: prove the database runtime loads in *this* image before it is ever published.
+#
+# This runs inside the final image, so it checks the artifact that would actually ship —
+# the traced `node_modules` tree, the generated client, and the real nesting — rather than
+# the builder's tree, which has every package installed and can never reproduce a packaging
+# defect. The R7C.1 image was built, published, and only then found to be unstartable at
+# `require('@prisma/adapter-pg')`; this is the step that would have stopped it here.
+#
+# It runs as root, before `USER nextjs`. The check needs no privileges, but running it as
+# the runtime user would require the files to be readable — which they must be anyway — and
+# keeping it before the USER switch means a future permission mistake fails the build
+# rather than the container.
+#
+# No DATABASE_URL is set and none is needed: Prisma constructs lazily, the script passes its
+# own obviously-fake connection string, and no connection is opened.
+COPY --chown=nextjs:nodejs scripts/verify-prisma-artifact-runtime.mjs ./scripts/verify-prisma-artifact-runtime.mjs
+RUN node scripts/verify-prisma-artifact-runtime.mjs /app
+
 USER nextjs
 
 EXPOSE 3000

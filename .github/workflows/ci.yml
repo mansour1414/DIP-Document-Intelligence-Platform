@@ -48,6 +48,31 @@ jobs:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dip
           NEXT_PUBLIC_APP_URL: http://localhost:3000
 
+      # R7C.3 — the database runtime must load in the artifact that would actually ship.
+      #
+      # A green compile is not evidence of this. TypeScript checks types, webpack checks
+      # bundling, the file tracer decides packaging, and only require() at runtime exercises
+      # the real directory layout. The R7C.1 image passed every step above and still died on
+      # `require('@prisma/adapter-pg')` with MODULE_NOT_FOUND, so this runs the closure check
+      # against the emitted standalone tree, outside the checkout.
+      #
+      - name: Verify Prisma runtime closure in the emitted artifact
+        run: |
+          set -euo pipefail
+          STANDALONE=.next/standalone
+          ARTIFACT="$(mktemp -d)/app"
+          mkdir -p "$ARTIFACT"
+          # The server bundle and its traced node_modules tree.
+          cp -a "$STANDALONE"/. "$ARTIFACT"/
+          # The check refuses to run under a source checkout, which is the point: from there
+          # Node's upward walk finds the repository's own node_modules and an empty artifact
+          # would pass. Copying out is what makes the result mean anything.
+          node scripts/verify-prisma-artifact-runtime.mjs "$ARTIFACT"
+        env:
+          # Not a secret and never dialled: construction is lazy in Prisma, and the script
+          # opens no connection.
+          DATABASE_URL: postgresql://artifact-check:artifact-check@127.0.0.1:5432/artifact_check
+
   test:
     name: Test
     runs-on: ubuntu-24.04

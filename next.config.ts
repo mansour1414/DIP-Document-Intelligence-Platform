@@ -106,33 +106,141 @@ const PDF_WORKER_RUNTIME_PACKAGES = [
 const PDF_WORKER_ARTIFACT = [...PDF_WORKER_TRACING, ...PDF_WORKER_RUNTIME_PACKAGES] as const;
 
 /**
- * The generated Prisma client, as a build input (R7C.1).
+ * The database runtime, packaged as **external** packages (R7C.3).
+ *
+ * ## What went wrong before this
+ *
+ * R7C.1 tried to fix the Prisma runtime closure by globbing the adapter's directory with
+ * `outputFileTracingIncludes`. That was the wrong tool, and it produced a confusing
+ * half-failure: the emitted image contained
+ * `/app/node_modules/@prisma/adapter-pg/dist/index.js` (so the package *looked* present,
+ * and the require stack in the failure pointed at a real file), but its own
+ * `require("@prisma/driver-adapter-utils")` had nothing to resolve, and the container
+ * died with `MODULE_NOT_FOUND`.
+ *
+ * This was reproduced here, not inferred. Building a standalone app with the R7C.1 array
+ * and then requiring the adapter from the artifact root produces the production error
+ * character for character — `Cannot find module '@prisma/driver-adapter-utils'` at
+ * `node_modules/@prisma/adapter-pg/dist/index.js:38:36`. The artifact contains
+ * `@prisma/adapter-pg` (all seven files: the glob worked) and `pg` (present because Next
+ * already externalises it), and `@prisma/driver-adapter-utils` alone is missing. A glob
+ * ships the package and nothing it depends on.
+ *
+ * The reason is that the two mechanisms answer different questions:
+ *
+ *   - `outputFileTracingIncludes` is a **file glob**. It copies exactly what the pattern
+ *     matches. It does not read `package.json`, so it does not know or care that
+ *     `@prisma/adapter-pg` depends on four other packages. Globbing a package therefore
+ *     ships that package and *orphans its dependencies*.
+ *   - `serverExternalPackages` is the **supported marker** for "resolve this at runtime,
+ *     do not bundle it". Next's file tracer follows the dependency graph of a package it
+ *     is told to leave external, so the whole closure is emitted together.
+ *
+ * Worse, `@prisma/adapter-pg` was not external at all by default. Next's built-in list
+ * contains `@prisma/client`, `prisma` and `pg` — but not the adapter, not
+ * `@prisma/driver-adapter-utils`, and not `@prisma/debug`. So webpack bundled the
+ * adapter's JavaScript into the server chunk, while its `require()` calls for those
+ * unlisted packages were left unresolved at build time, and the glob above then pasted a
+ * second, incomplete copy into the image. The failure was a mixture of "bundled where it
+ * should have been external" and "copied without its dependencies".
+ *
+ * ## Why these six roots
+ *
+ * Declaring the closure roots external makes the tracer emit each package **and** its
+ * dependencies, resolved from their real nesting (which matters here: `pg-types` uses a
+ * nested `postgres-array@2`, while the adapter uses the hoisted `postgres-array@3`, and
+ * only the lockfile knows that).
+ *
+ * The transitive packages are listed explicitly as well. That is deliberate duplication:
+ * a root alone would be enough today, but if a future version of one of these packages
+ * starts bundling a dependency instead of requiring it, the explicit entry keeps the
+ * intent visible and the artifact check still fails loudly rather than silently shipping
+ * a partial tree.
+ *
+ * NOT included, on purpose:
+ *   - `pg-cloudflare` — an *optional* dependency of `pg` for Cloudflare Workers. It is a
+ *     native/edge driver this application never loads, and `optionalDependencies` are not
+ *     followed here.
+ *   - `@types/pg`, `@types/node`, `undici-types` — type declarations. They appear in the
+ *     lockfile graph but are never `require()`d, so shipping them would be dead weight.
+ *   - any Prisma query engine binary — `src/lib/db/index.ts` uses `PrismaPg`, so queries
+ *     go through the driver. An engine would be megabytes of code that never executes.
+ *
+ * `node_modules/.prisma/client` stays a glob: it is *generated*, not a dependency, so it
+ * has no entry in the lockfile for a tracer to follow.
+ */
+
+/**
+ * Why `serverExternalPackages` alone is not enough (R7C.3, measured).
+ *
+ * Marking a package external makes the tracer emit its closure — but it emits only the
+ * files it saw being *used*. Measured on a real `next build` with only the externals
+ * declared, `@prisma/adapter-pg` landed in the standalone tree with `package.json` and
+ * `dist/index.mjs` and nothing else:
+ *
+ *     node_modules/@prisma/adapter-pg/package.json
+ *     node_modules/@prisma/adapter-pg/dist/index.mjs
+ *
+ * The package is dual-format. Its `exports` map selects `dist/index.mjs` for `import` and
+ * `dist/index.js` for `require`, and the server bundle uses `import` — so the tracer
+ * followed the ESM path and never saw the CJS file. At runtime `server.js` is CommonJS and
+ * `require("@prisma/adapter-pg")` resolves the `require` condition to `dist/index.js`,
+ * which is not in the image:
+ *
+ *     MODULE_NOT_FOUND: Cannot find module .../adapter-pg/dist/index.js
+ *
+ * The same split exists in `@prisma/driver-adapter-utils` and `@prisma/client-runtime-utils`,
+ * so fixing only the first one just moves the error. Hence both mechanisms, together:
+ * the externals decide *which packages and their dependencies* are emitted, and these
+ * globs make sure *every format of each package* is present. Neither is sufficient alone,
+ * and the artifact check is what proves the combination.
+ */
+const PRISMA_EXTERNAL_PACKAGES = [
+  "@prisma/client",
+  "@prisma/client-runtime-utils",
+  "@prisma/adapter-pg",
+  "@prisma/driver-adapter-utils",
+  "@prisma/debug",
+  "pg",
+  "pg-connection-string",
+  "pg-int8",
+  "pg-pool",
+  "pg-protocol",
+  "pg-types",
+  "pgpass",
+  "postgres-array",
+  "postgres-bytea",
+  "postgres-date",
+  "postgres-interval",
+  "split2",
+  "xtend",
+] as const;
+
+/**
+ * The *generated* half of the Prisma runtime.
  *
  * `prisma generate` writes JavaScript and a schema into `node_modules/.prisma/client`,
- * and `@prisma/client` re-exports from it. Next traces the *package* because routes
- * import it, but `.prisma/client` is not a package anything imports by name — it is a
- * sibling generated into `node_modules` at build time. If generation runs after tracing,
- * or if the tracer does not descend into a dot-directory, the standalone tree ships a
- * re-export with nothing behind it and every database call fails at runtime with
- * "did not initialize yet".
- *
- * That is why generation is a build step in `Dockerfile` *before* `npm run build`
- * (Task A), and why the closure is declared here as well: the declaration is what makes
- * the requirement visible to anyone reading the build config, and it survives a future
- * change that moves generation earlier or later.
- *
- * The engine binary is NOT included: this application uses `@prisma/adapter-pg`
- * (`PrismaPg` in `src/lib/db/index.ts`), so queries go through the driver, not a native
- * query engine. Shipping an engine would add megabytes of code that never executes.
+ * and `@prisma/client` re-exports from it. Nothing imports that path by name and it has
+ * no lockfile entry, so only a file glob reaches it. Generation now runs before the build
+ * (`Dockerfile`, R7C.1) — this declaration is what makes the requirement visible here and
+ * keeps it true if the build order is ever changed.
  */
 const PRISMA_RUNTIME_TRACING = [
-  "./node_modules/@prisma/client/**/*",
   "./node_modules/.prisma/client/**/*",
-  "./node_modules/@prisma/adapter-pg/**/*",
+  // The CJS entry of each package in the closure. See the note below on why this is
+  // needed *in addition to* `serverExternalPackages`.
+  ...PRISMA_EXTERNAL_PACKAGES.map((name) => `./node_modules/${name}/**/*`),
+  // `pg-types` keeps its own copy of `postgres-array` at major 2 while the adapter uses
+  // the hoisted major 3. A flat glob for the package name misses the nested one.
+  "./node_modules/pg-types/node_modules/postgres-array/**/*",
 ] as const;
 
 const nextConfig: NextConfig = {
   output: "standalone",
+  // R7C.3: see `PRISMA_EXTERNAL_PACKAGES`. These must be external, not bundled, so the
+  // file tracer emits each one with its real dependency closure instead of webpack
+  // inlining the adapter and leaving its requires unresolved.
+  serverExternalPackages: [...PRISMA_EXTERNAL_PACKAGES],
   // The bounded PDF child is **executed**, not imported, so the bundler cannot see it
   // and will not include it in a standalone image on its own. Everything listed here
   // is therefore a first-class build input rather than a bundle side effect.
@@ -176,9 +284,23 @@ const nextConfig: NextConfig = {
     // previous key matched nothing and the Public API standalone build silently shipped
     // without the child — the one deployment path where Fill Forms would fail with
     // WORKER_CRASHED while the verifier reported every file present.
-    "/api/fill-forms/inspect": [...PDF_WORKER_ARTIFACT, ...PRISMA_RUNTIME_TRACING],
-    "/api/jobs/[tool]": [...PDF_WORKER_ARTIFACT, ...PRISMA_RUNTIME_TRACING],
-    "/v1/jobs": [...PDF_WORKER_ARTIFACT, ...PRISMA_RUNTIME_TRACING],
+    "/api/fill-forms/inspect": [...PDF_WORKER_ARTIFACT],
+    "/api/jobs/[tool]": [...PDF_WORKER_ARTIFACT],
+    "/v1/jobs": [...PDF_WORKER_ARTIFACT],
+    // The database closure is keyed to `/`, not to individual routes (R7C.3).
+    //
+    // `outputFileTracingIncludes` keys are matched with `contains: true`, so `"/"` applies
+    // to every route. That is deliberate. The routes that reach `src/lib/db/index.ts` are
+    // *not* the three above — they are `/api/auth/signin`, `/api/auth/signup`,
+    // `/api/auth/oauth/github/callback`, `/api/usage`, `/[locale]/agent`,
+    // `/[locale]/workflows` and `/dashboard`. Listing only the PDF routes meant the DB
+    // packages were globbed into the tree by whichever route happened to match, so a
+    // deployment that served the dashboard but never ran a fill job could have shipped an
+    // incomplete database runtime.
+    //
+    // Keying to `/` also keeps the declaration honest as routes are added: a new route
+    // that imports the database needs no change here, and cannot be forgotten.
+    "/": [...PRISMA_RUNTIME_TRACING],
   },
   images: {
     remotePatterns: [],

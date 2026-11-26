@@ -278,3 +278,184 @@ node scripts/smoke-pdf-worker-artifact.mjs .next/standalone
 - **No ARM64 application acceptance.** Task A's correction is unverified by execution.
 - **Dependency security deferred:** 21 npm audit findings before dev-dependency pruning, **15 after pruning, 2 critical** (Codex). Requires a separate dependency-security and licensing assessment. No upgrades, no `npm audit fix --force`, no new packages were added.
 - **Groq evaluation:** HTTP 429 in CI run `45655814740`, independent of this work. No manual rerun performed.
+
+---
+
+# R7C.3 — Standalone Prisma Runtime Dependency Closure
+
+## The failure
+
+The R7C.2 ARM64 acceptance run built the image successfully and then stopped at the database
+stop-gate:
+
+```
+require('@prisma/client')        -> returns
+require('@prisma/adapter-pg')    -> MODULE_NOT_FOUND: Cannot find module '@prisma/driver-adapter-utils'
+                                    at /app/node_modules/@prisma/adapter-pg/dist/index.js:38:36
+```
+
+Exit 1, not OOM. `pg` resolution, adapter construction, client construction and server startup
+were never reached.
+
+## The cause, reproduced rather than inferred
+
+A standalone Next build of a minimal app using the **exact R7C.1 `PRISMA_RUNTIME_TRACING`
+array** reproduces the production error character for character, including the `38:36`
+throw location:
+
+```
+$ node -e "require('@prisma/adapter-pg')"        # from the artifact root
+Error: Cannot find module '@prisma/driver-adapter-utils'
+    at Object.<anonymous> (.../node_modules/@prisma/adapter-pg/dist/index.js:38:36)
+```
+
+The artifact contained:
+
+| package | present | why |
+| --- | --- | --- |
+| `@prisma/adapter-pg` | **all 7 files** | the R7C.1 glob worked |
+| `@prisma/client` | yes | the R7C.1 glob worked |
+| `pg` | yes | Next externalises `pg` by default |
+| `@prisma/driver-adapter-utils` | **absent** | nothing copied it |
+
+`outputFileTracingIncludes` is a **file glob**. It copies what the pattern matches; it never
+reads a `package.json`, so it does not know that `@prisma/adapter-pg` depends on
+`@prisma/driver-adapter-utils`, `@prisma/debug`, `pg` and `postgres-array`. The adapter's
+JavaScript was copied into the image and its dependency edge was dropped.
+
+There is a second, independent defect underneath it. `@prisma/adapter-pg` is **not** in Next's
+built-in external list (which contains `@prisma/client`, `prisma` and `pg`), so webpack
+*bundled* it into the server chunk. Its bundled `require()` calls for the unlisted packages
+were resolved at build time against a full `node_modules`; at runtime those packages were
+simply not in the image.
+
+Measured directly on the two builds:
+
+| config | adapter in server chunk | adapter emitted as external |
+| --- | --- | --- |
+| R7C.1 (globs only) | yes — bundled | no |
+| R7C.3 (externals + globs) | no | yes |
+
+## The correction
+
+Two mechanisms, both required:
+
+1. **`serverExternalPackages`** — all 18 runtime packages of the closure. This is what makes
+   the tracer emit each package *with its dependencies*, resolved from their real nesting.
+   It also stops webpack inlining the adapter and leaving its requires unresolved.
+2. **`outputFileTracingIncludes`** — the whole directory of each of those packages, plus the
+   nested `pg-types/node_modules/postgres-array`, plus the generated `.prisma/client`.
+
+Mechanism 2 is not redundant. With **externals and no globs**, a real build emitted:
+
+```
+node_modules/@prisma/adapter-pg/package.json
+node_modules/@prisma/adapter-pg/dist/index.mjs
+```
+
+Two files. The package is dual-format: its `exports` map picks `dist/index.mjs` for `import`
+and `dist/index.js` for `require`. The server bundle *imports* it, so the tracer followed the
+ESM path; the shipped `server.js` is CommonJS and *requires* it, resolving to `dist/index.js`,
+which was never emitted. `@prisma/driver-adapter-utils` and
+`@prisma/client-runtime-utils` have the same split, so fixing one only moves the error to the
+next one.
+
+The globs therefore cover **both formats of every package**, and the route key is `"/"`
+because `outputFileTracingIncludes` keys match with `contains: true`. The routes that actually
+reach `src/lib/db/index.ts` are `/api/auth/signin`, `/api/auth/signup`,
+`/api/auth/oauth/github/callback`, `/api/usage`, `/[locale]/agent`, `/[locale]/workflows` and
+`/dashboard` — **not** the three PDF routes the R7C.1 array was keyed to. Keying the database
+closure to `/` is what stops it depending on which route happens to run.
+
+The closure is 18 packages, derived from `package-lock.json` and asserted equal to the
+declaration by a test, so the two cannot drift. Deliberately excluded: `pg-cloudflare`
+(optional Cloudflare Workers driver, never loaded here), `@types/pg` / `@types/node` /
+`undici-types` (type declarations, never `require()`d), and any Prisma query engine binary
+(queries go through `PrismaPg`).
+
+## Verification
+
+Local, executed:
+
+| check | result |
+| --- | --- |
+| exact R7C.1 config reproduces the production `MODULE_NOT_FOUND` | **reproduced**, same module and `38:36` |
+| corrected config emits the full closure | `adapter-pg` all 7 files, `driver-adapter-utils` all 7, nested `postgres-array@2` present |
+| `require('@prisma/adapter-pg')` from the emitted artifact root | **loads** |
+| `new PrismaPg({...})` in the emitted artifact | **constructs** |
+| emitted `server.js` started, `GET /api/probe` (constructs `PrismaPg`) | **HTTP 200 `{"ok":true}`** |
+| `scripts/verify-prisma-artifact-runtime.mjs` on the artifact | all adapter/pg/nesting checks **PASS** |
+| `@prisma/client` + `PrismaClient` construction | **BLOCKED** — `prisma generate` is TLS-blocked here |
+| R7C.1 regression suite + smoke | **37/37 tests, smoke 6/6** |
+
+Not executed here, and not claimed: any ARM64 or Alpine run, genuine Prisma client
+generation, `PrismaClient` construction, server startup of the **real** application, or the
+six PDF smoke scenarios inside a rebuilt image.
+
+## Acceptance gate for the artifact
+
+`scripts/verify-prisma-artifact-runtime.mjs <artifact-root>` loads the closure **inside the
+emitted artifact, outside the source checkout**. It refuses to run at all if it can find a
+`.git` in any parent directory, because Node resolves `node_modules` by walking upward and
+would then find the repository's own tree and pass against an empty artifact.
+
+It checks, in order: `@prisma/client` loads; the generated client is present; the adapter
+loads **and each of its `require()` targets resolves from the adapter's own directory** — the
+check that would have caught this defect; `pg` loads and its requires resolve from `pg`'s
+directory; the nested and hoisted `postgres-array` are distinct and are majors 2 and 3;
+`PrismaPg` and `PrismaClient` construct; `$disconnect()` resolves. It opens no connection,
+takes no credentials and runs no query.
+
+It is wired into both places a broken closure can escape from:
+
+- **`Dockerfile`** (runner stage, before `USER nextjs`): `RUN node scripts/verify-prisma-artifact-runtime.mjs /app`.
+  This is inside the final image, so it checks what would actually ship — not the builder's
+  fully-populated `node_modules`, which can never reproduce a packaging defect. This is the
+  step that would have stopped the R7C.1 image before it was published.
+- **`.github/workflows/ci.yml`** (build job, after `npm run build`, where genuine
+  `prisma generate` succeeds): copies `.next/standalone` out of the checkout and verifies it.
+
+## Native acceptance commands (next pinned ARM64 run)
+
+```bash
+# 1. Build (genuine Prisma generation happens in this step; it is TLS-blocked here)
+docker build --platform linux/arm64 -f Dockerfile -t dip-document-app:r7c3 .
+
+# 2. The gate now runs during the build. Independently, from the image:
+docker run --rm --platform linux/arm64 --entrypoint node dip-document-app:r7c3 \
+  scripts/verify-prisma-artifact-runtime.mjs /app
+# expect exit 0
+
+# 3. The exact stop-gate that failed in R7C.2, from the image root
+docker run --rm --platform linux/arm64 --entrypoint node dip-document-app:r7c3 -e '
+  require("@prisma/client");
+  const { PrismaPg } = require("@prisma/adapter-pg");
+  new PrismaPg({ connectionString: "postgresql://check:check@127.0.0.1:5432/check" });
+  console.log("adapter closure OK");
+'
+
+# 4. Build marker and PDF artifact, unchanged from R7C.1
+docker run --rm --platform linux/arm64 --entrypoint node dip-document-app:r7c3 \
+  -e 'console.log(require("fs").readFileSync("node_modules/.dip-pdf-worker-target.json","utf8"))'
+docker run --rm --platform linux/arm64 --entrypoint node dip-document-app:r7c3 \
+  scripts/verify-pdf-worker-artifact.mjs /app
+
+# 5. The six PDF scenarios, then the production runner under the restricted env
+docker run --rm --platform linux/arm64 --entrypoint node dip-document-app:r7c3 \
+  scripts/smoke-pdf-worker-artifact.mjs /app
+```
+
+`PrismaClient` construction and server startup still need a real generated client, so they are
+covered by steps 1–2 in an environment where generation works; they remain **BLOCKED** here.
+
+## Status
+
+- **B31-03 remains OPEN.** **B31-04 remains OPEN** — production packaging acceptance is not
+  closed by this change, because it has not been executed on ARM64.
+- **R7C acceptance is NOT claimed.** What is claimed is narrower and evidenced: the packaging
+  mechanism is identified and reproduced, the correction is implemented and verified in a real
+  standalone build on x64, and an artifact gate now fails the build when the closure is broken.
+- **R7D remains pending and unimplemented.**
+- PR #31 remains **NO-GO** for merge; deployment remains **NO-GO**.
+- npm audit findings are unchanged and remain a separate release risk (no upgrades, no
+  `npm audit fix`).
