@@ -158,7 +158,10 @@ test("the traced file list and the artifact verifier cannot drift apart", async 
   // is `src/app/v1/jobs/route.ts`; keying it `/api/v1/jobs` matches nothing, so that build
   // silently shipped without the child while this list looked complete. A wrong key is
   // invisible in every file-based check, so it is asserted directly.
-  const routeKeys = [...config.matchAll(/^\s*"([^"]+)":\s*\[\.\.\.PDF_WORKER_ARTIFACT\]/gmu)].map((match) => match[1]);
+  // R7C.1: each route now spreads the Prisma runtime closure alongside the worker
+  // artifact, so the pattern allows trailing entries after `...PDF_WORKER_ARTIFACT`
+  // rather than requiring it to be the only element.
+  const routeKeys = [...config.matchAll(/^\s*"([^"]+)":\s*\[\.\.\.PDF_WORKER_ARTIFACT[^\]]*\]/gmu)].map((match) => match[1]);
   assert.deepEqual(routeKeys.sort(), ["/api/fill-forms/inspect", "/api/jobs/[tool]", "/v1/jobs"],
     "the packaged routes must be the real filesystem routes");
   assert.doesNotMatch(config, /"\/api\/v1\/jobs"\s*:/u,

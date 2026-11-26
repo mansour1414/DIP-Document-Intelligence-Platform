@@ -175,20 +175,122 @@ function missingIn(root, target) {
 export const TARGET_MARKER = "node_modules/.dip-pdf-worker-target.json";
 
 /** Read the artifact's declared target, if it has one. Unreadable is not fatal by itself. */
+/**
+ * Thrown when an artifact marker exists but does not describe a usable target.
+ *
+ * Distinct from a missing marker: a missing marker means "this artifact was built
+ * natively", which the running host can legitimately answer. A *present but incomplete*
+ * marker means the build intended a specific target and failed to state it fully, and
+ * that is never something to guess at.
+ */
+export class MarkerError extends Error {}
+
+/**
+ * Validate one marker document strictly.
+ *
+ * ## Why this is strict rather than forgiving
+ *
+ * The previous version parsed the marker and passed `{ cpu, libc }` to `resolveTarget()`,
+ * which quietly substitutes the *running host* for any undefined field. So an empty
+ * `{}` marker, a `{"cpu":"arm64"}` marker and a `["arm64"]` marker were all accepted and
+ * silently resolved to whatever machine the verifier happened to be on. Codex measured
+ * exactly that: all four malformed shapes exited 0.
+ *
+ * That is the failure mode the marker exists to prevent. If a cross-built ARM64 artifact
+ * declares `{"cpu":"arm64"}` and the verifier fills in the builder's libc, the check
+ * describes a target that does not exist and reports the artifact complete. Guessing is
+ * not more helpful than failing — it is the bug.
+ *
+ * So: every field must be present, a non-empty string, and semantically supported.
+ * Anything else is a build defect and is reported as one.
+ */
+export function parseMarker(value, markerPath) {
+  const describe = (detail) => new MarkerError(`The artifact target marker at ${markerPath} is invalid: ${detail}`);
+  if (value === null) throw describe("the document is null");
+  if (Array.isArray(value)) throw describe("the document is an array, not an object");
+  if (typeof value !== "object") throw describe(`the document is a ${typeof value}, not an object`);
+
+  const keys = Object.keys(value).sort();
+  // Unknown keys are rejected rather than ignored: a marker written with `{arch, clib}`
+  // would otherwise look complete while carrying no recognisable declaration at all.
+  const unknown = keys.filter((key) => key !== "cpu" && key !== "libc");
+  if (unknown.length > 0) throw describe(`unknown field(s) ${unknown.join(", ")}; expected exactly "cpu" and "libc"`);
+  for (const key of ["cpu", "libc"]) {
+    if (!(key in value)) throw describe(`the "${key}" field is missing; both "cpu" and "libc" are required`);
+    const field = value[key];
+    if (typeof field !== "string") throw describe(`"${key}" must be a string, saw ${Array.isArray(field) ? "array" : typeof field}`);
+    if (field.trim() === "") throw describe(`"${key}" is empty`);
+  }
+  try {
+    // `resolveTarget` is the single authority on which CPU/libc values are supported, so
+    // the marker cannot accept a value the rest of the packaging would reject.
+    return resolveTarget({ cpu: value.cpu, libc: value.libc });
+  } catch (error) {
+    throw describe(error instanceof Error ? error.message : String(error));
+  }
+}
+
+/** Read and strictly validate a marker file. */
+export function readMarker(markerPath) {
+  let raw;
+  try {
+    raw = readFileSync(markerPath, "utf8");
+  } catch (error) {
+    throw new MarkerError(`The artifact target marker at ${markerPath} cannot be read: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    throw new MarkerError(`The artifact target marker at ${markerPath} is not valid JSON: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return parseMarker(parsed, markerPath);
+}
+
+/**
+ * Resolve the target to verify.
+ *
+ * Precedence, and the reason for each step:
+ *
+ *   1. Explicit CLI overrides — a human stating the target outranks everything, and is
+ *      validated on its own terms (both fields, supported values) rather than merged with
+ *      the marker, so `--target-cpu=x64` next to an `arm64` marker is a rejected
+ *      contradiction rather than a hybrid target.
+ *   2. A marker the artifact itself carries — strict, see `parseMarker`.
+ *   3. The running process — only when the artifact declares nothing, which is the
+ *      native-build case.
+ */
 export function declaredTarget(root, overrides = {}) {
-  if (overrides.cpu || overrides.libc) return resolveTarget(overrides);
+  const hasCpu = overrides.cpu !== undefined && overrides.cpu !== "";
+  const hasLibc = overrides.libc !== undefined && overrides.libc !== "";
+  if (hasCpu || hasLibc) {
+    // An override must be complete: half an override would otherwise fall back to the
+    // host for the other half, which is the same defect one layer up.
+    if (!(hasCpu && hasLibc)) {
+      throw new MarkerError(`The target override is incomplete: ${hasCpu ? "--target-libc" : "--target-cpu"} is required when ${hasCpu ? "--target-cpu" : "--target-libc"} is given.`);
+    }
+    const explicit = resolveTarget({ cpu: overrides.cpu, libc: overrides.libc });
+    // A marker that contradicts the stated target is a real inconsistency, not a
+    // preference: the artifact says it was built for one platform and the operator says
+    // another. Verifying "the operator's answer" would hide the disagreement.
+    for (const base of [resolve(root), join(resolve(root), ".next/standalone")]) {
+      const marker = join(base, TARGET_MARKER);
+      if (!existsSync(marker)) continue;
+      const declared = readMarker(marker);
+      if (declared.cpu !== explicit.cpu || declared.libc !== explicit.libc) {
+        throw new MarkerError(
+          `The artifact at ${base} declares ${declared.cpu}/${declared.libc} but the verifier was told ${explicit.cpu}/${explicit.libc}. `
+          + "One of them is wrong; refusing to verify a contradictory target.",
+        );
+      }
+      return explicit;
+    }
+    return explicit;
+  }
   for (const base of [resolve(root), join(resolve(root), ".next/standalone")]) {
     const marker = join(base, TARGET_MARKER);
     if (!existsSync(marker)) continue;
-    try {
-      const parsed = JSON.parse(readFileSync(marker, "utf8"));
-      return resolveTarget({ cpu: parsed.cpu, libc: parsed.libc });
-    } catch (error) {
-      // A malformed marker is a build defect, not a reason to fall back silently to the
-      // running architecture: that fallback is precisely how a wrong-target artifact
-      // gets reported complete. Failing loudly is the honest behaviour.
-      throw new Error(`The artifact target marker at ${marker} is unreadable: ${error instanceof Error ? error.message : String(error)}`);
-    }
+    return readMarker(marker);
   }
   return resolveTarget(overrides);
 }
@@ -224,9 +326,10 @@ if (invokedDirectly) {
   try {
     result = checkPdfWorkerArtifact(root, overrides);
   } catch (error) {
-    // An unsupported CPU/libc is a configuration error, not a missing file. Say so
-    // distinctly: "x64 was assumed" is the bug that produced a wrong-target artifact
-    // being reported complete.
+    // Exit 2 covers every *declaration* problem — an unsupported CPU/libc, a malformed
+    // marker, a partial override, a contradictory one. None of them mean "the artifact is
+    // missing a file" (exit 1); they mean the verifier was asked to check something
+    // incoherent, and no amount of file inspection would make that answer meaningful.
     console.error(error instanceof Error ? error.message : String(error));
     process.exit(2);
   }

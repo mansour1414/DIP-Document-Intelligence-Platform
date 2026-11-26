@@ -105,6 +105,32 @@ const PDF_WORKER_RUNTIME_PACKAGES = [
  */
 const PDF_WORKER_ARTIFACT = [...PDF_WORKER_TRACING, ...PDF_WORKER_RUNTIME_PACKAGES] as const;
 
+/**
+ * The generated Prisma client, as a build input (R7C.1).
+ *
+ * `prisma generate` writes JavaScript and a schema into `node_modules/.prisma/client`,
+ * and `@prisma/client` re-exports from it. Next traces the *package* because routes
+ * import it, but `.prisma/client` is not a package anything imports by name — it is a
+ * sibling generated into `node_modules` at build time. If generation runs after tracing,
+ * or if the tracer does not descend into a dot-directory, the standalone tree ships a
+ * re-export with nothing behind it and every database call fails at runtime with
+ * "did not initialize yet".
+ *
+ * That is why generation is a build step in `Dockerfile` *before* `npm run build`
+ * (Task A), and why the closure is declared here as well: the declaration is what makes
+ * the requirement visible to anyone reading the build config, and it survives a future
+ * change that moves generation earlier or later.
+ *
+ * The engine binary is NOT included: this application uses `@prisma/adapter-pg`
+ * (`PrismaPg` in `src/lib/db/index.ts`), so queries go through the driver, not a native
+ * query engine. Shipping an engine would add megabytes of code that never executes.
+ */
+const PRISMA_RUNTIME_TRACING = [
+  "./node_modules/@prisma/client/**/*",
+  "./node_modules/.prisma/client/**/*",
+  "./node_modules/@prisma/adapter-pg/**/*",
+] as const;
+
 const nextConfig: NextConfig = {
   output: "standalone",
   // The bounded PDF child is **executed**, not imported, so the bundler cannot see it
@@ -150,9 +176,9 @@ const nextConfig: NextConfig = {
     // previous key matched nothing and the Public API standalone build silently shipped
     // without the child — the one deployment path where Fill Forms would fail with
     // WORKER_CRASHED while the verifier reported every file present.
-    "/api/fill-forms/inspect": [...PDF_WORKER_ARTIFACT],
-    "/api/jobs/[tool]": [...PDF_WORKER_ARTIFACT],
-    "/v1/jobs": [...PDF_WORKER_ARTIFACT],
+    "/api/fill-forms/inspect": [...PDF_WORKER_ARTIFACT, ...PRISMA_RUNTIME_TRACING],
+    "/api/jobs/[tool]": [...PDF_WORKER_ARTIFACT, ...PRISMA_RUNTIME_TRACING],
+    "/v1/jobs": [...PDF_WORKER_ARTIFACT, ...PRISMA_RUNTIME_TRACING],
   },
   images: {
     remotePatterns: [],

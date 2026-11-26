@@ -20,7 +20,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
@@ -213,8 +213,13 @@ test("R7C-11: the target marker is what a cross-build verifies against, and it w
       declaredTarget: (root: string, overrides?: Record<string, string>) => { cpu: string; libc: string };
     };
     assert.deepEqual(verifier.declaredTarget(root), { cpu: "arm64", libc: "musl" });
-    // An explicit flag still wins over the artifact's own marker.
-    assert.deepEqual(verifier.declaredTarget(root, { cpu: "x64", libc: "glibc" }), { cpu: "x64", libc: "glibc" });
+    // R7C.1: an explicit flag that CONTRADICTS the marker is now refused rather than
+    // winning. The earlier version let the override silently replace the artifact's own
+    // declaration, so `--target-cpu=x64` against an arm64 artifact verified a target the
+    // artifact does not have. See R7C.1-C6.
+    assert.throws(() => verifier.declaredTarget(root, { cpu: "x64", libc: "glibc" }), /contradict|declares arm64/u);
+    // An agreeing override is redundant but harmless.
+    assert.deepEqual(verifier.declaredTarget(root, { cpu: "arm64", libc: "musl" }), { cpu: "arm64", libc: "musl" });
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -228,4 +233,115 @@ test("R7C-12: the helper refuses an unsupported Docker architecture instead of g
     (error: unknown) => (error as { status?: number }).status === 2,
     "an unsupported CPU must exit 2",
   );
+});
+
+// ---------------------------------------------------------------------------------------
+// R7C.1 Task C — strict marker validation.
+//
+// Codex measured every malformed shape below returning exit 0, because `declaredTarget()`
+// passed the parsed marker to `resolveTarget()`, which silently substitutes the running
+// host for any missing field. An artifact declaring `{"cpu":"arm64"}` was therefore
+// verified as "arm64 + whatever libc the builder happened to have". Each case here is one
+// of the measured rows, asserted at the same level the measurement was taken: the CLI.
+// ---------------------------------------------------------------------------------------
+
+/** Run the real verifier CLI against a synthetic artifact root, returning its exit status. */
+function verifyExit(markerBody: string | undefined, extraArgs: string[] = []): number {
+  const root = mkdtempSync(join(tmpdir(), "dip-marker-"));
+  try {
+    if (markerBody !== undefined) {
+      mkdirSync(join(root, "node_modules"), { recursive: true });
+      writeFileSync(join(root, "node_modules/.dip-pdf-worker-target.json"), markerBody);
+    }
+    try {
+      execFileSync(process.execPath, [join(process.cwd(), "scripts/verify-pdf-worker-artifact.mjs"), root, ...extraArgs], { stdio: "pipe" });
+      return 0;
+    } catch (error) {
+      return (error as { status?: number }).status ?? -1;
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+test("R7C.1-C1: every malformed marker shape exits 2", () => {
+  // The four rows Codex measured as an incorrect 0, plus the shapes a marker could
+  // plausibly take. `2` is the declaration-error code; `1` would mean "artifact is
+  // missing files", which is a different (and misleading) diagnosis.
+  const malformed: Array<[string, string]> = [
+    ["empty object", "{}"],
+    ["cpu only", '{"cpu":"arm64"}'],
+    ["libc only", '{"libc":"glibc"}'],
+    ["array instead of object", '["arm64","glibc"]'],
+    ["null", "null"],
+    ["number", "42"],
+    ["string", '"arm64/glibc"'],
+    ["boolean", "true"],
+    ["empty strings", '{"cpu":"","libc":""}'],
+    ["whitespace strings", '{"cpu":"  ","libc":"  "}'],
+    ["cpu as number", '{"cpu":64,"libc":"glibc"}'],
+    ["libc as array", '{"cpu":"arm64","libc":["glibc"]}'],
+    ["unknown field alongside valid ones", '{"cpu":"arm64","libc":"glibc","arch":"arm64"}'],
+    ["unsupported cpu", '{"cpu":"riscv64","libc":"glibc"}'],
+    ["unsupported libc", '{"cpu":"arm64","libc":"uclibc"}'],
+  ];
+  for (const [label, body] of malformed) {
+    assert.equal(verifyExit(body), 2, `${label} must exit 2, not be silently accepted`);
+  }
+});
+
+test("R7C.1-C2: invalid JSON exits 2", () => {
+  for (const body of ["{not json", '{"cpu":"arm64",}', ""]) {
+    assert.equal(verifyExit(body), 2, `malformed JSON ${JSON.stringify(body)} must exit 2`);
+  }
+});
+
+test("R7C.1-C3: a complete, supported marker is accepted and drives the file check", () => {
+  // Exit 1 here is correct and expected: the synthetic root has no artifact files. What
+  // matters is that it got past declaration validation to the file check — a declaration
+  // error would be 2.
+  for (const body of ['{"cpu":"x64","libc":"glibc"}', '{"cpu":"arm64","libc":"glibc"}', '{"cpu":"arm64","libc":"musl"}', '{"cpu":"x64","libc":"musl"}']) {
+    assert.equal(verifyExit(body), 1, `${body} is a valid declaration and must reach the file check`);
+  }
+});
+
+test("R7C.1-C4: a missing marker still allows an explicit cross-target check", () => {
+  // No marker means a natively built artifact, where the host is a legitimate answer; and
+  // an explicit override is how a cross-build states its target. Neither is a declaration
+  // error, so both reach the file check.
+  assert.equal(verifyExit(undefined, ["--target-cpu=arm64", "--target-libc=musl"]), 1);
+  assert.equal(verifyExit(undefined, ["--target-cpu=x64", "--target-libc=glibc"]), 1);
+});
+
+test("R7C.1-C5: overrides are validated separately and cannot complete a marker", () => {
+  // A half override would otherwise fall back to the host for the other half — the same
+  // defect one layer up.
+  assert.equal(verifyExit(undefined, ["--target-cpu=arm64"]), 2, "a CPU-only override must be rejected");
+  assert.equal(verifyExit(undefined, ["--target-libc=musl"]), 2, "a libc-only override must be rejected");
+  assert.equal(verifyExit(undefined, ["--target-cpu=riscv64", "--target-libc=glibc"]), 2, "an unsupported override must be rejected");
+});
+
+test("R7C.1-C6: an override that contradicts the artifact's own marker is refused", () => {
+  // Verifying "the operator's answer" against an artifact that says otherwise would hide
+  // the disagreement rather than report it. The artifact is authoritative about what it
+  // is; a conflicting instruction means one of the two is wrong.
+  assert.equal(verifyExit('{"cpu":"arm64","libc":"glibc"}', ["--target-cpu=x64", "--target-libc=glibc"]), 2);
+  assert.equal(verifyExit('{"cpu":"arm64","libc":"glibc"}', ["--target-cpu=arm64", "--target-libc=musl"]), 2);
+  // An agreeing override is redundant but not an error.
+  assert.equal(verifyExit('{"cpu":"arm64","libc":"glibc"}', ["--target-cpu=arm64", "--target-libc=glibc"]), 1);
+});
+
+test("R7C.1-C7: host derivation happens only when nothing is declared", () => {
+  // The one case where guessing is correct, and the reason the strictness is scoped to
+  // *present* markers: a natively built artifact declares nothing, and the process running
+  // the check IS the target.
+  const verifier = require("../scripts/verify-pdf-worker-artifact.mjs") as {
+    declaredTarget: (root: string, overrides?: Record<string, string>) => { cpu: string; libc: string };
+  };
+  const empty = mkdtempSync(join(tmpdir(), "dip-nomarker-"));
+  try {
+    assert.deepEqual(verifier.declaredTarget(empty, {}), { cpu: process.arch === "arm64" ? "arm64" : "x64", libc: "glibc" });
+  } finally {
+    rmSync(empty, { recursive: true, force: true });
+  }
 });
