@@ -1,42 +1,57 @@
 /**
- * R7C.3 — the artifact runtime check must detect the failure it was built for.
+ * R7C.3.1 — the artifact runtime check must detect the failures it was built for.
  *
- * ## The defect these guard
+ * ## The two defects these guard
  *
- * The R7C.1 image contained `/app/node_modules/@prisma/adapter-pg/dist/index.js` — the
- * file was there, and the require stack in the failure pointed at it — yet loading it
- * raised `MODULE_NOT_FOUND: @prisma/driver-adapter-utils`. The package had been copied by
- * a file glob, which does not know about dependencies, so its own `require()` had nowhere
- * to resolve.
+ * 1. **R7C.1 packaging.** The emitted image contained
+ *    `/app/node_modules/@prisma/adapter-pg/dist/index.js` — the file was there, and the
+ *    require stack pointed at it — yet loading it raised `MODULE_NOT_FOUND:
+ *    @prisma/driver-adapter-utils`. The package had been copied by a file glob, which does
+ *    not know about dependencies, so its own `require()` had nowhere to resolve.
  *
- * No earlier gate could see this. TypeScript checks types, webpack checks bundling, the
- * tracer decides packaging, and only `require()` at runtime exercises the real directory
- * layout. So the regression test for the *checker* has to be a real require against a
- * real directory layout — not an assertion about configuration text.
+ * 2. **R7C.3 verifier.** The check that loads `@prisma/client` returned `{ path }` and the
+ *    construction check then tried to `new` that object, so a perfectly good artifact
+ *    failed with "@prisma/client did not yield a constructor". CI run `45750694222` shows
+ *    every packaging check passing and only construction and disconnect failing, which is
+ *    exactly the signature of a verifier bug rather than a packaging one.
  *
  * ## What is real here, and what is not
  *
- * Every package used below is copied from the repository's own `node_modules` at their
- * locked versions. The tests therefore exercise genuine `@prisma/adapter-pg`, genuine
- * `pg`, and genuine Node resolution — including the nested `postgres-array@2` under
- * `pg-types` that differs from the hoisted `postgres-array@3`.
+ * Every package copied below is the repository's own, at its locked version. So tests 1–5
+ * exercise genuine `@prisma/adapter-pg`, genuine `pg`, and genuine Node resolution —
+ * including the nested `postgres-array@2` under `pg-types` that differs from the hoisted
+ * `postgres-array@3`.
  *
- * `@prisma/client` is the one thing that cannot be real here: it requires a *generated*
- * `.prisma/client`, and `prisma generate` is TLS-blocked in this sandbox. So the
- * generated-client checks are asserted as their own failing outcome rather than faked —
- * fabricating a client would make this suite prove nothing and would violate the
- * "no fake Prisma Client" rule. The construction checks are BLOCKED until run natively;
- * the adapter and pg closure checks are fully exercised.
+ * **`@prisma/client` is the exception, and it matters.** A real one requires a *generated*
+ * `.prisma/client`, and `prisma generate` is TLS-blocked in this sandbox: it fetches the
+ * schema engine from `binaries.prisma.sh` before it generates anything. So the client tests
+ * below use a deliberately synthetic module that exports a class with a `$disconnect` —
+ * and they assert only the **verifier's control flow**, never that Prisma works. The
+ * constructor-versus-metadata bug is a control-flow bug, so this is the right level to test
+ * it at, but it is not evidence about the real client.
+ *
+ * The genuine acceptance gate is untouched: CI and the Dockerfile run this same script
+ * against a real generated client. Nothing here substitutes for that.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 
 const ROOT = process.cwd();
 const HARNESS = join(ROOT, "scripts/verify-prisma-artifact-runtime.mjs");
+
+/**
+ * How long the verifier may run before the test fails it.
+ *
+ * It must outlive the verifier's own 5s leak watchdog, because a leak is reported *by* the
+ * verifier and this bound is only the backstop for a true hang. If the event loop stays
+ * alive after `$disconnect()`, the process never exits and this timeout is what turns that
+ * into a failure instead of a stuck CI job.
+ */
+const EXTERNAL_TIMEOUT_MS = 20_000;
 
 /** Packages copied into every synthetic artifact: the real adapter and pg closure. */
 const CLOSURE = [
@@ -58,41 +73,110 @@ const CLOSURE = [
   "xtend",
 ];
 
+interface Report {
+  result: string;
+  checks: Array<{ check: string; ok: boolean; detail?: unknown; error?: string }>;
+  failed?: string[];
+}
+
+/**
+ * A synthetic `@prisma/client` that mimics the *shape* of a generated one.
+ *
+ * This exists solely to exercise the verifier's control flow, which a real client cannot do
+ * here because generation is TLS-blocked. It records each construction and each
+ * `$disconnect()` on `globalThis` so the test can assert the same client that was built is
+ * the one torn down — the property the R7C.3 bug destroyed.
+ *
+ * It is written into a throwaway directory. It is never used by CI, the Dockerfile, or any
+ * acceptance claim.
+ */
+function writeSyntheticClient(root: string, options: { leakHandle?: boolean } = {}): void {
+  const dir = join(root, "node_modules/@prisma/client");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "@prisma/client", version: "0.0.0-synthetic", main: "index.js" }));
+  writeFileSync(
+    join(dir, "index.js"),
+    `
+// SYNTHETIC — verifier control-flow test only. Not Prisma.
+class PrismaClient {
+  constructor(config) {
+    if (!config || typeof config !== "object") throw new Error("expected a config object");
+    if (!config.adapter) throw new Error("expected an adapter, which is the PrismaPg instance");
+    globalThis.__syntheticConstructed = (globalThis.__syntheticConstructed || 0) + 1;
+    globalThis.__syntheticClient = this;
+    this.disconnected = false;
+  }
+  async $disconnect() {
+    this.disconnected = true;
+    globalThis.__syntheticDisconnected = this;
+    ${options.leakHandle ? 'setInterval(() => {}, 1000); // deliberately keeps the loop alive' : ""}
+  }
+}
+module.exports = { PrismaClient };
+`,
+  );
+  // The generated-client directory the verifier looks for. Its contents are irrelevant to
+  // these tests; presence is what the check asserts.
+  mkdirSync(join(root, "node_modules/.prisma/client"), { recursive: true });
+  writeFileSync(join(root, "node_modules/.prisma/client/default.js"), "// SYNTHETIC\nmodule.exports = {};\n");
+}
+
 /**
  * Build a throwaway artifact containing the real packages.
  *
  * `nested` reproduces the lockfile's second, older `postgres-array` under `pg-types`.
- * It is the detail a naive flat copy loses, and losing it hands `pg-types` the wrong
- * major version without any error until a query payload is parsed.
  */
-function makeArtifact(): string {
+function makeArtifact(options: { nested?: boolean; client?: "synthetic" | "none"; leakHandle?: boolean } = {}): string {
+  const { nested = true, client = "none", leakHandle = false } = options;
   const root = mkdtempSync(join(tmpdir(), "dip-prisma-artifact-"));
   for (const name of CLOSURE) {
     const from = join(ROOT, "node_modules", name);
     if (!existsSync(from)) continue;
     cpSync(from, join(root, "node_modules", name), { recursive: true });
   }
-  cpSync(join(ROOT, "node_modules/pg-types/node_modules/postgres-array"), join(root, "node_modules/pg-types/node_modules/postgres-array"), { recursive: true });
+  if (nested) {
+    cpSync(join(ROOT, "node_modules/pg-types/node_modules/postgres-array"), join(root, "node_modules/pg-types/node_modules/postgres-array"), { recursive: true });
+  }
+  if (client === "synthetic") writeSyntheticClient(root, { leakHandle });
   return root;
 }
 
-function runHarness(root: string): { status: number; report: { result: string; checks: Array<{ check: string; ok: boolean; detail?: unknown; error?: string }>; failed?: string[] } } {
+/**
+ * Run the verifier under a bounded external timeout.
+ *
+ * `execFileSync` with `timeout` kills the child and throws, which is what turns a leaked
+ * handle into a test failure. Nothing here relies on the verifier terminating itself.
+ */
+function runHarness(root: string): { status: number; report: Report; timedOut: boolean } {
+  const started = Date.now();
   try {
-    const stdout = execFileSync(process.execPath, [HARNESS, root], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
-    return { status: 0, report: JSON.parse(stdout) };
+    const stdout = execFileSync(process.execPath, [HARNESS, root], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: EXTERNAL_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    });
+    return { status: 0, report: JSON.parse(stdout), timedOut: false };
   } catch (error) {
-    const failure = error as { status?: number; stdout?: string };
-    return { status: failure.status ?? -1, report: JSON.parse(failure.stdout ?? "{}") };
+    const failure = error as { status?: number; stdout?: string; signal?: string; killed?: boolean };
+    const timedOut = failure.signal === "SIGKILL" || Boolean(failure.killed) || Date.now() - started >= EXTERNAL_TIMEOUT_MS - 250;
+    return { status: failure.status ?? -1, report: JSON.parse(failure.stdout ?? "{}") as Report, timedOut };
   }
 }
 
-test("R7C.3-1: the adapter's own requires resolve against a real, complete artifact", () => {
+const failedEntries = (report: Report) => report.checks.filter((entry) => !entry.ok);
+const findCheck = (report: Report, prefix: string) => report.checks.find((entry) => entry.check.startsWith(prefix));
+
+// ---------------------------------------------------------------------------------------
+// Packaging closure (the R7C.1 defect).
+// ---------------------------------------------------------------------------------------
+
+test("R7C.3.1-1: the adapter's own requires resolve against a real, complete artifact", () => {
   const root = makeArtifact();
   try {
     const { report } = runHarness(root);
-    const adapterCheck = report.checks.find((entry) => entry.check.startsWith("@prisma/adapter-pg loads"));
-    assert.equal(adapterCheck?.ok, true, `the adapter must load, failures: ${JSON.stringify(report.checks.filter((entry) => !entry.ok))}`);
-    // And it must have resolved the *specific* module whose absence killed the R7C.1 image.
+    const adapterCheck = findCheck(report, "@prisma/adapter-pg loads");
+    assert.equal(adapterCheck?.ok, true, `the adapter must load; failures: ${JSON.stringify(failedEntries(report))}`);
     const requires = (adapterCheck?.detail as { requires: Record<string, string> }).requires;
     assert.ok(requires["@prisma/driver-adapter-utils"]?.startsWith(root),
       "@prisma/driver-adapter-utils must resolve inside the artifact");
@@ -101,109 +185,250 @@ test("R7C.3-1: the adapter's own requires resolve against a real, complete artif
   }
 });
 
-test("R7C.3-2: removing @prisma/driver-adapter-utils reproduces the exact production failure", () => {
-  // This is the negative regression case for the real defect: everything else stays
-  // intact, only the one orphaned dependency is removed — which is precisely the state a
-  // file-glob copy produces.
+test("R7C.3.1-2: removing @prisma/driver-adapter-utils reproduces the exact production failure", () => {
+  // The negative regression for the real defect: everything else intact, only the one
+  // orphaned dependency removed — precisely the state a file-glob copy produces.
   const root = makeArtifact();
   try {
     rmSync(join(root, "node_modules/@prisma/driver-adapter-utils"), { recursive: true, force: true });
     const { status, report } = runHarness(root);
     assert.equal(status, 1, "the check must fail when a required dependency is absent");
     assert.equal(report.result, "FAIL");
-    const joined = JSON.stringify(report.checks.filter((entry) => !entry.ok));
-    assert.match(joined, /@prisma\/driver-adapter-utils/u, "the failure must name the missing module");
-    assert.match(joined, /@prisma\/adapter-pg/u, "the failure must attribute it to the adapter");
+    const adapterFailure = failedEntries(report).find((entry) => entry.check.startsWith("@prisma/adapter-pg loads"));
+    assert.match(String(adapterFailure?.error), /@prisma\/driver-adapter-utils/u);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("R7C.3-3: removing pg is detected, not silently tolerated", () => {
+test("R7C.3.1-3: removing pg is detected, not silently tolerated", () => {
   const root = makeArtifact();
   try {
     rmSync(join(root, "node_modules/pg"), { recursive: true, force: true });
     const { status, report } = runHarness(root);
     assert.equal(status, 1);
-    assert.match(JSON.stringify(report.checks.filter((entry) => !entry.ok)), /\bpg\b/u);
+    assert.ok(failedEntries(report).some((entry) => /\bpg\b/u.test(String(entry.error))), JSON.stringify(failedEntries(report)));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("R7C.3-4: the nested postgres-array is preserved and proven distinct", () => {
-  // `pg-types` needs postgres-array@2 while the adapter uses @3. A flat copy collapses
-  // them and nothing fails until a result is parsed — so the harness asserts the two
-  // resolve to different directories, and this asserts the harness does that.
+// ---------------------------------------------------------------------------------------
+// Nested dependency layout (the R7C.3.1 Task 2 false positive).
+// ---------------------------------------------------------------------------------------
+
+test("R7C.3.1-4: the nested postgres-array@2 and hoisted @3 are both required, separate, and correct", () => {
   const root = makeArtifact();
   try {
     const { report } = runHarness(root);
-    const pgCheck = report.checks.find((entry) => entry.check.startsWith("pg loads"));
-    assert.equal(pgCheck?.ok, true, JSON.stringify(report.checks.filter((entry) => !entry.ok)));
-    const detail = pgCheck?.detail as { nestedPostgresArray: string; hoistedPostgresArray: string };
-    assert.ok(detail.nestedPostgresArray.includes("pg-types/node_modules/postgres-array"),
-      `nested copy must be the nested one, saw ${detail.nestedPostgresArray}`);
-    assert.ok(detail.hoistedPostgresArray.endsWith("/node_modules/postgres-array/index.js"),
-      `hoisted copy must be the hoisted one, saw ${detail.hoistedPostgresArray}`);
-    assert.notEqual(detail.nestedPostgresArray, detail.hoistedPostgresArray);
-    // Versions confirm the majors really differ, so this is not a same-version no-op.
-    // The resolved path is `<pkgdir>/index.js`, so the manifest is one level up.
-    const nested = JSON.parse(readFileSync(join(dirname(detail.nestedPostgresArray), "package.json"), "utf8")) as { version: string };
-    const hoisted = JSON.parse(readFileSync(join(dirname(detail.hoistedPostgresArray), "package.json"), "utf8")) as { version: string };
-    assert.equal(nested.version.split(".")[0], "2");
-    assert.equal(hoisted.version.split(".")[0], "3");
+    const nestedCheck = findCheck(report, "the nested postgres-array@2 and hoisted postgres-array@3");
+    assert.equal(nestedCheck?.ok, true, `nested layout must be verified; failures: ${JSON.stringify(failedEntries(report))}`);
+    const detail = nestedCheck?.detail as { nested: string; hoisted: string; nestedDir: string; hoistedDir: string };
+    assert.equal(detail.nested.split(".")[0], "2");
+    assert.equal(detail.hoisted.split(".")[0], "3");
+    assert.notEqual(detail.nestedDir, detail.hoistedDir);
+    assert.ok(detail.nestedDir.includes("pg-types/node_modules/postgres-array"), detail.nestedDir);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("R7C.3-5: the harness refuses to run inside a source checkout", () => {
-  // The escape hatch that would make every check vacuous: run from a directory under the
-  // repository and Node's upward walk finds the repository's node_modules, so a completely
-  // empty artifact would pass. This is the guard against that, tested where it matters.
-  const { status, report } = runHarness(ROOT);
-  assert.equal(status, 1);
-  assert.equal(report.result, "FAIL");
-  // The isolation refusal happens before any module check, so `checks` is empty and the
-  // reason is reported in `failed`. Both are asserted: an empty `checks` alone could also
-  // mean the script crashed before doing anything.
-  assert.deepEqual(report.checks, [], "no module check may run once isolation is refused");
-  assert.deepEqual(report.failed, ["artifact isolation"]);
+test("R7C.3.1-5: a flattened tree is REJECTED, not reported as acceptable", () => {
+  // The false positive that shipped in R7C.3: when both resolve to one directory the check
+  // returned success with a note. A flattened tree hands `pg-types` major 3 when it
+  // requires ~2.0.0, and nothing fails until a result row is parsed.
+  const root = makeArtifact({ nested: false });
+  try {
+    rmSync(join(root, "node_modules/pg-types/node_modules"), { recursive: true, force: true });
+    const { status, report } = runHarness(root);
+    const nestedCheck = findCheck(report, "the nested postgres-array@2 and hoisted postgres-array@3");
+    assert.equal(nestedCheck?.ok, false, "a single shared copy must fail the check");
+    assert.match(String(nestedCheck?.error), /flattened|major 2/u,
+      `the failure must explain the layout problem, got: ${nestedCheck?.error}`);
+    assert.equal(status, 1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
-test("R7C.3-6: a missing generated client fails the client checks while the adapter still proves itself", () => {
-  // Honest split. `@prisma/client` needs a generated `.prisma/client`, and generation is
-  // BLOCKED here (TLS), so this asserts the *diagnosis* rather than faking a client:
-  // the client checks fail for the right reason, the adapter check still passes, and the
-  // report distinguishes them. Native acceptance covers the construction path.
+test("R7C.3.1-6: a missing nested copy is not treated as success", () => {
+  // `pg-types` ships its own `node_modules`, so copying the package carries the nested copy
+  // with it. Delete the directory outright to model a tree where the nested copy was never
+  // emitted at all (the packaging failure), rather than one where it was flattened.
   const root = makeArtifact();
+  rmSync(join(root, "node_modules/pg-types/node_modules"), { recursive: true, force: true });
+  try {
+    const { status, report } = runHarness(root);
+    assert.equal(status, 1);
+    assert.equal(findCheck(report, "the nested postgres-array@2 and hoisted postgres-array@3")?.ok, false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------------------
+// Verifier control flow (the R7C.3.1 constructor/metadata bug).
+// ---------------------------------------------------------------------------------------
+
+test("R7C.3.1-7: construction uses the real constructor, and disconnects the SAME client", () => {
+  // This is the regression for CI 45750694222. The load check validated `PrismaClient` was a
+  // function and then returned `{ path }`, so the construction check `new`'d metadata and
+  // reported "@prisma/client did not yield a constructor" on a good artifact.
+  //
+  // The synthetic client is a stand-in for the generated one — see the file header. What it
+  // proves is the control flow: the value handed to `new` is the exported class, and the
+  // object torn down is the object built.
+  const root = makeArtifact({ client: "synthetic" });
+  try {
+    const { status, report } = runHarness(root);
+    assert.equal(findCheck(report, "@prisma/client loads")?.ok, true, JSON.stringify(failedEntries(report)));
+    const construction = findCheck(report, "PrismaPg and PrismaClient construct");
+    assert.equal(construction?.ok, true,
+      `construction must succeed when the client exports a constructor; got: ${construction?.error}`);
+    const disconnected = findCheck(report, "$disconnect resolves");
+    assert.equal(disconnected?.ok, true, `disconnect must succeed; got: ${disconnected?.error}`);
+    assert.deepEqual((disconnected?.detail as { disconnectedSameClient: boolean }).disconnectedSameClient, true);
+    assert.equal(status, 0, `a complete artifact must pass; failed: ${JSON.stringify(report.failed)}`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("R7C.3.1-8: the constructor is not the report metadata", () => {
+  // The precise bug, asserted directly: the load check's `detail` is `{ path }`, which is not
+  // callable, and construction must not depend on it. If someone reintroduces the mistake by
+  // returning the constructor in `detail` and `new`ing it, `new metadata` throws
+  // "is not a constructor" and this fails.
+  const root = makeArtifact({ client: "synthetic" });
+  try {
+    const { report } = runHarness(root);
+    const loadDetail = findCheck(report, "@prisma/client loads")?.detail as { path?: string; PrismaClient?: unknown };
+    assert.equal(typeof loadDetail, "object");
+    assert.equal(typeof loadDetail.PrismaClient, "undefined",
+      "the constructor must not be placed in serializable report metadata");
+    assert.equal(typeof loadDetail.path, "string", "the report should carry the resolved path");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("R7C.3.1-9: an ungenerated client fails for the right reason, without a misleading constructor error", () => {
+  const root = makeArtifact({ client: "none" });
   try {
     mkdirSync(join(root, "node_modules/@prisma/client"), { recursive: true });
     cpSync(join(ROOT, "node_modules/@prisma/client/default.js"), join(root, "node_modules/@prisma/client/default.js"));
     cpSync(join(ROOT, "node_modules/@prisma/client/package.json"), join(root, "node_modules/@prisma/client/package.json"));
     const { status, report } = runHarness(root);
     assert.equal(status, 1);
-    const clientCheck = report.checks.find((entry) => entry.check.startsWith("@prisma/client loads"));
-    assert.equal(clientCheck?.ok, false, "an ungenerated client must fail");
-    assert.match(String(report.checks.find((entry) => entry.check.startsWith("@prisma/client loads"))?.error), /prisma\/client\/default/u);
-    const generated = report.checks.find((entry) => entry.check.startsWith("the generated client is present"));
-    assert.equal(generated?.ok, false, "the generated-client directory must be reported absent");
-    // The adapter half is independent of this and must still have proven itself.
-    assert.equal(report.checks.find((entry) => entry.check.startsWith("@prisma/adapter-pg loads"))?.ok, true);
+    const clientFailure = failedEntries(report).find((entry) => entry.check.startsWith("@prisma/client loads"));
+    assert.match(String(clientFailure?.error), /prisma\/client\/default/u, "the cause must be the missing generated client");
+    assert.equal(findCheck(report, "the generated client is present")?.ok, false);
+    // The construction failure must point at the real cause rather than pretending it is a
+    // packaging problem of its own.
+    const construction = findCheck(report, "PrismaPg and PrismaClient construct");
+    assert.match(String(construction?.error), /see its error/u);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("R7C.3-7: the declared externals are exactly the lockfile's runtime closure", () => {
-  // The config is the only place that decides what gets externalised, and the failure
-  // mode of getting it wrong is silent: an omitted package orphans its dependents, and an
-  // extra one ships code that never runs. So the list is derived here from the *lockfile*
-  // — not from the config — and compared. This is what would have caught R7C.1: the
-  // adapter's dependency edge existed in the lockfile and was absent from the packaging.
-  const lock = JSON.parse(readFileSync(join(ROOT, "package-lock.json"), "utf8")) as { packages: Record<string, { version?: string; dependencies?: Record<string, string> }> };
+// ---------------------------------------------------------------------------------------
+// Natural exit (Task 3).
+// ---------------------------------------------------------------------------------------
+
+test("R7C.3.1-10: the verifier never forces termination", () => {
+  // `process.exit()` would end the process even with the client's pool still open, so it
+  // cannot distinguish a clean disconnect from a torn-down one. Exit status must come from
+  // `process.exitCode` and the loop must be allowed to drain.
+  const source = readFileSync(HARNESS, "utf8");
+  // Strip comments first. The script's own docblock *names* `process.exit()` to explain why
+  // it is not used, and a scan that cannot tell code from prose would fail on that.
+  const code = source.replace(/\/\*[\s\S]*?\*\//gu, "").replace(/(^|[^:])\/\/.*$/gmu, "$1");
+  assert.deepEqual([...code.matchAll(/process\.exit\s*\(/gu)], [], "process.exit() must not be called; use process.exitCode");
+  assert.match(code, /process\.exitCode\s*=/u, "the exit status must be set via process.exitCode");
+  // And the watchdog must not keep the process alive on its own.
+  assert.match(code, /\.unref\(\)/u, "the leak watchdog must be unref'd so it cannot hold the loop open");
+});
+
+test("R7C.3.1-11: a completed run exits naturally within the external bound", () => {
+  const root = makeArtifact({ client: "synthetic" });
+  try {
+    const { status, timedOut } = runHarness(root);
+    assert.equal(timedOut, false, "a clean run must not be killed by the external timeout");
+    assert.equal(status, 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("R7C.3.1-12: a leaked handle holds the process open and is caught by the external bound", () => {
+  // The complement of test 11: this is what proves the natural exit is real rather than
+  // merely declared. The synthetic client starts an interval in `$disconnect`, which is
+  // exactly the failure mode of a pool that was not torn down. The verifier's own unref'd
+  // watchdog fires, and the test's external timeout kills the process.
+  const root = makeArtifact({ client: "synthetic", leakHandle: true });
+  try {
+    const { status, timedOut } = runHarness(root);
+    assert.equal(timedOut, true,
+      "a leaked handle must keep the process alive; if this fails, the natural-exit check is not being exercised");
+    assert.equal(status, -1, `the killed process must not report success, got ${status}`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------------------
+// Anti-drift and isolation.
+// ---------------------------------------------------------------------------------------
+
+test("R7C.3.1-13: the verifier's hardcoded majors match the lockfile", () => {
+  // The verifier runs inside the built image, where the lockfile is absent, so the required
+  // majors are literals. This is what stops those literals drifting from the real graph.
+  const lock = JSON.parse(readFileSync(join(ROOT, "package-lock.json"), "utf8")) as {
+    packages: Record<string, { version?: string; dependencies?: Record<string, string> }>;
+  };
+  const hoisted = lock.packages["node_modules/postgres-array"]?.version;
+  const nested = lock.packages["node_modules/pg-types/node_modules/postgres-array"]?.version;
+  const pgTypesRange = lock.packages["node_modules/pg-types"]?.dependencies?.["postgres-array"];
+  const adapterRange = lock.packages["node_modules/@prisma/adapter-pg"]?.dependencies?.["postgres-array"];
+  assert.ok(hoisted && nested, "both postgres-array copies must be in the lockfile");
+
+  const source = readFileSync(HARNESS, "utf8");
+  const nestedMajor = /NESTED_POSTGRES_ARRAY_MAJOR = "(\d+)"/u.exec(source)?.[1];
+  const hoistedMajor = /HOISTED_POSTGRES_ARRAY_MAJOR = "(\d+)"/u.exec(source)?.[1];
+  assert.equal(nestedMajor, nested?.split(".")[0], `verifier expects nested major ${nestedMajor}, lockfile has ${nested}`);
+  assert.equal(hoistedMajor, hoisted?.split(".")[0], `verifier expects hoisted major ${hoistedMajor}, lockfile has ${hoisted}`);
+
+  // And the ranges really do diverge, so two copies are genuinely required.
+  assert.equal(pgTypesRange, "~2.0.0");
+  assert.equal(adapterRange, "3.0.4");
+  assert.notEqual(nested?.split(".")[0], hoisted?.split(".")[0],
+    "the two copies must be different majors, otherwise a flattened tree would be harmless");
+});
+
+test("R7C.3.1-14: the harness refuses to run inside a source checkout", () => {
+  // The escape hatch that would make every check vacuous: run from a directory under the
+  // repository and Node's upward walk finds the repository's node_modules, so a completely
+  // empty artifact would pass.
+  const { status, report } = runHarness(ROOT);
+  assert.equal(status, 1);
+  assert.equal(report.result, "FAIL");
+  assert.deepEqual(report.failed, ["artifact isolation"]);
+  // No module check may run once isolation is refused. The refusal itself is recorded in
+  // `checks` (so the report is never silently empty), and nothing else may be.
+  assert.deepEqual(report.checks.map((entry) => entry.check), ["artifact isolation"],
+    "no module check may run once isolation is refused");
+});
+
+test("R7C.3.1-15: the declared externals are exactly the lockfile's runtime closure", () => {
+  // Kept from R7C.3: the config is the only place deciding what is externalised, and getting
+  // it wrong is silent. The list is derived from the lockfile, not from the config, and the
+  // two are compared.
+  const lock = JSON.parse(readFileSync(join(ROOT, "package-lock.json"), "utf8")) as {
+    packages: Record<string, { dependencies?: Record<string, string> }>;
+  };
   const packages = lock.packages;
-  const resolveFrom = (fromPath: string, name: string): string | undefined => {
+  const resolve = (fromPath: string, name: string): string | undefined => {
     let base = fromPath;
     for (;;) {
       const candidate = base ? `${base}/node_modules/${name}` : `node_modules/${name}`;
@@ -218,13 +443,12 @@ test("R7C.3-7: the declared externals are exactly the lockfile's runtime closure
   const stack: Array<[string, string]> = [["", "@prisma/client"], ["", "@prisma/adapter-pg"]];
   while (stack.length) {
     const [from, name] = stack.pop() as [string, string];
-    const path = resolveFrom(from, name);
+    const path = resolve(from, name);
     if (!path || seen.has(path)) continue;
     seen.add(path);
     names.add(name);
     for (const dependency of Object.keys(packages[path]?.dependencies ?? {})) stack.push([path, dependency]);
   }
-  // Type declarations are in the graph but are never required at runtime.
   const runtimeClosure = new Set([...names].filter((name) => !name.startsWith("@types/") && name !== "undici-types"));
 
   const config = readFileSync(join(ROOT, "next.config.ts"), "utf8");
@@ -233,47 +457,20 @@ test("R7C.3-7: the declared externals are exactly the lockfile's runtime closure
 
   const missing = [...runtimeClosure].filter((name) => !declared.has(name)).sort();
   const extra = [...declared].filter((name) => !runtimeClosure.has(name)).sort();
-  assert.deepEqual(missing, [], `these runtime dependencies are not external, so they would be orphaned or bundled: ${missing.join(", ")}`);
-  assert.deepEqual(extra, [], `these are external but are not in the runtime graph: ${extra.join(", ")}`);
-  // And the optional Cloudflare driver must stay out: it is a worker-only adapter this
-  // application never loads, and pulling it in would add code that cannot execute here.
+  assert.deepEqual(missing, [], `not external, would be orphaned: ${missing.join(", ")}`);
+  assert.deepEqual(extra, [], `external but not in the runtime graph: ${extra.join(", ")}`);
+  assert.equal(declared.size, 18, "the closure is 18 packages");
   assert.equal(declared.has("pg-cloudflare"), false, "pg-cloudflare is optional and must not be externalised");
 });
 
-test("R7C.3-8: the packaging strategy is both externals AND complete globs", () => {
-  // Measured, not assumed. Two builds of the same app proved each mechanism insufficient
-  // alone, and the combination correct:
-  //
-  //   globs only (R7C.1)        -> adapter present, @prisma/driver-adapter-utils absent
-  //   externals only            -> adapter emitted as package.json + dist/index.mjs ONLY;
-  //                                Node's `require` condition wants dist/index.js, absent
-  //   externals + globs         -> every file of every package, correct nesting
-  //
-  // The second row is the subtle one: the tracer follows the ESM entry because the server
-  // bundle *imports* the package, while the shipped `server.js` is CommonJS and *requires*
-  // it. A dual-format package then resolves to a file that was never emitted.
+test("R7C.3.1-16: the packaging strategy is both externals AND complete globs", () => {
+  // Measured: globs alone orphan dependencies; externals alone emit only the ESM entry of a
+  // dual-format package. Both are needed, and both are asserted here.
   const config = readFileSync(join(ROOT, "next.config.ts"), "utf8");
-  assert.match(config, /serverExternalPackages:\s*\[\.\.\.PRISMA_EXTERNAL_PACKAGES\]/u,
-    "the closure must be declared external, which is what makes the tracer emit dependencies");
-
-  // The globs must cover both formats of each package. Globbing the package directory does
-  // that; globbing named files would silently miss whichever format is added later.
-  assert.match(config, /PRISMA_EXTERNAL_PACKAGES\.map\(\(name\) => `\.\/node_modules\/\$\{name\}\/\*\*\/\*`\)/u,
-    "every external package needs its whole directory traced, so both entry formats ship");
-  // And the one package whose dependency is nested rather than hoisted needs its own entry.
-  assert.match(config, /\.\/node_modules\/pg-types\/node_modules\/postgres-array\/\*\*\/\*/u,
-    "the nested postgres-array must be traced at its own path");
-
-  // The generated client cannot be derived from the lockfile, so it stays explicit.
-  assert.match(config, /"\.\/node_modules\/\.prisma\/client\/\*\*\/\*"/u,
-    "the generated client is not a package and needs an explicit glob");
-
-  // The database closure must not be keyed to a subset of routes. Routes that reach
-  // src/lib/db/index.ts are the auth, usage, dashboard and locale pages — not the PDF
-  // routes — so keying it to `/` is what keeps it from depending on which route runs.
-  const includesBlock = config.slice(config.indexOf("outputFileTracingIncludes: {"));
-  const prismaKeyLine = includesBlock.split("\n").find((line) => line.includes("PRISMA_RUNTIME_TRACING"));
-  assert.ok(prismaKeyLine, "the Prisma tracing list must be applied to some route key");
-  assert.match(prismaKeyLine as string, /^\s*"\/":/u,
-    `the database closure must be keyed to "/", found: ${prismaKeyLine}`);
+  assert.match(config, /serverExternalPackages:\s*\[\.\.\.PRISMA_EXTERNAL_PACKAGES\]/u);
+  assert.match(config, /PRISMA_EXTERNAL_PACKAGES\.map\(\(name\) => `\.\/node_modules\/\$\{name\}\/\*\*\/\*`\)/u);
+  assert.match(config, /\.\/node_modules\/pg-types\/node_modules\/postgres-array\/\*\*\/\*/u);
+  assert.match(config, /"\.\/node_modules\/\.prisma\/client\/\*\*\/\*"/u);
+  const prismaKeyLine = config.slice(config.indexOf("outputFileTracingIncludes: {")).split("\n").find((line) => line.includes("PRISMA_RUNTIME_TRACING"));
+  assert.match(prismaKeyLine as string, /^\s*"\/":/u, `the database closure must be keyed to "/", found: ${prismaKeyLine}`);
 });

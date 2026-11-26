@@ -448,6 +448,82 @@ docker run --rm --platform linux/arm64 --entrypoint node dip-document-app:r7c3 \
 `PrismaClient` construction and server startup still need a real generated client, so they are
 covered by steps 1–2 in an environment where generation works; they remain **BLOCKED** here.
 
+## R7C.3.1 — verifier correction
+
+CI run `45750694222` failed the Build job with 10/11 jobs passing. The failing step was the new
+artifact gate, and its log showed every packaging check **PASS** with only two **FAIL**:
+
+```
+@prisma/client loads     PASS
+generated client dir     PASS
+@prisma/adapter-pg       PASS
+driver-adapter-utils     PASS
+pg                       PASS
+nested dependency        PASS
+PrismaClient construction  FAIL  Error: @prisma/client did not yield a constructor
+disconnect                 FAIL
+```
+
+That signature — packaging all green, construction failing with "did not yield a constructor" —
+is a **verifier bug**, not a packaging one. Confirmed at the committed source:
+
+```js
+const PrismaClientCtor = check("@prisma/client loads", () => {
+  ...
+  if (typeof mod?.PrismaClient !== "function") throw new Error("...");
+  return { path };          // <- metadata
+});
+...
+if (typeof PrismaClientCtor !== "function") throw new Error("@prisma/client did not yield a constructor");
+```
+
+`check()` returns its callback's **detail object**, not the constructor. So `PrismaClientCtor`
+was `{ path }`, and the construction check failed on every artifact, including a perfect one.
+
+### Three corrections
+
+1. **Separated executable references from report metadata.** The constructor is held in a
+   module-level binding; `check()` returns only serializable detail. One client is constructed
+   and that same object is disconnected — the previous version built a second client solely for
+   the disconnect check, which proved less than tearing down the object it had built.
+2. **Removed the nested-dependency false positive.** The check returned success when both
+   `postgres-array` copies resolved to the same directory ("acceptable only if the lockfile also
+   collapsed them"). It never did: `pg-types` declares `~2.0.0`, the adapter declares `3.0.4`.
+   A flattened tree now fails, and each copy's major is read from its own `package.json` and
+   compared against the required major. The majors are literals because the script runs inside
+   the image where no lockfile exists; a repository test asserts they still match.
+3. **Natural exit instead of forced termination.** `process.exit()` was replaced with
+   `process.exitCode`. A forced exit terminates the process even with the client's pool still
+   open, so it cannot distinguish a clean disconnect from a torn-down one. With a natural exit a
+   leaked handle holds the event loop and the process hangs — visible, not hidden. An **unref'd**
+   5s watchdog reports the live handle types without ever *keeping* the process alive, and
+   external bounds (test timeout, CI step, Docker build) still own termination.
+
+### Regression coverage
+
+`test/prisma.artifact-runtime.test.ts` now has **16** tests. The two that matter most were
+verified non-vacuous by reintroducing each bug:
+
+| reintroduced bug | tests that failed |
+| --- | --- |
+| return `{ path }` into the constructor path | 7, 11, 12 |
+| accept one shared `postgres-array` copy | 5, 6 |
+
+Tests 11 and 12 are a pair: 11 proves a clean artifact exits naturally inside the external
+bound (measured 64 ms), 12 proves a synthetic leaked interval holds the process open until the
+bound kills it (exit 124, watchdog naming `Timeout`). Natural exit is therefore *exercised*, not
+merely declared.
+
+### Limitation — genuine client generation
+
+`prisma generate` is still TLS-blocked here: it fetches the schema engine from
+`binaries.prisma.sh` before writing anything, and it does so even for a driver-adapter client
+with `engineType = "client"`. So the client lives in the tests is a small synthetic module
+exporting a class with `$disconnect`, used **only** to exercise the verifier's control flow.
+It asserts nothing about Prisma itself and is never used by CI or the Dockerfile; the genuine
+generated-client gate keeps running there unchanged. No mock or stub replaces the real
+acceptance path.
+
 ## Status
 
 - **B31-03 remains OPEN.** **B31-04 remains OPEN** — production packaging acceptance is not
