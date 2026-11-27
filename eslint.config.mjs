@@ -12,6 +12,9 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // R7D.1: the precompiled executor bundle. Build output, not source — linting it would
+    // report every rule in a file nobody edits.
+    "dist/**",
   ]),
 ]);
 
