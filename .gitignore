@@ -17,3 +17,6 @@ __pycache__/
 
 # R7D.1: precompiled executor bundle (build output, produced by scripts/esbuild-executor.mjs)
 /dist/
+
+# Scratch verification scripts from local debugging. Not part of the build, not linted.
+tmp/
