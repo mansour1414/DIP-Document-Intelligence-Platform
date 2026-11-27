@@ -45,7 +45,7 @@ import {
 import { findCgroup2Mount, readCgroupMembership, readProcessStartTimeTicks } from "./host-facts";
 import { readUptimeMs } from "./host-clock";
 import { OwnershipJournal, containerNameFor, newExecutionId, type SupervisorRecord } from "./ownership-journal";
-import { ProvisionalResultStream, BoundedProvisionalOutput, sha256Hex } from "./provisional-stream";
+import { ProvisionalResultStream, sha256Hex } from "./provisional-stream";
 import { verifyWatchdogGrant, signTerminalCommit, type CommitExpectation, type CommitResult } from "./terminal-commit";
 import type { TerminalRequest } from "./terminal-auth";
 import type { ArmAck, ArmRequest, ArmDenied } from "./watchdog-protocol";
@@ -188,17 +188,21 @@ export class SupervisorExecution {
   private sequence = 0;
   private containerId: string | null = null;
   private policy: ExecutionPolicy | null = null;
-  private output: BoundedProvisionalOutput | null = null;
+
   /**
-   * The complete result frame: length prefix, metadata, output.
+   * The complete result frame, when one is deliberately requested.
    *
-   * ## Why this is retained separately from the output
+   * ## Not part of the operational streaming path
    *
-   * `BoundedProvisionalOutput` keeps the output slice, because that is what a caller would publish.
-   * The *commit* binds the whole frame, so the caller needs those bytes to verify its own copy.
-   * Accumulating the frame here is bounded by `maxOutputBytes` plus the metadata ceiling — both
-   * already enforced by the stream — so this is not a second bound, it is the same one applied to
-   * the whole file rather than to a slice of it.
+   * This is null on every `collectResult` call, including the one that produces a committed result.
+   * It exists for callers that genuinely need the whole frame in hand — a diagnostic capture, or a
+   * test asserting byte-for-byte equality — and `sealedFrame()` refuses rather than returning a
+   * partial frame.
+   *
+   * It is *not* how a result reaches a caller. The caller has its own copy, validated on arrival by
+   * `decodeResultV2`; the supervisor's contribution is the digest and the lengths, which the commit
+   * binds and which survive without a byte of the document. Retaining a second copy here would
+   * double the memory cost of every execution to serve a consumer that does not exist.
    */
   private frameBytes: Buffer | null = null;
   private refused: LifecycleRefusal | null = null;
@@ -619,16 +623,25 @@ export class SupervisorExecution {
     this.requirePhase("streaming", "INPUT_MISMATCH");
     const result = this.session?.result;
     if (result === undefined) throw new LifecycleError("RESULT_INVALID", "no result stream is attached");
-    // No frame buffer. `frameParts` used to hold every byte of the result so that
-    // `sealedFrame()` could return it whole; that is the buffering this contract forbids.
-    this.frameBytes = null;
-    this.output = new BoundedProvisionalOutput(this.options.limits.maxOutputBytes);
+    // ## Nothing here retains the document
+    //
+    // Two buffers were removed from this path and both mattered. `frameParts` held every byte so
+    // `sealedFrame()` could return it whole, and `BoundedProvisionalOutput` held a *second* full
+    // copy so `takeOutput()` could hand one out. Nothing ever called `takeOutput`, so the second
+    // copy was retained for a caller that does not exist — a full duplicate of a document that can
+    // legally be 384 MiB, sitting in the supervisor's heap beside the executor's own.
+    //
+    // The sink is now the validator itself: chunks are checked as they pass through and then
+    // dropped. The supervisor's evidence about the result is the digest, the frame length and the
+    // metadata length, all of which survive without a byte of the document.
     const stream = new ProvisionalResultStream({
       expectedOp: this.operation,
       executionId: this.executionId,
       maxOutputBytes: this.options.limits.maxOutputBytes,
       maxBufferedBytes: this.options.limits.maxBufferedBytes,
-      sink: (chunk) => this.output!.append(chunk.bytes),
+      // The validator has already accounted for and bounded these bytes; there is no second
+      // consumer, because there is deliberately no retained copy to feed.
+      sink: () => {},
     });
     try {
       for await (const chunk of result) {
@@ -657,12 +670,13 @@ export class SupervisorExecution {
         frameBytes: completion.frameBytes,
         metaBytes: metaLengthOf(completion.meta),
       };
-      this.output.seal(this.executionId, completion.outputSha256);
+      // The digest and lengths are the seal. There is no output object to seal, and inventing one
+      // would be re-creating the retention this method exists to avoid.
       this.transition("sealed");
       return { bytes: completion.outputBytes, digest: completion.outputSha256 };
     } catch (error) {
-      // A fault invalidates the output permanently. There is no partial publication.
-      this.output.discard();
+      // A fault invalidates the result permanently. There is no partial publication, and nothing
+      // was retained that could be published by mistake.
       this.fail("RESULT_INVALID");
       throw error instanceof LifecycleError ? error : new LifecycleError("RESULT_INVALID", error instanceof Error ? error.message : "result invalid");
     }
@@ -731,10 +745,11 @@ export class SupervisorExecution {
   /**
    * Obtain the terminal commit.
    *
-   * Two independent checks, in order: the watchdog's grant must verify against this
-   * supervisor's own record of the execution, and only then does the supervisor sign a commit
-   * for the caller. Neither alone releases anything — `BoundedProvisionalOutput.collect` refuses
-   * a commit whose fields do not describe the bytes it holds.
+   * Two independent checks, in order: the watchdog's grant must verify against this supervisor's
+   * own record of the execution, and only then does the supervisor sign a commit for the caller.
+   * Neither alone releases anything: the caller refuses a commit whose `resultDigest` and
+   * `resultBytes` do not describe the bytes it actually received, which is the only check made
+   * against evidence the supervisor cannot fabricate.
    */
   async authorize(params: {
     requestId: string;
@@ -887,10 +902,6 @@ export class SupervisorExecution {
   }
 
   /** The retained output, for the caller that has a verified commit. */
-  takeOutput(): BoundedProvisionalOutput {
-    if (this.output === null) throw new LifecycleError("RESULT_INVALID", "no output was retained");
-    return this.output;
-  }
 
   // ── internals ────────────────────────────────────────────────────────────────────────────────
 
