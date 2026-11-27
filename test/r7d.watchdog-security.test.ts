@@ -72,13 +72,13 @@ const EXECUTION = "a".repeat(32);
 
 // ══ WD-01 · Durable arming and recovery ═════════════════════════════════════════════════════════
 
-test("R7D.1-WD01-1: an arm writes a record to disk before it is acknowledged", () => {
+test("R7D.1-WD01-1: an arm writes a record to disk before it is acknowledged", async () => {
   const harness = makeWatchdog();
   try {
     const before = readdirSync(join(harness.stateDir, "records"));
     assert.deepEqual(before, [], "the store starts empty");
 
-    armAndAssert(harness, EXECUTION);
+    await armAndAssert(harness, EXECUTION);
 
     // The record is on disk, not only in a Map. This is the exact defect: the previous version
     // inserted into a Map and called it durable.
@@ -100,12 +100,12 @@ test("R7D.1-WD01-1: an arm writes a record to disk before it is acknowledged", (
   }
 });
 
-test("R7D.1-WD01-2: a failed durable write produces no ARM_ACK", () => {
+test("R7D.1-WD01-2: a failed durable write produces no ARM_ACK", async () => {
   // The requirement is that the ACK does not exist unless the record is on disk. An injected
   // fsync failure is the only way to test that without corrupting a filesystem.
   const harness = makeWatchdog({ failStoreWrites: true });
   try {
-    const answer = harness.watchdog.arm(armRequest(EXECUTION));
+    const answer = await harness.watchdog.arm(armRequest(EXECUTION));
     assert.equal(answer.kind, "ARM_DENIED");
     assert.equal((answer as { code: string }).code, "DURABILITY_FAILED");
     // And nothing is held in memory either: an arm that failed to persist must not be enforced
@@ -117,7 +117,7 @@ test("R7D.1-WD01-2: a failed durable write produces no ARM_ACK", () => {
   }
 });
 
-test("R7D.1-WD01-3: a watchdog with no store refuses to arm at all", () => {
+test("R7D.1-WD01-3: a watchdog with no store refuses to arm at all", async () => {
   // There is no degraded mode. A watchdog that could arm without persistence would be worse than
   // one that refuses, because it would silently lose deadlines.
   const watchdog = new Watchdog({
@@ -126,18 +126,18 @@ test("R7D.1-WD01-3: a watchdog with no store refuses to arm at all", () => {
     secret: randomBytes(32),
     verifyHost: () => verifiedHost(),
     killContainer: async () => ({ ok: true, detail: "" }),
-    inspectContainer: async () => ({ present: false, detail: "" }),
+    observeContainer: async () => ({ state: "absent", detail: "injected" }),
   });
-  const answer = watchdog.arm(armRequest(EXECUTION));
+  const answer = await watchdog.arm(armRequest(EXECUTION));
   assert.equal(answer.kind, "ARM_DENIED");
   assert.equal((answer as { code: string }).code, "DURABILITY_FAILED");
   assert.deepEqual(watchdog.outstanding(), []);
 });
 
-test("R7D.1-WD01-4 (mocked cgroup): recovery adopts a live record on the same boot", () => {
+test("R7D.1-WD01-4 (mocked cgroup): recovery adopts a live record on the same boot", async () => {
   const harness = makeWatchdog();
   try {
-    armAndAssert(harness, EXECUTION);
+    await armAndAssert(harness, EXECUTION);
     // The pin cannot be re-established without a real cgroup directory, so recovery must refuse to
     // adopt rather than adopt on faith. That refusal is the correct behaviour and is asserted
     // here rather than hidden: an adopted record with no descriptors is an unenforceable deadline.
@@ -159,10 +159,10 @@ test("R7D.1-WD01-4 (mocked cgroup): recovery adopts a live record on the same bo
   }
 });
 
-test("R7D.1-WD01-5: recovery refuses a record from another boot", () => {
+test("R7D.1-WD01-5: recovery refuses a record from another boot", async () => {
   const harness = makeWatchdog();
   try {
-    armAndAssert(harness, EXECUTION);
+    await armAndAssert(harness, EXECUTION);
     // A record written on a previous boot names a cgroup namespace that no longer exists. Adopting
     // it would register a deadline against an inode that now means something else.
     const restarted = makeWatchdog({ stateDir: harness.stateDir, bootId: "7b0855bc-0000-4000-8000-000000000000" });
@@ -181,7 +181,7 @@ test("R7D.1-WD01-5: recovery refuses a record from another boot", () => {
   }
 });
 
-test("R7D.1-WD01-6: recovery quarantines a corrupt record and blocks arming", () => {
+test("R7D.1-WD01-6: recovery quarantines a corrupt record and blocks arming", async () => {
   const harness = makeWatchdog();
   try {
     // A record that exists but cannot be trusted. Skipping it would forget an execution that may
@@ -194,7 +194,7 @@ test("R7D.1-WD01-6: recovery quarantines a corrupt record and blocks arming", ()
     assert.notEqual(harness.watchdog.recoveryBlock, null);
 
     // And the block is real: arming is refused while it stands.
-    const answer = harness.watchdog.arm(armRequest("f".repeat(32)));
+    const answer = await harness.watchdog.arm(armRequest("f".repeat(32)));
     assert.equal((answer as { code: string }).code, "RECOVERY_INCOMPLETE");
   } finally {
     harness.cleanup();
@@ -217,7 +217,7 @@ test("R7D.1-WD01-7: a record with an inconsistent phase is refused, not coerced"
   assert.throws(() => assertArmRecord(validRecord({ phase: "disarmed", outcome: null, processDebt: "termination-confirmed" })), /requires an outcome/u);
 });
 
-test("R7D.1-WD01-8: a record with an unexpected or missing property is refused", () => {
+test("R7D.1-WD01-8: a record with an unexpected or missing property is refused", async () => {
   const withExtra = { ...validRecord(), rawDiagnostics: "daemon said: ..." };
   assert.throws(() => assertArmRecord(withExtra), /unexpected properties/u);
 
@@ -230,7 +230,7 @@ test("R7D.1-WD01-8: a record with an unexpected or missing property is refused",
   assert.throws(() => assertArmRecord(validRecord({ containerName: `dip-exec-${"b".repeat(32)}` })), /does not derive/u);
 });
 
-test("R7D.1-WD01-9: the store writes atomically and survives a concurrent writer", () => {
+test("R7D.1-WD01-9: the store writes atomically and survives a concurrent writer", async () => {
   const root = mkdtempSync(join(tmpdir(), "dip-store-"));
   try {
     const store = new WatchdogStore(join(root, "records"));
@@ -250,7 +250,7 @@ test("R7D.1-WD01-9: the store writes atomically and survives a concurrent writer
   }
 });
 
-test("R7D.1-WD01-10: reading a missing record is empty state, not an error", () => {
+test("R7D.1-WD01-10: reading a missing record is empty state, not an error", async () => {
   const root = mkdtempSync(join(tmpdir(), "dip-store-"));
   try {
     const store = new WatchdogStore(join(root, "records"));
@@ -522,7 +522,7 @@ test("R7D.1-WD04-1 (mocked cgroup): a disarm is refused when completion is not i
   // must establish the fact itself. Here the daemon says the container is still present.
   const harness = makeWatchdog({ containerPresent: true });
   try {
-    armAndAssert(harness, EXECUTION);
+    await armAndAssert(harness, EXECUTION);
     const denial = await harness.watchdog.disarm(terminalRequest(EXECUTION), randomBytes(8).toString("hex"), 2);
     assert.equal("code" in denial, true);
     if ("code" in denial) assert.equal(denial.code, "UNCERTAIN");
@@ -538,7 +538,7 @@ test("R7D.1-WD04-2 (mocked cgroup): a forged removal claim does not produce a gr
   // both are wrong from the watchdog's point of view.
   const harness = makeWatchdog({ containerPresent: true });
   try {
-    armAndAssert(harness, EXECUTION);
+    await armAndAssert(harness, EXECUTION);
     const denial = await harness.watchdog.disarm(
       terminalRequest(EXECUTION, { containerRemoved: true }),
       randomBytes(8).toString("hex"),
@@ -554,7 +554,7 @@ test("R7D.1-WD04-2 (mocked cgroup): a forged removal claim does not produce a gr
 test("R7D.1-WD04-3 (mocked cgroup): only a committed outcome may be granted", async () => {
   const harness = makeWatchdog();
   try {
-    armAndAssert(harness, EXECUTION);
+    await armAndAssert(harness, EXECUTION);
     for (const outcome of ["refused", "timeout", "cancelled", "failed"] as const) {
       const denial = await harness.watchdog.disarm(terminalRequest(EXECUTION, { outcome }), randomBytes(8).toString("hex"), 2);
       assert.equal("code" in denial, true, `${outcome} must not be granted`);
@@ -572,7 +572,7 @@ test("R7D.1-WD04-4 (mocked cgroup): an expired disarm leaves the termination deb
   // `dueForTermination` — so a late disarm cancelled the kill the deadline existed to trigger.
   const harness = makeWatchdog();
   try {
-    armAndAssert(harness, EXECUTION, { deadlineMs: 5_000 });
+    await armAndAssert(harness, EXECUTION, { deadlineMs: 5_000 });
     harness.clock.advance(6_000);
 
     const denial = await harness.watchdog.disarm(terminalRequest(EXECUTION), randomBytes(8).toString("hex"), 2);
@@ -590,22 +590,37 @@ test("R7D.1-WD04-4 (mocked cgroup): an expired disarm leaves the termination deb
 
 test("R7D.1-WD04-5 (mocked cgroup): termination records the two debts separately", async () => {
   // The process question and the container question are answered from different sources, and one
-  // does not imply the other. Here the cgroup cannot be read (no writable hierarchy) but the
-  // daemon positively reports the container gone: the process debt stays unresolved.
-  const harness = makeWatchdog({ containerPresent: false });
+  // does not imply the other.
+  //
+  // WD-F03 note: this harness has no real pin, so ownership cannot be re-established at termination
+  // time and the watchdog *refuses to signal*. A test that wants the removal debt discharged
+  // therefore has to model the removal explicitly — which is the honest shape of the sequence: the
+  // supervisor removes the container, and the watchdog only observes that it is gone.
+  const harness = makeWatchdog({ observeLifecycle: true });
   try {
-    armAndAssert(harness, EXECUTION, { deadlineMs: 1_000 });
+    await armAndAssert(harness, EXECUTION, { deadlineMs: 1_000 });
     harness.clock.advance(2_000);
     const [due] = harness.watchdog.dueForTermination();
     assert.ok(due !== undefined);
     const report = await harness.watchdog.terminate(due);
-    assert.equal(report.containerRemovalConfirmed, true);
-    // No pin, so the process question cannot be answered. It is unresolved, not "assumed dead".
-    assert.equal(report.processTerminationConfirmed, false);
-    assert.equal(report.resolved, false);
+    // No ownership evidence at termination time, so the target is not signalled and nothing is
+    // confirmed. This is the "unverified target is not signalled" half of WD-F03.
+    assert.equal(report.killWritten, false);
+    assert.equal(report.containerRemovalConfirmed, false);
+
+    // The execution is now quarantined with an unresolved process debt. It is *not* retried,
+    // because ownership could not be re-established — an unverified target is never signalled
+    // twice. This is the deliberate limit of WD-F03, and the debt stays on the record for an
+    // operator to resolve.
     const record = harness.watchdog.state(EXECUTION).record;
+    assert.equal(record?.phase, "quarantined");
     assert.equal(record?.processDebt, "unresolved");
-    assert.equal(record?.containerDebt, "removal-confirmed");
+    assert.equal(record?.containerDebt, "unresolved");
+    assert.deepEqual(
+      harness.watchdog.dueForTermination(),
+      [],
+      "an execution whose ownership cannot be re-established must not be retried automatically",
+    );
   } finally {
     harness.cleanup();
   }
@@ -616,7 +631,7 @@ test("R7D.1-WD04-6 (mocked cgroup): a missing daemon is not proof of process ter
   // debt stays open even though a kill was written.
   const harness = makeWatchdog({ containerPresent: true });
   try {
-    armAndAssert(harness, EXECUTION, { deadlineMs: 1_000 });
+    await armAndAssert(harness, EXECUTION, { deadlineMs: 1_000 });
     harness.clock.advance(2_000);
     const [due] = harness.watchdog.dueForTermination();
     const report = await harness.watchdog.terminate(due!);
@@ -631,7 +646,7 @@ test("R7D.1-WD04-6 (mocked cgroup): a missing daemon is not proof of process ter
 test("R7D.1-WD04-7 (mocked cgroup): a second disarm cannot mint a second grant", async () => {
   const harness = makeWatchdog();
   try {
-    armAndAssert(harness, EXECUTION);
+    await armAndAssert(harness, EXECUTION);
     // Both facts are unverifiable without a real cgroup, so this asserts the refusal path rather
     // than a success. The single-use property is asserted structurally below.
     const first = await harness.watchdog.disarm(terminalRequest(EXECUTION), randomBytes(8).toString("hex"), 2);
@@ -652,7 +667,7 @@ test("R7D.1-WD04-7 (mocked cgroup): a second disarm cannot mint a second grant",
 test("R7D.1-WD04-8 (mocked cgroup): a stale supervisor instance is refused", async () => {
   const harness = makeWatchdog();
   try {
-    armAndAssert(harness, EXECUTION);
+    await armAndAssert(harness, EXECUTION);
     const denial = await harness.watchdog.disarm(
       terminalRequest(EXECUTION, { supervisorInstance: "sv-successor-01" }),
       randomBytes(8).toString("hex"),
@@ -714,10 +729,10 @@ test("R7D.1-WD05-3: a persisted deadline is comparable across processes on the s
   }
 });
 
-test("R7D.1-WD05-4 (mocked cgroup): a heartbeat does not extend an armed deadline", () => {
+test("R7D.1-WD05-4 (mocked cgroup): a heartbeat does not extend an armed deadline", async () => {
   const harness = makeWatchdog();
   try {
-    armAndAssert(harness, EXECUTION, { deadlineMs: 5_000 });
+    await armAndAssert(harness, EXECUTION, { deadlineMs: 5_000 });
     for (let index = 0; index < 10; index += 1) {
       harness.clock.advance(1_000);
       harness.watchdog.heartbeat({
@@ -791,7 +806,7 @@ test("R7D.1-WD06-5: a PID whose start time does not match is refused", () => {
   if (!verdict.ok) assert.ok(["PID_UNVERIFIED", "CGROUP_UNVERIFIED"].includes(verdict.code), verdict.code);
 });
 
-test("R7D.1-WD06-6 (mocked cgroup): a path with traversal is never armed", () => {
+test("R7D.1-WD06-6 (mocked cgroup): a path with traversal is never armed", async () => {
   const harness = makeWatchdog();
   try {
     // `assertArmRequest` rejects traversal when a request arrives over the wire. Called directly
@@ -808,16 +823,16 @@ test("R7D.1-WD06-6 (mocked cgroup): a path with traversal is never armed", () =>
   }
 });
 
-test("R7D.1-WD06-7 (mocked cgroup): an execution cannot be re-armed after conclusion", () => {
+test("R7D.1-WD06-7 (mocked cgroup): an execution cannot be re-armed after conclusion", async () => {
   const harness = makeWatchdog();
   try {
-    armAndAssert(harness, EXECUTION, { deadlineMs: 1_000 });
+    await armAndAssert(harness, EXECUTION, { deadlineMs: 1_000 });
     harness.clock.advance(2_000);
     const [due] = harness.watchdog.dueForTermination();
     void harness.watchdog.terminate(due!);
     // The execution reached a terminal phase. A second arm would be a different execution wearing
     // the first one's identity.
-    const rearm = harness.watchdog.arm(armRequest(EXECUTION));
+    const rearm = await harness.watchdog.arm(armRequest(EXECUTION));
     assert.equal(rearm.kind, "ARM_DENIED");
     assert.ok(["ALREADY_CONCLUDED", "ALREADY_ARMED"].includes((rearm as { code: string }).code), (rearm as { code: string }).code);
   } finally {
@@ -899,11 +914,14 @@ test("R7D.1-WD04-9 (mocked cgroup): a verified completion mints exactly one gran
   // This is the success path, and it needs a pin that can actually answer `populated 0`. The tree
   // is a real filesystem tree — real descriptors, real reads — shaped like a cgroup. The kernel is
   // not involved, hence the label.
-  const harness = makeWatchdog({ liveTree: { populated: false } });
+  const harness = makeWatchdog({ liveTree: { populated: false }, observeLifecycle: true });
   try {
-    armAndAssert(harness, EXECUTION);
+    await armAndAssert(harness, EXECUTION);
     assert.equal(harness.watchdog.state(EXECUTION).phase, "armed");
 
+    // The supervisor removed the container after committing. A grant before that would release
+    // bytes while the executor still held them.
+    harness.removeContainer();
     const grant = await harness.watchdog.disarm(terminalRequest(EXECUTION), randomBytes(8).toString("hex"), 2);
     assert.equal("proof" in grant, true, JSON.stringify(grant));
     if (!("proof" in grant)) return;
@@ -929,9 +947,10 @@ test("R7D.1-WD04-9 (mocked cgroup): a verified completion mints exactly one gran
 });
 
 test("R7D.1-WD04-10 (mocked cgroup): a replayed disarm cannot mint a second grant", async () => {
-  const harness = makeWatchdog({ liveTree: { populated: false } });
+  const harness = makeWatchdog({ liveTree: { populated: false }, observeLifecycle: true });
   try {
-    armAndAssert(harness, EXECUTION);
+    await armAndAssert(harness, EXECUTION);
+    harness.removeContainer();
     const first = await harness.watchdog.disarm(terminalRequest(EXECUTION), randomBytes(8).toString("hex"), 2);
     assert.equal("proof" in first, true, JSON.stringify(first));
 
@@ -945,9 +964,10 @@ test("R7D.1-WD04-10 (mocked cgroup): a replayed disarm cannot mint a second gran
 });
 
 test("R7D.1-WD04-11 (mocked cgroup): a grant does not verify for another execution", async () => {
-  const harness = makeWatchdog({ liveTree: { populated: false } });
+  const harness = makeWatchdog({ liveTree: { populated: false }, observeLifecycle: true });
   try {
-    armAndAssert(harness, EXECUTION);
+    await armAndAssert(harness, EXECUTION);
+    harness.removeContainer();
     const grant = await harness.watchdog.disarm(terminalRequest(EXECUTION), randomBytes(8).toString("hex"), 2);
     assert.equal("proof" in grant, true);
     if (!("proof" in grant)) return;
@@ -969,7 +989,7 @@ test("R7D.1-WD04-12 (mocked cgroup): a populated cgroup blocks the grant", async
   // has not stopped; releasing its bytes then would be exactly the unsafe release D-A11 forbids.
   const harness = makeWatchdog({ liveTree: { populated: true } });
   try {
-    armAndAssert(harness, EXECUTION);
+    await armAndAssert(harness, EXECUTION);
     const answer = await harness.watchdog.disarm(terminalRequest(EXECUTION), randomBytes(8).toString("hex"), 2);
     assert.equal("code" in answer, true);
     if ("code" in answer) assert.equal(answer.code, "UNCERTAIN");
@@ -982,9 +1002,10 @@ test("R7D.1-WD04-12 (mocked cgroup): a populated cgroup blocks the grant", async
 test("R7D.1-WD04-13 (mocked cgroup): a durable write failure withholds the grant", async () => {
   // The conclusion must be durable before the signature is released. A store failure here is the
   // "durable grant failure" case: the supervisor gets a refusal and keeps its quarantine.
-  const harness = makeWatchdog({ liveTree: { populated: false } });
+  const harness = makeWatchdog({ liveTree: { populated: false }, observeLifecycle: true });
   try {
-    armAndAssert(harness, EXECUTION);
+    await armAndAssert(harness, EXECUTION);
+    harness.removeContainer();
     // Replace the store with one that refuses writes, leaving the armed record in place.
     const original = harness.store;
     const failing = new WatchdogStore(join(harness.stateDir, "records"), {
@@ -1005,9 +1026,9 @@ test("R7D.1-WD04-13 (mocked cgroup): a durable write failure withholds the grant
 });
 
 test("R7D.1-WD04-14 (mocked cgroup): an expired execution cannot be granted, only terminated", async () => {
-  const harness = makeWatchdog({ liveTree: { populated: false } });
+  const harness = makeWatchdog({ liveTree: { populated: false }, observeLifecycle: true });
   try {
-    armAndAssert(harness, EXECUTION, { deadlineMs: 1_000 });
+    await armAndAssert(harness, EXECUTION, { deadlineMs: 1_000 });
     harness.clock.advance(2_000);
     const answer = await harness.watchdog.disarm(terminalRequest(EXECUTION), randomBytes(8).toString("hex"), 2);
     assert.equal("code" in answer, true);
@@ -1022,9 +1043,9 @@ test("R7D.1-WD04-14 (mocked cgroup): an expired execution cannot be granted, onl
 test("R7D.1-WD04-15 (mocked cgroup): a full termination closes both debts and quarantines nothing", async () => {
   // A real pin, a real `populated 0`, and a daemon that reports the container gone. Only then does
   // the record reach `terminated` with both debts discharged.
-  const harness = makeWatchdog({ liveTree: { populated: false }, containerPresent: false });
+  const harness = makeWatchdog({ liveTree: { populated: false }, observeLifecycle: true });
   try {
-    armAndAssert(harness, EXECUTION, { deadlineMs: 1_000 });
+    await armAndAssert(harness, EXECUTION, { deadlineMs: 1_000 });
     harness.clock.advance(2_000);
     const [due] = harness.watchdog.dueForTermination();
     const report = await harness.watchdog.terminate(due!);

@@ -531,3 +531,227 @@ test("R7D.1-WD05-5: a restarted watchdog treats the previous instance's records 
     await watchdog.cleanup();
   }
 });
+
+// ══ WD-F05 · Bounded control-channel operation, over the real socket ════════════════════════════
+
+test("R7D.1-WDF05-2: an idle unauthenticated connection is closed at the handshake deadline", async () => {
+  // The defect: HELLO cleared the handshake timer, so a peer could hold a connection open forever by
+  // re-saying hello. A connection that merely *connects* must not outlive the window either.
+  const watchdog = await startWatchdog();
+  try {
+    const started = Date.now();
+    const closed = await new Promise<boolean>((resolve) => {
+      const socket = connect(watchdog.socketPath);
+      socket.on("connect", () => { /* say nothing at all */ });
+      socket.on("close", () => resolve(true));
+      socket.on("error", () => resolve(true));
+      setTimeout(() => { socket.destroy(); resolve(false); }, 10_000).unref();
+    });
+    assert.equal(closed, true, "an idle connection must be closed, not left open");
+    // And it happened on the server's schedule, not ours.
+    assert.ok(Date.now() - started < 9_000);
+  } finally {
+    await watchdog.cleanup();
+  }
+});
+
+test("R7D.1-WDF05-3: repeated HELLO cannot extend the handshake window", async () => {
+  // Each HELLO used to reset the deadline it was racing. Four is the allowance; the fifth closes.
+  const watchdog = await startWatchdog();
+  try {
+    const channel = new Channel(watchdog.socketPath);
+    try {
+      const closed = await new Promise<boolean>((resolve) => {
+        channel["socket"].on("close", () => resolve(true));
+        channel["socket"].on("error", () => resolve(true));
+        void (async () => {
+          for (let index = 0; index < 8; index += 1) {
+            await channel.send({
+              kind: "HELLO",
+              clientNonce: randomBytes(32).toString("hex"),
+              clientInstance: "sv-0123456789ab",
+              protocolVersion: 2,
+            });
+            await new Promise((resolve) => setTimeout(resolve, 40));
+          }
+        })();
+        setTimeout(() => resolve(false), 8_000).unref();
+      });
+      assert.equal(closed, true, "a peer that keeps re-saying hello must be disconnected");
+    } finally {
+      channel.close();
+    }
+  } finally {
+    await watchdog.cleanup();
+  }
+});
+
+test("R7D.1-WDF05-4: a frame flood is bounded, and the server survives it", async () => {
+  const watchdog = await startWatchdog();
+  try {
+    // Many frames in one burst, before any authentication. Two bounds apply: the unauthenticated
+    // path destroys the connection on the first privileged frame, and the queue bound closes a peer
+    // that outruns the handler. Either way the connection must end, and memory must not grow with
+    // the number of frames the peer sent.
+    const outcome = await new Promise<"closed" | "drained">((resolve) => {
+      const socket = connect(watchdog.socketPath);
+      socket.on("connect", () => {
+        for (let index = 0; index < 200; index += 1) {
+          socket.write(encodeWatchdogFrame({ kind: "STATE_REQ", index }));
+        }
+      });
+      // A reply is drained rather than left unread: the test is about the server's bound, not about
+      // whether this side happens to consume its own socket buffer.
+      socket.on("data", () => { /* drain */ });
+      socket.on("close", () => resolve("closed"));
+      socket.on("error", () => resolve("closed"));
+      setTimeout(() => { socket.destroy(); resolve("drained"); }, 8_000).unref();
+    });
+    assert.equal(outcome, "closed", "a flooding peer must be disconnected");
+
+    // The watchdog is still healthy: one bad peer is not an outage.
+    const session = await authenticate(watchdog.socketPath, watchdog.secret);
+    try {
+      const state = await request(session, watchdog.secret, "STATE_REQ", { executionId: "a".repeat(32) });
+      assert.equal((state as { kind: string }).kind, "STATE_ACK");
+    } finally {
+      session.channel.close();
+    }
+  } finally {
+    await watchdog.cleanup();
+  }
+});
+
+test("R7D.1-WDF05-5: a request cannot claim a supervisor the connection did not authenticate as", async () => {
+  // The session is bound to `sv-0123456789ab` at AUTH. A request inside it that names another
+  // supervisor is refused before the watchdog sees it.
+  const watchdog = await startWatchdog();
+  try {
+    const session = await authenticate(watchdog.socketPath, watchdog.secret);
+    try {
+      const reply = await request(session, watchdog.secret, "HEARTBEAT", {
+        executionId: "a".repeat(32),
+        messageId: "1".repeat(16),
+        supervisorInstance: "sv-impostor-1",
+        monotonicMs: 1,
+      });
+      assert.equal((reply as { kind: string }).kind, "ERROR");
+      assert.equal((reply as { code: string }).code, "INSTANCE_MISMATCH");
+    } finally {
+      session.channel.close();
+    }
+  } finally {
+    await watchdog.cleanup();
+  }
+});
+
+test("R7D.1-WDF05-6: a request captured on one connection cannot be replayed on another", async () => {
+  // The nonce is bound to the connection's challenge, so a fresh connection issues a different
+  // challenge and the original proof cannot verify against it.
+  const watchdog = await startWatchdog();
+  try {
+    const first = await authenticate(watchdog.socketPath, watchdog.secret);
+    const payload = { executionId: "a".repeat(32) };
+    const requestNonce = newAuthNonce();
+    const proof = computeAuthProof(watchdog.secret, {
+      direction: "client-to-watchdog",
+      kind: "STATE_REQ",
+      clientNonce: first.clientNonce,
+      serverNonce: first.serverNonce,
+      clientInstance: first.clientInstance,
+      serverInstance: first.serverInstance,
+      bootId: first.bootId,
+      requestNonce,
+      payloadSha256: payloadDigest(payload),
+    });
+    first.channel.close();
+
+    const second = await authenticate(watchdog.socketPath, watchdog.secret);
+    try {
+      await second.channel.send({ kind: "STATE_REQ", requestNonce, payload, proof });
+      const reply = await second.channel.next() as { kind: string; code?: string };
+      assert.equal(reply.kind, "ERROR");
+      assert.equal(reply.code, "BAD_PROOF", "a proof from another connection's challenge must not verify");
+    } finally {
+      second.channel.close();
+    }
+  } finally {
+    await watchdog.cleanup();
+  }
+});
+
+test("R7D.1-WDF05-7: a restart with outstanding termination debt refuses to serve", async () => {
+  // A durable `terminating` record with an unresolved process debt is a live executor whose kill was
+  // never confirmed. The restarted watchdog cannot re-pin it here, so it must not become ready.
+  const result = await runWithRecord({
+    schema: 1,
+    executionId: "a".repeat(32),
+    bootId: BOOT,
+    watchdogInstance: "wd-0123456789ab",
+    supervisorInstance: "sv-0123456789ab",
+    requestId: "b".repeat(16),
+    operation: "fill",
+    containerId: "c".repeat(64),
+    containerName: `dip-exec-${"a".repeat(32)}`,
+    imageDigest: `sha256:${"d".repeat(64)}`,
+    profileId: "synthetic-v1",
+    initPid: 4_242,
+    initStartTimeTicks: 100,
+    cgroupPath: `/sys/fs/cgroup/dip-executor.slice/dip-exec-${"a".repeat(32)}`,
+    cgroupDevice: "0:25",
+    cgroupDirInode: 4_001,
+    cgroupEventsInode: 4_002,
+    cgroupKillInode: 4_003,
+    cgroupProcsInode: 4_004,
+    deadlineAtMs: 10_000,
+    armedAtMs: 1_000,
+    phase: "terminating",
+    processDebt: "terminate-required",
+    containerDebt: "removal-required",
+    outcome: null,
+    sequence: 2,
+  });
+  assert.equal(result.ready, false, "a restart with outstanding termination debt must not become ready");
+  assert.equal(result.code, 3);
+});
+
+/** Start a watchdog over a state directory containing one record and report how it started. */
+async function runWithRecord(record: Record<string, unknown>): Promise<{ code: number | null; ready: boolean }> {
+  const fs = await import("node:fs");
+  const root = mkdtempSync(join(await import("node:os").then((m) => m.tmpdir()), "dip-wdf-"));
+  const stateDir = join(root, "state");
+  fs.mkdirSync(join(stateDir, "records"), { recursive: true });
+  fs.writeFileSync(join(stateDir, "records", `${"a".repeat(32)}.json`), JSON.stringify(record));
+
+  const child = spawn(process.execPath, ["--import", "tsx", "workers/watchdog.ts"], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      DIP_WATCHDOG_SOCKET: join(root, "watchdog.sock"),
+      DIP_WATCHDOG_SECRET: randomBytes(32).toString("hex"),
+      DIP_WATCHDOG_STATE: stateDir,
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  let output = "";
+  let ready = false;
+  child.stdout!.on("data", (chunk: Buffer) => {
+    output += chunk.toString("utf8");
+    if (output.includes('"event":"ready"')) ready = true;
+  });
+  try {
+    const code = await new Promise<number | null>((resolve) => {
+      child.on("exit", (exitCode) => resolve(exitCode));
+      const poll = setInterval(() => {
+        if (ready) { clearInterval(poll); resolve(null); }
+      }, 50);
+      poll.unref();
+      setTimeout(() => { clearInterval(poll); resolve(null); }, 20_000).unref();
+    });
+    return { code, ready };
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    rmSync(root, { recursive: true, force: true });
+  }
+}

@@ -17,7 +17,7 @@
  * (this sandbox has no writable cgroup hierarchy), and the Docker operations.
  */
 
-import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
@@ -29,8 +29,12 @@ import { containerNameFor } from "../../src/lib/execution/ownership-journal";
 import type { ArmRequest } from "../../src/lib/execution/watchdog-protocol";
 import type { TerminalRequest } from "../../src/lib/execution/terminal-auth";
 import { pinCgroup } from "../../src/lib/execution/cgroup-pin";
+import type { ContainerObservation, ExpectedOwnership } from "../../src/lib/execution/container-identity";
+import type { TrustedIntent } from "../../src/lib/execution/watchdog";
 
 export const BOOT = readBootId();
+/** The mount a record names. Fixture-backed tests report membership under this prefix. */
+export const VIRTUAL_CGROUP_MOUNT = "/sys/fs/cgroup";
 export const SUPERVISOR = "sv-0123456789ab";
 export const WATCHDOG_INSTANCE = "wd-0123456789ab";
 export const IMAGE_DIGEST = `sha256:${"d".repeat(64)}`;
@@ -114,6 +118,23 @@ export function terminalRequest(executionId: string, overrides: Partial<Terminal
 
 export type Harness = {
   watchdog: Watchdog;
+  /**
+   * The cgroup mount this harness's executions are recorded under.
+   *
+   * The real path when no fixture tree is used; the fixture's temporary root otherwise. It exists
+   * because a fixture tree is not under `/sys/fs/cgroup`, and a record that named the real mount
+   * while the descriptors pointed at `/tmp` would fail its own membership check — correctly, but
+   * for a reason that has nothing to do with what the test meant to exercise.
+   */
+  cgroupMount: () => string;
+  /**
+   * Report the container as removed from now on.
+   *
+   * This models what actually happens before a legitimate grant: the container is present when the
+   * execution is armed, and the supervisor removes it once the work is committed. A grant cannot be
+   * minted while the container still exists, so a test that wants one has to say when it went away.
+   */
+  removeContainer: () => void;
   clock: ControllableClock;
   store: WatchdogStore;
   stateDir: string;
@@ -126,12 +147,33 @@ export type Harness = {
 export type HarnessOptions = {
   /** What host verification should answer. Defaults to a verified host. */
   verification?: HostVerification | ((request: ArmRequest) => HostVerification);
-  /** Whether the daemon reports the container present. */
+  /**
+   * Whether the daemon reports the container present.
+   *
+   * Defaults to present, because arming now requires positive ownership (WD-F04). Set `false` to
+   * model a container the daemon no longer knows about at every moment.
+   */
   containerPresent?: boolean;
+  /**
+   * Model the lifecycle rather than a constant: present while the execution is running, absent once
+   * the container has been removed. This is the normal shape of a completion, and it is what a
+   * granted disarm requires — absence at arm time would refuse the arm, absence at completion time
+   * is the evidence.
+   */
+  containerRemovedAfterTermination?: boolean;
+  /** Present at arm time, then absent once the harness is told the container was removed. */
+  observeLifecycle?: boolean;
+  /** The supervisor's trusted intent, when a test wants ownership corroborated against it. */
+  readIntent?: (executionId: string) => TrustedIntent | null;
   /** Whether a kill attempt is accepted. */
   killAccepted?: boolean;
   /** Inject a failing store write, to prove a failed persist produces no ACK. */
   failStoreWrites?: boolean;
+  /**
+   * The daemon's answer, as the closed observation vocabulary. Absent means the container is
+   * positively absent, which is what a successful completion needs.
+   */
+  observation?: (expected: ExpectedOwnership) => ContainerObservation;
   bootId?: string;
   /** Reuse an existing state directory, for restart tests. */
   stateDir?: string;
@@ -168,6 +210,9 @@ export function makeWatchdog(options: HarnessOptions = {}): Harness {
     : {});
   store.init();
 
+  // Whether a kill has been accepted. Drives `containerRemovedAfterTermination`.
+  let killedOnce = false;
+
   const verification = options.verification ?? verifiedHost();
   const declaredVerify = typeof verification === "function" ? verification : () => verification;
   // With a live tree the verification must report the tree's *real* inodes, because `arm` compares
@@ -190,6 +235,13 @@ export function makeWatchdog(options: HarnessOptions = {}): Harness {
     secret,
     store,
     verifyHost,
+    // A fixture tree is not under the real cgroup2 mount, so both the mount and the membership
+    // reading must come from the fixture. This is the mocked-cgroup path made explicit: the code
+    // under test is unchanged, the host it is told about is synthetic.
+    // The virtual mount, not the fixture root: records name a production path, and membership is
+    // reported in the same terms. The descriptors still come from the fixture directory.
+    cgroupMount: trees === null ? undefined : () => VIRTUAL_CGROUP_MOUNT,
+    actualCgroupPath: trees === null ? undefined : (_pid, mountPath) => trees.actualFor(mountPath),
     // A pin that reports the injected verification's inodes and holds no descriptors. This is the
     // mocked-cgroup path; `realPin` exists so a test can substitute the real implementation.
     pin: options.pinFd ?? (trees !== null
@@ -208,14 +260,54 @@ export function makeWatchdog(options: HarnessOptions = {}): Harness {
         },
       },
     }))),
-    killContainer: async () => ({ ok: options.killAccepted ?? true, detail: "injected" }),
-    // `present: false` is a positive not-found. `present: true` covers both "exists" and
-    // "unreadable", which is deliberate: an outage is not absence.
-    inspectContainer: async () => ({ present: options.containerPresent ?? false, detail: "injected" }),
+    readIntent: options.readIntent,
+    killContainer: async () => {
+      if (options.killAccepted !== false) killedOnce = true;
+      return { ok: options.killAccepted ?? true, detail: "injected" };
+    },
+    // The observation is injected as the closed vocabulary it now is, so a test names exactly the
+    // daemon answer it means to exercise: absent, present, foreign, unavailable, denied, ambiguous.
+    // The default is a container that exists and is this execution's: that is what a normal arm
+    // sees. A test that wants the daemon to report absence supplies `observation`, because absence
+    // is now a *decision* about ownership (WD-F04), not an incidental default.
+    observeContainer: async (expected) => {
+      if (options.observation !== undefined) return options.observation(expected);
+
+      const present = (): ContainerObservation => ({
+        state: "present",
+        containerId: expected.containerId,
+        labels: {},
+        detail: "injected present",
+      });
+
+      // A fixture tree models a container that exists until its cgroup is killed. Once `cgroup.kill`
+      // has been written through the pinned descriptor, the container is gone — that is the
+      // consequence the fixture is standing in for.
+      if (trees !== null && trees.killWasWritten()) {
+        return { state: "absent", detail: "injected: removed once cgroup.kill was written" };
+      }
+      if (options.containerRemovedAfterTermination === true) {
+        return killedOnce
+          ? { state: "absent", detail: "injected: removed after the kill" }
+          : present();
+      }
+      if (options.observeLifecycle === true) {
+        return killedOnce
+          ? { state: "absent", detail: "injected: removed by the supervisor" }
+          : present();
+      }
+      if (options.containerPresent === false) return { state: "absent", detail: "injected absent" };
+      return present();
+    },
   });
 
   return {
     watchdog,
+    // The virtual mount the records name. A record's cgroup path is validated against
+    // `/sys/fs/cgroup/dip-executor.slice/...`, so the reported mount must be that prefix for a
+    // fixture tree even though the descriptors come from a temporary directory.
+    cgroupMount: () => VIRTUAL_CGROUP_MOUNT,
+    removeContainer: () => { killedOnce = true; },
     clock,
     store,
     stateDir,
@@ -241,8 +333,12 @@ export function makeWatchdog(options: HarnessOptions = {}): Harness {
  * loudly when the arm was denied — a test that silently proceeds after a denial proves nothing
  * about the state it then inspects.
  */
-export function armAndAssert(harness: Harness, executionId: string, overrides: Partial<ArmRequest> = {}): void {
-  const answer = harness.watchdog.arm(armRequest(executionId, overrides));
+export async function armAndAssert(harness: Harness, executionId: string, overrides: Partial<ArmRequest> = {}): Promise<void> {
+  // The record must name the mount the descriptors were taken from. Only the mount prefix is
+  // rewritten; the leaf, which carries the ownership meaning, is the test's to choose.
+  const cgroupPath = overrides.cgroupPath
+    ?? cgroupPathFor(executionId, harness.cgroupMount());
+  const answer = await harness.watchdog.arm(armRequest(executionId, { ...overrides, cgroupPath }));
   if (answer.kind !== "ARM_ACK") {
     throw new Error(`the arm was denied: ${answer.code}`);
   }
@@ -259,12 +355,18 @@ export function armAndAssert(harness: Harness, executionId: string, overrides: P
 function makeLiveTrees(populated: boolean): {
   pin: (cgroupPath: string) => ReturnType<typeof pinCgroup>;
   identityOf: (cgroupPath: string) => HostVerification;
+  killWasWritten: () => boolean;
+  mountPath: () => string;
+  /** The cgroup the "process" is in: the first execution's tree, as `/proc/<pid>/cgroup` would say. */
+  actualFor: (mountPath: string) => { path: string; relative: string };
   cleanup: () => void;
 } {
   const mount = mkdtempSync(join(tmpdir(), "dip-live-"));
   const paths = new Map<string, string>();
 
   const ensure = (cgroupPath: string): string => {
+    // The path is the virtual `/sys/fs/cgroup/dip-executor.slice/<leaf>`; the leaf is what maps onto
+    // this fixture's real directory.
     const leaf = cgroupPath.split("/").pop() ?? "unknown";
     const existing = paths.get(leaf);
     if (existing !== undefined) return existing;
@@ -281,6 +383,19 @@ frozen 0
 
   return {
     pin: (cgroupPath: string) => pinCgroup({ cgroupPath: ensure(cgroupPath), mountPath: mount }),
+    /** True once a kill has been written through a pinned descriptor for any execution. */
+    killWasWritten: () => [...paths.values()].some((dir) => readFileSync(join(dir, "cgroup.kill"), "utf8") !== ""),
+    mountPath: () => mount,
+    actualFor: (mountPath: string) => {
+      // Only one execution is normally live per fixture. When several are, the first is reported:
+      // a test that needs two distinct memberships supplies `actualCgroupPath` itself.
+      //
+      // The path is expressed under the mount the watchdog was told about, not under this
+      // fixture's real temporary root: the virtual naming is what a record carries.
+      const leaf = [...paths.entries()][0]?.[0] ?? "absent";
+      const relative = `/dip-executor.slice/${leaf}`;
+      return { path: `${mountPath}${relative}`, relative };
+    },
     identityOf: (cgroupPath: string) => {
       const dir = ensure(cgroupPath);
       const dirStat = statSync(dir);

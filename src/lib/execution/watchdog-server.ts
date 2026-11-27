@@ -62,6 +62,22 @@ export const AUTH_LIMITS = Object.freeze({
    * and the connection is destroyed rather than allowed to grow.
    */
   maxResponseBufferBytes: 64 * 1024,
+  /**
+   * Frames one connection may have queued-but-unprocessed.
+   *
+   * The data handler serialises work through a promise chain. Without a bound, a peer that writes
+   * faster than the watchdog answers grows that chain — and therefore memory — without limit,
+   * before any authentication has happened. Exceeding this destroys the connection.
+   */
+  maxQueuedFrames: 8,
+  /**
+   * HELLO/AUTH messages one connection may send before authenticating.
+   *
+   * Repeated HELLO used to reset the session and, with it, the handshake timer — so a peer could
+   * hold a connection open indefinitely by re-saying hello. A small allowance covers a lost
+   * CHALLENGE; beyond it the connection is destroyed.
+   */
+  maxHandshakeMessages: 4,
 });
 
 export type WatchdogServerOptions = {
@@ -75,6 +91,24 @@ export type WatchdogServerOptions = {
   onTermination?: (result: Awaited<ReturnType<Watchdog["terminate"]>>) => void;
   log?: (line: string) => void;
 };
+
+/**
+ * Reduce a thrown error to a category the wire may carry (WD-F05).
+ *
+ * The closed set is deliberately small and contains no value derived from a peer. A supervisor that
+ * needs more has the watchdog's log and its own request; the control channel does not become a
+ * channel for whatever string a failure happened to contain.
+ */
+export function diagnosticCategory(error: unknown): string {
+  if (!(error instanceof Error)) return "unhandled";
+  const message = error.message;
+  if (/^the .* is not acceptable/u.test(message)) return "invalid-field";
+  if (/must be|required|expected/u.test(message)) return "invalid-shape";
+  if (/unrecognised|unknown/u.test(message)) return "unrecognised";
+  if (/not authenticated|proof/u.test(message)) return "authentication";
+  if (/exceeds|truncated|frame/u.test(message)) return "framing";
+  return "unhandled";
+}
 
 /**
  * Buffer frames until a complete one is available.
@@ -127,6 +161,9 @@ export async function startWatchdogServer(options: WatchdogServerOptions): Promi
     const frames = new FrameBuffer(WATCHDOG_LIMITS.frameBytes);
     let session: ServerSession | null = null;
     let requests = 0;
+    let handshakeMessages = 0;
+    /** Frames queued but not yet processed. Bounded by `maxQueuedFrames`. */
+    let queued = 0;
 
     // A connection that never completes the handshake is closed rather than allowed to sit. An
     // unauthenticated peer costs a socket and a timer; it must not cost anything unbounded.
@@ -149,7 +186,17 @@ export async function startWatchdogServer(options: WatchdogServerOptions): Promi
     // and an async handler would otherwise interleave two dispatches and reply out of order.
     let queue: Promise<void> = Promise.resolve();
     socket.on("data", (chunk: Buffer) => {
-      queue = queue.then(() => handleData(chunk)).catch(() => { socket.destroy(); });
+      queued += 1;
+      if (queued > AUTH_LIMITS.maxQueuedFrames) {
+        // The peer is writing faster than it is being answered. Destroying is the only bounded
+        // response: dropping chunks would desynchronise the frame boundary.
+        socket.destroy();
+        return;
+      }
+      queue = queue
+        .then(() => handleData(chunk))
+        .catch(() => { socket.destroy(); })
+        .finally(() => { queued -= 1; });
     });
 
     const handleData = async (chunk: Buffer): Promise<void> => {
@@ -166,7 +213,8 @@ export async function startWatchdogServer(options: WatchdogServerOptions): Promi
         try {
           message = decodeWatchdogFrame(frame);
         } catch (error) {
-          reply({ kind: "ERROR", code: "FRAMING", detail: error instanceof Error ? error.message : "unreadable" });
+          // A framing fault is the peer's own bytes; the category is all it is told.
+          reply({ kind: "ERROR", code: "FRAMING", detail: diagnosticCategory(error) });
           continue;
         }
 
@@ -174,8 +222,18 @@ export async function startWatchdogServer(options: WatchdogServerOptions): Promi
           // ---- Handshake ----
           if (typeof message === "object" && message !== null && (message as { kind?: unknown }).kind === "HELLO") {
             const hello = assertHello(message);
-            clearTimeout(handshakeTimer);
-            session = {
+            // WD-F05: the handshake timer is NOT cleared here. Clearing it on HELLO meant an
+            // unauthenticated peer could keep a connection alive forever by re-sending HELLO, since
+            // each one reset the deadline it was supposed to be racing. It is cleared only on a
+            // completed AUTH, where the connection has earned its unbounded lifetime.
+            handshakeMessages += 1;
+            if (handshakeMessages > AUTH_LIMITS.maxHandshakeMessages) {
+              socket.destroy();
+              return;
+            }
+            // A second HELLO replaces the session, which is allowed but bounded: the new nonce
+            // invalidates the old challenge, so this cannot be used to accumulate state.
+            const challenged: ServerSession = {
               clientNonce: hello.clientNonce,
               serverNonce: newAuthNonce(),
               clientInstance: hello.clientInstance,
@@ -184,13 +242,17 @@ export async function startWatchdogServer(options: WatchdogServerOptions): Promi
               authenticated: false,
               consumedNonces: new Set(),
               createdAtMs: Date.now(),
+              // Not bound until AUTH succeeds: HELLO is unauthenticated, so claiming an instance
+              // there proves nothing.
+              boundSupervisor: null,
             };
+            session = challenged;
             reply({
               kind: "CHALLENGE",
-              serverNonce: session.serverNonce,
-              clientNonce: session.clientNonce,
-              serverInstance: session.serverInstance,
-              bootId: session.bootId,
+              serverNonce: challenged.serverNonce,
+              clientNonce: challenged.clientNonce,
+              serverInstance: challenged.serverInstance,
+              bootId: challenged.bootId,
               pid: options.watchdog.identity.pid,
               protocolVersion: 2,
             });
@@ -227,6 +289,10 @@ export async function startWatchdogServer(options: WatchdogServerOptions): Promi
               return;
             }
             session.authenticated = true;
+            // WD-F05: the connection is now bound to this supervisor instance for its whole life.
+            session.boundSupervisor = session.clientInstance;
+            // Now, and only now, the connection has earned a lifetime beyond the handshake window.
+            clearTimeout(handshakeTimer);
             // The acknowledgement is signed in the other direction over the same transcript, so
             // the client learns it is talking to the process holding the secret, not merely to
             // something that accepted a guess.
@@ -266,6 +332,20 @@ export async function startWatchdogServer(options: WatchdogServerOptions): Promi
           }
 
           const request = assertAuthenticatedRequest(message);
+
+          // WD-F05: a connection authenticated by one supervisor cannot carry another's request.
+          // The comparison is against the session, never against the payload's own claim.
+          if (session.boundSupervisor === null) {
+            reply({ kind: "ERROR", code: "UNAUTHENTICATED" });
+            socket.destroy();
+            return;
+          }
+          const claimedSupervisor = (request.payload as { supervisorInstance?: unknown }).supervisorInstance;
+          if (typeof claimedSupervisor === "string" && claimedSupervisor !== session.boundSupervisor) {
+            reply({ kind: "ERROR", code: "INSTANCE_MISMATCH" });
+            socket.destroy();
+            return;
+          }
 
           // Per-request nonce: a captured request cannot be replayed, even on this connection.
           if (session.consumedNonces.has(request.requestNonce)) {
@@ -307,7 +387,12 @@ export async function startWatchdogServer(options: WatchdogServerOptions): Promi
         } catch (error) {
           // Answered, not ignored: silence leaves the supervisor waiting until its own deadline,
           // which looks like a hang rather than a refusal.
-          reply({ kind: "ERROR", code: "BAD_REQUEST", detail: error instanceof Error ? error.message : "unhandled" });
+          //
+          // WD-F05: the category is sanitized. A thrown message can carry a path, a PID or a
+          // daemon phrase assembled from container output; the caller needs to know *what kind* of
+          // refusal it was, and the details belong in the watchdog's own log, not on the wire.
+          options.log?.(`control request refused: ${error instanceof Error ? error.message : "unknown"}`);
+          reply({ kind: "ERROR", code: "BAD_REQUEST", detail: diagnosticCategory(error) });
         }
       }
     };
@@ -335,10 +420,20 @@ export async function startWatchdogServer(options: WatchdogServerOptions): Promi
   // The independent timer. `unref` is deliberately not used: this interval is the reason the
   // process stays alive when nothing is connected, and a watchdog that exits because it is idle is
   // a watchdog that is not watching.
+  //
+  // WD-F05: ticks must not overlap. `runDeadlines` awaits host work, so a slow termination would
+  // otherwise be re-entered on the next interval — issuing a second kill for the same execution and
+  // letting two attempts interleave. The in-flight flag makes a slow tick delay the next one
+  // instead of stacking on it.
+  let tickInFlight = false;
   const tick = setInterval(() => {
-    void runDeadlines(options).catch((error: unknown) => {
-      options.log?.(`deadline tick failed: ${error instanceof Error ? error.message : "unknown"}`);
-    });
+    if (tickInFlight) return;
+    tickInFlight = true;
+    void runDeadlines(options)
+      .catch((error: unknown) => {
+        options.log?.(`deadline tick failed: ${error instanceof Error ? error.message : "unknown"}`);
+      })
+      .finally(() => { tickInFlight = false; });
   }, options.tickIntervalMs ?? 250);
 
   return {

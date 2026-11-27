@@ -162,6 +162,15 @@ export type ServerSession = {
   /** Request nonces already consumed on this connection. */
   consumedNonces: Set<string>;
   createdAtMs: number;
+  /**
+   * Authenticated supervisor identity.
+   *
+   * WD-F05: the supervisor instance that completed the handshake. Every request through this
+   * connection is bound to it, so a connection authenticated by one supervisor cannot carry a
+   * request that names another. It is set only at authentication and never re-derived from a
+   * request payload.
+   */
+  boundSupervisor: string | null;
 };
 
 /** A per-connection session, as the client holds it. */

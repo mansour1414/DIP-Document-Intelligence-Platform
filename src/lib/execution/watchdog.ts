@@ -31,7 +31,6 @@
  *   exact execution-derived name, and hold the init process whose start time was verified.
  */
 
-import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   MessageIdWindow,
@@ -68,6 +67,16 @@ import {
   type WatchdogArmRecord,
 } from "./watchdog-store";
 import { randomBytes } from "node:crypto";
+import {
+  actualCgroupPath,
+  isExactMembership,
+  isInsideDipSubtree,
+  provesAbsence,
+  provesOwnership,
+  type ContainerObservation,
+  type ExpectedOwnership,
+} from "./container-identity";
+import { ExecutionArbiter } from "./execution-arbiter";
 
 /** The watchdog's own identity. A restarted watchdog is a different instance. */
 export type WatchdogIdentity = {
@@ -79,8 +88,25 @@ export type WatchdogIdentity = {
 };
 
 /** A live execution: the durable record plus the descriptors that pin its cgroup. */
+/** How many times an unresolved termination is retried before it needs an operator. */
+export const TERMINATION_RETRY_LIMIT = 3;
+/** Minimum spacing between retries, so a failing attempt is not repeated every tick. */
+export const TERMINATION_RETRY_BACKOFF_MS = 5_000;
+
 type LiveExecution = {
   record: WatchdogArmRecord;
+  /**
+   * Whether ownership of the target was verified at arm time or by a later observation.
+   *
+   * WD-F03 gates retries on this: a quarantine with verified ownership may be signalled again, and
+   * one without it may not. It is false for a record recovered from disk, because a recovered
+   * record is a claim until the host confirms it.
+   */
+  ownershipVerified: boolean;
+  /** Termination attempts made. Bounded so a permanently failing kill is not a busy loop. */
+  terminationAttempts: number;
+  /** Clock reading of the last attempt, for backoff. */
+  lastTerminationAtMs: number | null;
   /** Present only when the cgroup could be pinned. Its absence is why a termination may be owed. */
   pin: PinnedCgroup | null;
   heartbeatsSeen: number;
@@ -154,14 +180,18 @@ export function verifyArmIdentity(request: ArmRequest, bootId: string): HostVeri
   if (startTime !== request.initStartTimeTicks) return { ok: false, code: "PID_UNVERIFIED" };
 
   // The init process must actually be in that cgroup, not merely existing somewhere.
-  try {
-    const membership = readFileSync(`/proc/${request.initPid}/cgroup`, "utf8");
-    const relative = request.cgroupPath.slice(mount.path.length) || "/";
-    if (!membership.includes(`0::${relative}\n`) && !membership.includes(`0::${relative}`)) {
-      return { ok: false, code: "PID_UNVERIFIED" };
-    }
-  } catch {
-    return { ok: false, code: "PID_UNVERIFIED" };
+  //
+  // WD-F04: whole-component comparison, not a substring. The previous `includes` accepted a prefix,
+  // so a process in `.../dip-exec-aaa…-sibling` satisfied a claim about `.../dip-exec-aaa…`, which
+  // is exactly the unrelated-cgroup signal the requirement forbids.
+  const actual = actualCgroupPath(request.initPid, mount.path);
+  if (actual === null) return { ok: false, code: "PID_UNVERIFIED" };
+  const expectedRelative = request.cgroupPath.slice(mount.path.length) || "/";
+  if (!isExactMembership(actual.relative, expectedRelative)) return { ok: false, code: "PID_UNVERIFIED" };
+  // The member's cgroup must be the one named, and it must be inside the DIP subtree by whole
+  // components — a path that merely begins with the DIP slice's characters is not inside it.
+  if (!isInsideDipSubtree(actual.path, mount.path, DIP_CGROUP_SUBTREE)) {
+    return { ok: false, code: "NOT_DIP_OWNED" };
   }
 
   return {
@@ -195,16 +225,75 @@ export type WatchdogOptions = {
   secret: Buffer;
   /** Durable record store. Absent means the watchdog refuses to arm at all. */
   store?: WatchdogStore;
-  /** How the watchdog asks the daemon to kill a container, and to report removal. */
+  /**
+   * How the watchdog asks the daemon to kill a container.
+   *
+   * A kill is a request, never a proof. The proof is a later observation that positively reports
+   * the exact id absent.
+   */
   killContainer: (containerId: string) => Promise<{ ok: boolean; detail: string }>;
   /**
-   * Container presence, asked by exact id.
+   * Observe one container by exact id, as the closed `ContainerObservation` vocabulary.
    *
-   * `present: true` is "it exists". `present: false` is a *positive* not-found. An unreadable
-   * daemon must return `{ present: true, detail: "unresolved" }` from the caller's adapter,
-   * because an outage is not absence.
+   * This replaces a boolean `{ present }`. The boolean could not distinguish a daemon outage from
+   * an existing container, so removal could never be positively confirmed (WD-F01). Only
+   * `state: "absent"` discharges a removal debt; only `state: "present"` authorizes signalling.
    */
-  inspectContainer: (containerId: string) => Promise<{ present: boolean; detail: string }>;
+  observeContainer: (expected: ExpectedOwnership) => Promise<ContainerObservation>;
+  /**
+   * Read the actual cgroup a PID is in, from the host. Injected so ownership can be tested where
+   * no container exists; the production default reads `/proc/<pid>/cgroup`.
+   */
+  actualCgroupPath?: (pid: number, mountPath: string) => { path: string; relative: string } | null;
+  /**
+   * The cgroup2 mount to verify against.
+   *
+   * Injected only so a fixture tree can stand in for a real hierarchy. The production default
+   * discovers the mount from `/proc/self/mountinfo`, and there is no option to skip verification.
+   */
+  cgroupMount?: () => string | null;
+  /**
+   * Trusted supervisor intent, read from the journal. Used to corroborate ownership against a
+   * record this watchdog did not write (WD-F04). Optional: without it, ownership rests on the
+   * watchdog's own durable record and live observations alone.
+   */
+  readIntent?: (executionId: string) => TrustedIntent | null;
+};
+
+/**
+ * The supervisor's own record of what it intended to create.
+ *
+ * Deliberately a subset of the journal's `SupervisorRecord`: the watchdog needs the identity, not
+ * the outcome. Reading it gives the watchdog a second, independent statement of the same facts, so
+ * a container that matches only the watchdog's record but not the supervisor's intent is refused.
+ */
+export type TrustedIntent = {
+  executionId: string;
+  bootId: string;
+  supervisorInstance: string;
+  containerName: string;
+  containerId: string | null;
+  imageDigest: string;
+  profileId: string;
+};
+
+/**
+ * An execution the watchdog owes a termination attempt.
+ *
+ * `reason` separates the three debts, because they call for different handling and only one of them
+ * may be retried autonomously (WD-F03):
+ *
+ * - `deadline` — armed and past its deadline. Terminate.
+ * - `unresolved-process` — a termination was attempted and positive process termination was never
+ *   established, while ownership remains verified. Retry, bounded.
+ * - `unresolved-container` — the processes are confirmed gone and only metadata removal is owed.
+ *   Removal is attempted by exact id; there is no process to signal.
+ */
+export type TurnToTerminate = {
+  executionId: string;
+  containerId: string;
+  cgroupPath: string;
+  reason: "deadline" | "unresolved-process" | "unresolved-container";
 };
 
 /** What one termination attempt established. Everything here is evidence, not intention. */
@@ -212,6 +301,13 @@ export type TerminationReport = {
   executionId: string;
   /** The kernel accepted a write to the pinned `cgroup.kill`. Not proof of exit. */
   killWritten: boolean;
+  /**
+   * True when the target was signalled without the watchdog having proven it owns it.
+   *
+   * Always false in a correct run; it exists so a regression that signals an unverified target is
+   * observable rather than silent. WD-F03 makes it a hard precondition instead of an assertion.
+   */
+  signalledUnverified?: boolean;
   /** `cgroup.events` reported `populated 0`. Positive proof that no tasks remain. */
   processTerminationConfirmed: boolean;
   /** The exact container id was positively reported absent. */
@@ -232,6 +328,13 @@ export class Watchdog {
   private readonly options: WatchdogOptions;
   private readonly live = new Map<string, LiveExecution>();
   private readonly messageIds = new MessageIdWindow();
+  /**
+   * WD-F02: one operation at a time per execution, across every await.
+   *
+   * Without this, `disarm` read the phase, awaited the host, and then wrote a conclusion computed
+   * from the pre-await phase — so a concurrent `terminate` or a second `disarm` could be overwritten.
+   */
+  private readonly arbiter = new ExecutionArbiter();
   /** Set when recovery found something it could not positively resolve. Blocks all arming. */
   private recoveryBlocked: string | null = null;
 
@@ -243,10 +346,14 @@ export class Watchdog {
     return this.options.identity;
   }
 
+  /** The cgroup2 mount this watchdog verifies against. */
+  private cgroupMountPath(): string {
+    return this.options.cgroupMount?.() ?? findCgroup2Mount()?.path ?? "/sys/fs/cgroup";
+  }
+
   /** Pin a cgroup through the configured implementation. */
   private pinCgroup(cgroupPath: string): ReturnType<typeof pinCgroup> {
-    const mountPath = findCgroup2Mount()?.path ?? "/sys/fs/cgroup";
-    return (this.options.pin ?? pinCgroup)({ cgroupPath, mountPath });
+    return (this.options.pin ?? pinCgroup)({ cgroupPath, mountPath: this.cgroupMountPath() });
   }
 
   /** The durable store, or a throw. Arming without a store is not supported. */
@@ -316,6 +423,11 @@ export class Watchdog {
         heartbeatsSeen: 0,
         lastHeartbeatMs: this.options.clock.nowMs(),
         issuedGrants: new Set(),
+        // A recovered record is a claim until the host confirms it. Termination is still owed —
+        // the deadline is real — but a *retry* of an unconfirmed target is not authorized.
+        ownershipVerified: false,
+        terminationAttempts: 0,
+        lastTerminationAtMs: null,
       });
       adopted.push(record.executionId);
     }
@@ -351,7 +463,23 @@ export class Watchdog {
    * Reversing 3 and 4 would mean telling the supervisor a deadline is armed that this process
    * would forget on a crash.
    */
-  arm(request: ArmRequest): ArmAck | ArmDenied {
+  async arm(request: ArmRequest): Promise<ArmAck | ArmDenied> {
+    // Arming accepts a termination target, so it is arbitrated like every other mutation: two
+    // concurrent arms for one execution must not both persist a record.
+    const arbitrated = await this.arbiter.run(request.executionId, () => this.armLocked(request));
+    if (!arbitrated.ok) {
+      return {
+        kind: "ARM_DENIED",
+        messageId: request.messageId,
+        executionId: request.executionId,
+        watchdogInstance: this.options.identity.instance,
+        code: "ALREADY_ARMED",
+      };
+    }
+    return arbitrated.value;
+  }
+
+  private async armLocked(request: ArmRequest): Promise<ArmAck | ArmDenied> {
     const deny = (code: ArmDenied["code"]): ArmDenied => ({
       kind: "ARM_DENIED",
       messageId: request.messageId,
@@ -388,6 +516,21 @@ export class Watchdog {
       || pin.files["cgroup.procs"].inode !== verified.procsInode) {
       closePinned(pin);
       return deny("CGROUP_UNVERIFIED");
+    }
+
+    // ## WD-F04: the container must be this execution's, before the target is accepted
+    //
+    // A matching name, subtree and PID start time are not Docker ownership. The exact container id,
+    // all five derived labels, the pinned image and the profile are compared against the daemon,
+    // and corroborated against the supervisor's journal when it is readable. A container that is
+    // merely "present" is not enough; a foreign one is refused outright.
+    const ownership = await this.observeOwnership(request);
+    if (ownership !== "verified") {
+      closePinned(pin);
+      // `NOT_DIP_OWNED` is the denial the arm vocabulary already has for "this is not yours".
+      // An unavailable daemon is not a proven mismatch, so it is reported as an unverified target
+      // rather than as an accusation.
+      return deny(ownership === "foreign" ? "NOT_DIP_OWNED" : "CGROUP_UNVERIFIED");
     }
 
     const nowMs = this.options.clock.nowMs();
@@ -431,6 +574,10 @@ export class Watchdog {
 
     this.live.set(request.executionId, {
       record,
+      // Verified by `verifyArmIdentity` plus the descriptor cross-check immediately above.
+      ownershipVerified: true,
+      terminationAttempts: 0,
+      lastTerminationAtMs: null,
       pin,
       heartbeatsSeen: 0,
       lastHeartbeatMs: nowMs,
@@ -495,6 +642,26 @@ export class Watchdog {
    * execution stays due, and `terminate` will act on it.
    */
   async disarm(request: TerminalRequest, messageId: string, sequence: number): Promise<TerminalGrantMessage | TerminalDeniedMessage> {
+    // The lane is taken before anything is read. A refusal is answered without side effects.
+    const arbitrated = await this.arbiter.run(request.executionId, () => this.disarmLocked(request, messageId, sequence));
+    if (!arbitrated.ok) {
+      return {
+        executionId: request.executionId,
+        requestId: request.requestId,
+        code: "TERMINATION_PENDING",
+        watchdogInstance: this.options.identity.instance,
+      };
+    }
+    return arbitrated.value;
+  }
+
+  /**
+   * The disarm decision, holding the execution's lane for its whole duration.
+   *
+   * Every read of `entry.record` below happens with no other operation able to change it, so the
+   * revalidation after the await cannot be pre-empted between the check and the write.
+   */
+  private async disarmLocked(request: TerminalRequest, messageId: string, sequence: number): Promise<TerminalGrantMessage | TerminalDeniedMessage> {
     const deny = (code: TerminalDeniedMessage["code"]): TerminalDeniedMessage => ({
       executionId: request.executionId,
       requestId: request.requestId,
@@ -535,18 +702,51 @@ export class Watchdog {
     // cancellation or failure is a perfectly good terminal state and must not publish anything.
     if (context.outcome !== "committed") return deny("UNCERTAIN");
 
+    // The revision this decision is made against. Compared again after the await.
+    const sequenceBase = entry.record.sequence;
+
+    // Expiry is decided from the clock alone, before any host work. An expired disarm must be
+    // reported as expired whatever the daemon says: masking it behind an observation would turn
+    // "this execution is being terminated" into "the host is uncertain", and the supervisor would
+    // retry instead of standing aside.
+    const expiredEarly = compareDeadline(
+      { bootId: entry.record.bootId, deadlineAtMs: entry.record.deadlineAtMs },
+      this.options.clock,
+    );
+    if (expiredEarly.kind === "stale-boot") return deny("MISMATCH");
+    if (expiredEarly.kind === "due") return deny("EXPIRED");
+
+    // WD-F04: a disarm is also an ownership decision, because it authorizes publishing. The
+    // container's identity is re-established before any of it counts.
+    entry.ownershipVerified = await this.verifyContainerOwnership(entry);
+
+    // ## Revalidation after the await (WD-F02)
+    //
+    // The lane makes this defence in depth rather than the only guard: if arbitration ever
+    // regresses, the write below still cannot overwrite a conclusion reached while the host was
+    // being read. State, identity, deadline and sequence are re-checked against the record as it is
+    // *now*, not as it was before the await.
+    const current = this.live.get(context.executionId);
+    if (current === undefined || current !== entry) return deny("UNKNOWN_EXECUTION");
+    if (entry.record.executionId !== context.executionId
+      || entry.record.containerId !== context.containerId
+      || entry.record.bootId !== context.bootId) {
+      return deny("MISMATCH");
+    }
+    // `terminating` and `quarantined` are the transitions that can occur while evidence is being
+    // gathered: a deadline tick may have begun a termination, or a previous attempt may have left
+    // the execution unresolved. Either way this disarm must not conclude it.
+    const phaseNow: string = entry.record.phase;
+    if (phaseNow === "terminating") return deny("TERMINATION_PENDING");
+    if (phaseNow === "quarantined") return deny("UNCERTAIN");
+    // A record that advanced while the evidence was gathered belongs to a later decision.
+    if (entry.record.sequence !== sequenceBase) return deny("ALREADY_CONCLUDED");
+    // A grant already issued for this execution cannot be issued again, whatever the record says.
+    if (entry.issuedGrants.size > 0) return deny("ALREADY_CONCLUDED");
+
     // Caller-supplied `containerRemoved` is not evidence. It is recorded, and then ignored in
     // favour of what this process can establish.
     const evidence = await this.verifyCompletion(entry);
-
-    // Expired between the supervisor's decision and this call. This does **not** conclude the
-    // execution: the termination debt stands, and `terminate` will act on it. Concluding here was
-    // the defect that let a late disarm cancel a required kill.
-    const comparison = compareDeadline({ bootId: entry.record.bootId, deadlineAtMs: entry.record.deadlineAtMs }, this.options.clock);
-    if (comparison.kind === "stale-boot") return deny("MISMATCH");
-    if (comparison.kind === "due") {
-      return deny("EXPIRED");
-    }
 
     if (!evidence.processTerminationConfirmed || !evidence.containerRemovalConfirmed) {
       return deny("UNCERTAIN");
@@ -588,6 +788,112 @@ export class Watchdog {
   }
 
   /**
+   * Establish Docker ownership for a request that is about to be armed.
+   *
+   * Returns `foreign` only for a *positive* mismatch: the daemon answered and the container is not
+   * this execution's. An unreadable or unavailable daemon is `unverified`, which is a refusal but
+   * not an accusation.
+   */
+  private async observeOwnership(request: ArmRequest): Promise<"verified" | "foreign" | "unverified"> {
+    const intent = this.options.readIntent?.(request.executionId) ?? null;
+    if (intent !== null) {
+      if (intent.executionId !== request.executionId
+        || intent.bootId !== request.bootId
+        || intent.supervisorInstance !== request.supervisorInstance
+        || intent.containerName !== request.containerName
+        || intent.imageDigest !== request.imageDigest
+        || intent.profileId !== request.profileId) {
+        return "foreign";
+      }
+      if (intent.containerId !== null && intent.containerId !== request.containerId) return "foreign";
+    }
+
+    const observation = await this.options.observeContainer({
+      executionId: request.executionId,
+      containerId: request.containerId,
+      containerName: request.containerName,
+      imageDigest: request.imageDigest,
+      profileId: request.profileId,
+      bootId: request.bootId,
+      supervisorInstance: request.supervisorInstance,
+    });
+
+    switch (observation.state) {
+      case "present":
+        return "verified";
+      case "present-foreign":
+        return "foreign";
+      case "absent":
+        // The supervisor claims a container that does not exist. That is a mismatch between the
+        // request and the host, not an unavailable daemon.
+        return "foreign";
+      default:
+        return "unverified";
+    }
+  }
+
+  /** The ownership a record claims, in the shape the observation contract takes. */
+  private expectedOwnership(record: WatchdogArmRecord): ExpectedOwnership {
+    return {
+      executionId: record.executionId,
+      containerId: record.containerId,
+      containerName: record.containerName,
+      imageDigest: record.imageDigest,
+      profileId: record.profileId,
+      bootId: record.bootId,
+      supervisorInstance: record.supervisorInstance,
+    };
+  }
+
+  /**
+   * Establish that the container is still this execution's, from the daemon and the journal.
+   *
+   * WD-F04: a name, a subtree and a matching PID start time do not prove ownership. The container
+   * id, all five derived labels, the pinned image and the profile are compared exactly, and — when
+   * the supervisor's journal is readable — corroborated against the intent the supervisor wrote.
+   *
+   * Returns false for every observation other than a positively matched, currently present
+   * container. A foreign container is a *negative* answer, not an ambiguous one.
+   */
+  private async verifyContainerOwnership(entry: LiveExecution): Promise<boolean> {
+    const expected = this.expectedOwnership(entry.record);
+
+    const intent = this.options.readIntent?.(entry.record.executionId) ?? null;
+    if (intent !== null) {
+      // Two independent statements of the same facts must agree. A disagreement means one of them
+      // is stale or forged, and neither is a basis for signalling.
+      if (intent.executionId !== expected.executionId
+        || intent.bootId !== expected.bootId
+        || intent.supervisorInstance !== expected.supervisorInstance
+        || intent.containerName !== expected.containerName
+        || intent.imageDigest !== expected.imageDigest
+        || intent.profileId !== expected.profileId) {
+        return false;
+      }
+      if (intent.containerId !== null && intent.containerId !== expected.containerId) return false;
+    }
+
+    const observation = await this.options.observeContainer(expected);
+    if (!provesOwnership(observation)) return false;
+
+    // The recorded cgroup must still be the cgroup this execution's init is actually in. WD-F04:
+    // derived from `/proc/<pid>/cgroup`, with whole-component matching, not from a naming scheme.
+    //
+    // An unreadable mount is a refusal, not a skip: if the hierarchy cannot be found, membership
+    // cannot be established, and membership is a precondition for signalling.
+    const mount = this.options.cgroupMount?.() ?? (findCgroup2Mount()?.path ?? null);
+    if (mount === null) return false;
+    const readPath = this.options.actualCgroupPath ?? actualCgroupPath;
+    const actual = readPath(entry.record.initPid, mount);
+    if (actual === null) return false;
+    if (!isInsideDipSubtree(actual.path, mount, DIP_CGROUP_SUBTREE)) return false;
+    const expectedRelative = entry.record.cgroupPath.slice(mount.length);
+    if (!isExactMembership(actual.relative, expectedRelative)) return false;
+
+    return true;
+  }
+
+  /**
    * Establish completion from the host, not from the caller.
    *
    * Both facts are required and neither is inferred from the other: a container can be removed
@@ -597,6 +903,7 @@ export class Watchdog {
   private async verifyCompletion(entry: LiveExecution): Promise<{
     processTerminationConfirmed: boolean;
     containerRemovalConfirmed: boolean;
+    observation: ContainerObservation;
   }> {
     let processTerminationConfirmed = false;
     if (entry.pin !== null && entry.pin.dirFd >= 0) {
@@ -610,12 +917,12 @@ export class Watchdog {
       }
     }
 
-    const inspection = await this.options.inspectContainer(entry.record.containerId);
-    // `present: false` from this adapter means a *positive* not-found. Ambiguity is reported as
-    // `present: true` by the adapter precisely so it cannot be mistaken for removal here.
-    const containerRemovalConfirmed = inspection.present === false;
+    // WD-F01: only a positively confirmed exact-id absence discharges the removal debt. Every other
+    // observation — present, foreign, unavailable, denied, ambiguous — leaves it owed.
+    const observation = await this.options.observeContainer(this.expectedOwnership(entry.record));
+    const containerRemovalConfirmed = provesAbsence(observation);
 
-    return { processTerminationConfirmed, containerRemovalConfirmed };
+    return { processTerminationConfirmed, containerRemovalConfirmed, observation };
   }
 
   /**
@@ -625,16 +932,41 @@ export class Watchdog {
    * *not* concluded here: concluding is what `terminate` does once it has evidence, and marking it
    * concluded first is what used to make a late disarm cancel the kill.
    */
-  dueForTermination(): Array<{ executionId: string; containerId: string; cgroupPath: string }> {
-    const due: Array<{ executionId: string; containerId: string; cgroupPath: string }> = [];
+  dueForTermination(): TurnToTerminate[] {
+    const due: TurnToTerminate[] = [];
     for (const [executionId, entry] of this.live) {
-      if (entry.record.phase !== "armed" && entry.record.phase !== "terminating") continue;
+      const record = entry.record;
+
+      // ## WD-F03: an unresolved debt is not abandoned
+      //
+      // A quarantined execution was previously excluded here, which meant a positively identified
+      // executor whose kill could not be confirmed was never attempted again — the debt was
+      // retained on paper and dropped in practice. It is admitted now, but only on the terms below.
+      if (record.phase === "quarantined") {
+        // Retry only when ownership is still verified. An unverified target is never signalled
+        // again: repeating a signal at something that might be a different container is worse than
+        // waiting for an operator.
+        if (entry.ownershipVerified !== true) continue;
+        // Bounded: a retry budget, and a backoff so a failed attempt is not repeated on every tick.
+        if (entry.terminationAttempts >= TERMINATION_RETRY_LIMIT) continue;
+        const last = entry.lastTerminationAtMs ?? 0;
+        if (this.options.clock.nowMs() - last < TERMINATION_RETRY_BACKOFF_MS) continue;
+        due.push({
+          executionId,
+          containerId: record.containerId,
+          cgroupPath: record.cgroupPath,
+          reason: record.processDebt === "termination-confirmed" ? "unresolved-container" : "unresolved-process",
+        });
+        continue;
+      }
+
+      if (record.phase !== "armed" && record.phase !== "terminating") continue;
       const comparison = compareDeadline(
-        { bootId: entry.record.bootId, deadlineAtMs: entry.record.deadlineAtMs },
+        { bootId: record.bootId, deadlineAtMs: record.deadlineAtMs },
         this.options.clock,
       );
       if (comparison.kind !== "due") continue;
-      due.push({ executionId, containerId: entry.record.containerId, cgroupPath: entry.record.cgroupPath });
+      due.push({ executionId, containerId: record.containerId, cgroupPath: record.cgroupPath, reason: "deadline" });
     }
     return due;
   }
@@ -658,7 +990,24 @@ export class Watchdog {
    * have exited. The two questions are answered from the two sources that can actually answer
    * them.
    */
-  async terminate(due: { executionId: string; containerId: string; cgroupPath: string }): Promise<TerminationReport> {
+  async terminate(due: TurnToTerminate): Promise<TerminationReport> {
+    // WD-F02: the same lane as disarm. A termination and a disarm for one execution are mutually
+    // exclusive, so neither can write a conclusion computed from pre-await state.
+    const arbitrated = await this.arbiter.run(due.executionId, () => this.terminateLocked(due));
+    if (!arbitrated.ok) {
+      return {
+        executionId: due.executionId,
+        killWritten: false,
+        processTerminationConfirmed: false,
+        containerRemovalConfirmed: false,
+        resolved: false,
+        detail: "another operation holds this execution; the deadline is still owed",
+      };
+    }
+    return arbitrated.value;
+  }
+
+  private async terminateLocked(due: TurnToTerminate): Promise<TerminationReport> {
     const entry = this.live.get(due.executionId);
     if (entry === undefined) {
       return {
@@ -681,32 +1030,61 @@ export class Watchdog {
       };
     }
 
-    // Record intent before acting. A crash between here and the kill leaves `terminating`, which
-    // recovery treats as a termination owed rather than as clean state.
-    const terminating: WatchdogArmRecord = {
-      ...entry.record,
-      phase: "terminating",
-      processDebt: "terminate-required",
-      sequence: entry.record.sequence + 1,
-    };
-    try {
-      this.store().write(terminating);
-      entry.record = terminating;
-    } catch (error) {
-      return {
-        executionId: due.executionId,
-        killWritten: false,
-        processTerminationConfirmed: false,
-        containerRemovalConfirmed: false,
-        resolved: false,
-        detail: `the termination intent could not be recorded: ${error instanceof Error ? error.message : "unknown"}`,
+    // ## WD-F04 / WD-F03: ownership before the signal
+    //
+    // Nothing is signalled until the target is proven to be this execution's container *now*. This
+    // runs on every attempt, including a retry, so a retry against a container that has since been
+    // replaced is refused rather than acted on.
+    entry.ownershipVerified = await this.verifyContainerOwnership(entry);
+    entry.terminationAttempts += 1;
+    entry.lastTerminationAtMs = this.options.clock.nowMs();
+
+    // A container-debt-only turn has no process to signal: the processes are already confirmed
+    // gone, so writing `cgroup.kill` again would act on an empty cgroup. Removal is attempted
+    // below, by exact id, and nothing else.
+    const processOwed = entry.record.processDebt !== "termination-confirmed";
+
+    // Record intent before acting, so a crash between here and the kill leaves `terminating`.
+    //
+    // ## Why a write failure does not stop the termination
+    //
+    // WD-F03: an already armed execution with verified ownership has a mandatory emergency
+    // termination. Refusing to signal because the *journal* is unwritable would trade a durable
+    // record for a live container — and the record is the thing that can be reconstructed, while
+    // the running processes cannot be recalled. The write is therefore attempted, its failure is
+    // reported, and the termination proceeds.
+    let durableIntent = true;
+    if (processOwed) {
+      const terminating: WatchdogArmRecord = {
+        ...entry.record,
+        phase: "terminating",
+        processDebt: "terminate-required",
+        sequence: entry.record.sequence + 1,
       };
+      try {
+        this.store().write(terminating);
+        entry.record = terminating;
+      } catch {
+        // The in-memory record still advances, so the attempt is accounted for and a retry is
+        // bounded; only the durable copy is stale, and the report says so.
+        durableIntent = false;
+        entry.record = { ...terminating };
+      }
     }
 
     let killWritten = false;
+    let signalledUnverified = false;
     let detail = "";
 
-    if (entry.pin === null || entry.pin.dirFd < 0) {
+    if (!entry.ownershipVerified) {
+      // WD-F03: never signal an unverified target. The debt is retained, the attempt is counted,
+      // and an operator resolves it. Repeating a signal at something that might be a different
+      // container is worse than waiting.
+      detail = "ownership is not verified; the target was not signalled";
+      signalledUnverified = false;
+    } else if (!processOwed) {
+      detail = "the processes are already confirmed gone; no kill was written";
+    } else if (entry.pin === null || entry.pin.dirFd < 0) {
       detail = "no pinned descriptor is available; refusing to write by path";
     } else {
       const pinState = verifyPin(entry.pin);
@@ -725,8 +1103,9 @@ export class Watchdog {
     }
 
     // The cgroup write is the mechanism that reaches every process at once. The daemon kill is a
-    // fallback for the case where the cgroup could not be signalled at all.
-    if (!killWritten) {
+    // fallback for the case where the cgroup could not be signalled at all — and only for a target
+    // whose ownership is verified and whose processes are actually owed a signal.
+    if (!killWritten && entry.ownershipVerified && processOwed) {
       const killed = await this.options.killContainer(due.containerId);
       if (killed.ok) {
         killWritten = true;
@@ -736,33 +1115,50 @@ export class Watchdog {
       }
     }
 
-    // Post-condition 1: no tasks remain, read through the pinned descriptor.
-    let processTerminationConfirmed = false;
-    if (entry.pin !== null && entry.pin.dirFd >= 0) {
+    // Post-condition 1: no tasks remain, read through the pinned descriptor. A prior confirmation
+    // is not withdrawn by a later turn that cannot read the cgroup — the fact was established, and
+    // re-deriving it from a cgroup that may already have disappeared would retract true evidence.
+    let processTerminationConfirmed = !processOwed;
+    if (!processTerminationConfirmed && entry.pin !== null && entry.pin.dirFd >= 0) {
       const populated = pinnedIsPopulated(entry.pin);
       const procs = readPinnedProcs(entry.pin);
       processTerminationConfirmed = populated === false && (procs === null || procs.length === 0);
     }
 
-    // Post-condition 2: the exact container is gone, according to the daemon.
-    const inspection = await this.options.inspectContainer(due.containerId);
-    const containerRemovalConfirmed = inspection.present === false;
+    // Post-condition 2: the exact container is positively gone, according to the daemon. WD-F01:
+    // an unavailable daemon, a denied daemon, a timeout and a foreign container all leave this
+    // false. The debt is owed until absence is *observed*, not assumed.
+    const observation = await this.options.observeContainer(this.expectedOwnership(entry.record));
+    const containerRemovalConfirmed = provesAbsence(observation);
+    if (!containerRemovalConfirmed) {
+      detail = `${detail}; removal not confirmed (${observation.state})`;
+    }
 
-    const resolved = processTerminationConfirmed && containerRemovalConfirmed;
+    // `resolved` describes the *durable* conclusion, not the bare observations. If the record could
+    // not be written, nothing downstream may treat this execution as safely concluded: a restart
+    // would see the pre-attempt state, and a release authorized by memory alone is exactly what the
+    // durability requirement forbids.
+    const factsEstablished = processTerminationConfirmed && containerRemovalConfirmed;
     const concluded: WatchdogArmRecord = {
       ...entry.record,
-      phase: resolved ? "terminated" : "quarantined",
+      phase: factsEstablished ? "terminated" : "quarantined",
       processDebt: processTerminationConfirmed ? "termination-confirmed" : "unresolved",
       containerDebt: containerRemovalConfirmed ? "removal-confirmed" : "unresolved",
-      outcome: resolved ? "terminated" : "unresolved",
+      outcome: factsEstablished ? "terminated" : "unresolved",
       sequence: entry.record.sequence + 1,
     };
+    let recorded = false;
     try {
       this.store().write(concluded);
       entry.record = concluded;
-    } catch (error) {
-      detail = `${detail}; the outcome could not be recorded: ${error instanceof Error ? error.message : "unknown"}`;
+      recorded = true;
+    } catch {
+      // Kept in memory so the attempt is accounted for and a retry is bounded, but the report does
+      // not claim resolution.
+      entry.record = concluded;
+      detail = `${detail}; the outcome could not be recorded durably`;
     }
+    const resolved = factsEstablished && recorded;
 
     // Close the pin once the process question is answered either way: a resolved kill no longer
     // needs it, and an unresolved one must not keep writing through a stale handle.
@@ -771,9 +1167,16 @@ export class Watchdog {
       entry.pin = null;
     }
 
+    if (!durableIntent) {
+      // Reported, not swallowed: the in-memory record advanced but the durable copy did not, so a
+      // restart will see the state as it was before this attempt.
+      detail = `${detail}; the durable intent could not be written, so a restart may not see this attempt`;
+    }
+
     return {
       executionId: due.executionId,
       killWritten,
+      signalledUnverified,
       processTerminationConfirmed,
       containerRemovalConfirmed,
       resolved,

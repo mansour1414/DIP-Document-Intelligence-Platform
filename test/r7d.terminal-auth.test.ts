@@ -38,7 +38,7 @@ import { assertTerminalContext, computeTerminalProof, type TerminalRequest } fro
 import { readBootId, readProcessStartTimeTicks, findCgroup2Mount } from "../src/lib/execution/host-facts";
 import { BoundedProvisionalOutput } from "../src/lib/execution/provisional-stream";
 import { WatchdogStore } from "../src/lib/execution/watchdog-store";
-import { makeWatchdog as makeWatchdogHarness } from "./support/watchdog-harness";
+import { makeWatchdog as makeWatchdogHarness, VIRTUAL_CGROUP_MOUNT } from "./support/watchdog-harness";
 
 const SUPERVISOR = "sv-0123456789ab";
 const EXECUTION = "a".repeat(32);
@@ -100,19 +100,19 @@ test("R7D.1-CF02-13: the message-id window refuses a replay and stays bounded", 
   assert.ok(window.size <= 4, `window must stay bounded, saw ${window.size}`);
 });
 
-test("R7D.1-CF02-14: a watchdog refuses to arm a request from another boot", () => {
+test("R7D.1-CF02-14: a watchdog refuses to arm a request from another boot", async () => {
   // The real verifier, not an injected one: this asserts production behaviour.
   const harness = makeWatchdog({ realVerify: true });
-  const denied = harness.watchdog.arm(baseArm({ bootId: "previous-boot", cgroupPath: "/sys/fs/cgroup/dip-exec/x" }));
+  const denied = await harness.watchdog.arm(baseArm({ bootId: "previous-boot", cgroupPath: "/sys/fs/cgroup/dip-exec/x" }));
   assert.equal(denied.kind, "ARM_DENIED");
   assert.equal((denied as { code: string }).code, "BOOT_MISMATCH");
   // A refused arm leaves nothing armed.
   assert.deepEqual(harness.watchdog.outstanding(), []);
 });
 
-test("R7D.1-CF02-15: a watchdog refuses to arm when the cgroup cannot be verified", () => {
+test("R7D.1-CF02-15: a watchdog refuses to arm when the cgroup cannot be verified", async () => {
   const harness = makeWatchdog({ realVerify: true });
-  const denied = harness.watchdog.arm(baseArm({ cgroupPath: `/sys/fs/cgroup/dip-executor.slice/dip-exec-${EXECUTION}` }));
+  const denied = await harness.watchdog.arm(baseArm({ cgroupPath: `/sys/fs/cgroup/dip-executor.slice/dip-exec-${EXECUTION}` }));
   assert.equal(denied.kind, "ARM_DENIED");
   assert.equal((denied as { code: string }).code, "CGROUP_UNVERIFIED");
 });
@@ -171,19 +171,19 @@ test("R7D.1-CF02-16c: the host verifier refuses this process when it is not the 
 
 test("R7D.1-CF02-17: a watchdog refuses a second arm for the same execution", async () => {
   const harness = makeWatchdog();
-  const first = harness.watchdog.arm(baseArm({ messageId: "1".repeat(16) }));
+  const first = await harness.watchdog.arm(baseArm({ messageId: "1".repeat(16) }));
   assert.equal(first.kind, "ARM_ACK");
-  const second = harness.watchdog.arm(baseArm({ messageId: "2".repeat(16) }));
+  const second = await harness.watchdog.arm(baseArm({ messageId: "2".repeat(16) }));
   assert.equal((second as { code: string }).code, "ALREADY_ARMED");
   // A replayed message id is refused before the armed-state check, so the reason is specific.
-  const replay = harness.watchdog.arm(baseArm({ messageId: "1".repeat(16) }));
+  const replay = await harness.watchdog.arm(baseArm({ messageId: "1".repeat(16) }));
   assert.equal((replay as { code: string }).code, "REPLAYED");
   await harness.watchdog.disarm(terminalContext(harness.observed!), "3".repeat(16), 2);
 });
 
 test("R7D.1-CF02-18: a disarm whose deadline has passed is refused and leaves the execution terminable", async () => {
   const harness = makeWatchdog();
-  assert.notEqual(harness.armWithFakeCgroup(), null, "the harness must arm successfully");
+  assert.notEqual(await harness.armWithFakeCgroup(), null, "the harness must arm successfully");
   harness.advance(6_000);
   const denied = await harness.watchdog.disarm(terminalContext(harness.observed!), "3".repeat(16), 2);
   assert.equal((denied as { code: string }).code, "EXPIRED");
@@ -198,7 +198,10 @@ test("R7D.1-CF02-19: a grant is refused when the context names a different conta
   // makes the refusal below meaningful rather than indistinguishable from "nothing ever succeeds".
   const granted = makeGrantable();
   try {
-    armGrantable(granted);
+    await armGrantable(granted);
+    // The supervisor removed the container after committing; a grant before that would release
+    // bytes the executor still holds (WD-F04).
+    granted.harness.removeContainer();
     const mismatched = terminalContext(granted.digest, { containerId: "f".repeat(64) });
     const denied = await granted.harness.watchdog.disarm(mismatched, "5".repeat(16), 2);
     assert.equal((denied as { code: string }).code, "MISMATCH");
@@ -213,7 +216,8 @@ test("R7D.1-CF02-19: a grant is refused when the context names a different conta
 test("R7D.1-CF02-20: a second disarm is refused with ALREADY_CONCLUDED", async () => {
   const granted = makeGrantable();
   try {
-    armGrantable(granted);
+    await armGrantable(granted);
+    granted.harness.removeContainer();
     const first = await granted.harness.watchdog.disarm(terminalContext(granted.digest), "7".repeat(16), 2);
     assert.ok("proof" in first);
     const second = await granted.harness.watchdog.disarm(terminalContext(granted.digest), "8".repeat(16), 3);
@@ -225,7 +229,7 @@ test("R7D.1-CF02-20: a second disarm is refused with ALREADY_CONCLUDED", async (
 
 test("R7D.1-CF02-21: termination and disarm cannot both win", async () => {
   const harness = makeWatchdog();
-  assert.notEqual(harness.armWithFakeCgroup(), null, "the harness must arm successfully");
+  assert.notEqual(await harness.armWithFakeCgroup(), null, "the harness must arm successfully");
   // Advance to the deadline: the watchdog concludes it as unresolved.
   harness.advance(6_000);
   const due = harness.watchdog.dueForTermination();
@@ -241,7 +245,7 @@ test("R7D.1-CF02-21: termination and disarm cannot both win", async () => {
 
 test("R7D.1-CF02-22: a committed outcome without removal evidence is refused, not released", async () => {
   const harness = makeWatchdog();
-  assert.notEqual(harness.armWithFakeCgroup(), null, "the harness must arm successfully");
+  assert.notEqual(await harness.armWithFakeCgroup(), null, "the harness must arm successfully");
   // `containerRemoved: false` is the caller's own claim; the injected pin cannot confirm
   // termination either, so the refusal is `UNCERTAIN` rather than a release.
   const denied = await harness.watchdog.disarm(terminalContext(harness.observed!, { containerRemoved: false }), "a".repeat(16), 2);
@@ -355,7 +359,7 @@ test("R7D.1-CF02-27: a heartbeat proves liveness and authorizes nothing", () => 
   assert.deepEqual(harness.watchdog.outstanding(), []);
 });
 
-test("R7D.1-CF02-28: recovery refuses a record written on another boot", () => {
+test("R7D.1-CF02-28: recovery refuses a record written on another boot", async () => {
   // `adopt` took a request and decided; recovery now reads durable records, which is the only
   // source that survives a crash. A record naming another boot describes cgroup namespaces that no
   // longer exist, so it is reported as `previousBoot` and cannot become a live deadline.
@@ -371,10 +375,10 @@ test("R7D.1-CF02-28: recovery refuses a record written on another boot", () => {
   }
 });
 
-test("R7D.1-CF02-29: an arm whose cgroup cannot be verified is refused", () => {
+test("R7D.1-CF02-29: an arm whose cgroup cannot be verified is refused", async () => {
   const harness = makeWatchdog({ realVerify: true });
   try {
-    const denied = harness.watchdog.arm(baseArm({ cgroupPath: "/sys/fs/cgroup/dip-exec/gone" }));
+    const denied = await harness.watchdog.arm(baseArm({ cgroupPath: "/sys/fs/cgroup/dip-exec/gone" }));
     assert.equal(denied.kind, "ARM_DENIED");
     // Not in the DIP subtree, so ownership refuses before existence matters.
     assert.equal((denied as { code: string }).code, "NOT_DIP_OWNED");
@@ -387,7 +391,7 @@ test("R7D.1-CF02-29: an arm whose cgroup cannot be verified is refused", () => {
 test("R7D.1-CF02-30: a watchdog never reports an execution as terminated without positive evidence", async () => {
   const harness = makeWatchdog({ inspectPresent: true });
   try {
-    assert.notEqual(harness.armWithFakeCgroup(), null, "the harness must arm successfully");
+    assert.notEqual(await harness.armWithFakeCgroup(), null, "the harness must arm successfully");
     harness.advance(6_000);
     const due = harness.watchdog.dueForTermination();
     const result = await harness.watchdog.terminate(due[0]!);
@@ -412,7 +416,7 @@ test("R7D.1-CF02-31: a watchdog refuses to claim termination it cannot evidence"
   // pin, no kill is written and no debt is discharged.
   const harness = makeWatchdog();
   try {
-    assert.notEqual(harness.armWithFakeCgroup(), null, "the harness must arm successfully");
+    assert.notEqual(await harness.armWithFakeCgroup(), null, "the harness must arm successfully");
     harness.advance(6_000);
     const due = harness.watchdog.dueForTermination();
     const result = await harness.watchdog.terminate(due[0]!);
@@ -446,7 +450,7 @@ test("R7D.1-CF02-31: a watchdog refuses to claim termination it cannot evidence"
  * grant is actually minted, so it is named rather than inlined at each call site.
  */
 function makeGrantable(): { harness: ReturnType<typeof makeWatchdogHarness>; digest: string } {
-  const harness = makeWatchdogHarness({ liveTree: { populated: false } });
+  const harness = makeWatchdogHarness({ liveTree: { populated: false }, observeLifecycle: true });
   return { harness, digest: "e".repeat(64) };
 }
 
@@ -457,8 +461,8 @@ function grantedArm(digest: string): ArmRequest {
 }
 
 /** Arm a grantable harness and fail loudly if the arm was refused. */
-function armGrantable(granted: { harness: ReturnType<typeof makeWatchdogHarness>; digest: string }): void {
-  const answer = granted.harness.watchdog.arm(grantedArm(granted.digest));
+async function armGrantable(granted: { harness: ReturnType<typeof makeWatchdogHarness>; digest: string }): Promise<void> {
+  const answer = await granted.harness.watchdog.arm(grantedArm(granted.digest));
   if (answer.kind !== "ARM_ACK") throw new Error(`the arm was denied: ${answer.code}`);
 }
 
@@ -515,7 +519,7 @@ type Harness = {
   clock: { now: number };
   advance: (delta: number) => void;
   observed: string | null;
-  armWithFakeCgroup: () => unknown | null;
+  armWithFakeCgroup: () => Promise<unknown | null>;
   cleanup: () => void;
 };
 
@@ -550,7 +554,19 @@ function makeWatchdog(options: { inspectPresent?: boolean; verify?: HostVerifica
     secret: WATCHDOG_SECRET,
     store,
     killContainer: async () => ({ ok: true, detail: "killed" }),
-    inspectContainer: async () => ({ present: options.inspectPresent ?? false, detail: "inspected" }),
+    // The closed observation vocabulary: the test names the daemon answer it means. The default is
+    // a container that exists, because arming now requires positive Docker ownership (WD-F04).
+    observeContainer: async (expected) => (options.inspectPresent === false
+      ? { state: "absent", detail: "inspected" }
+      : { state: "present", containerId: expected.containerId, labels: {}, detail: "inspected" }),
+    // The fixture tree this harness pins is not under the real mount, so membership is reported
+    // under the virtual prefix the record names.
+    cgroupMount: () => VIRTUAL_CGROUP_MOUNT,
+    actualCgroupPath: (_pid, mountPath) => {
+      const record = { executionId: EXECUTION };
+      const relative = `/dip-executor.slice/dip-exec-${record.executionId}`;
+      return { path: `${mountPath}${relative}`, relative };
+    },
     // `realVerify` uses the production verifier against this host. Used by the tests that assert
     // a refusal, since an injected "ok" would make those assertions vacuous.
     verifyHost: options.realVerify === true ? undefined : () => injected,
@@ -577,8 +593,9 @@ function makeWatchdog(options: { inspectPresent?: boolean; verify?: HostVerifica
     clock,
     advance: (delta: number) => { clock.now += delta; },
     observed: "0".repeat(64),
-    armWithFakeCgroup: () => {
-      const ack = watchdog.arm(baseArm());
+    // Asynchronous now: arming observes the container before accepting the target (WD-F04).
+    armWithFakeCgroup: async () => {
+      const ack = await watchdog.arm(baseArm());
       return ack.kind === "ARM_ACK" ? ack : null;
     },
     cleanup: () => {

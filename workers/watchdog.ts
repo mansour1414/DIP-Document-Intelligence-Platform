@@ -33,11 +33,13 @@
 import { mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { readBootId, selfStartTimeTicks } from "../src/lib/execution/host-facts";
+import { OwnershipJournal } from "../src/lib/execution/ownership-journal";
 import { makeHostClock, readUptimeMs } from "../src/lib/execution/host-clock";
 import { Watchdog, newWatchdogIdentity } from "../src/lib/execution/watchdog";
 import { WatchdogStore } from "../src/lib/execution/watchdog-store";
 import { startWatchdogServer } from "../src/lib/execution/watchdog-server";
 import { killContainerAsync, inspectContainerAsync } from "../src/lib/execution/docker-lifecycle";
+import { classifyInspect } from "../src/lib/execution/container-identity";
 
 const required = (name: string): string => {
   const value = process.env[name];
@@ -71,6 +73,10 @@ function main(): void {
     process.exit(1);
   }
   const stateDir = required("DIP_WATCHDOG_STATE");
+  // The supervisor's journal, read-only. Present means ownership can be corroborated against a
+  // second, independent statement of the same facts (WD-F04). Absent means the watchdog relies on
+  // its own record and live observations, which is a weaker but still bounded position.
+  const journalRoot = process.env.DIP_WATCHDOG_JOURNAL ?? "";
   mkdirSync(stateDir, { recursive: true, mode: 0o700 });
   mkdirSync(dirname(socketPath), { recursive: true, mode: 0o700 });
 
@@ -88,6 +94,13 @@ function main(): void {
     process.exit(1);
   }
 
+  // A read-only view of the supervisor's journal. Constructed only if configured; a journal that
+  // cannot be bound at this authority would throw, and an unreadable intent is treated as absent
+  // rather than as a reason to stop watching.
+  const journal = journalRoot === ""
+    ? null
+    : new OwnershipJournal(journalRoot);
+
   const identity = newWatchdogIdentity(() => readUptimeMs(), selfStartTimeTicks(), bootId);
   const watchdog = new Watchdog({
     identity,
@@ -99,13 +112,27 @@ function main(): void {
       const outcome = await killContainerAsync(containerId);
       return outcome.ok ? { ok: true, detail: "killed" } : { ok: false, detail: outcome.fault };
     },
-    inspectContainer: async (containerId) => {
-      const outcome = await inspectContainerAsync(containerId);
-      // Ambiguity is not absence. An unreadable daemon must not be read as "the container is gone",
-      // because that is the answer that stops the watchdog from retrying and lets a removal debt
-      // be discharged that was never paid.
-      if (!outcome.ok) return { present: true, detail: `unresolved: ${outcome.fault}` };
-      return { present: true, detail: "present" };
+    // WD-F01: classify, do not coerce. `classifyInspect` is the only place the daemon's answer is
+    // turned into a decision, and `NOT_FOUND` is the only branch that yields absence.
+    observeContainer: async (expected) => classifyInspect(await inspectContainerAsync(expected.containerId), expected),
+    // WD-F04: the supervisor's own intent, when it is readable. A read failure is "no corroboration",
+    // not "corroborated": the caller must not treat an unreadable journal as agreement.
+    readIntent: journal === null ? undefined : (executionId) => {
+      try {
+        const record = journal.readSupervisor(executionId);
+        if (record === null) return null;
+        return {
+          executionId: record.executionId,
+          bootId: record.bootId,
+          supervisorInstance: record.supervisorInstance,
+          containerName: record.containerName,
+          containerId: record.containerId,
+          imageDigest: record.imageDigest,
+          profileId: record.profileId,
+        };
+      } catch {
+        return null;
+      }
     },
   });
 
