@@ -146,6 +146,10 @@ export async function requestWorkerReservation(options: ReservationRequestOption
       // Control frames only: this exchange declares an empty body and consumes no document bytes,
       // so a body frame would be a protocol violation rather than data to forward.
       queue.push(step.message as Record<string, unknown>);
+      // Consume the frame's bytes. Without this `pending` never shrinks, so `next()` re-parses the
+      // same frame forever: repeated JSON.parse plus unbounded Buffer.concat growth, i.e. a hang
+      // that ends in a V8 heap out-of-memory.
+      frames.clear(step.leftover);
       notify?.();
     }
   });
@@ -162,7 +166,7 @@ export async function requestWorkerReservation(options: ReservationRequestOption
     }
   };
 
-  try {
+  const exchange = async (): Promise<WorkerReservation> => {
     socket.write(encodeControlFrame({
       kind: "HELLO",
       protocolVersion: IPC_PROTOCOL_VERSION,
@@ -242,6 +246,29 @@ export async function requestWorkerReservation(options: ReservationRequestOption
       expiresAt: answer.expiresAt,
       idleExpiresAt: answer.idleExpiresAt,
     };
+  };
+
+  // An overall deadline for the complete authenticated exchange, not merely a connect timeout. A
+  // supervisor that connects but never answers must expire the exchange rather than leave the
+  // worker hanging (or buffering) forever.
+  const exchangeDeadlineMs = options.exchangeTimeoutMs ?? 10_000;
+  try {
+    return await Promise.race([
+      exchange(),
+      new Promise<never>((_, reject) => {
+        const timer = setTimeout(() => {
+          closed = true;
+          socket.destroy();
+          reject(
+            new CallerError(
+              "TIMEOUT",
+              `the reservation exchange did not complete within ${exchangeDeadlineMs}ms`,
+            ),
+          );
+        }, exchangeDeadlineMs);
+        timer.unref();
+      }),
+    ]);
   } finally {
     closed = true;
     socket.destroy();
@@ -268,6 +295,11 @@ export type ReservationRequestOptions = {
   operation: IpcOperation;
   requestId?: string;
   connectTimeoutMs?: number;
+  /**
+   * Overall deadline for the complete authenticated reservation exchange. A supervisor that connects
+   * but never answers expires the exchange rather than leaving the worker hanging forever.
+   */
+  exchangeTimeoutMs?: number;
   control?: Record<string, unknown>;
 };
 
