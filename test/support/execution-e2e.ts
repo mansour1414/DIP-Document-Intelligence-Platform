@@ -25,8 +25,8 @@
  * enforce them. That is D-A04, and it remains NOT TESTED.
  */
 
-import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, chmodSync } from "node:fs";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
@@ -423,6 +423,44 @@ fail("unsupported verb: " + String(verb));
 }
 
 /** Make the environment: directories, sockets, secrets, the fake adapter. */
+/**
+ * Build the executor bundle if it is missing or older than its sources.
+ *
+ * ## Why the harness builds it rather than assuming it
+ *
+ * `dist/` is ignored by git, so a clean checkout — which is exactly what CI does — has no bundle.
+ * A harness that threw here would fail the suite on every clean clone while passing on a
+ * developer's machine that had built once, which is the most misleading kind of green. The bridge
+ * test builds on demand for the same reason, and this reuses its rule: a *stale* bundle is worse
+ * than a missing one, because it passes against code that was replaced.
+ *
+ * The build uses the esbuild already present as a locked transitive of `tsx`; no package is added
+ * and the lockfile is untouched.
+ */
+function ensureExecutorBundle(bundle: string): void {
+  const newestSource = (dir: string): number => {
+    let newest = 0;
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) newest = Math.max(newest, newestSource(full));
+      else if (/\.(ts|mjs)$/u.test(entry.name)) newest = Math.max(newest, statSync(full).mtimeMs);
+    }
+    return newest;
+  };
+  const sourceMtime = Math.max(
+    newestSource(join(process.cwd(), "src", "lib", "pdf")),
+    newestSource(join(process.cwd(), "src", "lib", "execution")),
+  );
+  const stale = !existsSync(bundle) || sourceMtime > statSync(bundle).mtimeMs;
+  if (stale) {
+    execFileSync(process.execPath, [join(process.cwd(), "scripts", "esbuild-executor.mjs")], {
+      stdio: "pipe",
+      timeout: 120_000,
+    });
+  }
+  if (!existsSync(bundle)) throw new Error(`the executor bundle could not be built at ${bundle}`);
+}
+
 export function makeEnvironment(): E2EEnvironment {
   const root = mkdtempSync(join(tmpdir(), "dip-e2e-"));
   const sockets = join(root, "sockets");
@@ -451,7 +489,7 @@ export function makeEnvironment(): E2EEnvironment {
     watchdogInstance: "wd-0123456789ab",
     cleanup: () => rmSync(root, { recursive: true, force: true }),
   };
-  if (!existsSync(env.executorBundle)) throw new Error(`the executor bundle is missing at ${env.executorBundle}; run scripts/esbuild-executor.mjs`);
+  ensureExecutorBundle(env.executorBundle);
   writeDockerAdapter(env.dockerBin, env.executorBundle, stateDir, cgroupRoot);
   return env;
 }
