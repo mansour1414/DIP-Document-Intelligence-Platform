@@ -51,13 +51,26 @@ test("R7D.1-V2-2: fill round-trips with flatten as an explicit boolean", () => {
   assert.deepEqual({ ...request.fields }, { a: "1", b: true, c: ["x", "y"] });
 });
 
-test("R7D.1-V2-3: verify round-trips a transient baseline", () => {
-  const baseline = { kind: "flatten" as const, expected: { name: "Ada" }, untouched: { keep: "v" } };
-  const encoded = encodeControlV2({ v: WORKER_PROTOCOL_V2, op: "verify", baseline }, body, 512 * 1024 * 1024);
+test("R7D.1-V2-3: verify names a kind and carries no expected state", () => {
+  const encoded = encodeControlV2({ v: WORKER_PROTOCOL_V2, op: "verify", kind: "flatten" }, body, 512 * 1024 * 1024);
   const { request } = decodeControlV2(encoded, 512 * 1024 * 1024);
   assert.equal(request.op, "verify");
   if (request.op !== "verify") throw new Error("unreachable");
-  assert.deepEqual(request.baseline, baseline);
+  // F03: the expected and untouched maps live in the trusted worker's memory. The request
+  // carries a kind and nothing else, so a large form cannot approach the control ceiling and
+  // the comparison cannot be steered by what the caller claims.
+  assert.equal(request.kind, "flatten");
+  assert.deepEqual(Object.keys(request).sort(), ["kind", "op", "v"]);
+});
+
+test("R7D.1-F03-1: a verify request that still carries a baseline is refused, not ignored", () => {
+  // Silently dropping the maps would leave the sender believing its expectations were checked.
+  const encoded = encodeControlV2(
+    { v: WORKER_PROTOCOL_V2, op: "verify", kind: "fill", baseline: { kind: "fill", expected: { a: "b" } } } as never,
+    body,
+    1024,
+  );
+  assert.equal(faultOf(() => decodeControlV2(encoded, 1024)), "INVALID_REQUEST");
 });
 
 test("R7D.1-V2-4: a verify result is metadata-only and narrows correctly", () => {
@@ -122,8 +135,8 @@ test("R7D.1-V2-12: an unknown operation is rejected", () => {
   assert.equal(faultOf(() => decodeControlV2(encoded, 1024)), "INVALID_REQUEST");
 });
 
-test("R7D.1-V2-13: an invalid verify baseline kind is rejected", () => {
-  const encoded = encodeControlV2({ v: WORKER_PROTOCOL_V2, op: "verify", baseline: { kind: "nope" as never, expected: {} } }, body, 1024);
+test("R7D.1-V2-13: an invalid verify kind is rejected", () => {
+  const encoded = encodeControlV2({ v: WORKER_PROTOCOL_V2, op: "verify", kind: "nope" as never }, body, 1024);
   assert.equal(faultOf(() => decodeControlV2(encoded, 1024)), "INVALID_REQUEST");
 });
 
@@ -164,8 +177,10 @@ test("R7D.1-V2-18: v2 reuses v1's limits rather than defining its own", () => {
   // Both halves must reject it: the encoder refuses to emit it, and a frame that somehow
   // carried it would be refused on decode. Asserting only one would leave the other free
   // to become the weak link.
+  // The control ceiling still holds, and is now far harder to approach: the verify request
+  // carries a kind rather than a field inventory.
   assert.equal(
-    faultOf(() => encodeControlV2({ v: WORKER_PROTOCOL_V2, op: "verify", baseline: { kind: "fill", expected: { big: oversizedJson } } }, body, 1024)),
+    faultOf(() => encodeControlV2({ v: WORKER_PROTOCOL_V2, op: "fill", flatten: false, fields: { big: oversizedJson } } as never, body, 1024)),
     "CONTROL_TOO_LARGE",
   );
   const header = Buffer.alloc(4);

@@ -135,9 +135,14 @@ async function fill(bytes: Uint8Array, request: Extract<WorkerRequestV2, { op: "
  * a structural result, not a fidelity result.
  */
 async function verify(bytes: Uint8Array, request: Extract<WorkerRequestV2, { op: "verify" }>) {
-  const baseline = request.baseline;
-
-  if (baseline.kind === "flatten") {
+  // `request.kind` selects *which* verification runs. The expected values are not on the wire:
+  // they live in the trusted worker's memory, captured at admission inspection. The executor
+  // therefore reports structural facts, and the value comparison happens where the baseline is.
+  //
+  // This split is deliberate. An executor that received the expected values would be a
+  // container component holding field content it has no use for, and the comparison would be
+  // only as trustworthy as the request.
+  if (request.kind === "flatten") {
     const structural = await import("./form-verify").then((module) => module.verifyFlattened(bytes));
     return {
       ok: true as const,
@@ -148,19 +153,13 @@ async function verify(bytes: Uint8Array, request: Extract<WorkerRequestV2, { op:
     };
   }
 
-  const semantic = await import("./form-verify").then((module) =>
-    module.verifyFilled({
-      bytes,
-      expected: baseline.expected,
-      untouched: baseline.untouched,
-    }),
-  );
+  const structural = await import("./form-verify").then((module) => module.verifyFilledStructure(bytes));
   return {
     ok: true as const,
     op: "verify" as const,
-    pages: semantic.pages,
-    widgets: semantic.widgets,
-    preserved: semantic.preserved,
+    pages: structural.pages,
+    widgets: structural.widgets,
+    preserved: structural.preserved,
   };
 }
 

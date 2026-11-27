@@ -18,14 +18,30 @@
 
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 import { PDFDocument, StandardFonts } from "pdf-lib";
 import { decodeResultV2, encodeControlV2 } from "../src/lib/pdf/worker-protocol-v2";
+import { captureBaseline, compare } from "../src/lib/pdf/form-verify";
 
 const BUNDLE = join(process.cwd(), "dist", "executor-child.js");
+
+/** The newest mtime across the sources the bundle is built from. */
+function newestSourceMtime(): number {
+  let newest = 0;
+  const walk = (dir: string): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) walk(path);
+      else if (/\.(ts|mjs)$/u.test(entry.name)) newest = Math.max(newest, statSync(path).mtimeMs);
+    }
+  };
+  walk(join(process.cwd(), "src", "lib", "pdf"));
+  walk(join(process.cwd(), "src", "lib", "execution"));
+  return newest;
+}
 /** The hard input ceiling, so the fixture is never silently clipped. */
 const MAX_BODY = 512 * 1024 * 1024;
 
@@ -33,7 +49,11 @@ let workdir: string;
 
 before(async () => {
   workdir = mkdtempSync(join(tmpdir(), "dip-executor-"));
-  if (!existsSync(BUNDLE)) {
+  // Rebuild when any source is newer than the bundle. A stale artifact is worse than a missing
+  // one: it passes, and it passes against code that was replaced. This bit during development —
+  // a contract change was masked by a bundle built before it.
+  const stale = !existsSync(BUNDLE) || newestSourceMtime() > statSync(BUNDLE).mtimeMs;
+  if (stale) {
     // Build it here rather than requiring a prior step. CI runs `npm test`, which globs every
     // suite; a test that only passes when someone remembered to build first would either fail
     // CI or — worse, if it skipped instead — report green without running.
@@ -182,11 +202,8 @@ test("R7D.1-X-3: a real verify request confirms the filled document and returns 
     {
       v: 2,
       op: "verify",
-      baseline: {
-        kind: "fill",
-        expected: { "applicant.name": "Layla", "applicant.consent": true },
-        untouched: {},
-      },
+      // F03: only the kind travels. The expected values stay in the trusted worker's memory.
+      kind: "fill",
     },
     Buffer.from(filledResult.output),
     512 * 1024 * 1024,
@@ -260,4 +277,74 @@ test("R7D.1-X-8: the bundle contains no TypeScript loader and no test surface", 
   for (const forbidden of ["tsx", "esbuild", "node:test", "require(\"typescript\")"]) {
     assert.equal(source.includes(forbidden), false, `the executor bundle must not contain ${forbidden}`);
   }
+});
+
+// ---------------------------------------------------------------------------------------
+// F03 — the trusted-side comparison
+// ---------------------------------------------------------------------------------------
+
+test("R7D.1-F03-2: a baseline cannot be consumed twice", () => {
+  // A second comparison against the same baseline would be a second opinion from a stale
+  // snapshot; the execution it described has already been judged.
+  const baseline = captureBaseline({
+    pages: 1,
+    fields: [{ name: "a", kind: "text", value: "x" }],
+  });
+  const after = { pages: 1, fields: [{ name: "a", kind: "text" as const, value: "x" }] };
+  assert.deepEqual(compare(baseline, after, new Map()).findings, []);
+  assert.throws(() => compare(baseline, after, new Map()), /could not be verified/u);
+});
+
+test("R7D.1-F03-3: the comparison uses the engine's equality, including the two empty spellings", () => {
+  // `valuesEqual` treats a text field's `/V ()` and its absent `/V` as the same empty value.
+  // Re-deriving that rule here would have produced a false mismatch on a cleared field.
+  const baseline = captureBaseline({ pages: 1, fields: [{ name: "a", kind: "text", value: null }] });
+  const after = { pages: 1, fields: [{ name: "a", kind: "text" as const, value: "" }] };
+  assert.deepEqual(compare(baseline, after, new Map()).findings, []);
+});
+
+test("R7D.1-F03-4: a modified untouched field is reported by code, not by name or value", () => {
+  const baseline = captureBaseline({ pages: 1, fields: [{ name: "secret.field", kind: "text", value: "before" }] });
+  const after = { pages: 1, fields: [{ name: "secret.field", kind: "text" as const, value: "after" }] };
+  const result = compare(baseline, after, new Map());
+  assert.deepEqual(result.findings, ["UNTOUCHED_FIELD_MODIFIED"]);
+  // FF-08: findings carry no field name and no value.
+  assert.equal(JSON.stringify(result).includes("secret.field"), false);
+  assert.equal(JSON.stringify(result).includes("before"), false);
+  // Nothing was preserved, because the one untouched field changed.
+  assert.equal(result.preserved, 0);
+});
+
+test("R7D.1-F03-5: a field that disappears or appears is reported", () => {
+  const baseline = captureBaseline({ pages: 1, fields: [{ name: "a", kind: "text", value: "x" }] });
+  assert.deepEqual(compare(baseline, { pages: 1, fields: [] }, new Map()).findings.sort(), ["FIELD_MISSING"]);
+  const fresh = captureBaseline({ pages: 1, fields: [] });
+  assert.deepEqual(compare(fresh, { pages: 1, fields: [{ name: "b", kind: "text" as const, value: "y" }] }, new Map()).findings, ["FIELD_ADDED"]);
+});
+
+test("R7D.1-F03-6: an expected value that does not round-trip is reported", () => {
+  const baseline = captureBaseline({ pages: 1, fields: [{ name: "a", kind: "text", value: null }] });
+  const after = { pages: 1, fields: [{ name: "a", kind: "text" as const, value: "wrong" }] };
+  const expected = new Map<string, string | boolean | string[]>([["a", "Layla"]]);
+  assert.deepEqual(compare(baseline, after, expected).findings, ["VALUE_NOT_ROUND_TRIPPED"]);
+});
+
+test("R7D.1-F03-7: an unchanged untouched field counts as preserved", () => {
+  const baseline = captureBaseline({
+    pages: 1,
+    fields: [
+      { name: "a", kind: "text", value: "keep" },
+      { name: "b", kind: "checkbox", value: true },
+    ],
+  });
+  const after = {
+    pages: 1,
+    fields: [
+      { name: "a", kind: "text" as const, value: "keep" },
+      { name: "b", kind: "checkbox" as const, value: true },
+    ],
+  };
+  const result = compare(baseline, after, new Map());
+  assert.deepEqual(result.findings, []);
+  assert.equal(result.preserved, 2);
 });

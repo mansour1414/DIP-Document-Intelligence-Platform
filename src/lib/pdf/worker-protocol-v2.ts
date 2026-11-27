@@ -60,46 +60,22 @@ export type WorkerOpV2 = "inspect" | "fill" | "verify";
 export type WorkerRequestV2 =
   | { v: typeof WORKER_PROTOCOL_V2; op: "inspect" }
   | { v: typeof WORKER_PROTOCOL_V2; op: "fill"; flatten: boolean; fields: Record<string, string | boolean | string[]> }
-  | { v: typeof WORKER_PROTOCOL_V2; op: "verify"; baseline: VerifyBaseline };
+  | {
+      v: typeof WORKER_PROTOCOL_V2;
+      op: "verify";
+      /**
+       * Which verification to run.
+       *
+       * The expected and untouched maps are **not** here. They live in the trusted worker's
+       * memory, captured from the admission inspection, and are never transmitted: putting them
+       * on the wire would both risk the 256 KiB control ceiling on a large form and make the
+       * comparison depend on what the caller claimed rather than on what was observed.
+       */
+      kind: VerifyKind;
+    };
 
-/**
- * The transient expected-state for a fresh verification.
- *
- * ## Why this is not persisted
- *
- * `verify` compares a freshly re-parsed document against what the caller *intended*. The
- * original admission `inspect` does not persist a complete field inventory, and adding one
- * would put field names and values into durable storage — exactly the sensitive execution-
- * plane state R7D.1 §10 and §13 forbid. So the baseline travels with the request, lives in
- * worker memory for one operation, and is never journalled.
- *
- * ## What it contains
- *
- * Field *names* and their expected values must both be present for comparison, which means
- * this structure necessarily carries them. That is why it is transient, bounded by the
- * control ceiling (256 KiB), and never written to disk by the supervisor.
- */
-export type VerifyBaseline = {
-  /**
-   * Which verification to run.
-   *
-   * `fill` compares values and appearances; `flatten` additionally requires that every
-   * interactive field and widget annotation is gone.
-   */
-  kind: "fill" | "flatten";
-  /**
-   * The values the fill was asked to write. Compared with v1's `valuesEqual`, so checkbox
-   * and radio state handling, multi-widget fields and array-valued choices behave exactly
-   * as the existing engine does.
-   */
-  expected: Record<string, string | boolean | string[]>;
-  /**
-   * Fields that were present before the fill and must be unchanged after it.
-   *
-   * Captured from the admission inspection in the *worker's* memory, not from storage.
-   */
-  untouched?: Record<string, string | boolean | string[] | null>;
-};
+/** Which verification to run. The expected state itself never travels. */
+export type VerifyKind = "fill" | "flatten";
 
 /** Metadata-only result for `verify`. Never carries document bytes. */
 export type VerifyMeta = {
@@ -200,26 +176,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * Bounded by `VERIFY_BOUNDS.baselineBytes` after serialisation, because the JSON reader
  * has already materialised it and a size check before parsing would only be advisory.
  */
-function parseBaseline(value: unknown): VerifyBaseline {
-  if (!isRecord(value)) throw new WorkerProtocolError("The verify baseline is not an object.", "INVALID_REQUEST");
-  const { kind, expected, untouched } = value;
-  if (kind !== "fill" && kind !== "flatten") {
-    throw new WorkerProtocolError("The verify baseline kind is not supported.", "INVALID_REQUEST");
-  }
-  if (!isRecord(expected)) throw new WorkerProtocolError("The verify baseline expected values are not an object.", "INVALID_REQUEST");
-  if (untouched !== undefined && !isRecord(untouched)) {
-    throw new WorkerProtocolError("The verify baseline untouched values are not an object.", "INVALID_REQUEST");
-  }
-  if (Buffer.byteLength(JSON.stringify(value), "utf8") > VERIFY_BOUNDS.baselineBytes) {
-    throw new WorkerProtocolError("The verify baseline exceeds the transport limit.", "CONTROL_TOO_LARGE");
-  }
-  return {
-    kind,
-    expected: expected as VerifyBaseline["expected"],
-    ...(untouched === undefined ? {} : { untouched: untouched as VerifyBaseline["untouched"] }),
-  };
-}
-
 /** v1's field-map parser, re-expressed here so v2 does not import a mutable internal. */
 function parseFieldsV2(value: unknown): Record<string, string | boolean | string[]> {
   if (!isRecord(value)) throw new WorkerProtocolError("The fields payload is not an object.", "INVALID_REQUEST");
@@ -288,7 +244,17 @@ function parseRequestV2(raw: Record<string, unknown>): WorkerRequestV2 {
     }
     return { v: WORKER_PROTOCOL_V2, op: "fill", flatten: raw.flatten, fields: parseFieldsV2(raw.fields) };
   }
-  if (op === "verify") return { v: WORKER_PROTOCOL_V2, op: "verify", baseline: parseBaseline(raw.baseline) };
+  if (op === "verify") {
+    if (raw.kind !== "fill" && raw.kind !== "flatten") {
+      throw new WorkerProtocolError("The verify kind is not supported.", "INVALID_REQUEST");
+    }
+    // A caller that still sends a baseline is refused rather than having it ignored. Silently
+    // dropping it would leave the sender believing its expectations were checked.
+    if ("baseline" in raw) {
+      throw new WorkerProtocolError("The verify request must not carry a baseline; it is held in worker memory.", "INVALID_REQUEST");
+    }
+    return { v: WORKER_PROTOCOL_V2, op: "verify", kind: raw.kind };
+  }
   throw new WorkerProtocolError("The operation is not supported.", "INVALID_REQUEST");
 }
 

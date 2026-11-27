@@ -198,7 +198,7 @@ type AppearanceIssue =
   | "WIDGET_NO_APPEARANCE_STATE"
   | "APPEARANCE_STATE_WITHOUT_STREAM";
 
-function appearanceProblems(field: PDFField): AppearanceIssue[] {
+export function appearanceProblems(field: PDFField): AppearanceIssue[] {
   const problems: AppearanceIssue[] = [];
   for (const widget of field.acroField.getWidgets()) {
     const api = widget.AP();
@@ -233,7 +233,7 @@ function canonicalValue(kind: FormFieldKind, value: string | boolean | string[] 
   return value ?? "";
 }
 
-function valuesEqual(kind: FormFieldKind, expected: string | boolean | string[] | null, actual: string | boolean | string[] | null): boolean {
+export function valuesEqual(kind: FormFieldKind, expected: string | boolean | string[] | null, actual: string | boolean | string[] | null): boolean {
   const left = canonicalValue(kind, expected);
   const right = canonicalValue(kind, actual);
   if (Array.isArray(left) || Array.isArray(right)) {
