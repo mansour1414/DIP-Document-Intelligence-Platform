@@ -128,6 +128,46 @@ describe("R7D.1-RESX — real-socket reservation exchange", () => {
     }
   });
 
+  it("does not authorize fill merely by issuing an inspect reservation; the sequence advances only on a positively resolved execution", async () => {
+    const server = await startRoleServer(workerSocket);
+    try {
+      // Issuing inspect succeeds ...
+      const inspect = await withDeadline(
+        requestWorkerReservation({
+          socketPath: workerSocket,
+          secret: SECRET,
+          supervisorInstance: INSTANCE,
+          bootId: BOOT_ID,
+          clientInstance: CLIENT,
+          operation: "inspect",
+          connectTimeoutMs: 1_000,
+        }),
+        EXCHANGE_MS,
+        "inspect reservation",
+      );
+      assert.equal(inspect.operation, "inspect");
+      // ... but must not advance the sequence: fill without a resolved inspect is still refused.
+      await assert.rejects(
+        withDeadline(
+          requestWorkerReservation({
+            socketPath: workerSocket,
+            secret: SECRET,
+            supervisorInstance: INSTANCE,
+            bootId: BOOT_ID,
+            clientInstance: CLIENT,
+            operation: "fill",
+            connectTimeoutMs: 1_000,
+          }),
+          EXCHANGE_MS,
+          "fill reservation issued without a resolved inspect",
+        ),
+        /the supervisor refused a reservation: OUT_OF_SEQUENCE/,
+      );
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("fails closed with the internal TIMEOUT when the peer answers the challenge then goes silent", async () => {
     const silentDir = mkdtempSync(join(tmpdir(), "dip-res-silent-"));
     const silentSocket = join(silentDir, "worker.sock");

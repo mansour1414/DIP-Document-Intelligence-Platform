@@ -689,7 +689,15 @@ export async function startRoleSockets(options: RoleServerOptions): Promise<Role
       let authenticated = false;
       let attempts = 0;
       let closed = false;
-      let admitted: { executionId: string; released: boolean } | null = null;
+      // The authenticated caller identity and operation, captured at admission (when `hello` is
+      // provably non-null) so `session.release` can advance the caller's sequence on positive
+      // resolution without re-reading the possibly-null hello.
+      let admitted: {
+        executionId: string;
+        released: boolean;
+        callerIdentity: string;
+        operation: IpcOperation;
+      } | null = null;
       /** The nonce sent with READY_FOR_BODY. Empty until the gate opens. */
       let readyNonce = "";
       /** The authenticated control fields, as declared in the HELLO. */
@@ -1036,7 +1044,11 @@ export async function startRoleSockets(options: RoleServerOptions): Promise<Role
               if (!grant.ok) {
                 post({ kind: "RESERVATION_REFUSED", code: grant.code } satisfies ServerReservationRefused);
               } else {
-                advanceSequence(state, hello.clientInstance, grant.operation);
+                // The sequence is NOT advanced here: issuing a reservation must not, by itself,
+                // authorize the next operation. A sequence transition depends on the required
+                // positively validated execution outcome, which advances the sequence when the
+                // session is released with `resolved === true` (see `session.release` below).
+                // An issued-but-unused reservation therefore never authorizes `fill` or `verify`.
                 post({
                   kind: "RESERVED",
                   reservationId: grant.reservationId,
@@ -1070,7 +1082,12 @@ export async function startRoleSockets(options: RoleServerOptions): Promise<Role
               return;
             }
 
-            admitted = { executionId: decision.executionId, released: false };
+            admitted = {
+              executionId: decision.executionId,
+              released: false,
+              callerIdentity: hello.clientInstance,
+              operation: hello.operation,
+            };
             state.connections.set(role, (state.connections.get(role) ?? 0) + 1);
 
             post({ kind: "ADMITTED", executionId: decision.executionId } satisfies ServerAdmitted);
@@ -1107,6 +1124,13 @@ export async function startRoleSockets(options: RoleServerOptions): Promise<Role
             if (admitted === null || admitted.released) return;
             admitted.released = true;
             releaseResolved(state, admitted.executionId, resolved);
+            // A successful execution advances the caller's sequence: completing `inspect` authorizes
+            // `fill`, completing `fill` authorizes `verify`. Reservation issuance alone does not
+            // advance the sequence, so an issued-but-unused reservation never authorizes the next
+            // operation — the worker must actually execute and resolve the current step first.
+            if (resolved && admitted !== null) {
+              advanceSequence(state, admitted.callerIdentity, admitted.operation);
+            }
             // The session is over once admission is resolved: the handler has read what it needs and
             // written what it owes. Closing here is what lets the handler's `finally` mean something
             // — otherwise it would end the socket underneath a response still being flushed.
