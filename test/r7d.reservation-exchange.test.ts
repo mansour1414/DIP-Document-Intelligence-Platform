@@ -128,9 +128,10 @@ describe("R7D.1-RESX — real-socket reservation exchange", () => {
     }
   });
 
-  it("fails closed when the peer answers the challenge then goes silent, bounded by the deadline", async () => {
+  it("fails closed with the internal TIMEOUT when the peer answers the challenge then goes silent", async () => {
     const silentDir = mkdtempSync(join(tmpdir(), "dip-res-silent-"));
     const silentSocket = join(silentDir, "worker.sock");
+    let clientClosed = false;
     try {
       const { createServer } = await import("node:net");
       const server = createServer((socket) => {
@@ -152,34 +153,148 @@ describe("R7D.1-RESX — real-socket reservation exchange", () => {
             );
           }
         });
+        socket.on("close", () => {
+          clientClosed = true;
+        });
         socket.on("error", () => {});
       });
       await new Promise<void>((resolve) => server.listen(silentSocket, resolve));
       try {
-        await withDeadline(
+        // The internal exchange deadline (2s) must fire before the external test deadline (5s).
+        await requestWorkerReservation({
+          socketPath: silentSocket,
+          secret: SECRET,
+          supervisorInstance: INSTANCE,
+          bootId: BOOT_ID,
+          clientInstance: CLIENT,
+          operation: "inspect",
+          connectTimeoutMs: 1_000,
+          exchangeTimeoutMs: 2_000,
+        });
+        assert.fail("expected the exchange to fail on a silent peer");
+      } catch (error) {
+        assert.equal(
+          (error as { code?: string }).code,
+          "TIMEOUT",
+          `expected internal TIMEOUT, got: ${String(error)}`,
+        );
+        // The client must have torn its side of the socket down; the server observes the close
+        // on the next tick, so wait for it boundedly rather than asserting immediately.
+        let sawClose = false;
+        const closeDeadline = Date.now() + 1_000;
+        while (Date.now() < closeDeadline && !sawClose) {
+          sawClose = clientClosed;
+          if (!sawClose) await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        assert.equal(sawClose, true, "the client socket must be destroyed on exchange expiry");
+      } finally {
+        server.close();
+      }
+    } finally {
+      rmSync(silentDir, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed on a malformed frame during a real exchange, without an uncaught exception", async () => {
+    const malformedDir = mkdtempSync(join(tmpdir(), "dip-res-malformed-"));
+    const malformedSocket = join(malformedDir, "worker.sock");
+    try {
+      const { createServer } = await import("node:net");
+      const server = createServer((socket) => {
+        socket.on("data", (chunk) => {
+          const json = chunk.subarray(4).toString("utf8");
+          let message: { kind?: string; clientNonce?: string };
+          try { message = JSON.parse(json); } catch { return; }
+          if (message.kind === "HELLO") {
+            socket.write(
+              encodeFrame({
+                kind: "CHALLENGE",
+                serverNonce: "ab".repeat(32),
+                clientNonce: message.clientNonce,
+                supervisorInstance: INSTANCE,
+                bootId: BOOT_ID,
+                protocolVersion: 1,
+              }),
+            );
+          } else if (message.kind === "AUTH") {
+            // Claim a valid length prefix, then send invalid JSON — the client must fail closed.
+            const badJson = Buffer.from("{not valid json", "utf8");
+            const header = Buffer.alloc(4);
+            header.writeUInt32BE(badJson.byteLength, 0);
+            socket.write(Buffer.concat([header, badJson]));
+          }
+        });
+        socket.on("error", () => {});
+        socket.on("close", () => {});
+      });
+      await new Promise<void>((resolve) => server.listen(malformedSocket, resolve));
+      try {
+        await assert.rejects(
           requestWorkerReservation({
-            socketPath: silentSocket,
+            socketPath: malformedSocket,
             secret: SECRET,
             supervisorInstance: INSTANCE,
             bootId: BOOT_ID,
             clientInstance: CLIENT,
             operation: "inspect",
             connectTimeoutMs: 1_000,
+            exchangeTimeoutMs: 3_000,
           }),
-          EXCHANGE_MS,
-          "silent peer after challenge",
-        );
-        assert.fail("expected the exchange to fail on a silent peer");
-      } catch (error) {
-        assert.ok(
-          /deadline exceeded|TRANSPORT_CLOSED|NOT_READY/.test(String(error)),
-          String(error),
+          /malformed control frame/,
         );
       } finally {
         server.close();
       }
     } finally {
-      rmSync(silentDir, { recursive: true, force: true });
+      rmSync(malformedDir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not hang on an incomplete frame; the exchange deadline expires instead", async () => {
+    const incompleteDir = mkdtempSync(join(tmpdir(), "dip-res-incomplete-"));
+    const incompleteSocket = join(incompleteDir, "worker.sock");
+    try {
+      const { createServer } = await import("node:net");
+      const server = createServer((socket) => {
+        socket.on("data", (chunk) => {
+          const json = chunk.subarray(4).toString("utf8");
+          let message: { kind?: string; clientNonce?: string };
+          try { message = JSON.parse(json); } catch { return; }
+          if (message.kind === "HELLO") {
+            // Declare a 100-byte frame but send only the 4-byte header: the payload never arrives,
+            // so the client must wait within its bounded deadline and then expire.
+            const header = Buffer.alloc(4);
+            header.writeUInt32BE(100, 0);
+            socket.write(header);
+          }
+        });
+        socket.on("error", () => {});
+        socket.on("close", () => {});
+      });
+      await new Promise<void>((resolve) => server.listen(incompleteSocket, resolve));
+      try {
+        await requestWorkerReservation({
+          socketPath: incompleteSocket,
+          secret: SECRET,
+          supervisorInstance: INSTANCE,
+          bootId: BOOT_ID,
+          clientInstance: CLIENT,
+          operation: "inspect",
+          connectTimeoutMs: 1_000,
+          exchangeTimeoutMs: 2_000,
+        });
+        assert.fail("expected the exchange to expire on an incomplete frame");
+      } catch (error) {
+        assert.equal(
+          (error as { code?: string }).code,
+          "TIMEOUT",
+          `expected internal TIMEOUT on incomplete frame, got: ${String(error)}`,
+        );
+      } finally {
+        server.close();
+      }
+    } finally {
+      rmSync(incompleteDir, { recursive: true, force: true });
     }
   });
 });

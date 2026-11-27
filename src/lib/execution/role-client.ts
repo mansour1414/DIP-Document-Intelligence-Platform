@@ -136,12 +136,39 @@ export async function requestWorkerReservation(options: ReservationRequestOption
   const queue: Record<string, unknown>[] = [];
   let notify: (() => void) | null = null;
   let closed = false;
+  let failed = false;
+  let failReason: Error | null = null;
   let serverNonce: string | null = null;
 
+  /** Fail the exchange from the receive loop: close the socket and reject every waiting `next()`. */
+  const failReceive = (error: Error): void => {
+    if (failed) return;
+    failed = true;
+    closed = true;
+    failReason = error;
+    socket.destroy();
+    notify?.();
+  };
+
   socket.on("data", (chunk: Buffer) => {
-    frames.append(chunk);
+    try {
+      frames.append(chunk);
+    } catch (error) {
+      // Oversized buffer: a peer that will not stay within the bound is not trusted.
+      failReceive(error instanceof Error ? error : new Error("the control stream exceeded the bound"));
+      return;
+    }
     for (;;) {
-      const step = frames.next();
+      let step: ReturnType<FrameBufferLite["next"]>;
+      try {
+        step = frames.next();
+      } catch {
+        // Malformed frame: declared length unacceptable or invalid JSON — fail closed rather than
+        // re-parsing garbage or crashing the receive loop. The raw parse error is not surfaced to
+        // the peer; only a bounded failure code is.
+        failReceive(new Error("malformed control frame"));
+        return;
+      }
       if (step === null) break;
       // Control frames only: this exchange declares an empty body and consumes no document bytes,
       // so a body frame would be a protocol violation rather than data to forward.
@@ -150,6 +177,12 @@ export async function requestWorkerReservation(options: ReservationRequestOption
       // same frame forever: repeated JSON.parse plus unbounded Buffer.concat growth, i.e. a hang
       // that ends in a V8 heap out-of-memory.
       frames.clear(step.leftover);
+      // Bound the receive queue: a peer that frames faster than the exchange consumes them is
+      // refused instead of allowed to accumulate unbounded messages.
+      if (queue.length > 16) {
+        failReceive(new Error("the receive queue exceeded its bound"));
+        return;
+      }
       notify?.();
     }
   });
@@ -160,6 +193,7 @@ export async function requestWorkerReservation(options: ReservationRequestOption
     for (;;) {
       const queued = queue.shift();
       if (queued !== undefined) return queued;
+      if (failed) throw failReason ?? new Error("the receive loop failed");
       if (closed) return { kind: "__CLOSED__" };
       await new Promise<void>((resolve) => { notify = resolve; });
       notify = null;
@@ -252,11 +286,18 @@ export async function requestWorkerReservation(options: ReservationRequestOption
   // supervisor that connects but never answers must expire the exchange rather than leave the
   // worker hanging (or buffering) forever.
   const exchangeDeadlineMs = options.exchangeTimeoutMs ?? 10_000;
+  let deadlineTimer: NodeJS.Timeout | null = null;
+  const clearDeadline = (): void => {
+    if (deadlineTimer !== null) {
+      clearTimeout(deadlineTimer);
+      deadlineTimer = null;
+    }
+  };
   try {
     return await Promise.race([
-      exchange(),
+      exchange().finally(clearDeadline),
       new Promise<never>((_, reject) => {
-        const timer = setTimeout(() => {
+        deadlineTimer = setTimeout(() => {
           closed = true;
           socket.destroy();
           reject(
@@ -266,10 +307,11 @@ export async function requestWorkerReservation(options: ReservationRequestOption
             ),
           );
         }, exchangeDeadlineMs);
-        timer.unref();
+        deadlineTimer.unref();
       }),
     ]);
   } finally {
+    clearDeadline();
     closed = true;
     socket.destroy();
   }
