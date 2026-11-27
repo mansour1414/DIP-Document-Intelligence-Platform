@@ -22,7 +22,7 @@ function frameOf(meta: unknown, output?: Buffer): Buffer {
 /** A stable execution id, so a grant can be bound to it. */
 const EXECUTION = "0123456789abcdef0123456789abcdef";
 import assert from "node:assert/strict";
-import { BoundedProvisionalOutput, ProvisionalResultStream, StreamError, sha256Hex } from "../src/lib/execution/provisional-stream";
+import { BoundedProvisionalOutput, ProvisionalResultStream, StreamError, sha256Hex, type VerifiedTerminalCommit } from "../src/lib/execution/provisional-stream";
 import { WORKER_LIMITS } from "../src/lib/pdf/worker-protocol";
 
 /** Build one fd3 frame: `[u32 metaLen][meta JSON][output]`. */
@@ -198,58 +198,118 @@ test("R7D.1-S-14: the caller's provisional output is capped", () => {
   assert.equal(output.bytes, 512);
 });
 
+/** A commit that satisfies every field of the verified-commit contract. */
+function commit(overrides: Partial<VerifiedTerminalCommit> = {}): VerifiedTerminalCommit {
+  return {
+    executionId: EXECUTION,
+    requestId: "0123456789abcdef",
+    operation: "fill",
+    resultDigest: "0".repeat(64),
+    resultBytes: 64,
+    metaBytes: 128,
+    outcome: "committed",
+    containerRemoved: true,
+    watchdogInstance: "wd-0001",
+    verifiedAtMonotonicMs: 1_000,
+    ...overrides,
+  };
+}
+
 test("R7D.1-S-15: output cannot be published before the stream seals it", () => {
   const output = new BoundedProvisionalOutput(1024);
   output.append(Buffer.alloc(64, 5));
-  // No seal yet, so no grant can be issued and `collect` refuses.
-  assert.throws(() => output.grantTerminalCommit(), (error: unknown) => error instanceof StreamError);
-  assert.throws(() => output.collect({ executionId: EXECUTION, digest: "0".repeat(64), bytes: 64, consumed: false }), (error: unknown) => error instanceof StreamError);
+  // Unsealed, so there is nothing to compare a commit against.
+  assert.throws(() => output.collect(commit()), (error: unknown) => error instanceof StreamError);
 });
 
-test("R7D.1-F02-11: a grant is bound to the digest and byte count it was issued for", () => {
-  // The point of replacing `collect(true)` is that the boolean proved nothing. A grant that can
-  // be paired with different bytes would prove no more.
+test("R7D.1-CF02-1: a commit is bound to the digest and byte count it names", () => {
+  // The whole point of replacing a boolean is that the boolean proved nothing. A commit that can
+  // be paired with different bytes would prove no more, so every field is compared.
   const output = new BoundedProvisionalOutput(1024);
   output.append(Buffer.alloc(64, 5));
   output.seal(EXECUTION, "a".repeat(64));
   assert.throws(
-    () => output.collect({ executionId: EXECUTION, digest: "b".repeat(64), bytes: 64, consumed: false }),
+    () => output.collect(commit({ resultDigest: "b".repeat(64) })),
     (error: unknown) => error instanceof StreamError && /does not match the bytes/u.test(error.message),
   );
   assert.throws(
-    () => output.collect({ executionId: EXECUTION, digest: "a".repeat(64), bytes: 65, consumed: false }),
+    () => output.collect(commit({ resultDigest: "a".repeat(64), resultBytes: 65 })),
     (error: unknown) => error instanceof StreamError && /does not match the byte count/u.test(error.message),
   );
-  // The genuine grant works exactly once.
-  const published = output.collect(output.grantTerminalCommit());
-  assert.equal(published.byteLength, 64);
+  assert.equal(output.collect(commit({ resultDigest: "a".repeat(64) })).byteLength, 64);
 });
 
-test("R7D.1-F02-12: a grant from another execution is refused", () => {
+test("R7D.1-CF02-2: a commit from another execution is refused", () => {
   const output = new BoundedProvisionalOutput(1024);
   output.append(Buffer.alloc(8, 1));
   output.seal(EXECUTION, "c".repeat(64));
   assert.throws(
-    () => output.collect({ executionId: "f".repeat(32), digest: "c".repeat(64), bytes: 8, consumed: false }),
+    () => output.collect(commit({ executionId: "f".repeat(32), resultDigest: "c".repeat(64), resultBytes: 8 })),
     (error: unknown) => error instanceof StreamError && /different execution/u.test(error.message),
   );
 });
 
-test("R7D.1-F02-13: a grant is single-use", () => {
-  // One execution produces one document. A second publication is a second document.
+test("R7D.1-CF02-3: output is released at most once", () => {
+  // One execution produces one document. A second release is a second document, and the flag
+  // that enforces it lives on the object rather than on the caller's record.
   const output = new BoundedProvisionalOutput(1024);
   output.append(Buffer.alloc(8, 1));
   output.seal(EXECUTION, "d".repeat(64));
-  const grant = output.grantTerminalCommit();
-  assert.equal(output.collect(grant).byteLength, 8);
-  assert.throws(() => output.collect(grant), (error: unknown) => error instanceof StreamError && /already used/u.test(error.message));
+  assert.equal(output.collect(commit({ resultDigest: "d".repeat(64), resultBytes: 8 })).byteLength, 8);
+  assert.throws(
+    () => output.collect(commit({ resultDigest: "d".repeat(64), resultBytes: 8 })),
+    (error: unknown) => error instanceof StreamError && /already collected/u.test(error.message),
+  );
 });
 
-test("R7D.1-F02-14: output cannot be sealed twice", () => {
+test("R7D.1-CF02-4: an output cannot be sealed twice", () => {
   // A second seal would let a caller substitute a digest after the stream had already checked one.
   const output = new BoundedProvisionalOutput(1024);
   output.seal(EXECUTION, "e".repeat(64));
   assert.throws(() => output.seal(EXECUTION, "f".repeat(64)), (error: unknown) => error instanceof StreamError);
+});
+
+test("R7D.1-CF02-5: a refusal outcome never releases output", () => {
+  // A refusal is a perfectly good terminal state and it must not publish a document. The boolean
+  // grant could not express this: "the caller said true" has no opinion about what happened.
+  const output = new BoundedProvisionalOutput(1024);
+  output.append(Buffer.alloc(8, 1));
+  output.seal(EXECUTION, "0".repeat(64));
+  for (const outcome of ["refused", "timeout", "cancelled", "failed"] as const) {
+    assert.throws(
+      () => output.collect(commit({ resultDigest: "0".repeat(64), resultBytes: 8, outcome })),
+      (error: unknown) => error instanceof StreamError && /only a committed execution/u.test(error.message),
+      outcome,
+    );
+  }
+});
+
+test("R7D.1-CF02-6: a commit without confirmed removal never releases output", () => {
+  const output = new BoundedProvisionalOutput(1024);
+  output.append(Buffer.alloc(8, 1));
+  output.seal(EXECUTION, "0".repeat(64));
+  assert.throws(
+    () => output.collect(commit({ resultDigest: "0".repeat(64), resultBytes: 8, containerRemoved: false })),
+    (error: unknown) => error instanceof StreamError && /not confirmed removed/u.test(error.message),
+  );
+});
+
+test("R7D.1-CF02-7: sealed output is frozen and cannot accept more bytes", () => {
+  // Appending after the digest was verified would let the bytes differ from what was
+  // authenticated while the commit still described the old content.
+  const output = new BoundedProvisionalOutput(1024);
+  output.append(Buffer.alloc(8, 1));
+  output.seal(EXECUTION, "0".repeat(64));
+  assert.throws(() => output.append(Buffer.alloc(1)), (error: unknown) => error instanceof StreamError && /sealed/u.test(error.message));
+});
+
+test("R7D.1-CF02-8: the output class can no longer issue its own authorization", async () => {
+  // The defect was self-attestation. This asserts the affordance is gone rather than merely
+  // discouraged: there is no method that mints a grant.
+  const { readFileSync } = await import("node:fs");
+  const source = readFileSync("src/lib/execution/provisional-stream.ts", "utf8");
+  assert.equal(source.includes("grantTerminalCommit"), false, "a self-issued grant must not exist");
+  assert.equal(/TerminalCommitGrant/u.test(source), false);
 });
 
 test("R7D.1-S-16: discarded output is unreachable even with a commit", () => {
@@ -258,12 +318,8 @@ test("R7D.1-S-16: discarded output is unreachable even with a commit", () => {
   output.seal(EXECUTION, "0".repeat(64));
   output.discard();
   assert.equal(output.bytes, 0);
-  // Even a grant this object itself issued cannot resurrect discarded bytes.
-  assert.throws(() => output.grantTerminalCommit(), (error: unknown) => error instanceof StreamError);
-  assert.throws(
-    () => output.collect({ executionId: EXECUTION, digest: "0".repeat(64), bytes: 64, consumed: false }),
-    (error: unknown) => error instanceof StreamError,
-  );
+  // Not even a valid commit can resurrect discarded bytes.
+  assert.throws(() => output.collect(commit()), (error: unknown) => error instanceof StreamError);
   assert.throws(() => output.append(Buffer.alloc(1)), (error: unknown) => error instanceof StreamError);
 });
 
@@ -273,7 +329,7 @@ test("R7D.1-S-17: appended chunks are copied, so a reused buffer cannot corrupt 
   output.append(reused);
   output.seal(EXECUTION, "0".repeat(64));
   reused.fill(9);
-  const collected = output.collect(output.grantTerminalCommit());
+  const collected = output.collect(commit({ resultDigest: "0".repeat(64), resultBytes: 4 }));
   assert.deepEqual([...collected], [1, 1, 1, 1]);
 });
 
