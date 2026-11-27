@@ -31,8 +31,36 @@
  * filesystem's metadata only in memory, and a host crash can lose the record entirely.
  */
 
+import { randomBytes } from "node:crypto";
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync, writeSync, existsSync } from "node:fs";
 import { join } from "node:path";
+
+/**
+ * A durability operation failed.
+ *
+ * Distinct from a policy refusal: this means the filesystem did not confirm the write. The
+ * caller must treat the record as absent and quarantine, never as written.
+ */
+export class JournalDurabilityError extends Error {
+  constructor(message: string, readonly cause?: unknown) {
+    super(message);
+    this.name = "JournalDurabilityError";
+  }
+}
+
+/**
+ * A stored record failed schema validation.
+ *
+ * Also distinct: the file exists but does not describe anything trustworthy. Treated as
+ * quarantine, because a record that cannot be read is an execution whose ownership cannot be
+ * positively resolved.
+ */
+export class JournalSchemaError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "JournalSchemaError";
+  }
+}
 
 /** Lifecycle phases, in the only order they may occur. */
 export const JOURNAL_PHASES = [
@@ -117,6 +145,116 @@ export type WatchdogRecord = {
   sequence: number;
 };
 
+// ---------------------------------------------------------------------------------------
+// Strict schema validation
+// ---------------------------------------------------------------------------------------
+//
+// TypeScript types vanish at run time. A `SupervisorRecord` annotation guarantees nothing
+// about a parsed JSON file, and a cast would let an edited or truncated record drive a
+// lifecycle decision. These validators are the runtime contract.
+
+/**
+ * Require an object with exactly `allowed` keys.
+ *
+ * Unknown properties are rejected rather than ignored: a record carrying a field this schema
+ * does not define is either a schema mismatch or an attempt to persist something the record is
+ * not permitted to hold. Both should stop the read.
+ */
+function assertExactKeys(value: unknown, allowed: readonly string[], what: string): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new JournalSchemaError(`${what} is not an object`);
+  }
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  const expected = [...allowed].sort();
+  if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
+    const unexpected = keys.filter((key) => !expected.includes(key));
+    throw new JournalSchemaError(`${what} has unexpected properties: ${unexpected.join(", ") || "(missing keys)"}`);
+  }
+  return record;
+}
+
+function assertString(value: unknown, what: string, pattern: RegExp): string {
+  if (typeof value !== "string" || !pattern.test(value)) throw new JournalSchemaError(`${what} is not an acceptable string`);
+  return value;
+}
+
+function assertNumber(value: unknown, what: string, min: number, max = Number.MAX_SAFE_INTEGER): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < min || value > max) {
+    throw new JournalSchemaError(`${what} is not an acceptable integer`);
+  }
+  return value;
+}
+
+const SUPERVISOR_KEYS = [
+  "schema", "executionId", "bootId", "supervisorInstance", "containerName",
+  "containerId", "imageDigest", "profileId", "deadlineMs", "startedMonotonicMs",
+  "phase", "sequence", "outcome",
+] as const;
+
+const WATCHDOG_KEYS = [
+  "schema", "executionId", "bootId", "watchdogInstance", "containerId",
+  "cgroupPath", "cgroupEventsInode", "deadlineMs", "startedMonotonicMs", "phase", "sequence",
+] as const;
+
+/** Validate a supervisor record. Used on write and on read. */
+export function assertSupervisorRecord(value: unknown): SupervisorRecord {
+  const record = assertExactKeys(value, SUPERVISOR_KEYS, "supervisor record");
+  if (record.schema !== 1) throw new JournalSchemaError("supervisor record schema must be 1");
+  const executionId = assertString(record.executionId, "executionId", /^[a-f0-9]{32}$/u);
+  const containerName = assertString(record.containerName, "containerName", /^dip-exec-[a-f0-9]{32}$/u);
+  if (containerName !== `dip-exec-${executionId}`) throw new JournalSchemaError("containerName does not derive from executionId");
+  const phase = record.phase;
+  if (typeof phase !== "string" || !(JOURNAL_PHASES as readonly string[]).includes(phase)) {
+    throw new JournalSchemaError("phase is not in the closed set");
+  }
+  const outcome = record.outcome;
+  const OUTCOMES = ["committed", "refused", "timeout", "cancelled", "failed"];
+  if (outcome !== null && (typeof outcome !== "string" || !OUTCOMES.includes(outcome))) {
+    throw new JournalSchemaError("outcome is not in the closed set");
+  }
+  // A container id is all-hex or absent. A partial id is not a shorter identifier, it is a
+  // record that cannot be used to reconcile anything.
+  if (record.containerId !== null) assertString(record.containerId, "containerId", /^[a-f0-9]{64}$/u);
+  assertString(record.imageDigest, "imageDigest", /^sha256:[a-f0-9]{64}$/u);
+  assertString(record.bootId, "bootId", /^[a-z0-9-]{4,64}$/u);
+  assertString(record.supervisorInstance, "supervisorInstance", /^[a-z0-9-]{4,64}$/u);
+  assertString(record.profileId, "profileId", /^[a-z0-9-]{4,64}$/u);
+  assertNumber(record.deadlineMs, "deadlineMs", 1);
+  assertNumber(record.startedMonotonicMs, "startedMonotonicMs", 0);
+  assertNumber(record.sequence, "sequence", 1);
+  return value as SupervisorRecord;
+}
+
+export function parseSupervisorRecord(value: unknown): SupervisorRecord {
+  return assertSupervisorRecord(value);
+}
+
+/** Validate a watchdog record. Used on write and on read. */
+export function assertWatchdogRecord(value: unknown): WatchdogRecord {
+  const record = assertExactKeys(value, WATCHDOG_KEYS, "watchdog record");
+  if (record.schema !== 1) throw new JournalSchemaError("watchdog record schema must be 1");
+  assertString(record.executionId, "executionId", /^[a-f0-9]{32}$/u);
+  assertString(record.bootId, "bootId", /^[a-z0-9-]{4,64}$/u);
+  assertString(record.watchdogInstance, "watchdogInstance", /^[a-z0-9-]{4,64}$/u);
+  assertString(record.containerId, "containerId", /^[a-f0-9]{64}$/u);
+  // A cgroup path is an absolute kernel path; anything else is not one.
+  assertString(record.cgroupPath, "cgroupPath", /^\/sys\/fs\/cgroup\/[A-Za-z0-9._/-]+$/u);
+  assertNumber(record.cgroupEventsInode, "cgroupEventsInode", 1);
+  assertNumber(record.deadlineMs, "deadlineMs", 1);
+  assertNumber(record.startedMonotonicMs, "startedMonotonicMs", 0);
+  const phase = record.phase;
+  if (phase !== "armed" && phase !== "disarmed" && phase !== "expired" && phase !== "quarantined") {
+    throw new JournalSchemaError("watchdog phase is not in the closed set");
+  }
+  assertNumber(record.sequence, "sequence", 1);
+  return value as WatchdogRecord;
+}
+
+export function parseWatchdogRecord(value: unknown): WatchdogRecord {
+  return assertWatchdogRecord(value);
+}
+
 /** Validate an opaque execution id: hex only, so it cannot smuggle a path separator. */
 export function assertExecutionId(id: string): void {
   if (!/^[a-f0-9]{32}$/u.test(id)) throw new Error("execution id must be 32 lowercase hex characters");
@@ -142,10 +280,19 @@ export function containerNameFor(executionId: string): string {
 export class OwnershipJournal {
   readonly supervisorDir: string;
   readonly watchdogDir: string;
+  /**
+   * The fsync primitive.
+   *
+   * Injectable so the durability failure path can be exercised. Without this the only way to
+   * test "a failed fsync must fail closed" is to corrupt a filesystem, which is not something a
+   * test suite should do — and the path would then never be covered at all.
+   */
+  private readonly fsync: (fd: number) => void;
 
-  constructor(root: string) {
+  constructor(root: string, options: { fsync?: (fd: number) => void } = {}) {
     this.supervisorDir = join(root, "supervisor");
     this.watchdogDir = join(root, "watchdog");
+    this.fsync = options.fsync ?? ((fd: number) => fsyncSync(fd));
   }
 
   /** Create both directories, durable against a crash immediately after. */
@@ -174,43 +321,75 @@ export class OwnershipJournal {
    * check rejects the loser's content if it is stale.
    */
   private atomicWrite(path: string, contents: string): void {
-    const temporary = `${path}.tmp`;
-    const fd = openSync(temporary, "w", 0o600);
+    // A fixed `.tmp` name is unsafe under competing writes: two writers open the same file,
+    // interleave their contents, and both rename it into place. The result is one valid-looking
+    // record containing a mixture of two. The name is therefore unique per write, created
+    // exclusively (`wx` fails if it somehow exists), and removed on any failure path.
+    const temporary = `${path}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+    let fd: number | undefined;
     try {
+      fd = openSync(temporary, "wx", 0o600);
       writeSync(fd, contents);
-      // fsync the file before the rename, so the renamed entry points at durable content.
-      fsyncSync(fd);
+      // fsync the file before the rename, so the renamed entry points at durable content and
+      // not at a page cache entry a crash can still lose.
+      this.fsync(fd);
+    } catch (error) {
+      // Fail closed. An unwritten or fsync-less intent record is not a durable intent, and
+      // continuing would mean the daemon is asked to create a container the journal cannot
+      // describe after a crash.
+      if (fd !== undefined) {
+        try { closeSync(fd); } catch { /* already failing */ }
+        fd = undefined;
+      }
+      try { unlinkSync(temporary); } catch { /* nothing to remove */ }
+      throw new JournalDurabilityError("the journal record could not be written durably", error);
     } finally {
-      closeSync(fd);
+      if (fd !== undefined) closeSync(fd);
     }
     renameSync(temporary, path);
+    // A directory fsync that fails means the rename may not survive a crash. That is exactly
+    // the condition the journal exists to rule out, so it is an error, not a note.
     this.fsyncDir(path.slice(0, path.lastIndexOf("/")));
   }
 
+  /**
+   * fsync a directory, or fail.
+   *
+   * The previous version swallowed the error with a comment about portability. That is wrong
+   * for this file: durability of the rename is the entire reason the journal is crash-safe, and
+   * a silently skipped fsync makes every "durable intent" claim false while leaving the code
+   * looking correct. If the filesystem genuinely cannot fsync a directory, that is a property
+   * to discover at start-up, not to hide per write.
+   */
   private fsyncDir(dir: string): void {
     let fd: number | undefined;
     try {
       fd = openSync(dir, "r");
-      fsyncSync(fd);
-    } catch {
-      // Some filesystems refuse fsync on a directory descriptor. The rename is still
-      // atomic; only the durability guarantee is weaker, and there is no portable way to
-      // force it. Recorded here rather than silently ignored elsewhere.
+      this.fsync(fd);
+    } catch (error) {
+      throw new JournalDurabilityError(`the journal directory ${dir} could not be fsync'd`, error);
     } finally {
       if (fd !== undefined) closeSync(fd);
     }
   }
 
+  /**
+   * Read a supervisor record, validating it strictly.
+   *
+   * A cast would be the same mistake as the protocol decoder's: it would hand back whatever
+   * the file contained, and a hand-edited or partially-written record — a phase from an older
+   * schema, a container id of the wrong length — would then drive a lifecycle decision.
+   */
   readSupervisor(executionId: string): SupervisorRecord | null {
     const path = this.supervisorPath(executionId);
     if (!existsSync(path)) return null;
-    return JSON.parse(readFileSync(path, "utf8")) as SupervisorRecord;
+    return parseSupervisorRecord(JSON.parse(readFileSync(path, "utf8")));
   }
 
   readWatchdog(executionId: string): WatchdogRecord | null {
     const path = this.watchdogPath(executionId);
     if (!existsSync(path)) return null;
-    return JSON.parse(readFileSync(path, "utf8")) as WatchdogRecord;
+    return parseWatchdogRecord(JSON.parse(readFileSync(path, "utf8")));
   }
 
   /**
@@ -222,6 +401,10 @@ export class OwnershipJournal {
    * reasserting an earlier view of the world.
    */
   writeSupervisor(record: SupervisorRecord): void {
+    // Validate the record itself before it reaches the disk. A caller that built a malformed
+    // record — a phase not in the closed set, a container id of the wrong length — must fail
+    // here, while the caller still has the context to handle it.
+    assertSupervisorRecord(record);
     assertExecutionId(record.executionId);
     const previous = this.readSupervisor(record.executionId);
     if (previous) {
@@ -236,6 +419,7 @@ export class OwnershipJournal {
   }
 
   writeWatchdog(record: WatchdogRecord): void {
+    assertWatchdogRecord(record);
     assertExecutionId(record.executionId);
     const previous = this.readWatchdog(record.executionId);
     if (previous && record.sequence <= previous.sequence) {
@@ -264,8 +448,26 @@ export class OwnershipJournal {
       .sort();
   }
 
-  /** Remove both records once removal is confirmed. Never removes an unresolved record. */
-  clear(executionId: string): void {
+  /**
+   * Remove both records, but only with positive evidence that the execution is resolved.
+   *
+   * The previous version deleted whatever files happened to be there. That let a caller
+   * discard an unresolved execution — an execution whose container might still exist — simply
+   * by calling it. Removal now requires the record to be in a terminal phase *and* the container
+   * to be gone, and refuses otherwise.
+   */
+  clear(executionId: string, evidence: { containerRemoved: boolean }): void {
+    assertExecutionId(executionId);
+    const record = this.readSupervisor(executionId);
+    if (record !== null) {
+      const resolved = record.phase === "removed" && record.outcome !== null;
+      if (!resolved || !evidence.containerRemoved) {
+        throw new Error(
+          `refusing to clear ${executionId}: phase=${record.phase} outcome=${String(record.outcome)} `
+          + `containerRemoved=${String(evidence.containerRemoved)}. Retention is required until ownership is positively resolved.`,
+        );
+      }
+    }
     for (const path of [this.supervisorPath(executionId), this.watchdogPath(executionId)]) {
       if (existsSync(path)) unlinkSync(path);
     }

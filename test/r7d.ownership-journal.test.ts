@@ -10,7 +10,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, fsyncSync, mkdtempSync, statSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
@@ -138,10 +138,11 @@ test("R7D.1-J-7: quarantine is reachable from any phase and is terminal", () => 
 test("R7D.1-J-8: writes are atomic replacements, leaving no partial record", () => {
   withJournal((journal, root) => {
     journal.writeSupervisor(record({ sequence: 1, phase: "intent" }));
-    journal.writeSupervisor(record({ sequence: 2, phase: "created", containerId: "c0ffee" }));
+    const CONTAINER = "c0ffee".padEnd(64, "0");
+    journal.writeSupervisor(record({ sequence: 2, phase: "created", containerId: CONTAINER }));
     const stored = journal.readSupervisor(ID);
     assert.equal(stored?.phase, "created");
-    assert.equal(stored?.containerId, "c0ffee");
+    assert.equal(stored?.containerId, CONTAINER);
     // The temporary file is renamed away, never left behind.
     assert.equal(readdirSync(join(root, "supervisor")).some((name) => name.endsWith(".tmp")), false);
   });
@@ -197,8 +198,8 @@ test("R7D.1-J-11: an in-flight create with no container id is AMBIGUOUS, not abs
 });
 
 test("R7D.1-J-12: a known container id requires a lookup, never an assumption", () => {
-  assert.equal(classifyForRecovery(record({ phase: "created", containerId: "c0ffee" })), "needs-container-lookup");
-  assert.equal(classifyForRecovery(record({ phase: "running", containerId: "c0ffee" })), "needs-container-lookup");
+  assert.equal(classifyForRecovery(record({ phase: "created", containerId: "c0ffee".padEnd(64, "0") })), "needs-container-lookup");
+  assert.equal(classifyForRecovery(record({ phase: "running", containerId: "c0ffee".padEnd(64, "0") })), "needs-container-lookup");
 });
 
 test("R7D.1-J-13: only a removed-and-terminal record is resolved", () => {
@@ -211,7 +212,7 @@ test("R7D.1-J-13: only a removed-and-terminal record is resolved", () => {
 test("R7D.1-J-14: quarantine is sticky across restarts", () => {
   assert.equal(classifyForRecovery(record({ phase: "quarantined" })), "quarantined");
   // Even with a container id, a quarantined record stays quarantined.
-  assert.equal(classifyForRecovery(record({ phase: "quarantined", containerId: "c0ffee" })), "quarantined");
+  assert.equal(classifyForRecovery(record({ phase: "quarantined", containerId: "c0ffee".padEnd(64, "0") })), "quarantined");
 });
 
 // ---------------------------------------------------------------------------------------
@@ -233,12 +234,142 @@ test("R7D.1-J-15: durable intent is written before any daemon operation", () => 
 // Cleanup.
 // ---------------------------------------------------------------------------------------
 
-test("R7D.1-J-16: clear removes both records and nothing else", () => {
+test("R7D.1-J-16: clear requires positive removal evidence, then removes both records", () => {
   withJournal((journal) => {
     const other = "fedcba9876543210fedcba9876543210";
-    journal.writeSupervisor(record({ sequence: 1 }));
     journal.writeSupervisor(record({ executionId: other, sequence: 1, containerName: containerNameFor(other) }));
-    journal.clear(ID);
+    // Terminal phase AND a confirmed removal, or the call refuses.
+    journal.writeSupervisor(record({ sequence: 1, phase: "removed", outcome: "committed", containerId: "a".repeat(64) }));
+    assert.doesNotThrow(() => journal.clear(ID, { containerRemoved: true }));
     assert.deepEqual(journal.listSupervisor(), [other]);
   });
+});
+
+// ---------------------------------------------------------------------------------------
+// F04 — durability, schema and resolution evidence.
+// ---------------------------------------------------------------------------------------
+
+test("R7D.1-F04-1: clear refuses an unresolved record", () => {
+  withJournal((journal) => {
+    journal.writeSupervisor(record({ sequence: 1, phase: "running", containerId: "a".repeat(64) }));
+    assert.throws(() => journal.clear(ID, { containerRemoved: true }), /refusing to clear/u);
+    // Still there: an unresolved execution must be retained.
+    assert.equal(journal.readSupervisor(ID)?.phase, "running");
+  });
+});
+
+test("R7D.1-F04-2: clear refuses even a terminal record without removal evidence", () => {
+  withJournal((journal) => {
+    journal.writeSupervisor(record({ sequence: 1, phase: "removed", outcome: "committed", containerId: "a".repeat(64) }));
+    assert.throws(() => journal.clear(ID, { containerRemoved: false }), /refusing to clear/u);
+    assert.equal(journal.readSupervisor(ID)?.phase, "removed");
+  });
+});
+
+test("R7D.1-F04-3: a malformed stored record is rejected on read, not cast", () => {
+  // A cast would hand this back as a SupervisorRecord and a lifecycle decision would be made
+  // on a phase that does not exist.
+  withJournal((journal, root) => {
+    writeFileSync(join(root, "supervisor", `${ID}.json`), JSON.stringify({ ...record(), phase: "invented-phase" }));
+    assert.throws(() => journal.readSupervisor(ID), /closed set/u);
+  });
+});
+
+test("R7D.1-F04-4: a record with unknown properties is rejected", () => {
+  // An extra field could persist content the record is not permitted to hold.
+  withJournal((journal, root) => {
+    writeFileSync(join(root, "supervisor", `${ID}.json`), JSON.stringify({ ...record(), fieldName: "CANARY" }));
+    assert.throws(() => journal.readSupervisor(ID), /unexpected properties/u);
+  });
+});
+
+test("R7D.1-F04-5: a container id of the wrong length is rejected", () => {
+  withJournal((journal, root) => {
+    writeFileSync(join(root, "supervisor", `${ID}.json`), JSON.stringify({ ...record(), containerId: "abc123" }));
+    assert.throws(() => journal.readSupervisor(ID), /containerId/u);
+  });
+});
+
+test("R7D.1-F04-6: a record whose name does not derive from its id is rejected", () => {
+  withJournal((journal, root) => {
+    writeFileSync(join(root, "supervisor", `${ID}.json`), JSON.stringify({ ...record(), containerName: `dip-exec-${"b".repeat(32)}` }));
+    assert.throws(() => journal.readSupervisor(ID), /does not derive/u);
+  });
+});
+
+test("R7D.1-F04-7: an out-of-set outcome is rejected", () => {
+  withJournal((journal, root) => {
+    writeFileSync(join(root, "supervisor", `${ID}.json`), JSON.stringify({ ...record(), outcome: "probably-fine" }));
+    assert.throws(() => journal.readSupervisor(ID), /outcome/u);
+  });
+});
+
+test("R7D.1-F04-8: writes refuse a malformed record before it reaches the disk", () => {
+  withJournal((journal) => {
+    assert.throws(() => journal.writeSupervisor({ ...record(), phase: "nope" as never }), /closed set/u);
+    assert.throws(() => journal.writeSupervisor({ ...record(), containerId: "short" }), /containerId/u);
+    assert.equal(journal.readSupervisor(ID), null, "nothing may be written for a rejected record");
+  });
+});
+
+test("R7D.1-F04-9: temporary files are unique per write, so competing writers cannot interleave", () => {
+  // A fixed `.tmp` name lets two writers open the same file, mix their contents and both
+  // rename it — producing one valid-looking record that is a blend of two.
+  withJournal((journal, root) => {
+    journal.writeSupervisor(record({ sequence: 1 }));
+    // No temporary survives a successful write.
+    assert.equal(readdirSync(join(root, "supervisor")).some((name) => name.endsWith(".tmp")), false);
+  });
+  // And the temporary is opened exclusively, so a collision fails rather than interleaving.
+  const source = readFileSync("src/lib/execution/ownership-journal.ts", "utf8");
+  assert.match(source, /openSync\(temporary, "wx"/u, "temporaries must be created exclusively");
+  // The name must include a random component, or two writers in the same process collide.
+  assert.match(source, /randomBytes\(8\)/u);
+});
+
+
+test("R7D.1-F04-10: a failed file fsync fails the write closed", () => {
+  // Durability is the entire point of the journal. A swallowed fsync error makes every
+  // "durable intent" claim false while the code still looks correct, so it must throw.
+  const root = mkdtempSync(join(tmpdir(), "dip-journal-fail-"));
+  try {
+    const journal = new OwnershipJournal(root, {
+      fsync: () => { throw new Error("injected fsync failure"); },
+    });
+    // `init()` also fsyncs the directories, so construct the directories first with a healthy
+    // journal and then use the failing one.
+    new OwnershipJournal(root).init();
+    assert.throws(() => journal.writeSupervisor(record({ sequence: 1 })), /could not be written durably|fsync/u);
+    // No record may be visible, and no temporary may be left behind.
+    assert.equal(new OwnershipJournal(root).readSupervisor(ID), null);
+    assert.equal(readdirSync(join(root, "supervisor")).filter((name) => name.endsWith(".tmp")).length, 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("R7D.1-F04-11: the injected failure leaves no half-written record", () => {
+  // The rename must never happen after a failed fsync, or a reader would see a record whose
+  // contents the filesystem never confirmed.
+  const root = mkdtempSync(join(tmpdir(), "dip-journal-fail2-"));
+  try {
+    new OwnershipJournal(root).init();
+    // Fail the *file* fsync specifically — the one that happens before the rename. The
+    // directory fsync runs after the rename and is a different guarantee, so injecting there
+    // would only prove that the rename already happened.
+    const isDirectory = (fd: number): boolean => {
+      try { return statSync(`/proc/self/fd/${fd}`).isDirectory(); } catch { return false; }
+    };
+    const journal = new OwnershipJournal(root, {
+      fsync: (fd) => {
+        if (!isDirectory(fd)) throw new Error("injected file fsync failure");
+        fsyncSync(fd);
+      },
+    });
+    assert.throws(() => journal.writeSupervisor(record({ sequence: 1 })), /could not be written durably/u);
+    // The rename must not have happened, so no record is visible to any reader.
+    assert.equal(existsSync(join(root, "supervisor", `${ID}.json`)), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
