@@ -19,6 +19,7 @@ import {
   assertNoForbiddenFlags,
   buildCreateArgv,
   buildInspectArgv,
+  buildKillArgv,
   buildRemoveArgv,
   buildStartArgv,
   DOCKER_BIN,
@@ -35,6 +36,10 @@ function policy(overrides: Partial<ExecutionPolicy> = {}): ExecutionPolicy {
   return {
     image: `dip-executor@${DIGEST}`,
     name: "dip-exec-0123456789abcdef0123456789abcdef",
+    executionId: "0123456789abcdef0123456789abcdef",
+    bootId: "boot-0001",
+    supervisorInstance: "sup-0001",
+    profileId: "synthetic-r7d-v1",
     uid: 10001,
     gid: 10001,
     memoryBytes: SYNTHETIC_PROFILE.memoryBytes,
@@ -42,6 +47,8 @@ function policy(overrides: Partial<ExecutionPolicy> = {}): ExecutionPolicy {
     cpuPeriodMicros: SYNTHETIC_PROFILE.cpuPeriodMicros,
     pidsLimit: SYNTHETIC_PROFILE.pidsLimit,
     tmpfsBytes: SYNTHETIC_PROFILE.tmpfsBytes,
+    tmpBytes: SYNTHETIC_PROFILE.tmpBytes,
+    v8OldSpaceMb: SYNTHETIC_PROFILE.v8OldSpaceMb,
     cgroupParent: "/dip-executor-abcdef0123456789",
     seccompProfile: "runtime/default",
     apparmorProfile: "dip-executor",
@@ -90,8 +97,10 @@ test("R7D.1-D1-2: create retains stdin so that start -ai can attach to it", () =
 });
 
 test("R7D.1-D1-3: the start argv names exactly one container and attaches both streams", () => {
-  const start = buildStartArgv("dip-exec-x");
-  assert.deepEqual(start, ["start", "--attach", "--interactive", "dip-exec-x"]);
+  const start = buildStartArgv("dip-exec-0123456789abcdef0123456789abcdef");
+  assert.deepEqual(start, ["--host", "unix:///var/run/docker.sock", "start", "--attach", "--interactive", "dip-exec-0123456789abcdef0123456789abcdef"]);
+  // An arbitrary name is refused: only the derived execution-name form is accepted.
+  assert.throws(() => buildStartArgv("something-else"), /unrecognised container name/u);
 });
 
 test("R7D.1-D1-4: removal is an explicit named docker rm, never --rm on create", () => {
@@ -101,7 +110,17 @@ test("R7D.1-D1-4: removal is an explicit named docker rm, never --rm on create",
   const create = buildCreateArgv(policy());
   assert.equal(create.includes("--rm"), false, "create must not auto-remove");
   assert.equal(create.includes("--auto-remove"), false);
-  assert.deepEqual(buildRemoveArgv("dip-exec-x"), ["rm", "--force", "dip-exec-x"]);
+  const id = "a".repeat(64);
+  assert.deepEqual(buildRemoveArgv(id), ["--host", "unix:///var/run/docker.sock", "rm", "--force", id]);
+});
+
+test("R7D.1-D1-5: destructive operations require an exact container id, never a name", () => {
+  // F01: a name is not an identity. After a race or a restart another container could hold
+  // it, and `rm --force <name>` would then destroy something this system does not own.
+  assert.throws(() => buildRemoveArgv("dip-exec-0123456789abcdef0123456789abcdef"), /exact 64-hex container id/u);
+  assert.throws(() => buildKillArgv("dip-exec-0123456789abcdef0123456789abcdef"), /exact 64-hex container id/u);
+  assert.throws(() => buildRemoveArgv("a".repeat(63)), /exact 64-hex container id/u);
+  assert.doesNotThrow(() => buildKillArgv("a".repeat(64)));
 });
 
 // ---------------------------------------------------------------------------------------
@@ -115,9 +134,10 @@ test("R7D.1-P-1: every mandatory control appears in the create argv", () => {
     ["--cgroup-parent", "/dip-executor-abcdef0123456789"],
     ["--network", "none"],
     ["--ipc", "none"],
-    ["--pid", "private"],
-    ["--uts", "private"],
-    ["--userns", "private"],
+    // F01: --userns/--uts/--pid take no `private` value. --cgroupns does, and it is the
+    // documented way to request a private cgroup namespace.
+    ["--cgroupns", "private"],
+    ["--pull", "never"],
     ["--cap-drop", "ALL"],
     ["--memory", String(SYNTHETIC_PROFILE.memoryBytes)],
     ["--cpu-quota", String(SYNTHETIC_PROFILE.cpuQuotaMicros)],
@@ -143,14 +163,14 @@ test("R7D.1-P-3: the root filesystem is read-only and the scratch mount is harde
   const argv = buildCreateArgv(policy());
   assert.ok(argv.includes("--read-only"), "root must be read-only");
   const tmpfs = allValuesOf(argv, "--tmpfs");
-  assert.equal(tmpfs.length, 2, "expected the work mount and the masked mqueue mount");
-  const [work, mqueue] = tmpfs;
+  assert.equal(tmpfs.length, 3, "expected work, the bounded /tmp profile, and the masked mqueue mount");
+  const [work, tmp, mqueue] = tmpfs;
   assert.match(work, /^\/work:rw,noexec,nosuid,nodev,size=50331648$/u);
-  // /dev/mqueue stays writable in a default container; it is masked explicitly.
-  assert.match(mqueue, /^\/dev\/mqueue:/u);
-  assert.match(mqueue, /noexec/u);
-  assert.match(mqueue, /nosuid/u);
-  assert.match(mqueue, /nodev/u);
+  // The approved profile bounds /tmp specifically; the root is read-only so nothing can
+  // fall back to a path that does not exist.
+  assert.match(tmp, /^\/tmp:rw,noexec,nosuid,nodev,size=/u);
+  // F01: a *writable* tmpfs at /dev/mqueue is not a mask. It must be read-only.
+  assert.match(mqueue, /^\/dev\/mqueue:ro,/u, "the mqueue mask must be read-only");
 });
 
 test("R7D.1-P-4: security profiles are named, never disabled", () => {
@@ -168,10 +188,13 @@ test("R7D.1-P-5: no host namespaces, ports, mounts, devices or capabilities are 
   for (const forbidden of ["--privileged", "--publish", "-p", "--volume", "-v", "--mount", "--device", "--cap-add", "--restart"]) {
     assert.equal(argv.includes(forbidden), false, `${forbidden} must never be emitted`);
   }
-  // Every namespace that would share with the host is set to private.
+  // F01: the namespace flags with no supported `private` value must not be emitted at all.
+  // Their private state is the daemon default and is verified from inspect, not requested
+  // with an invented value the CLI would reject.
   for (const flag of ["--pid", "--uts", "--userns"]) {
-    assert.equal(valueOf(argv, flag), "private", `${flag} must be private`);
+    assert.equal(argv.includes(flag), false, `${flag} must not be emitted with an unsupported value`);
   }
+  assert.equal(valueOf(argv, "--cgroupns"), "private");
 });
 
 test("R7D.1-P-6: core dumps are disabled", () => {
@@ -179,11 +202,36 @@ test("R7D.1-P-6: core dumps are disabled", () => {
   assert.equal(valueOf(argv, "--ulimit"), "core=0");
 });
 
-test("R7D.1-P-7: the only label carries an opaque id, never content", () => {
+test("R7D.1-P-7: ownership labels are complete, derived and content-free", () => {
+  // F01: one label could not tie a container to its boot, supervisor, image and profile, so
+  // an orphan from a previous boot could not be distinguished from a current one.
   const argv = buildCreateArgv(policy());
   const labels = allValuesOf(argv, "--label");
-  assert.equal(labels.length, 1);
-  assert.match(labels[0], /^dip\.execution=[a-f0-9]{32}$/u, "the label must be the opaque execution id");
+  assert.deepEqual(labels.slice().sort(), [
+    "dip.boot=boot-0001",
+    `dip.execution=0123456789abcdef0123456789abcdef`,
+    `dip.image=sha256:${"a".repeat(64)}`,
+    "dip.profile=synthetic-r7d-v1",
+    "dip.supervisor=sup-0001",
+  ].sort());
+  for (const label of labels) {
+    // Only the five derived identities. No field name, value or digest may appear.
+    assert.match(label, /^dip\.(execution|boot|supervisor|image|profile)=[A-Za-z0-9:._-]+$/u);
+  }
+});
+
+test("R7D.1-P-8: the no-pull policy is explicit, since the daemon default is `missing`", () => {
+  // Without this a missing image is fetched at execution time, which turns an immutable
+  // allowlist into a suggestion and makes runtime behaviour depend on the network.
+  const argv = buildCreateArgv(policy());
+  assert.equal(valueOf(argv, "--pull"), "never");
+});
+
+test("R7D.1-P-9: the daemon is targeted explicitly, not through ambient configuration", () => {
+  const argv = buildCreateArgv(policy());
+  assert.equal(valueOf(argv, "--host"), "unix:///var/run/docker.sock");
+  // DOCKER_CONFIG is pinned so no inherited context or credential helper applies.
+  assert.equal(DOCKER_ENV.DOCKER_CONFIG, "/run/dip-docker-client");
 });
 
 // ---------------------------------------------------------------------------------------
@@ -220,7 +268,13 @@ test("R7D.1-E-4: assertNoForbiddenFlags rejects each forbidden flag in both form
 test("R7D.1-E-5: every emitted flag is in the supported allowlist", () => {
   // A flag that appears in argv but not in SUPPORTED_FLAGS is a bug by definition. This is
   // what stops an unreviewed option from being added to a command shape by a future edit.
-  const argv = [...buildCreateArgv(policy()), ...buildStartArgv("n"), ...buildRemoveArgv("n"), ...buildInspectArgv("n")];
+  const executable = "a".repeat(64);
+  const argv = [
+    ...buildCreateArgv(policy()),
+    ...buildStartArgv("dip-exec-0123456789abcdef0123456789abcdef"),
+    ...buildRemoveArgv(executable),
+    ...buildInspectArgv(executable),
+  ];
   const flags = argv.filter((arg) => arg.startsWith("-"));
   for (const flag of flags) {
     assert.ok((SUPPORTED_FLAGS as readonly string[]).includes(flag), `unsupported flag emitted: ${flag}`);
@@ -232,10 +286,12 @@ test("R7D.1-E-5: every emitted flag is in the supported allowlist", () => {
 // ---------------------------------------------------------------------------------------
 
 test("R7D.1-I-1: inspect asks for exactly the fields the preflight verifies", () => {
-  const argv = buildInspectArgv("dip-exec-x");
+  const argv = buildInspectArgv("dip-exec-0123456789abcdef0123456789abcdef");
   const format = valueOf(argv, "--format");
   assert.ok(format, "inspect must use an explicit format");
-  for (const field of [".HostConfig.CgroupParent", ".Config.User", ".HostConfig.NetworkMode", ".HostConfig.IpcMode", ".HostConfig.PidMode", ".HostConfig.ReadonlyRootfs", ".HostConfig.Memory", ".HostConfig.MemorySwap", ".HostConfig.RestartPolicy.Name", ".HostConfig.LogConfig.Type", ".HostConfig.Privileged"]) {
+  // F01 added the fields that decide the corrections: cgroupns mode, the three namespace
+  // modes that must verify private-by-default, auto-remove, and the label/env sets.
+  for (const field of [".HostConfig.CgroupParent", ".Config.User", ".HostConfig.NetworkMode", ".HostConfig.IpcMode", ".HostConfig.PidMode", ".HostConfig.UTSMode", ".HostConfig.UsernsMode", ".HostConfig.CgroupnsMode", ".HostConfig.ReadonlyRootfs", ".HostConfig.Memory", ".HostConfig.MemorySwap", ".HostConfig.RestartPolicy.Name", ".HostConfig.LogConfig.Type", ".HostConfig.Privileged", ".HostConfig.AutoRemove", ".Config.Labels"]) {
     assert.ok(format?.includes(field), `inspect format must include ${field}`);
   }
   assert.equal(argv.includes("--type"), true, "inspect must be typed, so an image or volume of the same name is not returned");
@@ -250,8 +306,15 @@ test("R7D.1-V-1: the Docker environment is an allowlist and cannot redirect the 
   // DOCKER_HOST would let an inherited variable point the supervisor at a remote daemon,
   // putting containers outside host cgroup accounting and watchdog reach.
   assert.equal("DOCKER_HOST" in DOCKER_ENV, false, "DOCKER_HOST must not be inherited");
-  assert.equal("DOCKER_CONFIG" in DOCKER_ENV, false, "DOCKER_CONFIG must not be inherited");
+  // DOCKER_CONFIG is present but *pinned* to a controller-owned directory, which is the
+  // point: an inherited value must not reach the client. Absence alone would prove nothing,
+  // since Docker would then read the operator's own config and contexts.
+  assert.equal(DOCKER_ENV.DOCKER_CONFIG, "/run/dip-docker-client");
   // No proxy or application secret may leak into the daemon client.
   const keys = Object.keys(DOCKER_ENV);
-  assert.deepEqual(keys.sort(), ["DOCKER_CLI_HINTS", "NODE_ENV", "PATH"]);
+  // F01 added DOCKER_CONFIG (pinned, so no inherited context applies). It must never be
+  // allowed to point at a file the supervisor did not create.
+  assert.deepEqual(keys.sort(), ["DOCKER_CLI_HINTS", "DOCKER_CONFIG", "NODE_ENV", "PATH"]);
+  // No proxy variable may influence how the client reaches the socket.
+  for (const key of keys) assert.doesNotMatch(key, /PROXY/iu);
 });
