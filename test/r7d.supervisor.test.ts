@@ -797,6 +797,67 @@ function emptyStream(): NodeJS.ReadableStream {
 
 // ══ D2 · The readiness gate ═════════════════════════════════════════════════════════════════════
 
+test("R7D.1-SV-24b: an expired deadline refuses the body rather than inviting it", async () => {
+  // ## The defect this closes
+  //
+  // The deadline was enforced in exactly one place — immediately before the terminal commit — so
+  // between arming and readiness nothing checked it. A caller arriving after the budget expired was
+  // handed `READY_FOR_BODY` and invited to stream a document into a container the watchdog had
+  // already given up on. The executor would parse the whole thing and only then learn the deadline
+  // was gone.
+  //
+  // The clock is injected so the expiry is exact rather than a sleep: `startedMonotonicMs` is an
+  // anchor into the past, and `deadlineMs` is 20 s in these options.
+  const { journal, cleanup } = makeJournal();
+  try {
+    let now = 1_000;
+    const execution = new SupervisorExecution("a".repeat(32), "b".repeat(16), "fill", {
+      ...options(journal, seam(), ARM_ACK_STUB),
+      monotonicMs: () => now,
+    });
+    execution.recordIntent({ image: policy().image, profileId: "synthetic-v1", policy: policy(), startedMonotonicMs: 0 });
+    await execution.create();
+    await execution.startAndPreflight(() => ({ ok: true }));
+    await execution.armWatchdog();
+
+    // Armed, and inside the budget: readiness is granted.
+    // (20 s after `startedMonotonicMs: 0`; 19 000 ms is inside it.)
+    now = 19_000;
+    execution.readyForBody();
+    assert.equal(execution.currentPhase, "ready-for-body");
+
+    // Now a second execution on a fresh journal, armed but discovered late.
+    const late = makeJournal();
+    try {
+      let lateNow = 1_000;
+      const expired = new SupervisorExecution("a".repeat(32), "b".repeat(16), "fill", {
+        ...options(late.journal, seam(), ARM_ACK_STUB),
+        monotonicMs: () => lateNow,
+      });
+      expired.recordIntent({ image: policy().image, profileId: "synthetic-v1", policy: policy(), startedMonotonicMs: 0 });
+      await expired.create();
+      await expired.startAndPreflight(() => ({ ok: true }));
+      await expired.armWatchdog();
+
+      // Past the 20 s budget. The body must not be released.
+      lateNow = 20_000;
+      assert.throws(
+        () => expired.readyForBody(),
+        (error: unknown) => error instanceof LifecycleError
+          && (error as LifecycleError).refusal === "ARM_REFUSED"
+          && /deadline passed before the body was released/u.test(error.message),
+      );
+      assert.equal(expired.refusal, "ARM_REFUSED");
+      // The phase did not advance, so no caller can be told to write even if it ignores the throw.
+      assert.notEqual(expired.currentPhase, "ready-for-body");
+    } finally {
+      late.cleanup();
+    }
+  } finally {
+    cleanup();
+  }
+});
+
 test("R7D.1-SV-24: a body cannot be released before the watchdog is armed", async () => {
   // ## The defect this closes
   //

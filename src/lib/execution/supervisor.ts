@@ -559,6 +559,26 @@ export class SupervisorExecution {
       this.fail("NOT_READY");
       throw new LifecycleError("NOT_READY", `expected an armed execution, this one is in ${this.phase}`);
     }
+    // ## D2-F02: the deadline is enforced here, not only at the commit
+    //
+    // The check existed but ran in one place — just before the terminal commit — which is far too
+    // late to be a budget. Between arming and this line the supervisor waits for a caller, and a
+    // caller that arrives after the deadline would have been handed `READY_FOR_BODY` and invited to
+    // stream a document into a container whose watchdog deadline had already passed. The executor
+    // would read it, produce a result, and only then be told the budget was gone.
+    //
+    // Enforcing it here means an exhausted budget refuses the body *before* a byte is sent, which
+    // is the only point at which "refuse" costs nothing. The clock read is the last thing checked
+    // and the first thing acted on: nothing between the phase test and the transition can consume
+    // the budget that was just measured.
+    if (this.deadlineExpired()) {
+      // `ARM_REFUSED`, from the closed set, and not `NOT_READY`. The lifecycle is healthy and
+      // armed, so "not ready" would invite a retry that the deadline refuses again; the honest
+      // statement is that arming is no longer valid, because the authority it represents has a
+      // deadline and that deadline has passed.
+      this.fail("ARM_REFUSED");
+      throw new LifecycleError("ARM_REFUSED", "the execution deadline passed before the body was released");
+    }
     this.transition("ready-for-body");
   }
 
