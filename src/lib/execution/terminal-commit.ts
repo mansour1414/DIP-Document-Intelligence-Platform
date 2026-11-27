@@ -262,6 +262,9 @@ export function verifyTerminalCommit(
 }
 
 function stripDirection(context: TerminalContext): TerminalRequest {
-  const { direction: _direction, ...rest } = context;
-  return rest;
+  // The direction is part of the transcript, not of the message: it is decided by which side is
+  // signing, so travelling with the message would let a relay choose it.
+  const { direction, ...rest } = context as TerminalContext & { direction?: unknown };
+  void direction;
+  return rest as TerminalRequest;
 }
