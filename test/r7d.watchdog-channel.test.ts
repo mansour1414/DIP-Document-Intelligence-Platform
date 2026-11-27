@@ -104,6 +104,8 @@ async function startWatchdog(): Promise<{
       DIP_WATCHDOG_SOCKET: socketPath,
       DIP_WATCHDOG_SECRET: secret.toString("hex"),
       DIP_WATCHDOG_STATE: stateDir,
+      // D2-F03: the supervisor's journal is mandatory, so every entry point needs one.
+      DIP_WATCHDOG_JOURNAL: join(root, "journal"),
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -453,6 +455,8 @@ test("R7D.1-WD01-11: a watchdog with an unreadable record refuses to become read
       DIP_WATCHDOG_SOCKET: socketPath,
       DIP_WATCHDOG_SECRET: randomBytes(32).toString("hex"),
       DIP_WATCHDOG_STATE: stateDir,
+      // D2-F03: the supervisor's journal is mandatory, so every entry point needs one.
+      DIP_WATCHDOG_JOURNAL: join(root, "journal"),
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -730,6 +734,8 @@ async function runWithRecord(record: Record<string, unknown>): Promise<{ code: n
       DIP_WATCHDOG_SOCKET: join(root, "watchdog.sock"),
       DIP_WATCHDOG_SECRET: randomBytes(32).toString("hex"),
       DIP_WATCHDOG_STATE: stateDir,
+      // D2-F03: the supervisor's journal is mandatory, so every entry point needs one.
+      DIP_WATCHDOG_JOURNAL: join(root, "journal"),
     },
     stdio: ["ignore", "pipe", "pipe"],
   });

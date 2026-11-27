@@ -70,16 +70,49 @@ ARG TARGETOS=linux
 # below fails closed with a readable message instead.
 ARG TARGETARCH
 
-# The lockfile is the authority. `npm ci` installs exactly it and fails if package.json and the
-# lockfile disagree, so the artifact cannot silently contain a different graph than CI tested.
+# ## D2-F05: Docker's architecture names are not Node's
+#
+# BuildKit sets `TARGETARCH` to the Docker/Go spelling: `amd64`, `arm64`, `386`, `arm`. npm's
+# `--cpu` flag and the `@napi-rs/canvas-<os>-<cpu>-gnu` package name use Node's spelling: `x64`,
+# `arm64`, `ia32`, `arm`. The guard below previously accepted `arm64|x64` and then passed the value
+# straight to `npm ci --cpu`, so:
+#
+#   - a real x64 build (`TARGETARCH=amd64`) was **rejected**, because `amd64` was not in the case
+#     pattern. The documented `--build-arg TARGETARCH=x64` therefore produced a closure whose
+#     `@napi-rs/canvas-linux-x64-gnu` package was filtered out by npm's own platform check, and the
+#     image failed at the first document with `MODULE_NOT_FOUND`.
+#
+# The mapping is explicit and total: one case statement turns the Docker names into Node names, and
+# an unsupported value fails closed. Nothing is defaulted, and nothing is guessed from the builder.
 COPY package.json package-lock.json ./
 RUN case "${TARGETARCH}" in \
-      arm64|x64) echo "resolving native closure for ${TARGETOS}/${TARGETARCH}" ;; \
+      amd64)   NODE_CPU=x64   ;; \
+      x64)     NODE_CPU=x64   ;; \
+      arm64)   NODE_CPU=arm64 ;; \
+      aarch64) NODE_CPU=arm64 ;; \
       *) echo "FATAL: TARGETARCH='${TARGETARCH}' is not a supported canvas target." >&2; \
-         echo "BuildKit supplies this automatically. With the classic builder pass" >&2; \
-         echo "  --build-arg TARGETARCH=arm64   (or x64)." >&2; exit 1 ;; \
+         echo "BuildKit supplies this automatically from the target platform." >&2; \
+         echo "With the classic builder pass --build-arg TARGETARCH=amd64 (or arm64)." >&2; \
+         exit 1 ;; \
     esac \
- && npm ci --no-audit --no-fund --ignore-scripts --os=${TARGETOS} --cpu=${TARGETARCH}
+ && echo "resolving native closure for ${TARGETOS}/${TARGETARCH} as npm cpu=${NODE_CPU}" \
+ && npm ci --no-audit --no-fund --ignore-scripts --os=${TARGETOS} --cpu=${NODE_CPU}
+
+# The stage-scoped record of the resolved npm cpu, for the runtime stage.
+#
+# `ARG` is stage-scoped in Docker: an `ARG` declared in one stage does not exist in the next, which
+# is why the `COPY --from=deps .../canvas-${TARGETOS}-${TARGETARCH}-gnu` line in the runtime stage
+# below expanded `TARGETARCH` to the empty string and copied from a path that was never populated.
+# Writing the resolved value to a file lets the runtime stage read what the deps stage *decided*
+# rather than re-deriving it from an `ARG` it cannot see.
+RUN case "${TARGETARCH}" in \
+      amd64|x64)   NODE_CPU=x64   ;; \
+      arm64|aarch64) NODE_CPU=arm64 ;; \
+      *) echo "FATAL: TARGETARCH='${TARGETARCH}' is not a supported canvas target." >&2; exit 1 ;; \
+    esac \
+ && printf '%s\n' "${NODE_CPU}" > /build/.node-cpu \
+ && test -d "/build/node_modules/@napi-rs/canvas-linux-${NODE_CPU}-gnu" \
+ && cp -a "/build/node_modules/@napi-rs/canvas-linux-${NODE_CPU}-gnu" /build/native-canvas
 
 # ---------------------------------------------------------------------------------------
 # Stage 2 — precompile the executor
@@ -145,7 +178,32 @@ COPY --from=deps /build/node_modules/@pdf-lib/upng ./node_modules/@pdf-lib/upng
 # acceptance host with a `MODULE_NOT_FOUND` for the .node file — after a successful build, and
 # only at the first document.
 COPY --from=deps /build/node_modules/@napi-rs/canvas ./node_modules/@napi-rs/canvas
-COPY --from=deps /build/node_modules/@napi-rs/canvas-${TARGETOS}-${TARGETARCH}-gnu ./node_modules/@napi-rs/canvas-${TARGETOS}-${TARGETARCH}-gnu
+
+# ## D2-F05: the native binding is placed by the name the deps stage resolved
+#
+# `ARG` is **stage-scoped**: the `TARGETOS`/`TARGETARCH` declared before the deps stage do not exist
+# here, so the previous `COPY .../canvas-${TARGETOS}-${TARGETARCH}-gnu` expanded both variables to
+# the empty string and copied from `/build/node_modules/@napi-rs/canvas--gnu`, a path that is never
+# populated. The failure is invisible at build time (an empty expansion is a normal string to
+# `COPY`) and appears only when the executor is started.
+#
+# They are therefore redeclared in this stage, so `TARGETOS` is available for the path below and an
+# invalid architecture fails here rather than producing a silently wrong image.
+ARG TARGETOS=linux
+ARG TARGETARCH
+
+# The npm `cpu` name is *not* `TARGETARCH`: Docker says `amd64`, Node says `x64`. Rather than repeat
+# that mapping in a second place — where the two could drift — the deps stage records the name it
+# resolved, and this stage reads it. The directory the loader requires is
+# `@napi-rs/canvas-linux-<cpu>-gnu`, so it is renamed into that exact position.
+COPY --from=deps /build/.node-cpu /tmp/.node-cpu
+COPY --from=deps /build/native-canvas /tmp/native-canvas
+RUN NODE_CPU="$(cat /tmp/.node-cpu)" \
+ && case "${NODE_CPU}" in x64|arm64) ;; *) echo "FATAL: the deps stage resolved an unusable cpu '${NODE_CPU}'" >&2; exit 1 ;; esac \
+ && mv /tmp/native-canvas "/app/node_modules/@napi-rs/canvas-linux-${NODE_CPU}-gnu" \
+ && rm -f /tmp/.node-cpu \
+ && test -f "/app/node_modules/@napi-rs/canvas-linux-${NODE_CPU}-gnu/package.json" \
+ && echo "native canvas binding installed for linux/${NODE_CPU} (target ${TARGETOS}/${TARGETARCH})"
 COPY --from=deps /build/node_modules/@fontsource/noto-sans-arabic ./node_modules/@fontsource/noto-sans-arabic
 COPY --from=deps /build/node_modules/pako ./node_modules/pako
 COPY --from=deps /build/node_modules/tslib ./node_modules/tslib

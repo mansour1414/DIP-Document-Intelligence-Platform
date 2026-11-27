@@ -590,36 +590,48 @@ test("R7D.1-WD04-4 (mocked cgroup): an expired disarm leaves the termination deb
 
 test("R7D.1-WD04-5 (mocked cgroup): termination records the two debts separately", async () => {
   // The process question and the container question are answered from different sources, and one
-  // does not imply the other.
+  // does not imply the other. Here the kernel confirms no tasks remain while the daemon still
+  // reports the container present — the shape of a stopped-but-not-removed container.
   //
-  // WD-F03 note: this harness has no real pin, so ownership cannot be re-established at termination
-  // time and the watchdog *refuses to signal*. A test that wants the removal debt discharged
-  // therefore has to model the removal explicitly — which is the honest shape of the sequence: the
-  // supervisor removes the container, and the watchdog only observes that it is gone.
-  const harness = makeWatchdog({ observeLifecycle: true });
+  // D2-F01 changed which of the two can be unanswerable without blocking the other: an execution
+  // that was identified while this process was running is signalled on kernel authority, so the
+  // process debt can close while the metadata debt stays owed.
+  let afterArm = false;
+  const harness = makeWatchdog({
+    liveTree: { populated: false },
+    observation: (expected) => (afterArm
+      ? { state: "present", containerId: expected.containerId, labels: {}, detail: "stopped but present" }
+      : { state: "present", containerId: expected.containerId, labels: {}, detail: "present" }),
+  });
   try {
     await armAndAssert(harness, EXECUTION, { deadlineMs: 1_000 });
+    afterArm = true;
     harness.clock.advance(2_000);
     const [due] = harness.watchdog.dueForTermination();
     assert.ok(due !== undefined);
     const report = await harness.watchdog.terminate(due);
-    // No ownership evidence at termination time, so the target is not signalled and nothing is
-    // confirmed. This is the "unverified target is not signalled" half of WD-F03.
-    assert.equal(report.killWritten, false);
-    assert.equal(report.containerRemovalConfirmed, false);
 
-    // The execution is now quarantined with an unresolved process debt. It is *not* retried,
-    // because ownership could not be re-established — an unverified target is never signalled
-    // twice. This is the deliberate limit of WD-F03, and the debt stays on the record for an
-    // operator to resolve.
+    // The processes are gone: the cgroup reports no tasks, so the process debt is discharged.
+    assert.equal(report.processTerminationConfirmed, true);
+    // The container is positively present, so the metadata debt is not. D2-F04 attempts removal by
+    // exact id; with no removal seam configured, the attempt cannot discharge it, and the report
+    // says so rather than inferring removal from the absent processes.
+    assert.equal(report.containerRemovalConfirmed, false);
+    assert.equal(report.resolved, false);
+
+    // The two debts are recorded independently, which is what lets a later turn do only the
+    // metadata work — no second signal at an empty cgroup.
     const record = harness.watchdog.state(EXECUTION).record;
     assert.equal(record?.phase, "quarantined");
-    assert.equal(record?.processDebt, "unresolved");
+    assert.equal(record?.processDebt, "termination-confirmed");
     assert.equal(record?.containerDebt, "unresolved");
+    // The retry is eligible once the backoff has elapsed. It is the metadata debt alone.
+    harness.clock.advance(6_000);
+    const retry = harness.watchdog.dueForTermination();
     assert.deepEqual(
-      harness.watchdog.dueForTermination(),
-      [],
-      "an execution whose ownership cannot be re-established must not be retried automatically",
+      retry.map((entry) => entry.reason),
+      ["unresolved-container"],
+      "only the metadata work is retried, not the process signal",
     );
   } finally {
     harness.cleanup();

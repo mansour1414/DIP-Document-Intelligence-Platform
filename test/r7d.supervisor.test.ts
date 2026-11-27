@@ -31,7 +31,7 @@ import { preflightContainer, preflightKernel } from "../src/lib/execution/prefli
 import { admit, newAdmissionState, release, reserve, startSupervisorServer } from "../src/lib/execution/supervisor-server";
 import { OwnershipJournal } from "../src/lib/execution/ownership-journal";
 import { INSPECT_FORMAT, SYNTHETIC_PROFILE, type ExecutionPolicy, type DockerOutcome } from "../src/lib/execution/docker-lifecycle";
-import { signDisarmGrant } from "../src/lib/execution/watchdog-protocol";
+import { signDisarmGrant, type ArmAck } from "../src/lib/execution/watchdog-protocol";
 import type { TerminalRequest } from "../src/lib/execution/terminal-auth";
 
 const WATCHDOG_SECRET = randomBytes(32);
@@ -127,6 +127,7 @@ function options(journal: OwnershipJournal, docker: DockerSeam, watchdog?: Super
     docker,
     watchdog,
     monotonicMs: () => 1_000,
+    hostFacts: HOST_FACTS,
   };
 }
 
@@ -160,8 +161,63 @@ function seam(overrides: Partial<DockerSeam> = {}): DockerSeam {
     remove: async () => ({ ok: true, value: { removed: true } }),
     kill: async () => ({ ok: true, value: { killed: true } }),
     start: async () => session,
+    // D2: the running container's init process, by exact id. The PID is arbitrary but stable, and
+    // the host facts below answer for it.
+    state: async (id: string) => ({ ok: true, value: { pid: 4_242, running: true, containerId: id } }),
     ...overrides,
   };
+}
+
+/**
+ * The kernel facts preflight reads, answered from a fixture.
+ *
+ * **Mocked evidence.** This environment has no writable cgroup2 mount and no Docker daemon, so a
+ * real container cannot be observed. The fixture answers consistently — the same cgroup for the
+ * same PID — which is what makes the *sequence* under test meaningful; it establishes nothing about
+ * kernel enforcement.
+ */
+const HOST_FACTS = Object.freeze({
+  // The arguments are part of the contract preflight uses; the fixture answers the same cgroup for
+  // any pid because there is only one container in these tests.
+  startTimeTicks: () => 100,
+  cgroupMembership: () => `/dip-executor.slice/dip-exec-${"a".repeat(32)}`,
+  cgroup2Mount: () => ({ path: "/sys/fs/cgroup", device: "0:25" }),
+});
+
+
+/**
+ * Walk the lifecycle from intent to a released body.
+ *
+ * D2 changed the gate: `readyForBody` now requires `armed`, not merely `preflight-passed`. A test
+ * that wants to describe a released body therefore has to arm, and arming requires an ack that
+ * matches the observation preflight took — which is the point of the gate, so the helper supplies
+ * exactly that rather than a permissive stub.
+ */
+const ARM_ACK_STUB: SupervisorOptions["watchdog"] = {
+  arm: async (request) => ({
+    kind: "ARM_ACK",
+    messageId: request.messageId,
+    executionId: request.executionId,
+    watchdogInstance: "wd-0123456789ab",
+    observedCgroupDirInode: 1,
+    observedCgroupEventsInode: 2,
+    observedCgroupKillInode: 3,
+    observedCgroupProcsInode: 4,
+    observedCgroupDevice: "0:25",
+    observedBootId: "boot-0123456789",
+    armedAtMonotonicMs: request.startedMonotonicMs,
+    proof: "0".repeat(64),
+  }),
+  disarm: async () => ({ code: "UNCERTAIN" }),
+};
+
+/** Record, create, start, preflight and arm — the sequence that releases a body. */
+async function armToReady(execution: SupervisorExecution): Promise<void> {
+  execution.recordIntent({ image: policy().image, profileId: "synthetic-v1", policy: policy(), startedMonotonicMs: 0 });
+  await execution.create();
+  await execution.startAndPreflight(() => ({ ok: true }));
+  await execution.armWatchdog();
+  execution.readyForBody();
 }
 
 test("R7D.1-SV-1: a container is not created until the intent is durable", async () => {
@@ -169,7 +225,7 @@ test("R7D.1-SV-1: a container is not created until the intent is durable", async
   try {
     let created = 0;
     const docker = seam({ create: async () => { created += 1; return { ok: true, value: { containerId: "c".repeat(64) } }; } });
-    const execution = new SupervisorExecution("a".repeat(32), "b".repeat(16), "fill", options(journal, docker));
+    const execution = new SupervisorExecution("a".repeat(32), "b".repeat(16), "fill", options(journal, docker, ARM_ACK_STUB));
 
     // Skipping `recordIntent` must make `create` refuse, not fall through to the daemon.
     await assert.rejects(execution.create(), (error: unknown) => error instanceof LifecycleError);
@@ -228,7 +284,10 @@ test("R7D.1-SV-4: the caller is not invited to send a body until preflight and a
   const { journal, cleanup } = makeJournal();
   try {
     const execution = new SupervisorExecution("a".repeat(32), "b".repeat(16), "fill", options(journal, seam(), {
-      arm: async () => ({ kind: "ARM_ACK", messageId: "1".repeat(16), executionId: "a".repeat(32), watchdogInstance: "wd-0123456789ab", observedCgroupDirInode: 1, observedCgroupEventsInode: 2, observedCgroupKillInode: 3, observedCgroupProcsInode: 4, observedCgroupDevice: "0:25", observedBootId: "boot-0123456789", armedAtMonotonicMs: 1_000, proof: "0".repeat(64) }),
+      // D2: the ack must echo the exchange it answers. A stub with a fixed message id is a
+      // different exchange, and the supervisor now refuses it — which is the check under test
+      // elsewhere and must not be tripped by the fixture here.
+      arm: async (request) => ({ kind: "ARM_ACK", messageId: request.messageId, executionId: request.executionId, watchdogInstance: "wd-0123456789ab", observedCgroupDirInode: 1, observedCgroupEventsInode: 2, observedCgroupKillInode: 3, observedCgroupProcsInode: 4, observedCgroupDevice: "0:25", observedBootId: "boot-0123456789", armedAtMonotonicMs: request.startedMonotonicMs, proof: "0".repeat(64) }),
       disarm: async () => ({ proof: "0".repeat(64) }),
     }));
 
@@ -255,7 +314,7 @@ test("R7D.1-SV-5: a failed preflight blocks the invitation and terminates the co
       inspect: async () => ({ ok: true, value: { raw: Object.values(conformingInspect({ "HostConfig.NetworkMode": "bridge" })).join("|") } }),
       kill: async () => { killed += 1; return { ok: true, value: { killed: true } }; },
     });
-    const execution = new SupervisorExecution("a".repeat(32), "b".repeat(16), "fill", options(journal, docker));
+    const execution = new SupervisorExecution("a".repeat(32), "b".repeat(16), "fill", options(journal, docker, ARM_ACK_STUB));
     execution.recordIntent({ image: policy().image, profileId: "synthetic-v1", policy: policy(), startedMonotonicMs: 0 });
     await execution.create();
 
@@ -394,15 +453,8 @@ test("R7D.1-SV-10: removal must be confirmed by inspection, not by the daemon's 
       remove: async () => ({ ok: true, value: { removed: true } }),
       inspect: async () => ({ ok: true, value: { raw: Object.values(conformingInspect()).join("|") } }),
     });
-    const execution = new SupervisorExecution("a".repeat(32), "b".repeat(16), "fill", options(journal, docker));
-    execution.recordIntent({ image: policy().image, profileId: "synthetic-v1", policy: policy(), startedMonotonicMs: 0 });
-    await execution.create();
-    await execution.startAndPreflight(() => ({ ok: true }));
-    execution.setObservation({
-      containerId: "c".repeat(64), imageDigest: policy().image, initPid: 1, initStartTimeTicks: 0,
-      cgroupPath: "/sys/fs/cgroup/x", startedMonotonicMs: 0, effective: conformingInspect(),
-    });
-    execution.readyForBody();
+    const execution = new SupervisorExecution("a".repeat(32), "b".repeat(16), "fill", options(journal, docker, ARM_ACK_STUB));
+    await armToReady(execution);
 
     await assert.rejects(
       execution.terminateAndRemove(),
@@ -426,15 +478,8 @@ test("R7D.1-SV-11: an ambiguous removal is a refusal, not an assumption", async 
         return { ok: false, fault: "DAEMON_UNAVAILABLE", ambiguous: true, detail: "socket gone" };
       },
     });
-    const execution = new SupervisorExecution("a".repeat(32), "b".repeat(16), "fill", options(journal, docker));
-    execution.recordIntent({ image: policy().image, profileId: "synthetic-v1", policy: policy(), startedMonotonicMs: 0 });
-    await execution.create();
-    await execution.startAndPreflight(() => ({ ok: true }));
-    execution.setObservation({
-      containerId: "c".repeat(64), imageDigest: policy().image, initPid: 1, initStartTimeTicks: 0,
-      cgroupPath: "/sys/fs/cgroup/x", startedMonotonicMs: 0, effective: conformingInspect(),
-    });
-    execution.readyForBody();
+    const execution = new SupervisorExecution("a".repeat(32), "b".repeat(16), "fill", options(journal, docker, ARM_ACK_STUB));
+    await armToReady(execution);
     await assert.rejects(
       execution.terminateAndRemove(),
       (error: unknown) => (error as LifecycleError).refusal === "REMOVAL_UNCONFIRMED",
@@ -629,19 +674,15 @@ test("R7D.1-SV-19: the terminal commit requires a verified watchdog grant", asyn
       // Present for preflight, absent afterwards: the container really is removed.
       inspect: sequenceInspect(),
     }), {
-      arm: async () => ({ kind: "ARM_ACK", messageId: "1".repeat(16), executionId: "a".repeat(32), watchdogInstance: "wd-0123456789ab", observedCgroupDirInode: 1, observedCgroupEventsInode: 2, observedCgroupKillInode: 3, observedCgroupProcsInode: 4, observedCgroupDevice: "0:25", observedBootId: "boot-0123456789", armedAtMonotonicMs: 1_000, proof: "0".repeat(64) }),
+      // D2: the ack must echo the exchange it answers. A stub with a fixed message id is a
+      // different exchange, and the supervisor now refuses it — which is the check under test
+      // elsewhere and must not be tripped by the fixture here.
+      arm: async (request) => ({ kind: "ARM_ACK", messageId: request.messageId, executionId: request.executionId, watchdogInstance: "wd-0123456789ab", observedCgroupDirInode: 1, observedCgroupEventsInode: 2, observedCgroupKillInode: 3, observedCgroupProcsInode: 4, observedCgroupDevice: "0:25", observedBootId: "boot-0123456789", armedAtMonotonicMs: request.startedMonotonicMs, proof: "0".repeat(64) }),
       // A grant whose proof is not a valid signature. The supervisor must verify it rather than
       // accepting the watchdog's word.
       disarm: async () => ({ proof: "0".repeat(64) }),
     }));
-    execution.recordIntent({ image: policy().image, profileId: "synthetic-v1", policy: policy(), startedMonotonicMs: 0 });
-    await execution.create();
-    await execution.startAndPreflight(() => ({ ok: true }));
-    execution.setObservation({
-      containerId: "c".repeat(64), imageDigest: policy().image, initPid: 1, initStartTimeTicks: 0,
-      cgroupPath: "/sys/fs/cgroup/x", startedMonotonicMs: 0, effective: conformingInspect(),
-    });
-    execution.readyForBody();
+    await armToReady(execution);
     await execution.terminateAndRemove();
 
     await assert.rejects(
@@ -671,21 +712,17 @@ test("R7D.1-SV-20: a correctly signed grant produces a commit the caller can ver
     };
     let seen: TerminalRequest | null = null;
     const execution = new SupervisorExecution("a".repeat(32), "b".repeat(16), "fill", options(journal, seam({ inspect: sequenceInspect() }), {
-      arm: async () => ({ kind: "ARM_ACK", messageId: "1".repeat(16), executionId: "a".repeat(32), watchdogInstance: "wd-0123456789ab", observedCgroupDirInode: 1, observedCgroupEventsInode: 2, observedCgroupKillInode: 3, observedCgroupProcsInode: 4, observedCgroupDevice: "0:25", observedBootId: "boot-0123456789", armedAtMonotonicMs: 1_000, proof: "0".repeat(64) }),
+      // D2: the ack must echo the exchange it answers. A stub with a fixed message id is a
+      // different exchange, and the supervisor now refuses it — which is the check under test
+      // elsewhere and must not be tripped by the fixture here.
+      arm: async (request) => ({ kind: "ARM_ACK", messageId: request.messageId, executionId: request.executionId, watchdogInstance: "wd-0123456789ab", observedCgroupDirInode: 1, observedCgroupEventsInode: 2, observedCgroupKillInode: 3, observedCgroupProcsInode: 4, observedCgroupDevice: "0:25", observedBootId: "boot-0123456789", armedAtMonotonicMs: request.startedMonotonicMs, proof: "0".repeat(64) }),
       disarm: async (request) => {
         seen = request;
         const grant = signDisarmGrant(WATCHDOG_SECRET, request);
         return { proof: grant.proof };
       },
     }));
-    execution.recordIntent({ image: policy().image, profileId: "synthetic-v1", policy: policy(), startedMonotonicMs: 0 });
-    await execution.create();
-    await execution.startAndPreflight(() => ({ ok: true }));
-    execution.setObservation({
-      containerId: "c".repeat(64), imageDigest: policy().image, initPid: 1, initStartTimeTicks: 0,
-      cgroupPath: "/sys/fs/cgroup/x", startedMonotonicMs: 0, effective: conformingInspect(),
-    });
-    execution.readyForBody();
+    await armToReady(execution);
     await execution.terminateAndRemove();
 
     const result = await execution.authorize({
@@ -710,13 +747,10 @@ test("R7D.1-SV-20: a correctly signed grant produces a commit the caller can ver
 test("R7D.1-SV-21: a result that does not match its declaration is discarded, not truncated", async () => {
   const { journal, cleanup } = makeJournal();
   try {
-    const execution = new SupervisorExecution("a".repeat(32), "b".repeat(16), "fill", options(journal, seam(), undefined));
-    execution.recordIntent({ image: policy().image, profileId: "synthetic-v1", policy: policy(), startedMonotonicMs: 0 });
-    await execution.create();
+    const execution = new SupervisorExecution("a".repeat(32), "b".repeat(16), "fill", options(journal, seam(), ARM_ACK_STUB));
     // A start seam whose result stream yields nothing at all: the frame is absent, so the stream
     // faults rather than reporting a zero-byte document.
-    await execution.startAndPreflight(() => ({ ok: true }));
-    execution.readyForBody();
+    await armToReady(execution);
     await execution.streamInput(emptyStream());
     await assert.rejects(
       execution.collectResult({ bytes: 0, digest: "0".repeat(64) }),
@@ -731,11 +765,8 @@ test("R7D.1-SV-21: a result that does not match its declaration is discarded, no
 test("R7D.1-SV-22: the body is bounded by the configured input limit", async () => {
   const { journal, cleanup } = makeJournal();
   try {
-    const execution = new SupervisorExecution("a".repeat(32), "b".repeat(16), "fill", options(journal, seam()));
-    execution.recordIntent({ image: policy().image, profileId: "synthetic-v1", policy: policy(), startedMonotonicMs: 0 });
-    await execution.create();
-    await execution.startAndPreflight(() => ({ ok: true }));
-    execution.readyForBody();
+    const execution = new SupervisorExecution("a".repeat(32), "b".repeat(16), "fill", options(journal, seam(), ARM_ACK_STUB));
+    await armToReady(execution);
     // The limit in this harness is 1024 bytes; 2 KiB must be refused mid-stream, not after it is
     // fully read.
     await assert.rejects(
@@ -785,3 +816,132 @@ function emptyStream(): NodeJS.ReadableStream {
     [Symbol.asyncIterator]: async function* () {},
   } as unknown as NodeJS.ReadableStream;
 }
+
+// ══ D2 · The readiness gate ═════════════════════════════════════════════════════════════════════
+
+test("R7D.1-SV-24: a body cannot be released before the watchdog is armed", async () => {
+  // ## The defect this closes
+  //
+  // `readyForBody` used to accept `preflight-passed`. A supervisor could therefore invite a caller to
+  // stream a document into a container that no deadline was enforced against, and if the arm was
+  // then refused the bytes were already in flight.
+  const { journal, cleanup } = makeJournal();
+  try {
+    const execution = new SupervisorExecution("a".repeat(32), "b".repeat(16), "fill", options(journal, seam(), ARM_ACK_STUB));
+    execution.recordIntent({ image: policy().image, profileId: "synthetic-v1", policy: policy(), startedMonotonicMs: 0 });
+    await execution.create();
+    await execution.startAndPreflight(() => ({ ok: true }));
+    // Preflight passed. The watchdog has not been asked.
+    assert.throws(
+      () => execution.readyForBody(),
+      (error: unknown) => error instanceof LifecycleError
+        && (error as LifecycleError).refusal === "ARM_REFUSED"
+        && /before the watchdog is armed/u.test(error.message),
+    );
+    // And the refusal is recorded, so a caller cannot retry into a released body.
+    assert.equal(execution.refusal, "ARM_REFUSED");
+
+    // After arming, the same call succeeds. A fresh journal, because one execution identity may only
+    // advance through one journal's sequence — a second record for the same id in the same run is a
+    // fencing violation, which the journal refuses (correctly).
+    const second = makeJournal();
+    try {
+      const armed = new SupervisorExecution("a".repeat(32), "b".repeat(16), "fill", options(second.journal, seam(), ARM_ACK_STUB));
+      await armToReady(armed);
+      assert.equal(armed.currentPhase, "ready-for-body");
+    } finally {
+      second.cleanup();
+    }
+  } finally {
+    cleanup();
+  }
+});
+
+test("R7D.1-SV-25: an arm ack describing a different exchange is refused", async () => {
+  // Every field the acknowledgement can disagree with is checked: the exchange id, the watchdog
+  // instance, the boot, and the cgroup identity. A stub that agrees with the supervisor on the
+  // execution but not on the message is still a different arm.
+  const { cleanup } = makeJournal();
+  // Only the fields an honest ack has, so an override cannot change the discriminant.
+  type AckFields = Omit<ArmAck, "kind">;
+  const cases: Array<[string, Partial<AckFields>]> = [
+    ["message", { messageId: "f".repeat(16) }],
+    ["execution", { executionId: "f".repeat(32) }],
+    ["instance", { watchdogInstance: "wd-impostor-1" }],
+    ["boot", { observedBootId: "00000000-0000-4000-8000-000000000000" }],
+  ];
+  for (const [name, override] of cases) {
+    // One journal per case: the same execution identity cannot be recorded twice in one journal.
+    const caseJournal = makeJournal();
+    try {
+      // A stub that answers with an ack identical to the honest one except for one field. Written
+      // out rather than spread, so the type is an `ArmAck` and not a union of every stub shape.
+      const watchdog: NonNullable<SupervisorOptions["watchdog"]> = {
+        arm: async (request): Promise<ArmAck> => ({
+          kind: "ARM_ACK",
+          messageId: request.messageId,
+          executionId: request.executionId,
+          watchdogInstance: "wd-0123456789ab",
+          observedCgroupDirInode: 1,
+          observedCgroupEventsInode: 2,
+          observedCgroupKillInode: 3,
+          observedCgroupProcsInode: 4,
+          observedCgroupDevice: "0:25",
+          observedBootId: "boot-0123456789",
+          armedAtMonotonicMs: request.startedMonotonicMs,
+          proof: "0".repeat(64),
+          ...override,
+        }),
+        disarm: async () => ({ code: "UNCERTAIN" }),
+      };
+      const execution = new SupervisorExecution("a".repeat(32), "b".repeat(16), "fill", options(caseJournal.journal, seam(), watchdog));
+      execution.recordIntent({ image: policy().image, profileId: "synthetic-v1", policy: policy(), startedMonotonicMs: 0 });
+      await execution.create();
+      await execution.startAndPreflight(() => ({ ok: true }));
+      await assert.rejects(
+        execution.armWatchdog(),
+        (error: unknown) => error instanceof LifecycleError && (error as LifecycleError).refusal === "ARM_REFUSED",
+        name,
+      );
+      // And no body may be released after a refused arm.
+      assert.throws(() => execution.readyForBody(), (error: unknown) => error instanceof LifecycleError);
+      assert.notEqual(execution.currentPhase, "ready-for-body", name);
+    } finally {
+      caseJournal.cleanup();
+      cleanup();
+    }
+  }
+});
+
+test("R7D.1-SV-26: a commit is refused after the deadline, before the watchdog is even asked", async () => {
+  // D2-F02 at the supervisor boundary: the deadline is re-decided immediately before the commit is
+  // requested. A clock that has moved past the budget refuses without a disarm attempt, so no grant
+  // can be minted for an execution that already expired.
+  const { journal, cleanup } = makeJournal();
+  try {
+    let now = 0;
+    let disarms = 0;
+    const watchdog: NonNullable<SupervisorOptions["watchdog"]> = {
+      ...ARM_ACK_STUB!,
+      disarm: async () => { disarms += 1; return { code: "UNCERTAIN" }; },
+    };
+    const execution = new SupervisorExecution("a".repeat(32), "b".repeat(16), "fill", {
+      ...options(journal, seam({ inspect: sequenceInspect() }), watchdog),
+      limits: { deadlineMs: 1_000, maxInputBytes: 1024, maxOutputBytes: 4096, maxBufferedBytes: 1024 },
+      monotonicMs: () => now,
+    });
+    await armToReady(execution);
+    await execution.terminateAndRemove();
+    // The budget is 1 s. The clock moves past it between removal and the commit.
+    now = 2_000;
+    await assert.rejects(
+      execution.authorize({ requestId: "b".repeat(16), resultBytes: 10, resultDigest: "e".repeat(64), metaBytes: 128, outcome: "committed", nonce: "0123456789abcdef" }),
+      (error: unknown) => error instanceof LifecycleError
+        && (error as LifecycleError).refusal === "COMMIT_REFUSED"
+        && /deadline passed/u.test(error.message),
+    );
+    assert.equal(disarms, 0, "an expired execution must not even ask the watchdog for a grant");
+  } finally {
+    cleanup();
+  }
+});

@@ -115,6 +115,19 @@ type LiveExecution = {
   issuedGrants: Set<string>;
 };
 
+/**
+ * Whether one termination attempt may signal its target, and on what authority.
+ *
+ * - `terminate` — the target may be signalled. `dockerIndependent` records that the daemon did not
+ *   confirm the identity during this attempt, so the authority came from established ownership and
+ *   the pinned descriptor alone (D2-F01). A report carrying it is evidence that the kernel carried
+ *   the attempt, not the daemon.
+ * - `quarantine` — nothing may be signalled. The debt stays owed.
+ */
+export type TerminationAuthority =
+  | { kind: "terminate"; dockerIndependent: boolean; detail: string }
+  | { kind: "quarantine"; detail: string };
+
 /** What the watchdog observed, or why it refused. */
 export type HostVerification =
   | {
@@ -241,6 +254,15 @@ export type WatchdogOptions = {
    */
   observeContainer: (expected: ExpectedOwnership) => Promise<ContainerObservation>;
   /**
+   * Remove one container by exact id (D2-F04).
+   *
+   * Optional, and its absence is not a way to skip the metadata debt: without it a present
+   * container simply stays owed. It only ever receives the exact 64-character id recorded at arm
+   * time — never a name, a label selector or a prefix — so one execution cannot remove another's
+   * container even if it wanted to.
+   */
+  removeContainer?: (containerId: string) => Promise<{ ok: boolean; detail: string }>;
+  /**
    * Read the actual cgroup a PID is in, from the host. Injected so ownership can be tested where
    * no container exists; the production default reads `/proc/<pid>/cgroup`.
    */
@@ -308,6 +330,15 @@ export type TerminationReport = {
    * observable rather than silent. WD-F03 makes it a hard precondition instead of an assertion.
    */
   signalledUnverified?: boolean;
+  /**
+   * The signal was authorized by established ownership and the pinned descriptor alone, without
+   * the daemon confirming the identity during this attempt (D2-F01).
+   *
+   * Reported so the evidence class of a termination is visible: a Docker-independent termination
+   * says the kernel carried it. It is never a weaker result — an unverified target is refused, not
+   * signalled independently.
+   */
+  dockerIndependent?: boolean;
   /** `cgroup.events` reported `populated 0`. Positive proof that no tasks remain. */
   processTerminationConfirmed: boolean;
   /** The exact container id was positively reported absent. */
@@ -518,19 +549,20 @@ export class Watchdog {
       return deny("CGROUP_UNVERIFIED");
     }
 
-    // ## WD-F04: the container must be this execution's, before the target is accepted
+    // ## WD-F04 / D2-F03: the container must be this execution's, before the target is accepted
     //
     // A matching name, subtree and PID start time are not Docker ownership. The exact container id,
     // all five derived labels, the pinned image and the profile are compared against the daemon,
-    // and corroborated against the supervisor's journal when it is readable. A container that is
-    // merely "present" is not enough; a foreign one is refused outright.
+    // and corroborated against intent the supervisor wrote independently. A container that is
+    // merely "present" is not enough; a foreign one is refused outright, and an arm that cannot be
+    // corroborated at all is refused rather than trusted.
     const ownership = await this.observeOwnership(request);
     if (ownership !== "verified") {
       closePinned(pin);
       // `NOT_DIP_OWNED` is the denial the arm vocabulary already has for "this is not yours".
-      // An unavailable daemon is not a proven mismatch, so it is reported as an unverified target
-      // rather than as an accusation.
-      return deny(ownership === "foreign" ? "NOT_DIP_OWNED" : "CGROUP_UNVERIFIED");
+      // An unreadable journal or an unavailable daemon is not a proven mismatch, so it is reported
+      // as an unverified target rather than as an accusation.
+      return deny(ownership === "foreign" ? "NOT_DIP_OWNED" : "OWNERSHIP_UNVERIFIED");
     }
 
     const nowMs = this.options.clock.nowMs();
@@ -752,6 +784,29 @@ export class Watchdog {
       return deny("UNCERTAIN");
     }
 
+    // ## D2-F02: the deadline is re-decided after every await, immediately before the conclusion
+    //
+    // The check at the top of this method decided expiry from the clock alone, before any host work.
+    // That is not enough on its own: `verifyContainerOwnership` and `verifyCompletion` each talk to
+    // the daemon, and a slow or wedged daemon can turn a request that started inside the deadline
+    // into one that finishes well outside it. A grant issued then would be a completion granted
+    // *after* the deadline — the one outcome that must never happen, because the two authorities
+    // (the supervisor finishing, the deadline expiring) would both have won.
+    //
+    // So expiry is decided again here, from the clock, after everything asynchronous has settled and
+    // before anything durable is written. A bounded, non-blocking observation: the deadline must be
+    // able to terminate even while this very method is waiting on Docker.
+    const expiredLate = compareDeadline(
+      { bootId: entry.record.bootId, deadlineAtMs: entry.record.deadlineAtMs },
+      this.options.clock,
+    );
+    if (expiredLate.kind === "stale-boot") return deny("MISMATCH");
+    if (expiredLate.kind === "due") return deny("EXPIRED");
+    // The record may also have moved while the host was being read — a termination attempt started
+    // concurrently would have rewritten it. A conclusion is not written over a later revision.
+    if (entry.record.sequence !== sequenceBase) return deny("ALREADY_CONCLUDED");
+    if (entry.record.phase !== "armed") return deny("TERMINATION_PENDING");
+
     // ## Durable conclusion before the grant
     //
     // The conclusion is written and fsynced *before* the grant is signed. If the process dies in
@@ -795,18 +850,40 @@ export class Watchdog {
    * not an accusation.
    */
   private async observeOwnership(request: ArmRequest): Promise<"verified" | "foreign" | "unverified"> {
-    const intent = this.options.readIntent?.(request.executionId) ?? null;
-    if (intent !== null) {
-      if (intent.executionId !== request.executionId
-        || intent.bootId !== request.bootId
-        || intent.supervisorInstance !== request.supervisorInstance
-        || intent.containerName !== request.containerName
-        || intent.imageDigest !== request.imageDigest
-        || intent.profileId !== request.profileId) {
-        return "foreign";
-      }
-      if (intent.containerId !== null && intent.containerId !== request.containerId) return "foreign";
+    // ## D2-F03: the supervisor's journal is mandatory for a new arm
+    //
+    // The watchdog's own record is written by the party being checked. A single source cannot
+    // corroborate itself, so an arm that has no independent statement of intent is refused: absent
+    // an intent, "the container matches what I wrote" only means the two halves of one process agree.
+    //
+    // The intent must be *readable and valid*, not merely present. A configured journal that cannot
+    // be read (permissions, a corrupted file, a record from a different schema) is refused rather
+    // than treated as "no corroboration needed", because the failure is indistinguishable from an
+    // attacker making the corroborating evidence disappear.
+    const readIntent = this.options.readIntent;
+    if (readIntent === undefined) return "unverified";
+    let intent: TrustedIntent | null;
+    try {
+      intent = readIntent(request.executionId);
+    } catch {
+      // Unreadable is not absent. Refused, and not as an accusation of foreignness: nothing is
+      // known about the target either way.
+      return "unverified";
     }
+    if (intent === null) return "unverified";
+
+    if (intent.executionId !== request.executionId
+      || intent.bootId !== request.bootId
+      || intent.supervisorInstance !== request.supervisorInstance
+      || intent.containerName !== request.containerName
+      || intent.imageDigest !== request.imageDigest
+      || intent.profileId !== request.profileId) {
+      return "foreign";
+    }
+    // The intent names the container id once `docker create` succeeded, and the supervisor arms
+    // after that. A null id here means the journal has not recorded creation, so there is nothing
+    // to arm against; a different non-null id is a different container.
+    if (intent.containerId === null || intent.containerId !== request.containerId) return "foreign";
 
     const observation = await this.options.observeContainer({
       executionId: request.executionId,
@@ -858,7 +935,20 @@ export class Watchdog {
   private async verifyContainerOwnership(entry: LiveExecution): Promise<boolean> {
     const expected = this.expectedOwnership(entry.record);
 
-    const intent = this.options.readIntent?.(entry.record.executionId) ?? null;
+    // ## D2-F03: a journal that cannot be read is a refusal to *arm*, not a barrier to *terminating*
+    //
+    // The journal is mandatory when a new arm is accepted, because a record cannot corroborate
+    // itself. It is not a condition on acting on an execution that was already armed from it: if a
+    // throwing read were propagated here, deleting or chmod'ing the journal would be a way to keep a
+    // container alive past its deadline. An unreadable intent therefore contributes no
+    // corroboration and nothing else — the same answer as a mismatch, which is refusal to signal
+    // unless authority was established earlier (D2-F01) and verified afresh from the daemon.
+    let intent: TrustedIntent | null = null;
+    try {
+      intent = this.options.readIntent?.(entry.record.executionId) ?? null;
+    } catch {
+      intent = null;
+    }
     if (intent !== null) {
       // Two independent statements of the same facts must agree. A disagreement means one of them
       // is stale or forged, and neither is a basis for signalling.
@@ -1030,12 +1120,14 @@ export class Watchdog {
       };
     }
 
-    // ## WD-F04 / WD-F03: ownership before the signal
+    // ## D2-F01 / WD-F04 / WD-F03: kernel-first authority before the signal
     //
-    // Nothing is signalled until the target is proven to be this execution's container *now*. This
-    // runs on every attempt, including a retry, so a retry against a container that has since been
-    // replaced is refused rather than acted on.
-    entry.ownershipVerified = await this.verifyContainerOwnership(entry);
+    // Nothing is signalled until the target is shown to be this execution's. The authority is the
+    // kernel's — established ownership plus a still-valid pinned descriptor — and the daemon's
+    // present answer can only corroborate it, never withhold it. A target whose ownership was never
+    // established (a record recovered from disk, an arm that failed verification) is refused, and a
+    // pin that no longer names its inode is refused, exactly as before.
+    const authority = await this.terminationAuthority(entry);
     entry.terminationAttempts += 1;
     entry.lastTerminationAtMs = this.options.clock.nowMs();
 
@@ -1076,11 +1168,12 @@ export class Watchdog {
     let signalledUnverified = false;
     let detail = "";
 
-    if (!entry.ownershipVerified) {
+    const maySignal = authority.kind === "terminate";
+    if (!maySignal) {
       // WD-F03: never signal an unverified target. The debt is retained, the attempt is counted,
       // and an operator resolves it. Repeating a signal at something that might be a different
       // container is worse than waiting.
-      detail = "ownership is not verified; the target was not signalled";
+      detail = authority.detail;
       signalledUnverified = false;
     } else if (!processOwed) {
       detail = "the processes are already confirmed gone; no kill was written";
@@ -1105,7 +1198,7 @@ export class Watchdog {
     // The cgroup write is the mechanism that reaches every process at once. The daemon kill is a
     // fallback for the case where the cgroup could not be signalled at all — and only for a target
     // whose ownership is verified and whose processes are actually owed a signal.
-    if (!killWritten && entry.ownershipVerified && processOwed) {
+    if (!killWritten && maySignal && processOwed) {
       const killed = await this.options.killContainer(due.containerId);
       if (killed.ok) {
         killWritten = true;
@@ -1125,11 +1218,36 @@ export class Watchdog {
       processTerminationConfirmed = populated === false && (procs === null || procs.length === 0);
     }
 
-    // Post-condition 2: the exact container is positively gone, according to the daemon. WD-F01:
-    // an unavailable daemon, a denied daemon, a timeout and a foreign container all leave this
-    // false. The debt is owed until absence is *observed*, not assumed.
-    const observation = await this.options.observeContainer(this.expectedOwnership(entry.record));
-    const containerRemovalConfirmed = provesAbsence(observation);
+    // ## Post-condition 2: metadata, by exact id, and only after the processes are confirmed gone
+    //
+    // D2-F04: observing that the container is absent is not the same as having removed it. A
+    // positively identified container can be **stopped but still present**, holding its name, its
+    // cgroup slot and its writable layer. The metadata debt is owed until the exact id is gone, and
+    // a present container is therefore removed here by exact id — never by name, label or prefix.
+    //
+    // The order matters: metadata removal is attempted only once the process question is answered.
+    // Removing a container whose processes are still running would let the daemon tear down the
+    // cgroup while tasks remain, which is how a terminated execution leaves orphans behind.
+    let observation = await this.options.observeContainer(this.expectedOwnership(entry.record));
+    let containerRemovalConfirmed = provesAbsence(observation);
+
+    if (!containerRemovalConfirmed && processTerminationConfirmed && observation.state === "present") {
+      // Bounded: one removal attempt per termination turn. `removeContainer` acts on the exact id
+      // the record names and cannot reach anything else.
+      const removal = await (this.options.removeContainer?.(due.containerId)
+        ?? Promise.resolve({ ok: false, detail: "no removal seam is configured" }));
+      const after = await this.options.observeContainer(this.expectedOwnership(entry.record));
+      observation = after;
+      containerRemovalConfirmed = provesAbsence(after);
+      detail = removal.ok
+        ? `${detail}; the exact container id was removed (${after.state})`
+        : `${detail}; the daemon refused the removal: ${removal.detail}`;
+    } else if (observation.state === "present" && !processTerminationConfirmed) {
+      // Present, and owed processes are still running. Deliberately *not* removed: the metadata is
+      // kept so the next attempt still has an addressable container to signal.
+      detail = `${detail}; the container is present but its processes are not confirmed gone, so removal is deferred`;
+    }
+
     if (!containerRemovalConfirmed) {
       detail = `${detail}; removal not confirmed (${observation.state})`;
     }
@@ -1177,11 +1295,64 @@ export class Watchdog {
       executionId: due.executionId,
       killWritten,
       signalledUnverified,
+      dockerIndependent: authority.kind === "terminate" && authority.dockerIndependent,
       processTerminationConfirmed,
       containerRemovalConfirmed,
       resolved,
       detail: detail || (resolved ? "terminated and removed" : "termination could not be positively established"),
     };
+  }
+
+  /**
+   * Termination authority for a target whose process identity was positively established.
+   *
+   * ## D2-F01: kernel-first, and Docker-independent
+   *
+   * Docker is not the authority on whether this execution's processes are alive; the kernel is,
+   * through the cgroup that was pinned when ownership was proved. Requiring a *live* Docker answer
+   * at every termination attempt made the daemon a gate on terminating its own container. Three
+   * situations followed, all of them wrong:
+   *
+   * - the daemon becomes unavailable mid-execution, so a container that is plainly running — its
+   *   identity established, its descriptors pinned — is never signalled;
+   * - the container's init exits while descendants remain in the cgroup, and the daemon reports the
+   *   container gone while `cgroup.procs` is not empty;
+   * - the daemon's metadata disappears (a pruned record, a restarted daemon) and the watchdog reads
+   *   "I cannot see it" as "it is not mine".
+   *
+   * The safe rule is not "Docker must confirm". It is: **previously established ownership plus a
+   * still-valid pinned descriptor authorizes the kernel signal; anything else authorizes nothing.**
+   * A daemon observation can *add* authority — it can establish absence and discharge the metadata
+   * debt — but it can never *remove* authority the kernel already carries.
+   *
+   * This deliberately does not weaken arming or restart recovery. Arming still requires a positive
+   * ownership observation, and a record recovered from disk starts with `ownershipVerified: false`,
+   * so it takes the `requires-observation` branch below and must be confirmed by the host before a
+   * signal. Only an execution that was verified while this process was running, or verified by an
+   * observation in this attempt, can reach `terminate`.
+   */
+  private async terminationAuthority(entry: LiveExecution): Promise<TerminationAuthority> {
+    // A descriptor that no longer names the inode it was pinned from is not a descriptor for this
+    // execution's cgroup. That is the one condition under which a pinned target is refused.
+    if (entry.pin !== null && entry.pin.dirFd >= 0) {
+      const pinState = verifyPin(entry.pin);
+      if (!pinState.ok) {
+        return { kind: "quarantine", detail: `the pin is no longer valid: ${pinState.code}` };
+      }
+    }
+
+    const confirmedNow = await this.verifyContainerOwnership(entry);
+    if (confirmedNow) entry.ownershipVerified = true;
+
+    if (entry.ownershipVerified) {
+      // Ownership was established — now, or earlier in this process's life. The kernel signal is
+      // authorized whatever the daemon says at this instant.
+      return { kind: "terminate", dockerIndependent: !confirmedNow, detail: "" };
+    }
+
+    // Never confirmed while this process was running. The record is a claim, and a claim is not a
+    // target. Refused, with the debt retained for an operator.
+    return { kind: "quarantine", detail: "ownership is not verified; the target was not signalled" };
   }
 
   /** Write a quarantined record, best-effort. Used on recovery failure paths. */

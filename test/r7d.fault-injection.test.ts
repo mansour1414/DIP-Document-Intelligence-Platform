@@ -63,6 +63,8 @@ async function startWatchdogProcess(prepare?: (stateDir: string) => void): Promi
       DIP_WATCHDOG_SOCKET: socketPath,
       DIP_WATCHDOG_SECRET: randomBytes(32).toString("hex"),
       DIP_WATCHDOG_STATE: stateDir,
+      // D2-F03: the supervisor's journal is mandatory, so every entry point needs one.
+      DIP_WATCHDOG_JOURNAL: join(root, "journal"),
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -117,6 +119,8 @@ async function runToExit(stateDir: string): Promise<{ code: number | null; ready
       DIP_WATCHDOG_SOCKET: join(root, "watchdog.sock"),
       DIP_WATCHDOG_SECRET: randomBytes(32).toString("hex"),
       DIP_WATCHDOG_STATE: stateDir,
+      // D2-F03: the supervisor's journal is mandatory, so every entry point needs one.
+      DIP_WATCHDOG_JOURNAL: join(root, "journal"),
     },
     stdio: ["ignore", "pipe", "pipe"],
   });

@@ -35,7 +35,7 @@
  */
 
 import { readFileSync } from "node:fs";
-import type { DockerOutcome, DockerFaultCategory } from "./docker-lifecycle";
+import { INSPECT_FORMAT, type DockerOutcome, type DockerFaultCategory } from "./docker-lifecycle";
 
 /** The five ownership labels, exactly as `ownershipLabels` derives them. */
 export const OWNERSHIP_LABEL_KEYS = Object.freeze([
@@ -108,6 +108,41 @@ export function classifyInspect(outcome: DockerOutcome<{ raw: string }>, expecte
 }
 
 /**
+ * The `|`-separated fields `INSPECT_FORMAT` produces, as an identity question.
+ *
+ * ## D2-F01: why the positions are derived, not written down
+ *
+ * The previous parser read the labels object from `parts[27]`. `INSPECT_FORMAT` has 28 fields and
+ * `Config.Labels` is at **26**; 27 is `Config.Env`. The parser therefore read the container's
+ * environment as its labels, `JSON.parse` returned an array, and every real container was
+ * classified `ambiguous` — no container could ever be verified as owned, so ownership could never
+ * be established from the daemon's answer. The test fixture repeated the same `27`, which is why
+ * the suite passed while nothing could work against a real daemon.
+ *
+ * The indexes are now computed from `INSPECT_FORMAT` itself. A field is found by its template, so
+ * inserting a field moves the reference with it, and a missing or duplicated field is a hard error
+ * at module load rather than a silent read of the wrong column.
+ */
+const INSPECT_FIELDS = INSPECT_FORMAT.split("|");
+
+function fieldIndex(template: string): number {
+  const index = INSPECT_FIELDS.indexOf(template);
+  if (index < 0) throw new Error(`INSPECT_FORMAT no longer contains ${template}, which ownership verification requires`);
+  if (INSPECT_FIELDS.lastIndexOf(template) !== index) throw new Error(`INSPECT_FORMAT contains ${template} more than once`);
+  return index;
+}
+
+/** Zero-based positions of the fields identity is derived from. Derived, never literal. */
+const INDEX = Object.freeze({
+  id: fieldIndex("{{.Id}}"),
+  cgroupParent: fieldIndex("{{.HostConfig.CgroupParent}}"),
+  labels: fieldIndex("{{json .Config.Labels}}"),
+});
+
+/** How many fields a well-formed inspect line has. A short or long line is a format violation. */
+export const INSPECT_FIELD_COUNT = INSPECT_FIELDS.length;
+
+/**
  * Parse the `|`-separated fields `INSPECT_FORMAT` produces.
  *
  * The format is a fixed list and every field is emitted, so a short line is a format violation —
@@ -116,14 +151,15 @@ export function classifyInspect(outcome: DockerOutcome<{ raw: string }>, expecte
 export function parseInspectFields(raw: string): InspectFields | null {
   // A JSON field may itself contain `|`, but the *labels* field is the only object-valued one and
   // it is JSON, so splitting on `|` is only safe because no earlier field can contain one. Each
-  // earlier field is an id, a mode, a number or a boolean.
+  // earlier field is an id, a mode, a number or a boolean. `Config.Env` — an array of strings that
+  // may contain `|` — is the last field and is not read here, so it cannot shift the count.
   const parts = raw.trim().split("|");
-  // 27 scalar fields then the labels object. The count is checked rather than assumed: a short line
-  // is a format violation, which is a different answer from a container with missing properties.
-  if (parts.length !== 28) return null;
-  const id = parts[0];
-  const cgroupParent = parts[1];
-  const labelsJson = parts[27];
+  // The count is checked rather than assumed: a short line is a format violation, which is a
+  // different answer from a container with missing properties.
+  if (parts.length !== INSPECT_FIELD_COUNT) return null;
+  const id = parts[INDEX.id];
+  const cgroupParent = parts[INDEX.cgroupParent];
+  const labelsJson = parts[INDEX.labels];
   let labels: Record<string, string>;
   try {
     const parsed: unknown = JSON.parse(labelsJson ?? "null");

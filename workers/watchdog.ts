@@ -38,7 +38,7 @@ import { makeHostClock, readUptimeMs } from "../src/lib/execution/host-clock";
 import { Watchdog, newWatchdogIdentity } from "../src/lib/execution/watchdog";
 import { WatchdogStore } from "../src/lib/execution/watchdog-store";
 import { startWatchdogServer } from "../src/lib/execution/watchdog-server";
-import { killContainerAsync, inspectContainerAsync } from "../src/lib/execution/docker-lifecycle";
+import { killContainerAsync, inspectContainerAsync, removeContainerAsync } from "../src/lib/execution/docker-lifecycle";
 import { classifyInspect } from "../src/lib/execution/container-identity";
 
 const required = (name: string): string => {
@@ -73,10 +73,16 @@ function main(): void {
     process.exit(1);
   }
   const stateDir = required("DIP_WATCHDOG_STATE");
-  // The supervisor's journal, read-only. Present means ownership can be corroborated against a
-  // second, independent statement of the same facts (WD-F04). Absent means the watchdog relies on
-  // its own record and live observations, which is a weaker but still bounded position.
-  const journalRoot = process.env.DIP_WATCHDOG_JOURNAL ?? "";
+  // ## D2-F03: the journal is required, not optional
+  //
+  // It used to be optional: without it the watchdog relied on its own record and live observations.
+  // That is a weaker position than it looks, because the record is written by the party the
+  // observation is meant to check — one process agreeing with itself is not corroboration. An arm
+  // is now refused unless the supervisor's independently written intent can be read and matches on
+  // exact identity, so a watchdog started without a journal would refuse every arm. Starting is
+  // therefore a start-up failure instead: failing at boot is legible, and failing on every request
+  // is not.
+  const journalRoot = required("DIP_WATCHDOG_JOURNAL");
   mkdirSync(stateDir, { recursive: true, mode: 0o700 });
   mkdirSync(dirname(socketPath), { recursive: true, mode: 0o700 });
 
@@ -94,12 +100,17 @@ function main(): void {
     process.exit(1);
   }
 
-  // A read-only view of the supervisor's journal. Constructed only if configured; a journal that
-  // cannot be bound at this authority would throw, and an unreadable intent is treated as absent
-  // rather than as a reason to stop watching.
-  const journal = journalRoot === ""
-    ? null
-    : new OwnershipJournal(journalRoot);
+  // A read-only view of the supervisor's journal: never bound, never written, and never
+  // authoritative — it is the second statement of intent that the daemon's answer is checked
+  // against. An unreadable intent is treated as "no corroboration" by the watchdog, which refuses
+  // the arm; it is not a reason to stop watching executions already in flight.
+  let journal: OwnershipJournal;
+  try {
+    journal = new OwnershipJournal(journalRoot);
+  } catch (error) {
+    process.stderr.write(`FATAL: the supervisor journal at ${journalRoot} is not usable: ${error instanceof Error ? error.message : String(error)}\n`);
+    process.exit(1);
+  }
 
   const identity = newWatchdogIdentity(() => readUptimeMs(), selfStartTimeTicks(), bootId);
   const watchdog = new Watchdog({
@@ -115,24 +126,26 @@ function main(): void {
     // WD-F01: classify, do not coerce. `classifyInspect` is the only place the daemon's answer is
     // turned into a decision, and `NOT_FOUND` is the only branch that yields absence.
     observeContainer: async (expected) => classifyInspect(await inspectContainerAsync(expected.containerId), expected),
-    // WD-F04: the supervisor's own intent, when it is readable. A read failure is "no corroboration",
-    // not "corroborated": the caller must not treat an unreadable journal as agreement.
-    readIntent: journal === null ? undefined : (executionId) => {
-      try {
-        const record = journal.readSupervisor(executionId);
-        if (record === null) return null;
-        return {
-          executionId: record.executionId,
-          bootId: record.bootId,
-          supervisorInstance: record.supervisorInstance,
-          containerName: record.containerName,
-          containerId: record.containerId,
-          imageDigest: record.imageDigest,
-          profileId: record.profileId,
-        };
-      } catch {
-        return null;
-      }
+    // WD-F04 / D2-F03: the supervisor's own intent. A read failure is "no corroboration", not
+    // "corroborated": the caller must not treat an unreadable journal as agreement.
+    readIntent: (executionId) => {
+      const record = journal.readSupervisor(executionId);
+      if (record === null) return null;
+      return {
+        executionId: record.executionId,
+        bootId: record.bootId,
+        supervisorInstance: record.supervisorInstance,
+        containerName: record.containerName,
+        containerId: record.containerId,
+        imageDigest: record.imageDigest,
+        profileId: record.profileId,
+      };
+    },
+    // D2-F04: removal by exact id, so a stopped-but-present container's metadata can be discharged
+    // rather than left owed forever. The id comes from the watchdog's own record.
+    removeContainer: async (containerId) => {
+      const outcome = await removeContainerAsync(containerId);
+      return outcome.ok ? { ok: true, detail: "removed" } : { ok: false, detail: outcome.fault };
     },
   });
 

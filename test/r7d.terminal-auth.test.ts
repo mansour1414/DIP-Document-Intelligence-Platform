@@ -567,6 +567,18 @@ function makeWatchdog(options: { inspectPresent?: boolean; verify?: HostVerifica
       const relative = `/dip-executor.slice/dip-exec-${record.executionId}`;
       return { path: `${mountPath}${relative}`, relative };
     },
+    // D2-F03: the supervisor's independently written intent, which every arm is now corroborated
+    // against. It matches `baseArm` exactly, because that is the production relationship: the
+    // supervisor records the intent, creates the container it names, and only then arms.
+    readIntent: (executionId) => ({
+      executionId,
+      bootId,
+      supervisorInstance: SUPERVISOR,
+      containerName: CONTAINER_NAME,
+      containerId: CONTAINER_ID,
+      imageDigest: IMAGE_DIGEST,
+      profileId: "synthetic-v1",
+    }),
     // `realVerify` uses the production verifier against this host. Used by the tests that assert
     // a refusal, since an injected "ok" would make those assertions vacuous.
     verifyHost: options.realVerify === true ? undefined : () => injected,

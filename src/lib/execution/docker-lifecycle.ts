@@ -897,6 +897,64 @@ export function inspectContainerAsync(containerId: string): Promise<DockerOutcom
   );
 }
 
+/**
+ * The inspect fields that describe *this instance of* a container, not its configuration.
+ *
+ * ## Why a second inspect rather than more fields on `INSPECT_FORMAT`
+ *
+ * `INSPECT_FORMAT` is the effective-configuration contract that `preflightContainer` compares
+ * exactly, and its field count is asserted by the parser, the fixture and the tests. The init PID,
+ * its kernel start time and the running state are a different question asked at a different moment:
+ * configuration is fixed at `create`, while these change with the process. Keeping them in a
+ * separate typed read means adding one cannot silently shift the configuration columns, which is the
+ * defect class D2-F01/F04 already burned once.
+ */
+export const STATE_INSPECT_FORMAT = ["{{.State.Pid}}", "{{.State.Running}}", "{{.Id}}"].join("|");
+
+export function buildStateInspectArgv(containerId: string): string[] {
+  assertContainerId(containerId);
+  const argv = [...DOCKER_GLOBAL_FLAGS, "inspect", "--type", "container", "--format", STATE_INSPECT_FORMAT, containerId];
+  assertNoForbiddenFlags(argv);
+  return argv;
+}
+
+/** What the daemon says about a container's live process. `pid` is 0 when it is not running. */
+export type ContainerStateInspect = {
+  /** The container's init PID in the host's PID namespace. 0 when the container is not running. */
+  pid: number;
+  running: boolean;
+  /** The id the daemon echoed, so a reply for another container is detectable. */
+  containerId: string;
+};
+
+/**
+ * Asynchronous state inspect by exact id.
+ *
+ * The PID this returns is checked against the kernel before it is used: a PID is recycled, so the
+ * supervisor reads the process's start time from `/proc` and records the pair. D2-F02's preflight
+ * then compares the pair against a *second* reading, which is what makes "this process" checkable
+ * rather than assumed.
+ */
+export function inspectStateAsync(containerId: string): Promise<DockerOutcome<ContainerStateInspect>> {
+  return runDockerAsync(
+    buildStateInspectArgv(containerId),
+    DOCKER_DEADLINE_MS.inspect,
+    (stdout) => {
+      const parts = stdout.trim().split("|");
+      if (parts.length !== 3) throw new Error("docker inspect did not return the state format");
+      const pid = Number(parts[0]);
+      const running = parts[1];
+      const id = parts[2] ?? "";
+      if (!Number.isSafeInteger(pid) || pid < 0) throw new Error("docker inspect returned no usable init pid");
+      if (running !== "true" && running !== "false") throw new Error("docker inspect returned no usable running state");
+      if (!/^[a-f0-9]{64}$/u.test(id)) throw new Error("docker inspect echoed no container id");
+      return { pid, running: running === "true", containerId: id };
+    },
+    // Read-only, so a failure is definite: nothing changed.
+    true,
+  );
+}
+
 /** Asynchronous `docker kill` by exact id. */
 export function killContainerAsync(containerId: string): Promise<DockerOutcome<{ killed: boolean }>> {
   return runDockerAsync(

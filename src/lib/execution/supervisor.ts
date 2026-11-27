@@ -36,10 +36,13 @@ import {
   inspectContainerAsync,
   killContainerAsync,
   removeContainerAsync,
+  inspectStateAsync,
   INSPECT_FORMAT,
+  type ContainerStateInspect,
   type DockerOutcome,
   type ExecutionPolicy,
 } from "./docker-lifecycle";
+import { findCgroup2Mount, readCgroupMembership, readProcessStartTimeTicks } from "./host-facts";
 import { OwnershipJournal, containerNameFor, newExecutionId, type SupervisorRecord } from "./ownership-journal";
 import { ProvisionalResultStream, BoundedProvisionalOutput, sha256Hex } from "./provisional-stream";
 import { verifyWatchdogGrant, signTerminalCommit, type CommitExpectation, type CommitResult } from "./terminal-commit";
@@ -54,6 +57,7 @@ export type SupervisorPhase =
   | "container-created"
   | "started"
   | "preflight-passed"
+  | "armed"
   | "ready-for-body"
   | "streaming"
   | "sealed"
@@ -73,6 +77,8 @@ export type LifecycleRefusal =
   | "START_FAILED"
   | "PREFLIGHT_FAILED"
   | "ARM_REFUSED"
+  /** The body was offered before preflight, arming and admission had all completed (D2). */
+  | "NOT_READY"
   | "INPUT_MISMATCH"
   | "RESULT_INVALID"
   | "TERMINATION_UNCONFIRMED"
@@ -107,6 +113,19 @@ export type SupervisorOptions = {
   };
   /** Monotonic clock, injectable so deadlines are testable. */
   monotonicMs?: () => number;
+  /**
+   * The kernel facts preflight needs: a process's start time, its cgroup, and the cgroup2 mount.
+   *
+   * Injectable for the same reason the watchdog's host verification is: this environment has no
+   * writable cgroup2 mount, so a real container cannot be observed here. The default reads `/proc`
+   * and `/proc/self/mountinfo`, and there is no option to skip the observation — only to answer it
+   * from a fixture. A fixture answer is mocked evidence and is labelled as such in the tests.
+   */
+  hostFacts?: {
+    startTimeTicks: (pid: number) => number;
+    cgroupMembership: (pid: number) => string | null;
+    cgroup2Mount: () => { path: string; device: string } | null;
+  };
 };
 
 /** The attached child session `docker start -a -i` produces. */
@@ -126,6 +145,14 @@ export type DockerSeam = {
   remove: (id: string) => Promise<DockerOutcome<{ removed: boolean }>>;
   kill: (id: string) => Promise<DockerOutcome<{ killed: boolean }>>;
   start: (name: string) => Promise<DockerSession>;
+  /**
+   * The running container's init PID and state, by exact id.
+   *
+   * Separate from `inspect` because it answers a different question at a different moment:
+   * configuration is fixed at `create`, while PID and running state exist only after `start`. See
+   * `STATE_INSPECT_FORMAT`.
+   */
+  state: (id: string) => Promise<DockerOutcome<ContainerStateInspect>>;
 };
 
 /** A refusal carries a code and nothing that could be mistaken for document content. */
@@ -205,6 +232,9 @@ export class SupervisorExecution {
     };
     this.options.journal.writeSupervisor(record);
     this.policy = input.policy;
+    // The deadline anchor, taken from the same instant the journal recorded. A retry cannot move
+    // it, which is what stops "one more attempt" from becoming an extension (D2-F02).
+    this.startedMonotonicMs = input.startedMonotonicMs;
     this.transition("intent-recorded");
     return record;
   }
@@ -249,17 +279,15 @@ export class SupervisorExecution {
   async startAndPreflight(preflight: (observation: PreflightObservation) => PreflightVerdict): Promise<void> {
     this.requirePhase("container-created", "CREATE_FAILED");
     const docker = this.docker();
-    const inspected = await docker.inspect(this.containerId!);
-    if (!inspected.ok) {
-      this.fail("PREFLIGHT_FAILED");
-      throw new LifecycleError("PREFLIGHT_FAILED", `inspect failed: ${inspected.fault}`);
-    }
-    const fields = inspected.value.raw.split("|");
-    if (fields.length !== INSPECT_FORMAT.split("|").length) {
-      this.fail("PREFLIGHT_FAILED");
-      throw new LifecycleError("PREFLIGHT_FAILED", "the inspect output did not match the requested format");
-    }
 
+    // ## D2-F02: observe the *running* container, not the created one
+    //
+    // The previous order inspected the container, then started it, then judged the pre-start
+    // snapshot. Every field it judged was configuration, so the snapshot was not wrong — but the
+    // things that only exist once a container runs were absent from it: the init PID, the cgroup the
+    // init is actually in, the start time that makes the PID checkable. Those are exactly the
+    // identity the watchdog is armed against, so the observation that authorizes arming has to be
+    // taken after the process exists.
     let session: DockerSession;
     try {
       session = await docker.start(containerNameFor(this.executionId));
@@ -269,7 +297,9 @@ export class SupervisorExecution {
     }
     this.transition("started");
 
-    const observation = parseInspect(fields, this.containerId!, this.policy!);
+    const observation = await this.observeEffective(this.containerId!, session);
+    this.setObservation(observation);
+
     const verdict = preflight(observation);
     if (!verdict.ok) {
       this.fail("PREFLIGHT_FAILED");
@@ -283,13 +313,102 @@ export class SupervisorExecution {
     this.transition("preflight-passed");
   }
 
-  /** Arm the watchdog. Without an ack there is no invitation. */
+  /**
+   * Read the effective state from the daemon *and* the kernel, after the container is running.
+   *
+   * ## Why two sources, and why neither is enough
+   *
+   * The daemon reports the configuration it was given. A daemon that was told to apply a profile
+   * reports that profile whether or not the kernel honoured it, and a container started before the
+   * daemon's configuration took effect reports the old one. The kernel reports the truth about the
+   * process — which PID it is, which cgroup it is in — but knows nothing about `--security-opt`.
+   *
+   * So: configuration from the daemon, process identity from the daemon *cross-checked against*
+   * `/proc`. A disagreement between the two is a failure, not a preference for one reading.
+   */
+  private async observeEffective(containerId: string, session: DockerSession): Promise<PreflightObservation> {
+    const docker = this.docker();
+
+    const inspected = await docker.inspect(containerId);
+    if (!inspected.ok) throw new LifecycleError("PREFLIGHT_FAILED", `inspect failed: ${inspected.fault}`);
+    const fields = inspected.value.raw.split("|");
+    if (fields.length !== INSPECT_FORMAT.split("|").length) {
+      throw new LifecycleError("PREFLIGHT_FAILED", "the inspect output did not match the requested format");
+    }
+    const base = parseInspect(fields, containerId, this.policy!);
+
+    // The init process, by exact id, from the daemon.
+    const state = await docker.state(containerId);
+    if (!state.ok) throw new LifecycleError("PREFLIGHT_FAILED", `state inspect failed: ${state.fault}`);
+    if (!state.value.running) throw new LifecycleError("PREFLIGHT_FAILED", "the container is not running");
+    if (state.value.containerId !== containerId) {
+      throw new LifecycleError("PREFLIGHT_FAILED", "the daemon answered for a different container id");
+    }
+    const initPid = state.value.pid;
+    if (!Number.isSafeInteger(initPid) || initPid <= 1) {
+      throw new LifecycleError("PREFLIGHT_FAILED", "the daemon reported no usable init pid");
+    }
+
+    // The kernel's view of that PID: its start time and its cgroup. A PID alone is recycled, so the
+    // start time is what makes the pair an identity rather than a number.
+    const facts = this.options.hostFacts ?? {
+      startTimeTicks: readProcessStartTimeTicks,
+      cgroupMembership: readCgroupMembership,
+      cgroup2Mount: findCgroup2Mount,
+    };
+
+    let initStartTimeTicks: number;
+    try {
+      initStartTimeTicks = facts.startTimeTicks(initPid);
+    } catch {
+      throw new LifecycleError("PREFLIGHT_FAILED", "the init process does not exist");
+    }
+    const relative = facts.cgroupMembership(initPid);
+    if (relative === null) throw new LifecycleError("PREFLIGHT_FAILED", "the init process has no unified cgroup");
+    const mount = facts.cgroup2Mount();
+    if (mount === null) throw new LifecycleError("PREFLIGHT_FAILED", "the cgroup2 hierarchy could not be found");
+
+    // The cgroup path is composed from the verified mount and the process's own membership. It is
+    // never composed from a naming convention, and it is never asserted: it is read.
+    const cgroupPath = relative === "/" ? mount.path : `${mount.path}${relative}`;
+
+    // The session must be live: a preflight over a container whose streams have already closed is a
+    // preflight of something that is about to be terminated.
+    void session;
+
+    base.initPid = initPid;
+    base.initStartTimeTicks = initStartTimeTicks;
+    base.cgroupPath = cgroupPath;
+    base.startedMonotonicMs = this.now();
+    return base;
+  }
+
+  /**
+   * Arm the watchdog. Without a verified ack there is no invitation.
+   *
+   * ## D2: the ack is compared field by field against what this supervisor verified
+   *
+   * The previous check compared the execution id and the boot id. That is not enough: an ack can
+   * name the right execution while describing a different cgroup, a different container id or a
+   * different watchdog instance, and the supervisor would then release a body on the strength of a
+   * deadline armed against something else.
+   *
+   * What is checked here is everything the acknowledgement can disagree with:
+   *
+   * - the exchange (execution id and message id);
+   * - the watchdog instance that signed it, which must be the one this supervisor was configured to
+   *   trust, not merely some process that authenticated;
+   * - the boot, because a deadline on another boot is a deadline in a namespace that is gone;
+   * - the cgroup device, because a different filesystem is a different hierarchy;
+   * - the pinned inodes, which must be ones the kernel actually reported.
+   */
   async armWatchdog(): Promise<ArmAck> {
     this.requirePhase("preflight-passed", "PREFLIGHT_FAILED");
     const watchdog = this.options.watchdog;
     if (watchdog === undefined) throw new LifecycleError("ARM_REFUSED", "no watchdog channel is configured");
     const observation = this.lastObservation;
     if (observation === null) throw new LifecycleError("ARM_REFUSED", "no verified observation to arm against");
+
     const request: ArmRequest = {
       kind: "ARM_REQ",
       messageId: randomBytes(8).toString("hex"),
@@ -314,18 +433,66 @@ export class SupervisorExecution {
       this.fail("ARM_REFUSED");
       throw new LifecycleError("ARM_REFUSED", `the watchdog refused to arm: ${answer.code}`);
     }
-    // The ack must describe the same identity the supervisor verified, or the watchdog is
-    // enforcing a deadline against something else.
-    if (answer.executionId !== this.executionId || answer.observedBootId !== this.options.bootId) {
+
+    const ack = answer;
+    if (ack.executionId !== this.executionId || ack.messageId !== request.messageId) {
       this.fail("ARM_REFUSED");
-      throw new LifecycleError("ARM_REFUSED", "the arm ack described a different execution");
+      throw new LifecycleError("ARM_REFUSED", "the arm ack described a different exchange");
     }
-    return answer;
+    if (ack.watchdogInstance !== this.options.watchdogInstance) {
+      this.fail("ARM_REFUSED");
+      throw new LifecycleError("ARM_REFUSED", "the arm ack came from a different watchdog instance");
+    }
+    if (ack.observedBootId !== this.options.bootId) {
+      this.fail("ARM_REFUSED");
+      throw new LifecycleError("ARM_REFUSED", "the arm ack described a different boot");
+    }
+    if (!Number.isSafeInteger(ack.observedCgroupDirInode) || ack.observedCgroupDirInode <= 0
+      || !Number.isSafeInteger(ack.observedCgroupKillInode) || ack.observedCgroupKillInode <= 0
+      || !/^\d+:\d+$/u.test(ack.observedCgroupDevice)) {
+      this.fail("ARM_REFUSED");
+      throw new LifecycleError("ARM_REFUSED", "the arm ack carries no usable cgroup identity");
+    }
+    // The deadline the watchdog armed must start when this supervisor's observation did, to within
+    // the exchange. A materially different start means the watchdog timed a different event.
+    if (Math.abs(ack.armedAtMonotonicMs - observation.startedMonotonicMs) > this.options.limits.deadlineMs) {
+      this.fail("ARM_REFUSED");
+      throw new LifecycleError("ARM_REFUSED", "the arm ack was armed outside this execution's window");
+    }
+
+    this.transition("armed");
+    return ack;
   }
 
-  /** Invite the caller to send a body. The only method that may produce this signal. */
+  /**
+   * Invite the caller to send a body. The only method that may produce this signal.
+   *
+   * ## D2: the gate is the whole sequence, not its last step
+   *
+   * The previous gate accepted `preflight-passed`, which meant a caller could be invited to stream a
+   * document before the watchdog had armed. If the arm was then refused, or the watchdog process was
+   * not the one the supervisor believed, the container was running with no deadline enforced against
+   * it — and the document was already in flight.
+   *
+   * The only state from which a body may be released is `armed`: preflight has passed, the watchdog
+   * has acknowledged the exact identity preflight verified, and the supervisor has compared that
+   * acknowledgement against its own record. Anything else is a refusal that names what was missing.
+   *
+   * Admission is checked by the caller (the role socket), which holds the token; this method cannot
+   * see it. `NOT_READY` is therefore about the lifecycle, and a caller that was not admitted never
+   * reaches a lifecycle at all.
+   */
   readyForBody(): void {
-    this.requirePhase("preflight-passed", "PREFLIGHT_FAILED");
+    if (this.phase === "preflight-passed") {
+      // Specific: the lifecycle is healthy but the deadline is not enforced. A caller told
+      // "PREFLIGHT_FAILED" here would investigate the wrong half of the sequence.
+      this.fail("ARM_REFUSED");
+      throw new LifecycleError("ARM_REFUSED", "the body cannot be released before the watchdog is armed");
+    }
+    if (this.phase !== "armed") {
+      this.fail("NOT_READY");
+      throw new LifecycleError("NOT_READY", `expected an armed execution, this one is in ${this.phase}`);
+    }
     this.transition("ready-for-body");
   }
 
@@ -482,6 +649,21 @@ export class SupervisorExecution {
     const watchdog = this.options.watchdog;
     if (watchdog === undefined) throw new LifecycleError("COMMIT_REFUSED", "no watchdog channel is configured");
 
+    // ## D2-F02: the deadline is decided again, here, immediately before the commit is requested
+    //
+    // Removal is a sequence of daemon calls, and the deadline does not pause for them. An execution
+    // whose budget ran out while its container was being removed has exactly one authoritative
+    // outcome — expired — and it is not this commit. Asking the watchdog for a grant would at best
+    // return `EXPIRED`; asking at all would put the supervisor in the position of having attempted a
+    // completion after the authority had already changed hands.
+    //
+    // The supervisor never extends the deadline on a retry: `deadlineMs` is fixed at intent time and
+    // recorded in the journal, so this comparison is against the same instant it always was.
+    if (this.deadlineExpired()) {
+      this.fail("COMMIT_REFUSED");
+      throw new LifecycleError("COMMIT_REFUSED", "the execution deadline passed before the commit");
+    }
+
     const request: TerminalRequest = {
       executionId: this.executionId,
       requestId: this.requestId,
@@ -551,6 +733,8 @@ export class SupervisorExecution {
 
   private session: DockerSession | undefined;
   private lastObservation: PreflightObservation | null = null;
+  /** The monotonic instant the intent was recorded, which the deadline is measured from. */
+  private startedMonotonicMs: number | null = null;
 
   setObservation(observation: PreflightObservation): void {
     this.lastObservation = observation;
@@ -563,6 +747,20 @@ export class SupervisorExecution {
 
   private now(): number {
     return this.options.monotonicMs?.() ?? Math.round(performance.now());
+  }
+
+  /**
+   * Whether this execution's own deadline has passed.
+   *
+   * Decided from the clock alone, with no host work: the point of the check is that it cannot be
+   * delayed by the very operation it is gating. `startedMonotonicMs` is the observation time
+   * recorded at intent, so the deadline is an anchor into the past rather than a countdown that
+   * every retry could restart.
+   */
+  private deadlineExpired(): boolean {
+    const started = this.startedMonotonicMs;
+    if (started === null) return false;
+    return this.now() - started >= this.options.limits.deadlineMs;
   }
 
   private nextSequence(): number {
@@ -714,4 +912,4 @@ export function newExecution(): string {
   return newExecutionId(randomBytes);
 }
 
-export { sha256Hex, killContainerAsync, removeContainerAsync, inspectContainerAsync, createContainerAsync };
+export { sha256Hex, killContainerAsync, removeContainerAsync, inspectContainerAsync, createContainerAsync, inspectStateAsync };

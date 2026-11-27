@@ -141,7 +141,13 @@ export type Harness = {
   secret: Buffer;
   cleanup: () => void;
   /** Rebuild a watchdog over the same store, as a restart would. */
-  restart: (options?: { bootId?: string; verification?: HostVerification; verifyHost?: (r: ArmRequest, b: string) => HostVerification }) => Harness;
+  /**
+   * Rebuild a watchdog over the same store and clock, as a restart would.
+   *
+   * Takes the full option set: a restarted process observes a host that may have changed while it
+   * was down (an unavailable daemon, a removed container), and a restart test needs to say so.
+   */
+  restart: (options?: HarnessOptions) => Harness;
 };
 
 export type HarnessOptions = {
@@ -163,8 +169,30 @@ export type HarnessOptions = {
   containerRemovedAfterTermination?: boolean;
   /** Present at arm time, then absent once the harness is told the container was removed. */
   observeLifecycle?: boolean;
-  /** The supervisor's trusted intent, when a test wants ownership corroborated against it. */
+  /**
+   * The supervisor's trusted intent.
+   *
+   * D2-F03 makes this mandatory for an arm: the watchdog's own record cannot corroborate itself, so
+   * every arm is checked against the supervisor's independently written intent. The harness supplies
+   * one that matches `armRequest` by default, because that is the normal case — a supervisor that
+   * recorded its intent and then created the container it armed against. A test that exercises the
+   * refusal (no journal, unreadable journal, a disagreeing intent) sets this explicitly.
+   */
   readIntent?: (executionId: string) => TrustedIntent | null;
+  /**
+   * Model a watchdog started without the supervisor's journal.
+   *
+   * D2-F03: this must refuse every arm. It is a separate flag rather than passing `readIntent:
+   * undefined`, which is indistinguishable from omitting the option.
+   */
+  noJournal?: boolean;
+  /**
+   * Remove one container by exact id (D2-F04).
+   *
+   * Absent by default: the metadata debt then simply stays owed, which is what most tests want. A
+   * test about metadata removal supplies this and asserts on the id it receives.
+   */
+  removeContainer?: (containerId: string) => Promise<{ ok: boolean; detail: string }>;
   /** Whether a kill attempt is accepted. */
   killAccepted?: boolean;
   /** Inject a failing store write, to prove a failed persist produces no ACK. */
@@ -260,7 +288,20 @@ export function makeWatchdog(options: HarnessOptions = {}): Harness {
         },
       },
     }))),
-    readIntent: options.readIntent,
+    // D2-F03: an intent that matches the arm request the harness builds, so the corroboration
+    // succeeds in the ordinary case. `noJournal` removes it entirely, which must refuse every arm.
+    removeContainer: options.removeContainer,
+    readIntent: options.noJournal === true
+      ? undefined
+      : (options.readIntent ?? ((executionId: string): TrustedIntent => ({
+        executionId,
+        bootId,
+        supervisorInstance: SUPERVISOR,
+        containerName: containerNameFor(executionId),
+        containerId: "c".repeat(64),
+        imageDigest: IMAGE_DIGEST,
+        profileId: "synthetic-v1",
+      }))),
     killContainer: async () => {
       if (options.killAccepted !== false) killedOnce = true;
       return { ok: options.killAccepted ?? true, detail: "injected" };
