@@ -33,6 +33,7 @@
  */
 
 import { closeSync, constants, fstatSync, fsyncSync, openSync, readFileSync, statSync, writeFileSync, readlinkSync } from "node:fs";
+import { isInsideDipSubtree } from "./container-identity";
 
 /** The control files this module pins. `cgroup.controllers` is deliberately absent: read-only and unrelated. */
 export const PINNED_CONTROL_FILES = ["cgroup.kill", "cgroup.events", "cgroup.procs"] as const;
@@ -78,6 +79,15 @@ export function pinCgroup(options: {
   cgroupPath: string;
   /** The cgroup2 mount point discovered from `/proc/self/mountinfo`. */
   mountPath: string;
+  /**
+   * The subtree the path must be inside, relative to the mount.
+   *
+   * Required, and not defaulted. The subtree depends on the daemon's cgroup driver — under systemd
+   * the slice name nests, so the boundary is `dip.slice/dip-executor.slice`, while cgroupfs uses a
+   * flat `dip-executor.slice`. A default would silently pick one and produce a pin that refuses
+   * either every systemd container or every cgroupfs one, depending on which default was chosen.
+   */
+  subtree: string;
 }) : PinResult {
   const { cgroupPath, mountPath } = options;
 
@@ -91,7 +101,10 @@ export function pinCgroup(options: {
   }
   // A dedicated DIP subtree only. Pinning the root, or another tenant's directory, would give this
   // watchdog an honoured handle to a cgroup it does not own.
-  if (!cgroupPath.startsWith(`${mountPath}/dip-executor.slice`)) {
+  //
+  // Whole-component containment, not `startsWith`: `dip.slice/dip-executor.slice-evil` begins with
+  // the subtree's characters and is a different directory.
+  if (!isInsideDipSubtree(cgroupPath, mountPath, options.subtree)) {
     return { ok: false, code: "PATH_INVALID", detail: "the cgroup is not in the dedicated DIP subtree" };
   }
 

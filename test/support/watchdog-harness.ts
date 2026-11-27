@@ -22,6 +22,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { Watchdog, type HostVerification, type WatchdogIdentity } from "../../src/lib/execution/watchdog";
+import { dedicatedSubtreeFor, expectedCgroupRelative } from "../../src/lib/execution/docker-lifecycle";
 import { WatchdogStore } from "../../src/lib/execution/watchdog-store";
 import { type HostClock } from "../../src/lib/execution/host-clock";
 import { readBootId, readProcessStartTimeTicks } from "../../src/lib/execution/host-facts";
@@ -73,8 +74,22 @@ export function verifiedHost(overrides: Partial<Extract<HostVerification, { ok: 
  * as a transient scope inside the dedicated slice. A leaf named after the container *name* is
  * matched by no driver, so a fixture that used one was testing a layout that cannot exist.
  */
+/**
+ * The cgroup driver this harness models.
+ *
+ * The fixture builds a **flat** tree — `dip-executor.slice/<leaf>` — which is what the `cgroupfs`
+ * driver produces. It does not model systemd's nesting (`dip.slice/dip-executor.slice/...`), and
+ * saying so explicitly is the point: the two layouts are different, so a fixture that stayed silent
+ * would be silently asserting the wrong one for whichever driver the production default happened
+ * to be.
+ */
+export const FIXTURE_CGROUP_DRIVER = "cgroupfs" as const;
+
+/** The subtree the fixture's trees live in, relative to the mount. */
+export const FIXTURE_SUBTREE = dedicatedSubtreeFor(FIXTURE_CGROUP_DRIVER);
+
 export function cgroupPathFor(containerId: string, mountPath = "/sys/fs/cgroup"): string {
-  return `${mountPath}/dip-executor.slice/docker-${containerId}.scope`;
+  return `${mountPath}/${expectedCgroupRelative(FIXTURE_CGROUP_DRIVER, containerId)}`;
 }
 
 /** The container id `armRequest` uses by default. */
@@ -278,6 +293,10 @@ export function makeWatchdog(options: HarnessOptions = {}): Harness {
     // The virtual mount, not the fixture root: records name a production path, and membership is
     // reported in the same terms. The descriptors still come from the fixture directory.
     cgroupMount: trees === null ? undefined : () => VIRTUAL_CGROUP_MOUNT,
+    // The fixture's trees are flat, so the watchdog is told the driver that produces flat trees.
+    // Leaving this to the production default would make every arm on this harness fail ownership,
+    // for a reason that has nothing to do with what the test is about.
+    cgroupDriver: trees === null ? undefined : () => FIXTURE_CGROUP_DRIVER,
     actualCgroupPath: trees === null ? undefined : (_pid, mountPath) => trees.actualFor(mountPath),
     // A pin that reports the injected verification's inodes and holds no descriptors. This is the
     // mocked-cgroup path; `realPin` exists so a test can substitute the real implementation.
@@ -420,7 +439,7 @@ function makeLiveTrees(populated: boolean): {
     const leaf = cgroupPath.split("/").pop() ?? "unknown";
     const existing = paths.get(leaf);
     if (existing !== undefined) return existing;
-    const dir = join(mount, "dip-executor.slice", leaf);
+    const dir = join(mount, FIXTURE_SUBTREE, leaf);
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, "cgroup.kill"), "");
     writeFileSync(join(dir, "cgroup.events"), `populated ${populated ? 1 : 0}
@@ -432,7 +451,7 @@ frozen 0
   };
 
   return {
-    pin: (cgroupPath: string) => pinCgroup({ cgroupPath: ensure(cgroupPath), mountPath: mount }),
+    pin: (cgroupPath: string) => pinCgroup({ cgroupPath: ensure(cgroupPath), mountPath: mount, subtree: FIXTURE_SUBTREE }),
     /** True once a kill has been written through a pinned descriptor for any execution. */
     killWasWritten: () => [...paths.values()].some((dir) => readFileSync(join(dir, "cgroup.kill"), "utf8") !== ""),
     mountPath: () => mount,
@@ -443,7 +462,7 @@ frozen 0
       // The path is expressed under the mount the watchdog was told about, not under this
       // fixture's real temporary root: the virtual naming is what a record carries.
       const leaf = [...paths.entries()][0]?.[0] ?? "absent";
-      const relative = `/dip-executor.slice/${leaf}`;
+      const relative = `/${FIXTURE_SUBTREE}/${leaf}`;
       return { path: `${mountPath}${relative}`, relative };
     },
     identityOf: (cgroupPath: string) => {

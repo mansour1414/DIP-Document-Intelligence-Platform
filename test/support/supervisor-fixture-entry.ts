@@ -35,6 +35,10 @@ const fixture = new CgroupFixture(root);
 
 void main({
   ...productionSeams(),
+  // No cgroup driver here, and that is not an omission. Preflight *reads* the container's cgroup
+  // from `/proc/<pid>/cgroup` and corroborates it against the mount; it never derives a path from a
+  // naming convention, so the driver has nothing to tell it. The driver matters to the watchdog,
+  // which must decide whether the path it is shown is the one the configured daemon would create.
   hostFacts: {
     startTimeTicks: readProcessStartTimeTicks,
     cgroupMembership: (pid) => fixtureMembership(root, pid),

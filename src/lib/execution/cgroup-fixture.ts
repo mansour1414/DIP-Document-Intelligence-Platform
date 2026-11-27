@@ -25,6 +25,7 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { readProcessStartTimeTicks } from "./host-facts";
+import { dedicatedSubtreeFor, expectedCgroupRelative } from "./docker-lifecycle";
 
 /** One carved-out cgroup directory in the fake hierarchy. */
 export type FixtureCgroup = {
@@ -73,7 +74,7 @@ export class CgroupFixture {
    * makes a real child process look like it is inside the fixture.
    */
   relativeFor(containerId: string): string {
-    return `${DIP_FIXTURE_SUBTREE}/${containerId}`;
+    return `/${expectedCgroupRelative(FIXTURE_CGROUP_DRIVER, containerId)}`;
   }
 
   /**
@@ -84,7 +85,7 @@ export class CgroupFixture {
    * the production path checks are exercised rather than bypassed.
    */
   createContainerCgroup(containerId: string, pids: number[]): FixtureCgroup {
-    const dir = join(this.root, "dip-executor.slice", containerId);
+    const dir = join(this.root, DIP_FIXTURE_SUBTREE, containerId);
     mkdirSync(dir, { recursive: true });
     this.created.push(dir);
     this.writeProcs(dir, pids);
@@ -141,8 +142,30 @@ export class CgroupFixture {
   }
 }
 
-/** The dedicated subtree the watchdog verifies against, restated so the fixture cannot drift. */
-export const DIP_FIXTURE_SUBTREE = "dip-executor.slice";
+/**
+ * The cgroup driver the fixture models.
+ *
+ * `cgroupfs`, because the fixture builds a flat tree: `dip-executor.slice/<container id>`. That is
+ * exactly what the cgroupfs driver produces, so the fixture and the policy agree without either
+ * being special-cased.
+ *
+ * ## Why not systemd, when systemd is the production default
+ *
+ * The systemd layout is nested (`dip.slice/dip-executor.slice/docker-<id>.scope`) and its leaf is
+ * named after the *scope unit*, not the container. Modelling it here would mean the fixture had to
+ * invent unit names, and a fixture that invents the thing under test is no longer a fixture. The
+ * `systemd` path is covered directly and by name in `r7d.cgroup-policy.test.ts`, where the
+ * derivation can be asserted exactly instead of inferred from a directory listing.
+ */
+export const FIXTURE_CGROUP_DRIVER = "cgroupfs" as const;
+
+/**
+ * The dedicated subtree the watchdog verifies against, derived so the fixture cannot drift.
+ *
+ * This used to be a second literal `"dip-executor.slice"`, which agreed with the lifecycle only by
+ * coincidence — and stopped agreeing the moment the systemd path learned to nest.
+ */
+export const DIP_FIXTURE_SUBTREE = dedicatedSubtreeFor(FIXTURE_CGROUP_DRIVER);
 
 /**
  * Host facts answered from a fixture tree.
@@ -188,7 +211,7 @@ export function fixtureMembership(root: string, pid: number): string | null {
 
 /** Place a PID into a fixture cgroup, from the test process. */
 export function recordFixtureMembership(root: string, pid: number, containerId: string): void {
-  const relative = `${DIP_FIXTURE_SUBTREE}/${containerId}`;
+  const relative = `/${expectedCgroupRelative(FIXTURE_CGROUP_DRIVER, containerId)}`;
   const file = join(root, "membership.map");
   let existing: string;
   try {

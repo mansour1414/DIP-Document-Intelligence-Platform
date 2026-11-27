@@ -144,16 +144,24 @@ test("R7D.1-CF02-16: the host verifier refuses a PID that is not in the cgroup i
 });
 
 test("R7D.1-CF02-16b: the host verifier refuses a PID whose start time does not match", () => {
-  // This sandbox has no `dip-executor.slice`, so a request naming one cannot resolve to a real
-  // cgroup. Both facts below are therefore refused — but for a reason this test can name, rather
-  // than by trusting the request. The PID-level probes that need a legitimate DIP cgroup are in
-  // `r7d.watchdog-security.test.ts`, where the refusal code is asserted explicitly.
+  // This sandbox has no systemd slice hierarchy at all, so a request naming one cannot resolve to a
+  // real cgroup. Every fact below is therefore refused — but for a reason this test can name,
+  // rather than by trusting the request. The PID-level probes that need a legitimate DIP cgroup are
+  // in `r7d.watchdog-security.test.ts`, where the refusal code is asserted explicitly.
+  //
+  // `NOT_DIP_OWNED` is now among the expected codes, and its presence is informative rather than
+  // incidental: the default driver is systemd, so the boundary is `dip.slice/dip-executor.slice`,
+  // and on a host that has no such directory the ownership check refuses before existence is
+  // consulted. That is the correct order — ownership before existence — so the test states the
+  // outcome the host actually produces instead of pinning a code that depends on the host.
   const result = verifyArmIdentity(baseArm({
     initPid: process.pid,
     initStartTimeTicks: readProcessStartTimeTicks(process.pid) + 1,
   }), readBootId());
   assert.equal(result.ok, false);
-  if (!result.ok) assert.ok(["PID_UNVERIFIED", "CGROUP_UNVERIFIED"].includes(result.code), result.code);
+  if (!result.ok) {
+    assert.ok(["PID_UNVERIFIED", "CGROUP_UNVERIFIED", "NOT_DIP_OWNED"].includes(result.code), result.code);
+  }
 });
 
 test("R7D.1-CF02-16c: the host verifier refuses this process when it is not the execution's init", () => {
@@ -165,7 +173,9 @@ test("R7D.1-CF02-16c: the host verifier refuses this process when it is not the 
     initStartTimeTicks: readProcessStartTimeTicks(process.pid),
   }), readBootId());
   assert.equal(result.ok, false);
-  if (!result.ok) assert.ok(["PID_UNVERIFIED", "CGROUP_UNVERIFIED"].includes(result.code), result.code);
+  if (!result.ok) {
+    assert.ok(["PID_UNVERIFIED", "CGROUP_UNVERIFIED", "NOT_DIP_OWNED"].includes(result.code), result.code);
+  }
 
   // And the same request with a boot id that is not this boot is refused earlier still.
   const stale = verifyArmIdentity(baseArm({ bootId: "00000000-0000-4000-8000-000000000000" }), readBootId());

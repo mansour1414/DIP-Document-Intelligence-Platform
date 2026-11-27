@@ -66,6 +66,14 @@ export type WatchdogSeams = {
   cgroupMount?: () => string | null;
   /** The `major:minor` device of an injected mount. Required with `cgroupMount`. */
   cgroupMountDevice?: () => string | null;
+  /**
+   * The daemon's cgroup driver.
+   *
+   * Exists as a seam because the two driver layouts place the container in different trees, and a
+   * fixture that models one of them must say which. The production default lives in the
+   * `Watchdog` options, not here, so an unset seam means "whatever production does".
+   */
+  cgroupDriver?: () => "systemd" | "cgroupfs";
   actualCgroupPath?: (pid: number, mountPath: string) => { path: string; relative: string } | null;
 };
 
@@ -159,6 +167,7 @@ export function main(seams: WatchdogSeams = {}): void {
     // Present only when the entrypoint supplied them.
     ...(seams.cgroupMount === undefined ? {} : { cgroupMount: seams.cgroupMount }),
     ...(seams.cgroupMountDevice === undefined ? {} : { cgroupMountDevice: seams.cgroupMountDevice }),
+    ...(seams.cgroupDriver === undefined ? {} : { cgroupDriver: seams.cgroupDriver }),
     ...(seams.actualCgroupPath === undefined ? {} : { actualCgroupPath: seams.actualCgroupPath }),
     removeContainer: async (containerId) => {
       const outcome = await removeContainerAsync(containerId);

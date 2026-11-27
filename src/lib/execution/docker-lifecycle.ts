@@ -277,14 +277,32 @@ export type CgroupDriver = "systemd" | "cgroupfs";
 /**
  * The dedicated cgroup parent: a systemd slice name.
  *
- * ## Why this is a top-level slice, and not a directory
+ * ## Why the name is dash-separated, and what that costs
  *
- * `dip-executor.slice` is not a path someone creates; it is a slice unit name, and systemd
- * materialises it at the root of the cgroup tree — `/sys/fs/cgroup/dip-executor.slice` — exactly as
- * it materialises `system.slice` and `user.slice`. Slice nesting is encoded in the name as
- * dash-separated components: `foo-bar.slice` lives inside `foo.slice`, so a name containing no dash
- * is a direct child of the root slice. It is therefore *not* nested under `system.slice`, and it is
- * not correct to assume it is a directory that already exists.
+ * `dip-executor.slice` is not a directory someone creates; it is a slice *unit* name, and systemd
+ * encodes the tree position in the name itself. `systemd.slice(5)`:
+ *
+ * > The name consists of a dash-separated series of names, which describes the path to the slice
+ * > from the root slice. The root slice is named `-.slice`. Example: `foo-bar.slice` is a slice
+ * > that is located within `foo.slice`, which in turn is located in the root slice `-.slice`.
+ *
+ * A hyphen is therefore **not** part of a leaf name — it is the separator between levels. This name
+ * has one hyphen, which means the slice is a child of `dip.slice`, and systemd materialises it at:
+ *
+ * ```text
+ *   /sys/fs/cgroup/dip.slice/dip-executor.slice                       (systemd driver)
+ *   /sys/fs/cgroup/dip.slice/dip-executor.slice/docker-<id>.scope     (its container)
+ * ```
+ *
+ * An earlier version of this file asserted the name was a child of the root slice and sat at
+ * `/sys/fs/cgroup/dip-executor.slice`. That was wrong in the one direction that fails closed *and*
+ * silently: the watchdog would have refused to arm every container, because it was comparing
+ * against a path systemd never creates.
+ *
+ * The cgroupfs driver has no slice semantics at all. It joins the parent onto the cgroup root as a
+ * plain directory, so the container lands at `/sys/fs/cgroup/dip-executor.slice/<id>` and the hyphen
+ * is just a character. The two layouts are not interchangeable and are never accepted in place of
+ * one another.
  *
  * The previous form, `--cgroup-parent /dip-executor-<hex>`, could not be resolved to a slice by the
  * systemd driver, and `verifyArmIdentity` only arms containers inside the dedicated subtree, so the
@@ -294,6 +312,37 @@ export type CgroupDriver = "systemd" | "cgroupfs";
 export const DEDICATED_CGROUP_SLICE = "dip-executor.slice";
 
 /**
+ * The slice path the systemd driver materialises for a slice name.
+ *
+ * Derived from the name rather than hard-coded, because the derivation *is* the rule: split the
+ * stem on `-`, drop the `.slice` suffix, and every leading component is an ancestor slice.
+ * `dip-executor.slice` becomes `dip.slice/dip-executor.slice`.
+ *
+ * This is a function so the watchdog, the pin and the lifecycle cannot hold three opinions about
+ * the hierarchy. One literal in each of three files is exactly how the original defect survived
+ * review: each file agreed with itself.
+ */
+export function systemdSlicePath(sliceName: string): string {
+  const suffix = ".slice";
+  const stem = sliceName.endsWith(suffix) ? sliceName.slice(0, -suffix.length) : sliceName;
+  const levels = stem.split("-");
+  if (levels.some((level) => level === "")) {
+    throw new Error(`refusing an unusable slice name: ${sliceName}`);
+  }
+  return levels.map((_, index) => `${levels.slice(0, index + 1).join("-")}${suffix}`).join("/");
+}
+
+/**
+ * The subtree, relative to the cgroup2 mount, that contains every DIP executor cgroup.
+ *
+ * The watchdog's authority is this subtree and nothing else. It differs per driver because the two
+ * drivers build different trees from the same name.
+ */
+export function dedicatedSubtreeFor(driver: CgroupDriver): string {
+  return driver === "systemd" ? systemdSlicePath(DEDICATED_CGROUP_SLICE) : DEDICATED_CGROUP_SLICE;
+}
+
+/**
  * The parent passed to `docker create`.
  *
  * Both drivers accept the slice name: systemd resolves it as a slice unit, cgroupfs treats it as a
@@ -301,7 +350,16 @@ export const DEDICATED_CGROUP_SLICE = "dip-executor.slice";
  * the subtree, not one container within it.
  */
 export function cgroupParentFor(driver: CgroupDriver): string {
-  void driver;
+  // Shaped rather than returned blindly: an unknown driver reaching the daemon would be a
+  // configuration error discovered as a container that can never be armed. Validate at the boundary.
+  if (driver !== "systemd" && driver !== "cgroupfs") {
+    throw new Error(`refusing an unknown cgroup driver: ${String(driver)}`);
+  }
+  // Both drivers are handed the slice name: systemd resolves it as a unit name, cgroupfs creates a
+  // directory with that name. What differs is the tree each produces, which `expectedCgroupRelative`
+  // owns. Keeping the *parent string* in one place and the *resulting path* in another is deliberate
+  // — they are different facts about different layers, and conflating them is what made the driver
+  // argument decorative.
   return DEDICATED_CGROUP_SLICE;
 }
 
@@ -312,9 +370,22 @@ export function cgroupParentFor(driver: CgroupDriver): string {
  * supervisor observes, and the value the watchdog must independently confirm.
  */
 export function expectedCgroupRelative(driver: CgroupDriver, containerId: string): string {
+  // The leaf is the driver's; the containing subtree is the *derived* subtree, which under systemd
+  // is not the slice name. Both halves come from the same derivation, so they cannot drift.
   return driver === "systemd"
-    ? `${DEDICATED_CGROUP_SLICE}/docker-${containerId}.scope`
-    : `${DEDICATED_CGROUP_SLICE}/${containerId}`;
+    ? `${dedicatedSubtreeFor("systemd")}/docker-${containerId}.scope`
+    : `${dedicatedSubtreeFor("cgroupfs")}/${containerId}`;
+}
+
+/**
+ * Whether a path relative to the cgroup2 mount names exactly one DIP executor cgroup.
+ *
+ * One implementation, used by the pin and the watchdog, so "is this ours" cannot mean two things.
+ * The caller passes the driver it is configured with: accepting both layouts regardless of the
+ * configured driver would let the verification agree with whatever it was shown.
+ */
+export function isExpectedCgroupRelative(driver: CgroupDriver, relative: string, containerId: string): boolean {
+  return relative === `/${expectedCgroupRelative(driver, containerId)}`;
 }
 
 /**

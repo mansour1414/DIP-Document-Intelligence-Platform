@@ -118,7 +118,7 @@ const LF = String.fromCharCode(10);
  * the watchdog are separate processes.
  */
 function placeInCgroup(containerId, pid) {
-  const dir = join(CGROUP_ROOT, "dip-executor.slice", "docker-" + containerId + ".scope");
+  const dir = join(CGROUP_ROOT, "dip-executor.slice", containerId);
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, "cgroup.kill"), "");
   writeFileSync(join(dir, "cgroup.events"), "populated 1" + LF + "frozen 0" + LF);
@@ -127,7 +127,7 @@ function placeInCgroup(containerId, pid) {
   let existing = "";
   try { existing = readFileSync(map, "utf8"); } catch (e) { existing = ""; }
   const kept = existing.split(LF).filter(function (line) { return line !== "" && Number(line.split(" ")[0]) !== pid; });
-  kept.push(pid + " dip-executor.slice/docker-" + containerId + ".scope");
+  kept.push(pid + " dip-executor.slice/" + containerId);
   writeFileSync(map, kept.join(LF) + LF);
 }
 
@@ -400,7 +400,7 @@ if (verb === "rm") {
   // own bookkeeping but left the cgroup populated made every completion UNCERTAIN — the daemon
   // said the container was gone while the cgroup still listed a process. Both effects are
   // performed here so the two agree, as they do on a real host.
-  const cgroupDir = join(CGROUP_ROOT, "dip-executor.slice", "docker-" + id + ".scope");
+  const cgroupDir = join(CGROUP_ROOT, "dip-executor.slice", id);
   try {
     writeFileSync(join(cgroupDir, "cgroup.procs"), "");
     writeFileSync(join(cgroupDir, "cgroup.events"), "populated 0" + LF + "frozen 0" + LF);
@@ -408,7 +408,9 @@ if (verb === "rm") {
   const mapFile = join(CGROUP_ROOT, "membership.map");
   try {
     const kept = readFileSync(mapFile, "utf8").split(LF).filter(function (line) {
-      return line !== "" && line.indexOf("docker-" + id + ".scope") < 0;
+      // Match the whole leaf, not a substring of it: the leaf is now the bare container id, and a
+      // substring test would also drop membership lines for any id sharing a prefix.
+      return line !== "" && line.split(" ")[1] !== "dip-executor.slice/" + id;
     });
     writeFileSync(mapFile, kept.length > 0 ? kept.join(LF) + LF : "");
   } catch (e) { /* no membership map */ }

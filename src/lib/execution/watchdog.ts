@@ -77,6 +77,11 @@ import {
   type ExpectedOwnership,
 } from "./container-identity";
 import { ExecutionArbiter } from "./execution-arbiter";
+import {
+  dedicatedSubtreeFor,
+  isExpectedCgroupRelative,
+  type CgroupDriver,
+} from "./docker-lifecycle";
 
 /** The watchdog's own identity. A restarted watchdog is a different instance. */
 export type WatchdogIdentity = {
@@ -141,8 +146,24 @@ export type HostVerification =
     }
   | { ok: false; code: "BOOT_MISMATCH" | "CGROUP_UNVERIFIED" | "PID_UNVERIFIED" | "NOT_DIP_OWNED" };
 
-/** The dedicated subtree every DIP container must live in. Nothing outside it may be armed. */
-export const DIP_CGROUP_SUBTREE = "dip-executor.slice";
+/**
+ * The dedicated subtree every DIP container must live in, per driver. Nothing outside it is armed.
+ *
+ * ## Why this is a function now
+ *
+ * It was a constant, `"dip-executor.slice"`, and every caller compared against it. That was correct
+ * for `cgroupfs` and wrong for `systemd`, where the slice name *encodes* nesting: one hyphen means
+ * the slice is a child of `dip.slice`, so the directory systemd actually creates is
+ * `dip.slice/dip-executor.slice`. A watchdog holding the flat name would have refused every
+ * container on the default cgroup driver — failing closed, so no container was ever harmed, but
+ * also never armed, which is an outage dressed as a security control.
+ *
+ * The value is derived from the slice name by the same function the lifecycle uses, so the daemon's
+ * parent and the watchdog's boundary cannot disagree.
+ */
+export function dipCgroupSubtree(driver: CgroupDriver): string {
+  return dedicatedSubtreeFor(driver);
+}
 
 /**
  * Independently confirm, from the host, that the container in a request is the container that
@@ -163,12 +184,23 @@ export type HostEvidence = {
   cgroup2Mount: () => { path: string; device: string } | null;
   actualCgroupPath: (pid: number, mountPath: string) => { path: string; relative: string } | null;
   startTimeTicks: (pid: number) => number;
+  /**
+   * The daemon's cgroup driver.
+   *
+   * A property of the daemon, supplied by configuration — never inferred from the path that is
+   * being verified. Inferring it would make every check succeed, because the path being checked
+   * would be the one that taught the checker which layout to expect.
+   */
+  cgroupDriver: () => CgroupDriver;
 };
 
 export const realHostEvidence: HostEvidence = {
   cgroup2Mount: findCgroup2Mount,
   actualCgroupPath: (pid, mountPath) => actualCgroupPath(pid, mountPath),
   startTimeTicks: readProcessStartTimeTicks,
+  // Docker's default on cgroup v2, and the layout this host's daemon uses. A cgroupfs deployment
+  // supplies `cgroupfs` through its seams; there is no auto-detection for the reason above.
+  cgroupDriver: () => "systemd",
 };
 
 export function verifyArmIdentity(
@@ -185,7 +217,13 @@ export function verifyArmIdentity(
 
   // WD-06: ownership before existence. A path outside the dedicated DIP subtree belongs to
   // something else, and no amount of inode verification makes killing it correct.
-  const expectedPrefix = `${mount.path}/${DIP_CGROUP_SUBTREE}/`;
+  //
+  // The subtree is the *driver's* subtree. Under systemd the slice name encodes nesting, so the
+  // boundary is `dip.slice/dip-executor.slice`; under cgroupfs it is the flat `dip-executor.slice`.
+  // Comparing against one fixed string was the defect: it was correct for exactly one driver.
+  const driver = evidence.cgroupDriver();
+  const subtree = dedicatedSubtreeFor(driver);
+  const expectedPrefix = `${mount.path}/${subtree}/`;
   if (!request.cgroupPath.startsWith(expectedPrefix) || request.cgroupPath.split("/").includes("..")) {
     return { ok: false, code: "NOT_DIP_OWNED" };
   }
@@ -207,10 +245,11 @@ export function verifyArmIdentity(
   if (request.containerName !== `dip-exec-${request.executionId}`) {
     return { ok: false, code: "NOT_DIP_OWNED" };
   }
+  // One comparison, against the layout the *configured driver* produces. Accepting both layouts
+  // whatever the driver would be the permissive version of this check: it would let a cgroupfs
+  // daemon satisfy a systemd expectation (or the reverse) as long as the path looked plausible.
   const relative = request.cgroupPath.slice(mount.path.length);
-  const isSystemdScope = relative === `/${DIP_CGROUP_SUBTREE}/docker-${request.containerId}.scope`;
-  const isCgroupfsDir = relative === `/${DIP_CGROUP_SUBTREE}/${request.containerId}`;
-  if (!isSystemdScope && !isCgroupfsDir) {
+  if (!isExpectedCgroupRelative(driver, relative, request.containerId)) {
     return { ok: false, code: "NOT_DIP_OWNED" };
   }
 
@@ -242,7 +281,7 @@ export function verifyArmIdentity(
   if (!isExactMembership(actual.relative, expectedRelative)) return { ok: false, code: "PID_UNVERIFIED" };
   // The member's cgroup must be the one named, and it must be inside the DIP subtree by whole
   // components — a path that merely begins with the DIP slice's characters is not inside it.
-  if (!isInsideDipSubtree(actual.path, mount.path, DIP_CGROUP_SUBTREE)) {
+  if (!isInsideDipSubtree(actual.path, mount.path, subtree)) {
     return { ok: false, code: "NOT_DIP_OWNED" };
   }
 
@@ -320,6 +359,15 @@ export type WatchdogOptions = {
    * indistinguishable.
    */
   cgroupMountDevice?: () => string | null;
+  /**
+   * The daemon's cgroup driver, as configured.
+   *
+   * A seam and not a deduction. The two layouts are not interchangeable, and a watchdog that
+   * inferred the driver from the path it was asked to verify would be verifying nothing: the
+   * observation would choose the rule that judges it. Defaults to `systemd`, which is Docker's
+   * default on cgroup v2.
+   */
+  cgroupDriver?: () => CgroupDriver;
   /**
    * Trusted supervisor intent, read from the journal. Used to corroborate ownership against a
    * record this watchdog did not write (WD-F04). Optional: without it, ownership rests on the
@@ -448,7 +496,14 @@ export class Watchdog {
       },
       actualCgroupPath: (pid, mountPath) => (this.options.actualCgroupPath ?? actualCgroupPath)(pid, mountPath),
       startTimeTicks: readProcessStartTimeTicks,
+      // Configured, never deduced: see the option's comment.
+      cgroupDriver: () => this.options.cgroupDriver?.() ?? "systemd",
     };
+  }
+
+  /** The configured driver, for the checks that are not routed through `hostEvidence`. */
+  private cgroupDriver(): CgroupDriver {
+    return this.options.cgroupDriver?.() ?? "systemd";
   }
 
   private cgroupMountPath(): string {
@@ -457,7 +512,13 @@ export class Watchdog {
 
   /** Pin a cgroup through the configured implementation. */
   private pinCgroup(cgroupPath: string): ReturnType<typeof pinCgroup> {
-    return (this.options.pin ?? pinCgroup)({ cgroupPath, mountPath: this.cgroupMountPath() });
+    return (this.options.pin ?? pinCgroup)({
+      cgroupPath,
+      mountPath: this.cgroupMountPath(),
+      // The subtree follows the driver, so the pin and `verifyArmIdentity` agree about the
+      // boundary by construction rather than by both happening to use the same literal.
+      subtree: dedicatedSubtreeFor(this.cgroupDriver()),
+    });
   }
 
   /** The durable store, or a throw. Arming without a store is not supported. */
@@ -1055,7 +1116,7 @@ export class Watchdog {
     const readPath = this.options.actualCgroupPath ?? actualCgroupPath;
     const actual = readPath(entry.record.initPid, mount);
     if (actual === null) return false;
-    if (!isInsideDipSubtree(actual.path, mount, DIP_CGROUP_SUBTREE)) return false;
+    if (!isInsideDipSubtree(actual.path, mount, dedicatedSubtreeFor(this.cgroupDriver()))) return false;
     const expectedRelative = entry.record.cgroupPath.slice(mount.length);
     if (!isExactMembership(actual.relative, expectedRelative)) return false;
 

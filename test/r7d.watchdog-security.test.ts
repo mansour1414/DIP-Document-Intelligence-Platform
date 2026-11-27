@@ -31,11 +31,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import {
-  DIP_CGROUP_SUBTREE,
   Watchdog,
   newWatchdogIdentity,
   verifyArmIdentity,
 } from "../src/lib/execution/watchdog";
+import { dedicatedSubtreeFor } from "../src/lib/execution/docker-lifecycle";
 import { WatchdogStore, assertArmRecord, type WatchdogArmRecord } from "../src/lib/execution/watchdog-store";
 import { compareDeadline, makeHostClock, readUptimeMs } from "../src/lib/execution/host-clock";
 import {
@@ -363,7 +363,7 @@ test("R7D.1-WD02-5: a HELLO with a malformed nonce or version is refused", () =>
 test("R7D.1-WD03-1: control files are opened through the pinned directory descriptor", () => {
   const fixture = fakeCgroupTree();
   try {
-    const pin = pinCgroup({ cgroupPath: fixture.cgroupPath, mountPath: fixture.mount });
+    const pin = pinCgroup({ cgroupPath: fixture.cgroupPath, mountPath: fixture.mount, subtree: dedicatedSubtreeFor("cgroupfs") });
     assert.equal(pin.ok, true, JSON.stringify(pin));
     if (!pin.ok) return;
 
@@ -391,13 +391,13 @@ test("R7D.1-WD03-2: a write through the pinned descriptor survives a path replac
   // the original inode.
   const fixture = fakeCgroupTree();
   try {
-    const pin = pinCgroup({ cgroupPath: fixture.cgroupPath, mountPath: fixture.mount });
+    const pin = pinCgroup({ cgroupPath: fixture.cgroupPath, mountPath: fixture.mount, subtree: dedicatedSubtreeFor("cgroupfs") });
     assert.equal(pin.ok, true);
     if (!pin.ok) return;
 
     try {
       // Replace the path with a decoy that looks identical.
-      const decoy = join(fixture.mount, `${DIP_CGROUP_SUBTREE}-decoy`);
+      const decoy = join(fixture.mount, `${dedicatedSubtreeFor("cgroupfs")}-decoy`);
       mkdirSync(decoy);
       for (const name of ["cgroup.kill", "cgroup.events", "cgroup.procs"]) {
         writeFileSync(join(decoy, name), name === "cgroup.events" ? "populated 1\n" : "0\n");
@@ -431,7 +431,7 @@ test("R7D.1-WD03-2: a write through the pinned descriptor survives a path replac
 test("R7D.1-WD03-3: a closed descriptor is detected, not silently reused", () => {
   const fixture = fakeCgroupTree();
   try {
-    const pin = pinCgroup({ cgroupPath: fixture.cgroupPath, mountPath: fixture.mount });
+    const pin = pinCgroup({ cgroupPath: fixture.cgroupPath, mountPath: fixture.mount, subtree: dedicatedSubtreeFor("cgroupfs") });
     assert.equal(pin.ok, true);
     if (!pin.ok) return;
 
@@ -453,7 +453,7 @@ test("R7D.1-WD03-4: pinning refuses a path outside the dedicated DIP subtree", (
   try {
     // The cgroup root, and another tenant's directory, are both refused. A pin is an honoured
     // handle: pinning the wrong object is worse than refusing.
-    const root = pinCgroup({ cgroupPath: fixture.mount, mountPath: fixture.mount });
+    const root = pinCgroup({ cgroupPath: fixture.mount, mountPath: fixture.mount, subtree: dedicatedSubtreeFor("cgroupfs") });
     assert.equal(root.ok, false);
     if (!root.ok) assert.equal(root.code, "PATH_INVALID");
 
@@ -463,7 +463,7 @@ test("R7D.1-WD03-4: pinning refuses a path outside the dedicated DIP subtree", (
     const outside = join(fixture.mount, "other-tenant");
     mkdirSync(outside);
     for (const name of ["cgroup.kill", "cgroup.events", "cgroup.procs"]) writeFileSync(join(outside, name), "");
-    const foreign = pinCgroup({ cgroupPath: outside, mountPath: fixture.mount });
+    const foreign = pinCgroup({ cgroupPath: outside, mountPath: fixture.mount, subtree: dedicatedSubtreeFor("cgroupfs") });
     assert.equal(foreign.ok, false);
     if (!foreign.ok) assert.equal(foreign.code, "PATH_INVALID");
   } finally {
@@ -474,11 +474,15 @@ test("R7D.1-WD03-4: pinning refuses a path outside the dedicated DIP subtree", (
 test("R7D.1-WD03-5: pinning refuses traversal and a path under another mount", () => {
   const fixture = fakeCgroupTree();
   try {
-    const traversal = pinCgroup({ cgroupPath: `${fixture.mount}/${DIP_CGROUP_SUBTREE}/../../etc`, mountPath: fixture.mount });
+    const traversal = pinCgroup({
+      cgroupPath: `${fixture.mount}/${dedicatedSubtreeFor("cgroupfs")}/../../etc`,
+      mountPath: fixture.mount,
+      subtree: dedicatedSubtreeFor("cgroupfs"),
+    });
     assert.equal(traversal.ok, false);
     if (!traversal.ok) assert.equal(traversal.code, "PATH_INVALID");
 
-    const elsewhere = pinCgroup({ cgroupPath: "/tmp/not-a-cgroup", mountPath: fixture.mount });
+    const elsewhere = pinCgroup({ cgroupPath: "/tmp/not-a-cgroup", mountPath: fixture.mount, subtree: dedicatedSubtreeFor("cgroupfs") });
     assert.equal(elsewhere.ok, false);
     if (!elsewhere.ok) assert.equal(elsewhere.code, "PATH_INVALID");
   } finally {
@@ -489,7 +493,7 @@ test("R7D.1-WD03-5: pinning refuses traversal and a path under another mount", (
 test("R7D.1-WD03-6: a missing control file refuses the pin and closes what it opened", () => {
   const fixture = fakeCgroupTree({ omit: "cgroup.kill" });
   try {
-    const pin = pinCgroup({ cgroupPath: fixture.cgroupPath, mountPath: fixture.mount });
+    const pin = pinCgroup({ cgroupPath: fixture.cgroupPath, mountPath: fixture.mount, subtree: dedicatedSubtreeFor("cgroupfs") });
     assert.equal(pin.ok, false);
     if (!pin.ok) assert.equal(pin.code, "CONTROL_FILE_ABSENT");
     // No descriptor leak: a refused pin must not leave the directory open.
@@ -502,7 +506,7 @@ test("R7D.1-WD03-6: a missing control file refuses the pin and closes what it op
 test("R7D.1-WD03-7: events and procs are read through the pinned descriptor", () => {
   const fixture = fakeCgroupTree({ populated: false });
   try {
-    const pin = pinCgroup({ cgroupPath: fixture.cgroupPath, mountPath: fixture.mount });
+    const pin = pinCgroup({ cgroupPath: fixture.cgroupPath, mountPath: fixture.mount, subtree: dedicatedSubtreeFor("cgroupfs") });
     assert.equal(pin.ok, true);
     if (!pin.ok) return;
     try {
@@ -776,7 +780,12 @@ test("R7D.1-WD06-1: a cgroup outside the dedicated DIP subtree is refused", () =
 });
 
 test("R7D.1-WD06-2: a cgroup whose leaf does not derive from the execution id is refused", () => {
-  const request = armRequest(EXECUTION, { cgroupPath: `/sys/fs/cgroup/${DIP_CGROUP_SUBTREE}/dip-exec-${"b".repeat(32)}` });
+  // The path is well-formed for the *default* driver (systemd), so the only thing wrong with it is
+  // the leaf. Building it against a flat subtree would make this test pass because of the subtree
+  // rather than because of the leaf, which is the defect it claims to detect.
+  const request = armRequest(EXECUTION, {
+    cgroupPath: `/sys/fs/cgroup/${dedicatedSubtreeFor("systemd")}/dip-exec-${"b".repeat(32)}`,
+  });
   const verdict = verifyArmIdentity(request, BOOT);
   assert.equal(verdict.ok, false);
   if (!verdict.ok) assert.equal(verdict.code, "NOT_DIP_OWNED");
@@ -807,10 +816,11 @@ test("R7D.1-WD06-5: a PID whose start time does not match is refused", () => {
   // a mismatched start time on a legitimate path is a reused PID.
   const mount = "/sys/fs/cgroup";
   const request = armRequest(EXECUTION, {
-    // The documented systemd layout: the container id names the transient scope inside the slice.
-    // A leaf that no driver produces is refused by ownership, which would make this test report an
-    // ownership failure while claiming to test the PID check.
-    cgroupPath: `${mount}/${DIP_CGROUP_SUBTREE}/docker-${"c".repeat(64)}.scope`,
+    // The documented systemd layout: the container id names the transient scope, and the slice
+    // nests under `dip.slice` because the name's hyphen encodes a level. A leaf that no driver
+    // produces would be refused by ownership, which would make this test report an ownership
+    // failure while claiming to test the PID check.
+    cgroupPath: `${mount}/${dedicatedSubtreeFor("systemd")}/docker-${"c".repeat(64)}.scope`,
     initPid: process.pid,
     initStartTimeTicks: readProcessStartTimeTicks(process.pid) + 1,
   });
@@ -829,7 +839,7 @@ test("R7D.1-WD06-6 (mocked cgroup): a path with traversal is never armed", async
     // against the verifier, traversal is caught by the ownership check, because a path with `..`
     // cannot derive the execution's leaf.
     const verdict = verifyArmIdentity(
-      armRequest(EXECUTION, { cgroupPath: `/sys/fs/cgroup/${DIP_CGROUP_SUBTREE}/../../etc` }),
+      armRequest(EXECUTION, { cgroupPath: `/sys/fs/cgroup/${dedicatedSubtreeFor("systemd")}/../../etc` }),
       readBootId(),
     );
     assert.equal(verdict.ok, false);
@@ -906,7 +916,13 @@ function fakeCgroupTree(options: { omit?: string; populated?: boolean } = {}): {
 } {
   const mount = mkdtempSync(join(tmpdir(), "dip-mount-"));
   const executionId = EXECUTION;
-  const cgroupPath = join(mount, DIP_CGROUP_SUBTREE, `dip-exec-${executionId}`);
+  // ## The fixture is a cgroupfs tree, and says so
+  //
+  // cgroupfs places the container in a flat directory named by the parent. systemd would nest it
+  // under `dip.slice/dip-executor.slice`, and `fakeCgroupTree` deliberately does not model that —
+  // so the driver is passed explicitly rather than left to a default that would make this fixture
+  // silently wrong for one of the two layouts.
+  const cgroupPath = join(mount, dedicatedSubtreeFor("cgroupfs"), `dip-exec-${executionId}`);
   mkdirSync(cgroupPath, { recursive: true });
   const populated = options.populated ?? true;
   for (const name of ["cgroup.kill", "cgroup.events", "cgroup.procs"]) {

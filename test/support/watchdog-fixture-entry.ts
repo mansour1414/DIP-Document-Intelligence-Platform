@@ -8,7 +8,7 @@
  * an environment switch inside `workers/watchdog.ts`.
  */
 
-import { CgroupFixture, fixtureMembership } from "../../src/lib/execution/cgroup-fixture";
+import { CgroupFixture, FIXTURE_CGROUP_DRIVER, fixtureMembership } from "../../src/lib/execution/cgroup-fixture";
 import { main } from "../../workers/watchdog";
 
 const root = process.env.DIP_TEST_CGROUP_FIXTURE ?? "";
@@ -20,6 +20,10 @@ if (root === "") {
 const fixture = new CgroupFixture(root);
 
 main({
+  // The fixture builds a flat tree, which is the cgroupfs layout. Saying so is not a convenience:
+  // the watchdog verifies against the tree its configured driver produces, so an undeclared driver
+  // would make every arm fail ownership for a reason the test is not about.
+  cgroupDriver: () => FIXTURE_CGROUP_DRIVER,
   cgroupMount: () => fixture.root,
   // The fixture's device, in the `major:minor` form records carry. Stable for the fixture's life,
   // and distinct from any real device so a record from one hierarchy cannot be replayed in another.
