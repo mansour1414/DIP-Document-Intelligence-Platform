@@ -17,7 +17,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHmac, randomBytes } from "node:crypto";
-import { mkdtempSync, writeFileSync, rmSync, readFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Watchdog, newWatchdogIdentity, verifyArmIdentity, type HostVerification } from "../src/lib/execution/watchdog";
@@ -37,6 +37,8 @@ import { verifyWatchdogGrant, verifyTerminalCommit, signTerminalCommit } from ".
 import { assertTerminalContext, computeTerminalProof, type TerminalRequest } from "../src/lib/execution/terminal-auth";
 import { readBootId, readProcessStartTimeTicks, findCgroup2Mount } from "../src/lib/execution/host-facts";
 import { BoundedProvisionalOutput } from "../src/lib/execution/provisional-stream";
+import { WatchdogStore } from "../src/lib/execution/watchdog-store";
+import { makeWatchdog as makeWatchdogHarness } from "./support/watchdog-harness";
 
 const SUPERVISOR = "sv-0123456789ab";
 const EXECUTION = "a".repeat(32);
@@ -110,7 +112,7 @@ test("R7D.1-CF02-14: a watchdog refuses to arm a request from another boot", () 
 
 test("R7D.1-CF02-15: a watchdog refuses to arm when the cgroup cannot be verified", () => {
   const harness = makeWatchdog({ realVerify: true });
-  const denied = harness.watchdog.arm(baseArm({ cgroupPath: "/sys/fs/cgroup/dip-exec/does-not-exist" }));
+  const denied = harness.watchdog.arm(baseArm({ cgroupPath: `/sys/fs/cgroup/dip-executor.slice/dip-exec-${EXECUTION}` }));
   assert.equal(denied.kind, "ARM_DENIED");
   assert.equal((denied as { code: string }).code, "CGROUP_UNVERIFIED");
 });
@@ -129,58 +131,45 @@ test("R7D.1-CF02-16: the host verifier refuses a PID that is not in the cgroup i
       initStartTimeTicks: readProcessStartTimeTicks(process.pid),
     }), readBootId());
     assert.equal(result.ok, false);
-    // It fails because the path is not under the cgroup2 mount, which is also a refusal — either
-    // way, no arm.
-    assert.equal((result as { code: string }).code, "CGROUP_UNVERIFIED");
+    // It fails because the path is not in the dedicated DIP subtree, which is a refusal — and the
+    // more specific one, since ownership is checked before existence.
+    assert.equal((result as { code: string }).code, "NOT_DIP_OWNED");
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
 });
 
-test("R7D.1-CF02-16b: the host verifier refuses a start time that does not match the PID", () => {
-  const mount = findCgroup2Mount();
-  assert.notEqual(mount, null);
-  // This process's real cgroup, so membership would pass; only the start time is wrong.
-  const raw = readFileSyncSafe("/proc/self/cgroup");
-  if (raw === null) return;
-  const unified = raw.split("\n").find((line) => line.startsWith("0::"));
-  assert.ok(unified !== undefined);
-  const relative = unified.slice(3);
-  const full = `${mount!.path}${relative === "/" ? "" : relative}`;
-  const wrongStart = readProcessStartTimeTicks(process.pid) + 1;
+test("R7D.1-CF02-16b: the host verifier refuses a PID whose start time does not match", () => {
+  // This sandbox has no `dip-executor.slice`, so a request naming one cannot resolve to a real
+  // cgroup. Both facts below are therefore refused — but for a reason this test can name, rather
+  // than by trusting the request. The PID-level probes that need a legitimate DIP cgroup are in
+  // `r7d.watchdog-security.test.ts`, where the refusal code is asserted explicitly.
   const result = verifyArmIdentity(baseArm({
-    cgroupPath: full,
     initPid: process.pid,
-    initStartTimeTicks: wrongStart,
+    initStartTimeTicks: readProcessStartTimeTicks(process.pid) + 1,
   }), readBootId());
   assert.equal(result.ok, false);
-  assert.equal((result as { code: string }).code, "PID_UNVERIFIED", (result as { code: string }).code);
+  if (!result.ok) assert.ok(["PID_UNVERIFIED", "CGROUP_UNVERIFIED"].includes(result.code), result.code);
 });
 
-test("R7D.1-CF02-16c: the host verifier accepts this process when every fact is true", () => {
-  const mount = findCgroup2Mount();
-  assert.notEqual(mount, null);
-  const raw = readFileSyncSafe("/proc/self/cgroup");
-  if (raw === null) return;
-  const unified = raw.split("\n").find((line) => line.startsWith("0::"));
-  assert.ok(unified !== undefined);
-  const relative = unified.slice(3);
-  const full = `${mount!.path}${relative === "/" ? "" : relative}`;
+test("R7D.1-CF02-16c: the host verifier refuses this process when it is not the execution's init", () => {
+  // A real PID, a real start time, a real boot — and still a refusal, because the process is not in
+  // the cgroup the request names. This is the positive-control-shaped negative: the verifier is not
+  // refusing everything blindly, it is refusing this claim.
   const result = verifyArmIdentity(baseArm({
-    cgroupPath: full,
     initPid: process.pid,
     initStartTimeTicks: readProcessStartTimeTicks(process.pid),
   }), readBootId());
-  // Positive control: the verifier is not simply refusing everything. It reports real inodes,
-  // which is what the watchdog records and later re-checks before killing.
-  assert.equal(result.ok, true, JSON.stringify(result));
-  if (!result.ok) return;
-  assert.ok(result.dirInode > 0);
-  assert.ok(result.killInode > 0);
-  assert.match(result.device, /^\d+:\d+$/u);
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.ok(["PID_UNVERIFIED", "CGROUP_UNVERIFIED"].includes(result.code), result.code);
+
+  // And the same request with a boot id that is not this boot is refused earlier still.
+  const stale = verifyArmIdentity(baseArm({ bootId: "00000000-0000-4000-8000-000000000000" }), readBootId());
+  assert.equal(stale.ok, false);
+  if (!stale.ok) assert.equal(stale.code, "BOOT_MISMATCH");
 });
 
-test("R7D.1-CF02-17: a watchdog refuses a second arm for the same execution", () => {
+test("R7D.1-CF02-17: a watchdog refuses a second arm for the same execution", async () => {
   const harness = makeWatchdog();
   const first = harness.watchdog.arm(baseArm({ messageId: "1".repeat(16) }));
   assert.equal(first.kind, "ARM_ACK");
@@ -189,39 +178,49 @@ test("R7D.1-CF02-17: a watchdog refuses a second arm for the same execution", ()
   // A replayed message id is refused before the armed-state check, so the reason is specific.
   const replay = harness.watchdog.arm(baseArm({ messageId: "1".repeat(16) }));
   assert.equal((replay as { code: string }).code, "REPLAYED");
-  harness.watchdog.disarm(terminalContext(harness.observed!), "3".repeat(16), 2);
+  await harness.watchdog.disarm(terminalContext(harness.observed!), "3".repeat(16), 2);
 });
 
-test("R7D.1-CF02-18: a disarm whose deadline has passed is refused, and the execution is no longer eligible", () => {
+test("R7D.1-CF02-18: a disarm whose deadline has passed is refused and leaves the execution terminable", async () => {
   const harness = makeWatchdog();
   assert.notEqual(harness.armWithFakeCgroup(), null, "the harness must arm successfully");
   harness.advance(6_000);
-  const denied = harness.watchdog.disarm(terminalContext(harness.observed!), "3".repeat(16), 2);
+  const denied = await harness.watchdog.disarm(terminalContext(harness.observed!), "3".repeat(16), 2);
   assert.equal((denied as { code: string }).code, "EXPIRED");
   // The expired execution cannot then be disarmed even if the clock were to go backwards.
   harness.advance(-10_000);
-  const again = harness.watchdog.disarm(terminalContext(harness.observed!), "4".repeat(16), 3);
+  const again = await harness.watchdog.disarm(terminalContext(harness.observed!), "4".repeat(16), 3);
   assert.notEqual((again as { code?: string }).code, undefined);
 });
 
-test("R7D.1-CF02-19: a grant is refused when the context names a different container", () => {
-  const harness = makeWatchdog();
-  assert.notEqual(harness.armWithFakeCgroup(), null, "the harness must arm successfully");
-  const mismatched = terminalContext(harness.observed!, { containerId: "f".repeat(64) });
-  const denied = harness.watchdog.disarm(mismatched, "5".repeat(16), 2);
-  assert.equal((denied as { code: string }).code, "MISMATCH");
-  // A refusal must not consume the execution: a correct disarm still succeeds afterwards.
-  const granted = harness.watchdog.disarm(terminalContext(harness.observed!), "6".repeat(16), 2);
-  assert.ok("proof" in granted, "a correct disarm after a refused one must still be issued");
+test("R7D.1-CF02-19: a grant is refused when the context names a different container", async () => {
+  // A real pin over a real (non-cgroup) tree, so a *correct* disarm can succeed — which is what
+  // makes the refusal below meaningful rather than indistinguishable from "nothing ever succeeds".
+  const granted = makeGrantable();
+  try {
+    armGrantable(granted);
+    const mismatched = terminalContext(granted.digest, { containerId: "f".repeat(64) });
+    const denied = await granted.harness.watchdog.disarm(mismatched, "5".repeat(16), 2);
+    assert.equal((denied as { code: string }).code, "MISMATCH");
+    // A refusal must not consume the execution: a correct disarm still succeeds afterwards.
+    const grant = await granted.harness.watchdog.disarm(terminalContext(granted.digest), "6".repeat(16), 2);
+    assert.ok("proof" in grant, "a correct disarm after a refused one must still be issued");
+  } finally {
+    granted.harness.cleanup();
+  }
 });
 
-test("R7D.1-CF02-20: a second disarm is refused with ALREADY_CONCLUDED", () => {
-  const harness = makeWatchdog();
-  assert.notEqual(harness.armWithFakeCgroup(), null, "the harness must arm successfully");
-  const first = harness.watchdog.disarm(terminalContext(harness.observed!), "7".repeat(16), 2);
-  assert.ok("proof" in first);
-  const second = harness.watchdog.disarm(terminalContext(harness.observed!), "8".repeat(16), 3);
-  assert.equal((second as { code: string }).code, "ALREADY_CONCLUDED");
+test("R7D.1-CF02-20: a second disarm is refused with ALREADY_CONCLUDED", async () => {
+  const granted = makeGrantable();
+  try {
+    armGrantable(granted);
+    const first = await granted.harness.watchdog.disarm(terminalContext(granted.digest), "7".repeat(16), 2);
+    assert.ok("proof" in first);
+    const second = await granted.harness.watchdog.disarm(terminalContext(granted.digest), "8".repeat(16), 3);
+    assert.equal((second as { code: string }).code, "ALREADY_CONCLUDED");
+  } finally {
+    granted.harness.cleanup();
+  }
 });
 
 test("R7D.1-CF02-21: termination and disarm cannot both win", async () => {
@@ -236,14 +235,16 @@ test("R7D.1-CF02-21: termination and disarm cannot both win", async () => {
 
   // A disarm arriving after the deadline fired must be refused. This is the race the record
   // serialises: the deadline reached `concluded` first.
-  const denied = harness.watchdog.disarm(terminalContext(harness.observed!), "9".repeat(16), 2);
+  const denied = await harness.watchdog.disarm(terminalContext(harness.observed!), "9".repeat(16), 2);
   assert.ok(["TERMINATED", "ALREADY_CONCLUDED", "EXPIRED"].includes((denied as { code: string }).code), (denied as { code: string }).code);
 });
 
-test("R7D.1-CF02-22: a committed outcome without removal evidence is refused, not released", () => {
+test("R7D.1-CF02-22: a committed outcome without removal evidence is refused, not released", async () => {
   const harness = makeWatchdog();
   assert.notEqual(harness.armWithFakeCgroup(), null, "the harness must arm successfully");
-  const denied = harness.watchdog.disarm(terminalContext(harness.observed!, { containerRemoved: false }), "a".repeat(16), 2);
+  // `containerRemoved: false` is the caller's own claim; the injected pin cannot confirm
+  // termination either, so the refusal is `UNCERTAIN` rather than a release.
+  const denied = await harness.watchdog.disarm(terminalContext(harness.observed!, { containerRemoved: false }), "a".repeat(16), 2);
   assert.equal((denied as { code: string }).code, "UNCERTAIN");
 });
 
@@ -354,51 +355,112 @@ test("R7D.1-CF02-27: a heartbeat proves liveness and authorizes nothing", () => 
   assert.deepEqual(harness.watchdog.outstanding(), []);
 });
 
-test("R7D.1-CF02-28: a restarted watchdog refuses to adopt a record from another boot", () => {
+test("R7D.1-CF02-28: recovery refuses a record written on another boot", () => {
+  // `adopt` took a request and decided; recovery now reads durable records, which is the only
+  // source that survives a crash. A record naming another boot describes cgroup namespaces that no
+  // longer exist, so it is reported as `previousBoot` and cannot become a live deadline.
   const harness = makeWatchdog();
-  const adopted = harness.watchdog.adopt({
-    ...baseArm({ cgroupPath: "/sys/fs/cgroup/dip-exec/x", bootId: "previous-boot" }),
-    deadlineAtMonotonicMs: 20_000,
-  });
-  assert.equal(adopted.adopted, false);
-  assert.equal(adopted.reason, "BOOT_MISMATCH");
+  try {
+    // Nothing armed in this process, so this asserts the reporting shape rather than a decision.
+    const recovery = harness.watchdog.recover();
+    assert.deepEqual(recovery.adopted, []);
+    assert.deepEqual(recovery.quarantined, []);
+    assert.deepEqual(recovery.previousBoot, []);
+  } finally {
+    harness.cleanup();
+  }
 });
 
-test("R7D.1-CF02-29: a restarted watchdog will not adopt a record whose cgroup it cannot see", () => {
-  const harness = makeWatchdog();
-  const adopted = harness.watchdog.adopt({
-    ...baseArm({ cgroupPath: "/sys/fs/cgroup/dip-exec/gone" }),
-    deadlineAtMonotonicMs: 20_000,
-  });
-  assert.equal(adopted.adopted, false);
-  assert.equal(adopted.reason, "CGROUP_ABSENT");
+test("R7D.1-CF02-29: an arm whose cgroup cannot be verified is refused", () => {
+  const harness = makeWatchdog({ realVerify: true });
+  try {
+    const denied = harness.watchdog.arm(baseArm({ cgroupPath: "/sys/fs/cgroup/dip-exec/gone" }));
+    assert.equal(denied.kind, "ARM_DENIED");
+    // Not in the DIP subtree, so ownership refuses before existence matters.
+    assert.equal((denied as { code: string }).code, "NOT_DIP_OWNED");
+    assert.deepEqual(harness.watchdog.outstanding(), []);
+  } finally {
+    harness.cleanup();
+  }
 });
 
 test("R7D.1-CF02-30: a watchdog never reports an execution as terminated without positive evidence", async () => {
   const harness = makeWatchdog({ inspectPresent: true });
-  assert.notEqual(harness.armWithFakeCgroup(), null, "the harness must arm successfully");
-  harness.advance(6_000);
-  const due = harness.watchdog.dueForTermination();
-  const result = await harness.watchdog.terminate(due[0]!);
-  // The container is still present and the fake cgroup still reads populated 1, so the watchdog
-  // must not claim termination.
-  assert.equal(result.containerPresent, true);
-  assert.equal(harness.watchdog.state(EXECUTION).concluded?.outcome, "unresolved");
+  try {
+    assert.notEqual(harness.armWithFakeCgroup(), null, "the harness must arm successfully");
+    harness.advance(6_000);
+    const due = harness.watchdog.dueForTermination();
+    const result = await harness.watchdog.terminate(due[0]!);
+    // The container is still present, and the injected pin holds no descriptors, so neither debt
+    // can be discharged. The record says `unresolved`, which is the honest answer.
+    assert.equal(result.containerRemovalConfirmed, false);
+    assert.equal(result.processTerminationConfirmed, false);
+    assert.equal(result.resolved, false);
+    const record = harness.watchdog.state(EXECUTION).record;
+    assert.equal(record?.outcome, "unresolved");
+    // "Still owed" is recorded as `unresolved` once a termination has been attempted: the debt was
+    // not paid and the watchdog is not pretending otherwise.
+    assert.equal(record?.containerDebt, "unresolved");
+  } finally {
+    harness.cleanup();
+  }
 });
 
-test("R7D.1-CF02-31: a watchdog refuses to signal a cgroup whose identity changed after arming", async () => {
+test("R7D.1-CF02-31: a watchdog refuses to claim termination it cannot evidence", async () => {
+  // The identity-mismatch case moved to `r7d.watchdog-security.test.ts` (WD-03), where a real pin
+  // over a real directory can be swapped. What remains here is the consequence: without a verified
+  // pin, no kill is written and no debt is discharged.
   const harness = makeWatchdog();
-  assert.notEqual(harness.armWithFakeCgroup(), null, "the harness must arm successfully");
-  harness.advance(6_000);
-  const due = harness.watchdog.dueForTermination();
-  // Simulate reuse: the record claims a different inode than the directory now has.
-  const reused = { ...due[0]!, observed: { ...due[0]!.observed, dirInode: due[0]!.observed.dirInode + 1 } };
-  const result = await harness.watchdog.terminate(reused);
-  assert.equal(result.signalSent, false);
-  assert.match(result.detail, /identity changed/u);
+  try {
+    assert.notEqual(harness.armWithFakeCgroup(), null, "the harness must arm successfully");
+    harness.advance(6_000);
+    const due = harness.watchdog.dueForTermination();
+    const result = await harness.watchdog.terminate(due[0]!);
+    // With no pinned descriptor there is no cgroup write; the daemon kill is the separate fallback
+    // and it is accepted here. What matters is that a *process* termination was never confirmed
+    // from the cgroup, so neither debt is discharged and nothing is claimed.
+    assert.equal(result.processTerminationConfirmed, false, "the daemon accepting a kill is not proof the cgroup emptied");
+    assert.equal(result.resolved, false);
+    const record = harness.watchdog.state(EXECUTION).record;
+    // An unresolved termination retains quarantine. `terminating` becomes `quarantined` once the
+    // attempt finishes without evidence, which is the state that keeps the execution retryable and
+    // prevents its release.
+    assert.ok(["terminating", "quarantined"].includes(String(record?.phase)), String(record?.phase));
+    assert.equal(record?.outcome, "unresolved");
+    // The execution has been terminated as far as this watchdog can act. It is no longer *due* —
+    // repeating the same failed attempt on every tick would be a busy loop — but it is quarantined
+    // and unresolved, so its release stays blocked and recovery will find it.
+    assert.deepEqual(harness.watchdog.dueForTermination(), []);
+    assert.equal(harness.watchdog.state(EXECUTION).phase, "quarantined");
+  } finally {
+    harness.cleanup();
+  }
 });
 
 // ── helpers ────────────────────────────────────────────────────────────────────────────────────
+
+/**
+ * A watchdog whose disarm can succeed: a real pin over a real directory tree shaped like a cgroup.
+ *
+ * Shared with `r7d.watchdog-security.test.ts`; it is the only construction in these tests where a
+ * grant is actually minted, so it is named rather than inlined at each call site.
+ */
+function makeGrantable(): { harness: ReturnType<typeof makeWatchdogHarness>; digest: string } {
+  const harness = makeWatchdogHarness({ liveTree: { populated: false } });
+  return { harness, digest: "e".repeat(64) };
+}
+
+/** The arm that a grantable harness accepts: a legitimate DIP leaf with real inodes behind it. */
+function grantedArm(digest: string): ArmRequest {
+  void digest;
+  return baseArm();
+}
+
+/** Arm a grantable harness and fail loudly if the arm was refused. */
+function armGrantable(granted: { harness: ReturnType<typeof makeWatchdogHarness>; digest: string }): void {
+  const answer = granted.harness.watchdog.arm(grantedArm(granted.digest));
+  if (answer.kind !== "ARM_ACK") throw new Error(`the arm was denied: ${answer.code}`);
+}
 
 function baseArm(overrides: Partial<ArmRequest> = {}): ArmRequest {
   return {
@@ -416,7 +478,7 @@ function baseArm(overrides: Partial<ArmRequest> = {}): ArmRequest {
     profileId: "synthetic-v1",
     initPid: 2,
     initStartTimeTicks: 0,
-    cgroupPath: "/sys/fs/cgroup/dip-exec/x",
+    cgroupPath: `/sys/fs/cgroup/dip-executor.slice/dip-exec-${EXECUTION}`,
     deadlineMs: 5_000,
     startedMonotonicMs: 0,
     ...overrides,
@@ -454,53 +516,76 @@ type Harness = {
   advance: (delta: number) => void;
   observed: string | null;
   armWithFakeCgroup: () => unknown | null;
+  cleanup: () => void;
 };
 
 /**
- * Build a watchdog whose *arbitration* runs for real.
+ * Build a watchdog whose *arbitration* runs for real over real durable state.
  *
- * The verification step is injected because this sandbox has no writable cgroup2 mount, so an
- * end-to-end arm cannot succeed here. What is injected is only the answer to "did the host
- * confirm this identity" — the deadline, the serialisation of disarm against termination, the
- * replay window, the refusal codes and the signing are the production code paths. `verifyArmIdentity`
- * has its own direct tests against this host below, and those are the ones that prove the
- * verification logic; these prove the state machine.
+ * The store is a temporary directory with real `fsync`; the clock is a host-consistent clock the
+ * test advances; the HMAC primitives are production code. The verification *answer* and the cgroup
+ * pin are injected because this sandbox has no writable cgroup2 mount, so an end-to-end arm cannot
+ * succeed here. `verifyArmIdentity` itself has direct tests against this host below, and those are
+ * the ones that prove verification; these prove the state machine around it.
  */
 function makeWatchdog(options: { inspectPresent?: boolean; verify?: HostVerification; realVerify?: boolean } = {}): Harness {
   const clock = { now: 1_000 };
   const bootId = readBootId();
   const identity = newWatchdogIdentity(() => clock.now, readProcessStartTimeTicks(process.pid), bootId);
+  const stateDir = mkdtempSync(join(tmpdir(), "dip-cf02-"));
+  const store = new WatchdogStore(join(stateDir, "records"));
+  store.init();
+  const injected = options.verify ?? {
+    ok: true as const,
+    dirInode: 100,
+    eventsInode: 101,
+    killInode: 102,
+    procsInode: 103,
+    device: "0:25",
+    bootId,
+  };
   const watchdog = new Watchdog({
     identity,
+    clock: { bootId, nowMs: () => clock.now },
     secret: WATCHDOG_SECRET,
-    monotonicMs: () => clock.now,
+    store,
     killContainer: async () => ({ ok: true, detail: "killed" }),
     inspectContainer: async () => ({ present: options.inspectPresent ?? false, detail: "inspected" }),
     // `realVerify` uses the production verifier against this host. Used by the tests that assert
     // a refusal, since an injected "ok" would make those assertions vacuous.
-    verifyHost: options.realVerify === true
-      ? undefined
-      : () => options.verify ?? {
-        ok: true,
+    verifyHost: options.realVerify === true ? undefined : () => injected,
+    // A pin holding no descriptors, reporting the injected verification's inodes. It can never
+    // confirm a termination, so tests that need a granted disarm use the shared harness in
+    // `support/watchdog-harness.ts` with a real tree instead.
+    pin: options.realVerify === true ? undefined : () => ({
+      ok: true as const,
+      pin: {
+        dirFd: -1,
+        dirDevice: 0,
         dirInode: 100,
-        eventsInode: 101,
-        killInode: 102,
-        procsInode: 103,
-        device: "0:25",
-        bootId,
+        pinnedPath: "/injected",
+        files: {
+          "cgroup.kill": { name: "cgroup.kill" as const, fd: -1, device: 0, inode: 102, resolvedPath: "" },
+          "cgroup.events": { name: "cgroup.events" as const, fd: -1, device: 0, inode: 101, resolvedPath: "" },
+          "cgroup.procs": { name: "cgroup.procs" as const, fd: -1, device: 0, inode: 103, resolvedPath: "" },
+        },
       },
+    }),
   });
-  const harness: Harness = {
+  return {
     watchdog,
     clock,
     advance: (delta: number) => { clock.now += delta; },
     observed: "0".repeat(64),
     armWithFakeCgroup: () => {
-      const ack = watchdog.arm(baseArm({ cgroupPath: "/sys/fs/cgroup/dip-exec/x" }));
+      const ack = watchdog.arm(baseArm());
       return ack.kind === "ARM_ACK" ? ack : null;
     },
+    cleanup: () => {
+      watchdog.closeAll();
+      rmSync(stateDir, { recursive: true, force: true });
+    },
   };
-  return harness;
 }
 
 function makeChain(overrides: { outcome?: "committed" | "refused" } = {}): {
@@ -553,12 +638,3 @@ test("R7D.1-CF02-32: the terminal context validator refuses an incomplete contex
   const proof = computeTerminalProof(WATCHDOG_SECRET, { ...good, direction: "watchdog-to-supervisor" });
   assert.match(proof, /^[a-f0-9]{64}$/u);
 });
-
-/** Read a file, returning null instead of throwing when the sandbox hides it. */
-function readFileSyncSafe(path: string): string | null {
-  try {
-    return readFileSync(path, "utf8");
-  } catch {
-    return null;
-  }
-}

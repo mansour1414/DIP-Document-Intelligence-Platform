@@ -118,7 +118,30 @@ export type TerminalGrantMessage = {
 export type TerminalDeniedMessage = {
   executionId: string;
   requestId: string;
-  code: "EXPIRED" | "TERMINATED" | "CANCELLED" | "UNCERTAIN" | "ALREADY_CONCLUDED" | "UNKNOWN_EXECUTION" | "MISMATCH";
+  code:
+    | "EXPIRED"
+    | "TERMINATED"
+    | "CANCELLED"
+    | "UNCERTAIN"
+    | "ALREADY_CONCLUDED"
+    | "UNKNOWN_EXECUTION"
+    | "MISMATCH"
+    /**
+     * A termination is already underway for this execution.
+     *
+     * Distinct from `ALREADY_CONCLUDED`: nothing is decided yet, and answering "concluded" would
+     * tell the supervisor the outcome is known when the kill has not been confirmed.
+     */
+    | "TERMINATION_PENDING"
+    /**
+     * Completion was verified but the conclusion could not be recorded durably.
+     *
+     * Distinct from `UNCERTAIN`, and the distinction is operational: `UNCERTAIN` means the host
+     * could not be asked, so retrying is the only option; this means the host answered and the
+     * answer could not be stored, which is a storage fault the supervisor should surface rather
+     * than interpret as an ambiguous execution.
+     */
+    | "DURABILITY_FAILED";
   watchdogInstance: string;
 };
 

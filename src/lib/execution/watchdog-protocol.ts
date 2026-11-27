@@ -117,7 +117,38 @@ export type ArmDenied = {
   messageId: string;
   executionId: string;
   watchdogInstance: string;
-  code: "OWNERSHIP_UNVERIFIED" | "BOOT_MISMATCH" | "CGROUP_UNVERIFIED" | "PID_UNVERIFIED" | "ALREADY_ARMED" | "REPLAYED" | "INVALID";
+  code:
+    | "OWNERSHIP_UNVERIFIED"
+    | "BOOT_MISMATCH"
+    | "CGROUP_UNVERIFIED"
+    | "PID_UNVERIFIED"
+    | "ALREADY_ARMED"
+    | "REPLAYED"
+    | "INVALID"
+    /**
+     * The cgroup is not in the dedicated DIP subtree, or its leaf does not derive from the
+     * execution id. Nothing outside that subtree belongs to this control plane.
+     */
+    | "NOT_DIP_OWNED"
+    /**
+     * The watchdog could not write the arm record durably.
+     *
+     * A refusal, not a degraded mode: an arm that exists only in memory would be forgotten by a
+     * crash, and the supervisor would be told a deadline was armed that no process is enforcing.
+     */
+    | "DURABILITY_FAILED"
+    /**
+     * Startup recovery found a record it could not positively resolve.
+     *
+     * Arming is refused until an operator clears it: with an unresolved execution, the watchdog
+     * does not know whether a container it is responsible for is still running.
+     */
+    | "RECOVERY_INCOMPLETE"
+    /**
+     * This execution already reached a terminal phase. Re-arming would be a second execution
+     * wearing the first one's identity.
+     */
+    | "ALREADY_CONCLUDED";
 };
 
 export type DisarmRequest = {
