@@ -46,7 +46,9 @@ function commitFor(
     operation: "fill",
     resultDigest: sha256Hex(frame),
     resultBytes: frame.byteLength,
-    metaBytes: FRAME.byteLength,
+    // The sealed metadata length is the declared block length in the frame's own prefix, not the
+    // whole frame — a real supervisor seals what it actually validated.
+    metaBytes: frame.readUInt32BE(0),
     outcome: "committed",
     containerRemoved: true,
     watchdogInstance: WATCHDOG_INSTANCE,
@@ -96,6 +98,8 @@ function spec(body: Buffer, overrides: Partial<RequestSpec> = {}): RequestSpec {
     bodyDigest: digestOf(body),
     metaBytes: FRAME.byteLength,
     executionId: EXECUTION,
+    bootId: BOOT,
+    supervisorInstance: SUPERVISOR_INSTANCE,
     ...overrides,
   };
 }

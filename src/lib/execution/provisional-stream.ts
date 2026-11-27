@@ -229,6 +229,11 @@ export class ProvisionalResultStream {
     if (this.ended) throw this.invalidate("CLOSED", "the stream already ended");
     if (this.invalidated) throw new StreamError("CLOSED", "the stream was invalidated by an earlier framing fault");
     const view = Buffer.isBuffer(input) ? input : Buffer.from(input.buffer, input.byteOffset, input.byteLength);
+    // Hash every byte of the frame as it arrives — the metadata header, the metadata block, and
+    // the output — so `resultDigest` and `resultBytes` describe the same byte range: the complete
+    // result frame including its metadata. Nothing is hashed twice: `consume` no longer updates
+    // the digest.
+    this.hash.update(view);
     this.frameBytes += view.byteLength;
     // A single coalesced chunk may contain a header *and* a body, so the views advance through
     // the input rather than being recursively fed back through `push`.
@@ -295,7 +300,8 @@ export class ProvisionalResultStream {
       // process that is supposed to remain a thin pipe.
       throw this.invalidate("BUFFER_EXCEEDED", "the consumer is not keeping up with the result stream");
     }
-    this.hash.update(body);
+    // `push` already hashed every byte of the frame (metadata header + block + output). The
+    // digest is not updated here again, so `outputSha256` covers the complete frame exactly once.
     this.outputBytes += body.byteLength;
     this.pendingBytes += body.byteLength;
     this.options.sink({ index: this.chunks, bytes: body });

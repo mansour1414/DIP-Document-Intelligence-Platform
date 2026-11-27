@@ -222,6 +222,7 @@ async function authenticate(
     role,
     requestId: hello.requestId,
     operation: hello.operation as "inspect",
+    clientInstance: hello.clientInstance as string,
     reservationId: hello.reservationId as string | null,
     controlLength: Number(hello.controlLength),
     controlSha256: String(hello.controlSha256),
@@ -254,19 +255,20 @@ test("R7D.1-D2R-1: a correct handshake authenticates both directions and admits 
       bootId: BOOT,
       serverNonce: Buffer.from(String(challenge.serverNonce), "hex"),
       clientNonce: Buffer.from(hello.clientNonce, "hex"),
-      role: "app",
-      requestId: hello.requestId,
-      operation: "inspect",
-      reservationId: null,
-      controlLength: 0,
-      controlSha256: createHash("sha256").digest("hex"),
-      bodyLength: 0,
-      bodySha256: createHash("sha256").digest("hex"),
-    });
-    client.send({ kind: "AUTH", proof: computeProof(fixture.secrets.app, transcript).toString("hex") });
+    role: "app",
+    requestId: hello.requestId,
+    operation: "inspect",
+    clientInstance: hello.clientInstance as string,
+    reservationId: null,
+    controlLength: 0,
+    controlSha256: createHash("sha256").digest("hex"),
+    bodyLength: 0,
+    bodySha256: createHash("sha256").digest("hex"),
+  });
+  client.send({ kind: "AUTH", proof: computeProof(fixture.secrets.app, transcript).toString("hex") });
 
-    const authOk = await client.next();
-    assert.equal(authOk.kind, "AUTH_OK");
+  const authOk = await client.next();
+  assert.equal(authOk.kind, "AUTH_OK");
     assert.equal(authOk.supervisorInstance, SUPERVISOR);
     // Mutual authentication: the server's proof verifies under the *client-to-server transcript's*
     // sibling. A channel that only authenticated the client would return a mismatch here.
@@ -280,6 +282,7 @@ test("R7D.1-D2R-1: a correct handshake authenticates both directions and admits 
       role: "app",
       requestId: hello.requestId,
       operation: "inspect",
+      clientInstance: hello.clientInstance as string,
       reservationId: null,
       controlLength: 0,
       controlSha256: createHash("sha256").digest("hex"),
@@ -311,18 +314,19 @@ test("R7D.1-D2R-2: the wrong role's secret cannot authenticate, so one credentia
       bootId: BOOT,
       serverNonce: Buffer.from(String(challenge.serverNonce), "hex"),
       clientNonce: Buffer.from(hello.clientNonce, "hex"),
-      role: "worker",
-      requestId: hello.requestId,
-      operation: "inspect",
-      reservationId: null,
-      controlLength: 0,
-      controlSha256: createHash("sha256").digest("hex"),
-      bodyLength: 0,
-      bodySha256: createHash("sha256").digest("hex"),
-    });
-    // An `app` secret presented on the `worker` socket. This is the credential-leak case: the web
-    // process is compromised and tries to reach the socket only workers may use.
-    client.send({ kind: "AUTH", proof: computeProof(fixture.secrets.app, transcript).toString("hex") });
+    role: "worker",
+    requestId: hello.requestId,
+    operation: "inspect",
+    clientInstance: hello.clientInstance as string,
+    reservationId: null,
+    controlLength: 0,
+    controlSha256: createHash("sha256").digest("hex"),
+    bodyLength: 0,
+    bodySha256: createHash("sha256").digest("hex"),
+  });
+  // An `app` secret presented on the `worker` socket. This is the credential-leak case: the web
+  // process is compromised and tries to reach the socket only workers may use.
+  client.send({ kind: "AUTH", proof: computeProof(fixture.secrets.app, transcript).toString("hex") });
     const refusal = await client.next();
     assert.equal(refusal.kind, "REFUSED");
     assert.equal(refusal.code, "AUTH_FAILED");
@@ -348,6 +352,7 @@ test("R7D.1-D2R-3: a replayed AUTH is refused, and the challenge is burned by a 
       role: "app",
       requestId: hello.requestId,
       operation: "inspect",
+      clientInstance: hello.clientInstance as string,
       reservationId: null,
       controlLength: 0,
       controlSha256: createHash("sha256").digest("hex"),
@@ -374,6 +379,7 @@ test("R7D.1-D2R-3: a replayed AUTH is refused, and the challenge is burned by a 
       role: "app",
       requestId: second.hello.requestId,
       operation: "inspect",
+      clientInstance: second.hello.clientInstance as string,
       reservationId: null,
       controlLength: 0,
       controlSha256: createHash("sha256").digest("hex"),

@@ -47,6 +47,7 @@ function transcript(overrides: Partial<TranscriptInput> = {}): TranscriptInput {
     role: "worker",
     requestId: "0123456789abcdef",
     operation: "fill",
+    clientInstance: "client-0001",
     reservationId: "fedcba9876543210",
     controlLength: 128,
     controlSha256: "a".repeat(64),

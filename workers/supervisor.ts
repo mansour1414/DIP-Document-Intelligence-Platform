@@ -324,7 +324,7 @@ export async function main(seams: SupervisorSeams = productionSeams()): Promise<
       emit({ event: "connection", role: session.role, operation: session.operation, executionId: session.executionId });
       const execution = new SupervisorExecution(
         session.executionId,
-        session.executionId,
+        session.requestId,
         session.operation,
         {
           journal,
@@ -380,10 +380,12 @@ export async function main(seams: SupervisorSeams = productionSeams()): Promise<
       });
 
       if (outcome.kind === "refused") {
-        // Nothing was created. The refusal is reported and the slot is genuinely free — holding it
-        // would block admission forever for a request that needs no cleanup.
+        // Nothing was created. The refusal is reported. A refusal is not a positive execution
+        // outcome, so the slot is released without advancing the worker's sequence: completing
+        // `inspect` authorizes `fill`, completing `fill` authorizes `verify`, but a refusal does
+        // not authorize anything.
         session.send({ kind: "REFUSED", code: "REJECTED" });
-        session.release(true);
+        session.release(false);
         emit({ event: "refused", executionId: session.executionId, code: outcome.code, detail: outcome.detail });
         return;
       }
@@ -403,7 +405,7 @@ export async function main(seams: SupervisorSeams = productionSeams()): Promise<
       // than the bytes themselves. A caller reconciles what it received against these totals, and
       // the commit is what makes the result publishable.
       session.send({ kind: "STREAM_END", bytes: outcome.resultBytes, digest: outcome.resultDigest });
-      session.send({ kind: "TERMINAL_COMMIT", message: outcome.commitProof });
+      session.send({ kind: "TERMINAL_COMMIT", message: outcome.commitMessage });
       session.release(true);
       emit({ event: "committed", executionId: session.executionId, resultBytes: outcome.resultBytes, metaBytes: outcome.metaBytes });
     },

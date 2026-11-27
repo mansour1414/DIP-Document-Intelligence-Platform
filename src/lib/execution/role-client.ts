@@ -238,6 +238,7 @@ export async function requestWorkerReservation(options: ReservationRequestOption
       role: "worker",
       requestId,
       operation: options.operation,
+      clientInstance: options.clientInstance,
       reservationId: null,
       controlLength: declaredControl.length,
       controlSha256: declaredControl.sha256,
@@ -497,6 +498,7 @@ export async function openRoleChannel(options: RoleClientOptions): Promise<RoleC
     role: options.role,
     requestId,
     operation: options.operation,
+    clientInstance: options.clientInstance,
     reservationId: options.reservationId ?? null,
     controlLength: declaredControl.length,
     controlSha256: declaredControl.sha256,
@@ -555,11 +557,19 @@ export async function openRoleChannel(options: RoleClientOptions): Promise<RoleC
   let commitResolver: ((message: TerminalCommitMessage | null) => void) | null = null;
   const commitPromise = new Promise<TerminalCommitMessage | null>((resolve) => { commitResolver = resolve; });
   let settled = false;
-  const settle = (): void => {
+  const settleStream = (): void => {
     if (settled) return;
     settled = true;
     resultStream.end();
-    commitResolver?.(null);
+  };
+  let commitResolved = false;
+  /** Deliver the terminal commit exactly once. `STREAM_END` ends the byte stream but must not
+   * resolve the commit to `null` first: the supervisor sends `STREAM_END` and then
+   * `TERMINAL_COMMIT`, so resolving on `STREAM_END` would lose the commit the caller must verify. */
+  const resolveCommit = (msg: TerminalCommitMessage | null): void => {
+    if (commitResolved) return;
+    commitResolved = true;
+    commitResolver?.(msg);
   };
 
   const pump = async (): Promise<void> => {
@@ -589,15 +599,16 @@ export async function openRoleChannel(options: RoleClientOptions): Promise<RoleC
             break;
           }
           case "STREAM_END":
-            settle();
+            // End the byte stream; the terminal commit may still follow on this connection.
+            settleStream();
             break;
           case "TERMINAL_COMMIT":
-            commitResolver?.(message.message as TerminalCommitMessage);
+            resolveCommit(message.message as TerminalCommitMessage);
             break;
           case "REFUSED": {
             const error = new CallerError("NOT_READY", `the supervisor refused: ${String(message.code)}`);
             resultStream.destroy(error);
-            commitResolver?.(null);
+            resolveCommit(null);
             break;
           }
           default:
@@ -605,9 +616,10 @@ export async function openRoleChannel(options: RoleClientOptions): Promise<RoleC
         }
       }
     } catch {
-      settle();
+      resolveCommit(null);
     } finally {
-      settle();
+      settleStream();
+      if (!commitResolved) resolveCommit(null);
     }
   };
   void pump();
@@ -738,8 +750,12 @@ export async function callSupervisor(options: RoleClientOptions & {
         role: options.role,
         bodyBytes: options.bodyBytes,
         bodyDigest: options.bodyDigest,
+        // `executeRequest` derives the authoritative metadata length from the independently
+        // received result frame; this placeholder is overridden by the caller.
         metaBytes: 0,
         executionId,
+        supervisorInstance: options.supervisorInstance,
+        bootId: options.bootId,
       },
       options.body,
       options.secret,

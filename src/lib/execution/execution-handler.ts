@@ -53,6 +53,7 @@ import {
   type PreflightVerdict,
   type SupervisorExecution,
 } from "./supervisor";
+import type { TerminalCommitMessage } from "./terminal-auth";
 import type { AdmittedSession } from "./role-sockets";
 import {
   SYNTHETIC_PROFILE,
@@ -121,7 +122,7 @@ export type TrustedExecutionPolicy = {
 /** What one composed execution produced. Closed, because the caller branches on it. */
 export type ExecutionOutcome =
   /** A validated result and an authenticated commit. `frame` is what the commit describes. */
-  | { kind: "committed"; resultBytes: number; resultDigest: string; metaBytes: number; commitProof: string }
+  | { kind: "committed"; resultBytes: number; resultDigest: string; metaBytes: number; commitMessage: TerminalCommitMessage }
   /** Refused before any executor existed. Nothing to clean up, so the slot is released. */
   | { kind: "refused"; code: string; detail: string }
   /** Refused after an executor may have existed. The slot stays held until reconciliation. */
@@ -291,7 +292,10 @@ export async function composeExecution(options: ComposeOptions): Promise<Executi
       resultBytes: sealed.bytes,
       resultDigest: sealed.digest,
       metaBytes: execution.sealedMetaBytes(),
-      commitProof: terminal.message.proof,
+      // The full commit message (context + proof) is sent to the caller, which must verify it
+      // independently. Sending only the proof string would leave the caller unable to rebuild the
+      // signed transcript, so caller-side commit verification would silently fail.
+      commitMessage: terminal.message,
     };
   } catch (error) {
     const code = refusalOf(error, "RESULT_INVALID");

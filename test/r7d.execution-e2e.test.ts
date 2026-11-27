@@ -43,9 +43,16 @@ import {
   syntheticForm,
   type E2EEnvironment,
 } from "./support/execution-e2e";
-import { decodeResultV2 } from "../src/lib/pdf/worker-protocol-v2";
-import { openRoleChannel, declareBody } from "../src/lib/execution/role-client";
-import { createHash } from "node:crypto";
+import {
+  decodeResultV2,
+  encodeControlV2,
+  type WorkerMetaV2,
+  asVerifyMeta,
+} from "../src/lib/pdf/worker-protocol-v2";
+import { openRoleChannel, declareBody, requestWorkerReservation } from "../src/lib/execution/role-client";
+import { executeRequest } from "../src/lib/execution/caller";
+import { createHash, randomBytes } from "node:crypto";
+import { Readable } from "node:stream";
 
 // The configured image, from the harness: the supervisor compares the request against its own
 // environment, so a restated literal here would silently become a different request.
@@ -169,53 +176,178 @@ test("R7D.1-D2E-1: a real PDF is inspected through real processes and returns a 
   }
 });
 
-test("R7D.1-D2E-2: a real PDF is filled and verified through the same plane", async () => {
-  // Fill and verify, not just inspect: `fill` carries output bytes, which is the case that
-  // exercises the frame's own declared output length against the bytes it actually carried.
+test("R7D.1-D2E-2: a real worker runs Inspect, then Fill, then Verify, each with its own reservation", async () => {
+  // Genuine end-to-end: every step is a real worker that obtains its own reservation, authenticates
+  // over a real Unix socket, submits a real document, and independently validates the terminal
+  // commit before accepting any result. The sequence is enforced by the supervisor: a reservation
+  // for `fill` is refused until `inspect` has positively resolved, and `verify` until `fill` has.
   const env = makeEnvironment();
   let plane: Awaited<ReturnType<typeof startPlane>> | null = null;
   try {
     plane = await startPlane(env);
     const pdf = await syntheticForm();
+    const fields = { "applicant.name": "Ada Lovelace", "applicant.consent": true };
 
-    const run = async (socketPath: string, secret: string, role: "worker"): Promise<Buffer> => {
-      // A worker needs an invite. The reservation is minted by the supervisor's admission, and this
-      // harness has no side channel to ask for one — so the test drives the worker socket only if
-      // one was minted, and otherwise reports honestly that the worker path needs R7D.2's caller.
-      throw new Error(`worker role requires a reservation minted by admission (${socketPath}, ${secret.length}, ${role})`);
-    };
-    void run;
+    /** One authenticated worker execution, with the caller validating the terminal commit itself. */
+    async function runExecution(
+      operation: "inspect" | "fill" | "verify",
+      reservationId: string,
+      body: Buffer,
+      expectedOp: "inspect" | "fill" | "verify",
+    ): Promise<{ meta: unknown; frameBytes: Buffer; executionId: string }> {
+      const requestId = randomBytes(16).toString("hex");
+      const secret = Buffer.from(env.secrets.worker, "hex");
+      const options = {
+        socketPath: env.workerSocket,
+        role: "worker" as const,
+        operation,
+        secret,
+        supervisorInstance: env.supervisorInstance,
+        bootId: BOOT_ID,
+        clientInstance: env.clientInstance,
+        reservationId,
+        requestId,
+        control: CONTROL,
+      };
+      declareBody(options, {
+        length: body.byteLength,
+        sha256: createHash("sha256").update(body).digest("hex"),
+      });
+      const session = await openRoleChannel(options);
+      try {
+        const executionId = await session.executionId;
+        assert.match(executionId, /^[a-f0-9]{32}$/u, "the supervisor mints the execution id");
+        // Exercise the production caller over the real socket: it authenticates the invitation,
+        // streams the body, collects and validates the result frame, and verifies the terminal
+        // commit itself before returning any bytes. This is `executeRequest`, not a test-only
+        // re-implementation of verification.
+        const result = await executeRequest(
+          session.channel,
+          {
+            requestId,
+            operation: expectedOp,
+            role: "worker" as const,
+            bodyBytes: body.byteLength,
+            bodyDigest: createHash("sha256").update(body).digest("hex"),
+            // `executeRequest` derives the authoritative metadata length from the independently
+            // received result frame; this placeholder is overridden by the caller.
+            metaBytes: 0,
+            executionId,
+            supervisorInstance: env.supervisorInstance,
+            bootId: BOOT_ID,
+          },
+          Readable.from([body]),
+          secret,
+        );
+        const frameBytes = result.bytes;
+        const decoded = decodeResultV2(frameBytes, 384 * 1024 * 1024, expectedOp);
+        assert.equal(decoded.meta.ok, true, `${operation}: result not successful`);
+        assert.equal(decoded.meta.op, expectedOp, `${operation}: result operation mismatch`);
+        return { meta: decoded.meta, frameBytes, executionId };
+      } finally {
+        session.destroy();
+      }
+    }
 
-    const frame = controlFrame({
-      op: "fill",
-      flatten: false,
-      fields: { "applicant.name": "Ada Lovelace", "applicant.consent": true },
-    }, pdf);
+    // ── Inspect ──
+    const inspectReservation = await requestWorkerReservation({
+      socketPath: env.workerSocket,
+      secret: Buffer.from(env.secrets.worker, "hex"),
+      supervisorInstance: env.supervisorInstance,
+      bootId: BOOT_ID,
+      clientInstance: env.clientInstance,
+      operation: "inspect",
+      connectTimeoutMs: 1_000,
+    });
+    assert.equal(inspectReservation.operation, "inspect");
+    const inspect = await runExecution(
+      "inspect",
+      inspectReservation.reservationId,
+      controlFrame({ op: "inspect" }, pdf),
+      "inspect",
+    );
+    assert.equal(typeof (inspect.meta as { pages?: number }).pages, "number", "inspect reports a page count");
+    const inventory = (inspect.meta as { inventory?: { fields?: { name: string }[] } }).inventory;
+    assert.ok(inventory?.fields?.some((field) => field.name === "applicant.name"), "the real form field is in the inspect inventory");
+
+    // ── Fill ──
+    const fillReservation = await requestWorkerReservation({
+      socketPath: env.workerSocket,
+      secret: Buffer.from(env.secrets.worker, "hex"),
+      supervisorInstance: env.supervisorInstance,
+      bootId: BOOT_ID,
+      clientInstance: env.clientInstance,
+      operation: "fill",
+      connectTimeoutMs: 1_000,
+    });
+    assert.equal(fillReservation.operation, "fill");
+    const fillFrame = controlFrame({ op: "fill", flatten: false, fields }, pdf);
+    const fill = await runExecution("fill", fillReservation.reservationId, fillFrame, "fill");
+    assert.ok(Buffer.isBuffer(fill.frameBytes) && fill.frameBytes.byteLength > 0, "fill returns a framed result");
+    const filledPdf = decodeResultV2(fill.frameBytes, 384 * 1024 * 1024, "fill").output;
+    assert.ok(filledPdf.byteLength > 0, "fill returns output bytes");
+    assert.notEqual(filledPdf.byteLength, pdf.byteLength, "a filled PDF is not a byte-identical copy");
+    const reopened = await import("pdf-lib").then((m) => m.PDFDocument.load(Buffer.from(filledPdf)));
+    assert.equal(
+      reopened.getForm().getTextField("applicant.name").getText(),
+      "Ada Lovelace",
+      "the filled PDF carries the requested field value",
+    );
+
+    // ── Verify ──
+    const verifyReservation = await requestWorkerReservation({
+      socketPath: env.workerSocket,
+      secret: Buffer.from(env.secrets.worker, "hex"),
+      supervisorInstance: env.supervisorInstance,
+      bootId: BOOT_ID,
+      clientInstance: env.clientInstance,
+      operation: "verify",
+      connectTimeoutMs: 1_000,
+    });
+    assert.equal(verifyReservation.operation, "verify");
+    const verifyFrame = controlFrame({ op: "verify", kind: "fill" }, Buffer.from(filledPdf));
+    const verify = await runExecution("verify", verifyReservation.reservationId, verifyFrame, "verify");
+    asVerifyMeta(verify.meta as unknown as WorkerMetaV2);
+    assert.equal((verify.meta as { pages: number }).pages >= 1, true, "verify reports a page count");
+    assert.equal(typeof (verify.meta as { widgets: number }).widgets, "number", "verify reports a widget count");
+  } finally {
+    await plane?.supervisor.stop();
+    await plane?.watchdog.stop();
+    env.cleanup();
+  }
+});
+
+test("R7D.1-D2E-8: the app role may not fill, and the refusal names the policy", async () => {
+  // `app` may only inspect. A fill through the app socket is refused with OPERATION_NOT_PERMITTED,
+  // and nothing is admitted — so no reservation, no slot, no executor.
+  const env = makeEnvironment();
+  let plane: Awaited<ReturnType<typeof startPlane>> | null = null;
+  try {
+    plane = await startPlane(env);
+    const pdf = await syntheticForm();
+    const frame = controlFrame(
+      { op: "fill", flatten: false, fields: { "applicant.name": "Ada Lovelace" } },
+      pdf,
+    );
     const options = {
       socketPath: env.appSocket,
       role: "app" as const,
-      // `app` may only inspect. The fill is driven through the app socket to prove the *policy*
-      // refuses it — the worker path needs a reservation, which is R7D.2's caller contract.
       operation: "fill" as const,
       secret: Buffer.from(env.secrets.app, "hex"),
       supervisorInstance: env.supervisorInstance,
       bootId: BOOT_ID,
-      // The identity this caller presents. A worker reservation is bound to it, so it must be a
-      // real per-caller value rather than a constant the client used to invent.
       clientInstance: env.clientInstance,
       control: CONTROL,
     };
     declareBody(options, { length: frame.byteLength, sha256: createHash("sha256").update(frame).digest("hex") });
-
     await assert.rejects(
       openRoleChannel(options),
       (error: unknown) => String((error as { message?: string }).message).includes("OPERATION_NOT_PERMITTED"),
       "the app role may not fill, and the refusal names the policy rather than the handshake",
     );
-
     // Nothing was admitted by the refused request.
-    const state = plane.supervisor.events().filter((event) => event.event === "connection");
-    assert.equal(state.length, 0, "a refused request never reaches a handler");
+    const connections = plane.supervisor.events().filter((event) => event.event === "connection");
+    assert.equal(connections.length, 0, "a refused request never reaches a handler");
   } finally {
     await plane?.supervisor.stop();
     await plane?.watchdog.stop();

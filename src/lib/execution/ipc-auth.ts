@@ -140,6 +140,9 @@ export type TranscriptInput = {
   role: IpcRole;
   requestId: string;
   operation: IpcOperation;
+  /** The authenticated caller identity, bound into the transcript so it cannot be repudiated or
+   * swapped after the proof. */
+  clientInstance: string;
   /** Present when the exchange is bound to admitted capacity. */
   reservationId: string | null;
   controlLength: number;
@@ -186,6 +189,7 @@ export function buildTranscript(input: TranscriptInput): Buffer {
   pushText(input.role);
   pushText(input.requestId);
   pushText(input.operation);
+  pushText(input.clientInstance);
   // A sentinel rather than an empty field, so "absent" and "present but empty" differ.
   pushText(input.reservationId ?? "\u0000none");
   pushText(String(input.controlLength));

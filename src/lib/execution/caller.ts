@@ -61,6 +61,7 @@ export type CallerFailureCode =
   | "INPUT_MISMATCH"
   | "RESULT_TOO_LARGE"
   | "RESULT_UNVERIFIED"
+  | "RESULT_INVALID"
   | "COMMIT_MISSING"
   | "TIMEOUT"
   | "TRANSPORT_CLOSED"
@@ -92,6 +93,12 @@ export type RequestSpec = {
   metaBytes: number;
   /** The execution identity the caller expects. Refusing a different one is the point. */
   executionId: string;
+  /** Independently trusted supervisor identity, configured by the caller -- never copied from the
+   * commit message, which a peer could forge. */
+  supervisorInstance: string;
+  /** Independently trusted boot identity, configured by the caller -- never copied from the
+   * commit message. */
+  bootId: string;
 };
 
 /**
@@ -220,6 +227,18 @@ export async function executeRequest(
     throw new CallerError("COMMIT_MISSING", "the supervisor sent no terminal commit");
   }
   const frameBytes = Buffer.concat(chunks);
+  if (frameBytes.byteLength < 4) {
+    channel.cancel();
+    throw new CallerError("RESULT_INVALID", "the result frame has no metadata length prefix");
+  }
+  // The metadata length is read from the independently received, bounded framing: the four-byte
+  // length prefix of the result frame the caller actually holds. It is not taken from the commit,
+  // which would make the comparison circular.
+  const metaBytes = frameBytes.readUInt32BE(0);
+  if (metaBytes > frameBytes.byteLength) {
+    channel.cancel();
+    throw new CallerError("RESULT_INVALID", "the result declares more metadata than the frame carries");
+  }
   const verified: CommitResult = verifyTerminalCommit(
     secret,
     message,
@@ -227,13 +246,13 @@ export async function executeRequest(
       executionId: spec.executionId,
       requestId: spec.requestId,
       operation: spec.operation,
-      // The digest here is of the complete frame, which is what the chain binds. The body is a
-      // slice of it, so a commit bound to the body would not describe what the supervisor sealed.
+      // The digest is of the complete frame, which is what the chain binds. The body is a slice
+      // of it, so a commit bound to the body would not describe what the supervisor sealed.
       resultDigest: sha256Hex(frameBytes),
       resultBytes: frameBytes.byteLength,
-      metaBytes: spec.metaBytes,
-      bootId: message.context.bootId,
-      supervisorInstance: message.context.supervisorInstance,
+      metaBytes,
+      bootId: spec.bootId,
+      supervisorInstance: spec.supervisorInstance,
     },
     now(),
   );

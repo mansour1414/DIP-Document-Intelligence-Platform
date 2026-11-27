@@ -588,6 +588,9 @@ export type RoleServerOptions = {
 export type AdmittedSession = {
   role: IpcRole;
   operation: IpcOperation;
+  /** The caller's request id, bound into the authenticated HELLO transcript. The terminal commit
+   * echoes it so the caller can confirm the commit is for the request it actually sent. */
+  requestId: string;
   executionId: string;
   socket: Socket;
   /**
@@ -977,6 +980,7 @@ export async function startRoleSockets(options: RoleServerOptions): Promise<Role
               role,
               requestId: hello!.requestId,
               operation: hello!.operation,
+              clientInstance: hello!.clientInstance,
               reservationId: hello!.reservationId,
               controlLength: hello!.controlLength,
               controlSha256: hello!.controlSha256,
@@ -1117,6 +1121,7 @@ export async function startRoleSockets(options: RoleServerOptions): Promise<Role
         const session: AdmittedSession = {
           role,
           operation: hello.operation,
+          requestId: hello.requestId,
           executionId: admitted.executionId,
           socket,
           send: (message) => send(message),
