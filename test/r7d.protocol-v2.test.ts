@@ -292,7 +292,7 @@ function frameOf(meta: unknown, output?: Buffer): Buffer {
 /** Run a frame through the streaming validator and return its fault, if any. */
 function faultOfStream(frame: Buffer): string | undefined {
   try {
-    const stream = new ProvisionalResultStream({ expectedOp: "fill", sink: () => {} });
+    const stream = new ProvisionalResultStream({ executionId: "0123456789abcdef0123456789abcdef", expectedOp: "fill", sink: () => {} });
     stream.push(frame);
     stream.finish();
     return undefined;

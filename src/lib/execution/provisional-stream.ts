@@ -100,6 +100,14 @@ function faultFor(error: unknown, fallback: StreamFault = "META_INVALID_SHAPE"):
 export type ProvisionalStreamOptions = {
   /** The operation the request asked for. A mismatched answer is rejected on the header. */
   expectedOp: WorkerOpV2;
+  /**
+   * The execution this stream belongs to.
+   *
+   * Required, and bound into the terminal grant. Without it a grant from one execution is
+   * indistinguishable from a grant from another with the same digest, which is unlikely and
+   * not impossible — and the failure mode is publishing the wrong document.
+   */
+  executionId: string;
   /** Largest acceptable output, from runtime config. Defaults to the hard input ceiling. */
   maxOutputBytes?: number;
   /**
@@ -112,6 +120,20 @@ export type ProvisionalStreamOptions = {
   maxBufferedBytes?: number;
   /** Receives each chunk as it is validated. Must not retain it beyond the call. */
   sink: ProvisionalSink;
+};
+
+/**
+ * Proof that a stream issued its own terminal commit.
+ *
+ * Opaque by construction: it carries no method the caller can forge, and `collect` compares it
+ * against the stream's recorded completion rather than trusting its contents. A caller can
+ * construct this shape, which is why every field is checked — the type alone proves nothing.
+ */
+export type TerminalCommitGrant = {
+  readonly executionId: string;
+  readonly digest: string;
+  readonly bytes: number;
+  consumed: boolean;
 };
 
 /**
@@ -135,6 +157,10 @@ export class ProvisionalResultStream {
   private declaredOutputBytes: number | null = null;
   /** Set by any framing fault; a dead stream never accepts another byte. */
   private invalidated = false;
+  /** Set once a terminal commit has been issued; publication requires it. */
+  private granted = false;
+  /** The validated end state, retained so a grant can be checked against it. */
+  private completion: { outputBytes: number; outputSha256: string } | null = null;
 
   constructor(options: ProvisionalStreamOptions) {
     this.options = options;
@@ -241,7 +267,15 @@ export class ProvisionalResultStream {
    * that disagrees, an operation that should have been metadata-only but carried bytes, and
    * a frame shorter than its own header promised.
    */
-  finish(): StreamCompletion {
+  /**
+   * Assert the stream ended cleanly.
+   *
+   * `seal` is the output this stream's bytes went into. Passing it closes the gap between
+   * "the stream says the frame was valid" and "these bytes may be published": the output object
+   * records the verified digest and length, and only then can it issue a terminal grant. Without
+   * this the two objects were independent, and a caller could hand `collect` any output it liked.
+   */
+  finish(seal?: BoundedProvisionalOutput): StreamCompletion {
     if (this.ended) throw new StreamError("CLOSED", "the stream already ended");
     this.ended = true;
     if (this.meta === null) {
@@ -255,9 +289,17 @@ export class ProvisionalResultStream {
     } catch (error) {
       throw new StreamError(faultFor(error, "TRUNCATED"), error instanceof Error ? error.message : "the result failed validation");
     }
+    const outputSha256 = this.hash.digest("hex");
+    this.completion = { outputBytes: this.outputBytes, outputSha256 };
+    if (seal !== undefined) {
+      if (seal.bytes !== this.outputBytes) {
+        throw new StreamError("TRUNCATED", "the sealed output does not hold the bytes this stream forwarded");
+      }
+      seal.seal(this.options.executionId, outputSha256);
+    }
     return {
       outputBytes: this.outputBytes,
-      outputSha256: this.hash.digest("hex"),
+      outputSha256,
       frameBytes: this.frameBytes,
       meta: this.meta,
     };
@@ -285,9 +327,53 @@ export class BoundedProvisionalOutput {
   private readonly chunks: Uint8Array[] = [];
   private total = 0;
   private discarded = false;
+  /** Set by `seal` once the stream has validated its own end state. */
+  private sealed: { executionId: string; digest: string; bytes: number } | null = null;
+  private granted = false;
 
   constructor(capBytes: number) {
     this.cap = capBytes;
+  }
+
+  /**
+   * Record the stream's validated completion.
+   *
+   * Called by `ProvisionalResultStream` once its frame has ended, its digest and length have
+   * been reconciled, and no fault has occurred. It exists so the object holding the bytes knows
+   * what the stream concluded, without the caller carrying that fact — and without a caller
+   * being able to assert it.
+   */
+  seal(executionId: string, digest: string): void {
+    if (this.sealed !== null) throw new StreamError("CLOSED", "this output was already sealed");
+    this.sealed = { executionId, digest, bytes: this.total };
+  }
+
+  /**
+   * Issue the terminal commit.
+   *
+   * ## Why the caller's boolean was not enough
+   *
+   * The previous signature was `collect(commitGranted: boolean)`. Every caller that wrote
+   * `collect(true)` published the document, and there was nothing behind the `true` — no
+   * binding to the metadata, no confirmation that the exit outcome was clean, no evidence the
+   * container was gone. A caller with a bug, or one merely optimistic about its own
+   * preconditions, publishes unverified bytes and the type system agrees with it.
+   *
+   * Everything this object can check has been checked by the time it gets here. The caller
+   * still owns the lifecycle evidence this class cannot see. What it refuses is issuing a grant
+   * over output that is not internally consistent, and that refusal is the difference between
+   * "the caller said so" and "the bytes and the metadata agree".
+   */
+  grantTerminalCommit(): TerminalCommitGrant {
+    if (this.discarded) throw new StreamError("CLOSED", "output was discarded");
+    if (this.sealed === null) throw new StreamError("CLOSED", "the stream has not sealed this output");
+    this.granted = true;
+    return {
+      executionId: this.sealed.executionId,
+      digest: this.sealed.digest,
+      bytes: this.sealed.bytes,
+      consumed: false,
+    };
   }
 
   get bytes(): number {
@@ -317,10 +403,44 @@ export class BoundedProvisionalOutput {
     this.total = 0;
   }
 
-  /** Only valid after a terminal commit. Throws otherwise, because publication is gated. */
-  collect(commitGranted: boolean): Uint8Array {
-    if (!commitGranted) throw new StreamError("CLOSED", "publication requires a terminal commit");
+  /**
+   * The bytes, but only with a grant this stream itself issued.
+   *
+   * ## Why the caller's boolean was not enough
+   *
+   * The previous signature was `collect(commitGranted: boolean)`. Every caller that wrote
+   * `collect(true)` published the document, and there was nothing behind the `true` — no
+   * binding to the metadata, no confirmation that the exit outcome was clean, no evidence that
+   * the container was gone. A caller with a bug, or one that was simply optimistic about its
+   * own preconditions, publishes unverified bytes and the type system agrees with it.
+   *
+   * A grant is now issued by `grantTerminalCommit` and can only be issued once the stream knows
+   * its own end state: the frame is complete, the digest and length match the declaration, and
+   * no fault occurred. Whatever the caller decides about lifecycle evidence, this object is the
+   * authority for "is this byte sequence the one the executor declared", and it refuses to
+   * answer otherwise.
+   *
+   * The grant is single-use. A second publication of the same provisional output would be a
+   * second document from one execution.
+   */
+  collect(grant: TerminalCommitGrant): Uint8Array {
     if (this.discarded) throw new StreamError("CLOSED", "output was discarded");
+    if (this.sealed === null) throw new StreamError("CLOSED", "the stream has not sealed this output");
+    // Check the grant's contents before its provenance. A forged grant must be reported as a
+    // mismatch, not as "no commit was issued": the two are different failures and conflating them
+    // would hide a binding defect behind a lifecycle one.
+    if (grant.executionId !== this.sealed.executionId) {
+      throw new StreamError("CLOSED", "the grant belongs to a different execution");
+    }
+    if (grant.digest !== this.sealed.digest) {
+      throw new StreamError("CLOSED", "the grant does not match the bytes this stream carries");
+    }
+    if (grant.bytes !== this.sealed.bytes) {
+      throw new StreamError("CLOSED", "the grant does not match the byte count this stream carries");
+    }
+    if (grant.consumed) throw new StreamError("CLOSED", "the grant was already used");
+    if (!this.granted) throw new StreamError("CLOSED", "publication requires a terminal commit");
+    grant.consumed = true;
     return Buffer.concat(this.chunks.map((chunk) => Buffer.from(chunk)));
   }
 }

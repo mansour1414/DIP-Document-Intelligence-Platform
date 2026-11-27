@@ -10,6 +10,9 @@
  * measurement, not on an opinion about the code.
  */
 import test from "node:test";
+
+/** A stable execution id, so a grant can be bound to it. */
+const EXECUTION = "0123456789abcdef0123456789abcdef";
 import assert from "node:assert/strict";
 import { BoundedProvisionalOutput, ProvisionalResultStream, StreamError, sha256Hex } from "../src/lib/execution/provisional-stream";
 import { WORKER_LIMITS } from "../src/lib/pdf/worker-protocol";
@@ -40,7 +43,7 @@ const verifyMeta = { ok: true, op: "verify", pages: 1, widgets: 0, preserved: 2 
 
 test("R7D.1-S-1: a fill result is forwarded chunk by chunk as it arrives", () => {
   const seen: number[] = [];
-  const stream = new ProvisionalResultStream({ expectedOp: "fill", sink: (chunk) => seen.push(chunk.bytes.byteLength) });
+  const stream = new ProvisionalResultStream({ executionId: EXECUTION, expectedOp: "fill", sink: (chunk) => seen.push(chunk.bytes.byteLength) });
   const output = Buffer.alloc(3000, 7);
   const bytes = frame(fillMeta(output.byteLength), output);
   // Feed in 100-byte slices, as a pipe would deliver them.
@@ -60,6 +63,7 @@ test("R7D.1-S-2: a result much larger than the reader's capacity is never retain
   let forwarded = 0;
   let peakBacklog = 0;
   const stream = new ProvisionalResultStream({
+    executionId: EXECUTION,
     expectedOp: "fill",
     maxBufferedBytes: CAP,
     sink: (chunk) => {
@@ -82,7 +86,7 @@ test("R7D.1-S-2: a result much larger than the reader's capacity is never retain
 });
 
 test("R7D.1-S-3: a consumer that stops reading is refused rather than buffered without bound", () => {
-  const stream = new ProvisionalResultStream({ expectedOp: "fill", maxBufferedBytes: 1024, sink: () => { /* never acknowledges */ } });
+  const stream = new ProvisionalResultStream({ executionId: EXECUTION, expectedOp: "fill", maxBufferedBytes: 1024, sink: () => { /* never acknowledges */ } });
   const output = Buffer.alloc(64 * 1024, 1);
   const bytes = frame(fillMeta(output.byteLength), output);
   assert.throws(() => stream.push(bytes), (error: unknown) => error instanceof StreamError && error.fault === "BUFFER_EXCEEDED");
@@ -96,20 +100,20 @@ test("R7D.1-S-4: an operation mismatch is rejected before any output is forwarde
   // A container asked for `verify` that answers with a `fill` payload must not get to
   // stream megabytes before anyone notices.
   const seen: number[] = [];
-  const stream = new ProvisionalResultStream({ expectedOp: "verify", sink: (chunk) => seen.push(chunk.bytes.byteLength) });
+  const stream = new ProvisionalResultStream({ executionId: EXECUTION, expectedOp: "verify", sink: (chunk) => seen.push(chunk.bytes.byteLength) });
   const bytes = frame(fillMeta(5000), Buffer.alloc(5000));
   assert.throws(() => stream.push(bytes), (error: unknown) => error instanceof StreamError && error.fault === "OP_MISMATCH");
   assert.deepEqual(seen, [], "no output may be forwarded after an operation mismatch");
 });
 
 test("R7D.1-S-5: metadata-only operations reject output bytes", () => {
-  const stream = new ProvisionalResultStream({ expectedOp: "verify", sink: () => {} });
+  const stream = new ProvisionalResultStream({ executionId: EXECUTION, expectedOp: "verify", sink: () => {} });
   stream.push(frame(verifyMeta, Buffer.alloc(10)));
   assert.throws(() => stream.finish(), (error: unknown) => error instanceof StreamError && error.fault === "UNEXPECTED_OUTPUT");
 });
 
 test("R7D.1-S-6: a declared output length that disagrees with the frame is refused", () => {
-  const stream = new ProvisionalResultStream({ expectedOp: "fill", sink: () => {} });
+  const stream = new ProvisionalResultStream({ executionId: EXECUTION, expectedOp: "fill", sink: () => {} });
   stream.push(frame(fillMeta(100), Buffer.alloc(50)));
   assert.throws(() => stream.finish(), (error: unknown) => error instanceof StreamError && error.fault === "TRUNCATED");
 });
@@ -119,20 +123,20 @@ test("R7D.1-S-6: a declared output length that disagrees with the frame is refus
 // ---------------------------------------------------------------------------------------
 
 test("R7D.1-S-7: a truncated header is refused, not treated as an empty result", () => {
-  const stream = new ProvisionalResultStream({ expectedOp: "fill", sink: () => {} });
+  const stream = new ProvisionalResultStream({ executionId: EXECUTION, expectedOp: "fill", sink: () => {} });
   stream.push(Buffer.from([0, 0]));
   assert.throws(() => stream.finish(), (error: unknown) => error instanceof StreamError && error.fault === "TRUNCATED");
 });
 
 test("R7D.1-S-8: oversized metadata is refused on the declared length alone", () => {
-  const stream = new ProvisionalResultStream({ expectedOp: "fill", sink: () => {} });
+  const stream = new ProvisionalResultStream({ executionId: EXECUTION, expectedOp: "fill", sink: () => {} });
   const header = Buffer.alloc(4);
   header.writeUInt32BE(WORKER_LIMITS.metaBytes + 1, 0);
   assert.throws(() => stream.push(header), (error: unknown) => error instanceof StreamError && error.fault === "META_TOO_LARGE");
 });
 
 test("R7D.1-S-9: invalid JSON metadata is refused", () => {
-  const stream = new ProvisionalResultStream({ expectedOp: "fill", sink: () => {} });
+  const stream = new ProvisionalResultStream({ executionId: EXECUTION, expectedOp: "fill", sink: () => {} });
   const json = Buffer.from("{not json", "utf8");
   const header = Buffer.alloc(4);
   header.writeUInt32BE(json.byteLength, 0);
@@ -140,12 +144,12 @@ test("R7D.1-S-9: invalid JSON metadata is refused", () => {
 });
 
 test("R7D.1-S-10: an unknown operation in the metadata is refused", () => {
-  const stream = new ProvisionalResultStream({ expectedOp: "fill", sink: () => {} });
+  const stream = new ProvisionalResultStream({ executionId: EXECUTION, expectedOp: "fill", sink: () => {} });
   assert.throws(() => stream.push(frame({ ok: true, op: "exfiltrate" })), (error: unknown) => error instanceof StreamError && error.fault === "META_INVALID_SHAPE");
 });
 
 test("R7D.1-S-11: output beyond the configured ceiling is refused", () => {
-  const stream = new ProvisionalResultStream({ expectedOp: "fill", maxOutputBytes: 1024, sink: () => {} });
+  const stream = new ProvisionalResultStream({ executionId: EXECUTION, expectedOp: "fill", maxOutputBytes: 1024, sink: () => {} });
   assert.throws(() => stream.push(frame(fillMeta(2048), Buffer.alloc(2048))), (error: unknown) => error instanceof StreamError && error.fault === "OUTPUT_TOO_LARGE");
 });
 
@@ -153,7 +157,7 @@ test("R7D.1-S-12: the stream is single-use", () => {
   // A fill frame, because its metadata contract is the simplest complete one. The point of
   // this test is lifecycle, not inventory shape.
   const output = Buffer.alloc(16, 6);
-  const stream = new ProvisionalResultStream({ expectedOp: "fill", sink: () => {} });
+  const stream = new ProvisionalResultStream({ executionId: EXECUTION, expectedOp: "fill", sink: () => {} });
   stream.push(frame(fillMeta(output.byteLength), output));
   stream.finish();
   assert.throws(() => stream.push(Buffer.alloc(1)), (error: unknown) => error instanceof StreamError && error.fault === "CLOSED");
@@ -165,7 +169,7 @@ test("R7D.1-S-12: the stream is single-use", () => {
 // ---------------------------------------------------------------------------------------
 
 test("R7D.1-S-13: the running digest matches the digest of what has arrived so far", () => {
-  const stream = new ProvisionalResultStream({ expectedOp: "fill", sink: () => {} });
+  const stream = new ProvisionalResultStream({ executionId: EXECUTION, expectedOp: "fill", sink: () => {} });
   const first = Buffer.alloc(1024, 9);
   const header = Buffer.from(frame(fillMeta(2048), undefined));
   stream.push(Buffer.concat([header, first]));
@@ -186,20 +190,72 @@ test("R7D.1-S-14: the caller's provisional output is capped", () => {
   assert.equal(output.bytes, 512);
 });
 
-test("R7D.1-S-15: provisional output cannot be published without a terminal commit", () => {
+test("R7D.1-S-15: output cannot be published before the stream seals it", () => {
   const output = new BoundedProvisionalOutput(1024);
   output.append(Buffer.alloc(64, 5));
-  assert.throws(() => output.collect(false), (error: unknown) => error instanceof StreamError);
-  const published = output.collect(true);
+  // No seal yet, so no grant can be issued and `collect` refuses.
+  assert.throws(() => output.grantTerminalCommit(), (error: unknown) => error instanceof StreamError);
+  assert.throws(() => output.collect({ executionId: EXECUTION, digest: "0".repeat(64), bytes: 64, consumed: false }), (error: unknown) => error instanceof StreamError);
+});
+
+test("R7D.1-F02-11: a grant is bound to the digest and byte count it was issued for", () => {
+  // The point of replacing `collect(true)` is that the boolean proved nothing. A grant that can
+  // be paired with different bytes would prove no more.
+  const output = new BoundedProvisionalOutput(1024);
+  output.append(Buffer.alloc(64, 5));
+  output.seal(EXECUTION, "a".repeat(64));
+  assert.throws(
+    () => output.collect({ executionId: EXECUTION, digest: "b".repeat(64), bytes: 64, consumed: false }),
+    (error: unknown) => error instanceof StreamError && /does not match the bytes/u.test(error.message),
+  );
+  assert.throws(
+    () => output.collect({ executionId: EXECUTION, digest: "a".repeat(64), bytes: 65, consumed: false }),
+    (error: unknown) => error instanceof StreamError && /does not match the byte count/u.test(error.message),
+  );
+  // The genuine grant works exactly once.
+  const published = output.collect(output.grantTerminalCommit());
   assert.equal(published.byteLength, 64);
+});
+
+test("R7D.1-F02-12: a grant from another execution is refused", () => {
+  const output = new BoundedProvisionalOutput(1024);
+  output.append(Buffer.alloc(8, 1));
+  output.seal(EXECUTION, "c".repeat(64));
+  assert.throws(
+    () => output.collect({ executionId: "f".repeat(32), digest: "c".repeat(64), bytes: 8, consumed: false }),
+    (error: unknown) => error instanceof StreamError && /different execution/u.test(error.message),
+  );
+});
+
+test("R7D.1-F02-13: a grant is single-use", () => {
+  // One execution produces one document. A second publication is a second document.
+  const output = new BoundedProvisionalOutput(1024);
+  output.append(Buffer.alloc(8, 1));
+  output.seal(EXECUTION, "d".repeat(64));
+  const grant = output.grantTerminalCommit();
+  assert.equal(output.collect(grant).byteLength, 8);
+  assert.throws(() => output.collect(grant), (error: unknown) => error instanceof StreamError && /already used/u.test(error.message));
+});
+
+test("R7D.1-F02-14: output cannot be sealed twice", () => {
+  // A second seal would let a caller substitute a digest after the stream had already checked one.
+  const output = new BoundedProvisionalOutput(1024);
+  output.seal(EXECUTION, "e".repeat(64));
+  assert.throws(() => output.seal(EXECUTION, "f".repeat(64)), (error: unknown) => error instanceof StreamError);
 });
 
 test("R7D.1-S-16: discarded output is unreachable even with a commit", () => {
   const output = new BoundedProvisionalOutput(1024);
   output.append(Buffer.alloc(64, 5));
+  output.seal(EXECUTION, "0".repeat(64));
   output.discard();
   assert.equal(output.bytes, 0);
-  assert.throws(() => output.collect(true), (error: unknown) => error instanceof StreamError);
+  // Even a grant this object itself issued cannot resurrect discarded bytes.
+  assert.throws(() => output.grantTerminalCommit(), (error: unknown) => error instanceof StreamError);
+  assert.throws(
+    () => output.collect({ executionId: EXECUTION, digest: "0".repeat(64), bytes: 64, consumed: false }),
+    (error: unknown) => error instanceof StreamError,
+  );
   assert.throws(() => output.append(Buffer.alloc(1)), (error: unknown) => error instanceof StreamError);
 });
 
@@ -207,7 +263,8 @@ test("R7D.1-S-17: appended chunks are copied, so a reused buffer cannot corrupt 
   const output = new BoundedProvisionalOutput(1024);
   const reused = Buffer.alloc(4, 1);
   output.append(reused);
+  output.seal(EXECUTION, "0".repeat(64));
   reused.fill(9);
-  const collected = output.collect(true);
+  const collected = output.collect(output.grantTerminalCommit());
   assert.deepEqual([...collected], [1, 1, 1, 1]);
 });
