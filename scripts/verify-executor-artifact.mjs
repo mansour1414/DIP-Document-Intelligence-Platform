@@ -75,12 +75,29 @@ check("child answers the protocol version", () => {
  * missing `@pdf-lib/standard-fonts` and `@pdf-lib/upng`. The check is "the closure is complete",
  * not "these names are present", so the transitive entries are enumerated rather than assumed.
  */
+/**
+ * The one native canvas binding this image is allowed to contain, for the architecture it was
+ * built for.
+ *
+ * Derived from the running process rather than assumed. The first version of this list named
+ * `canvas-linux-x64-gnu` unconditionally and would have passed on x64 while the acceptance host
+ * is native ARM64 — the image would have failed at the first document with a `MODULE_NOT_FOUND`
+ * for the `.node` file, after a successful build.
+ */
+const NATIVE = {
+  linux: { x64: "canvas-linux-x64-gnu", arm64: "canvas-linux-arm64-gnu" },
+};
+const nativePackage = NATIVE[process.platform]?.[process.arch];
+if (nativePackage === undefined) {
+  throw new Error(`this artifact verifier has no canvas mapping for ${process.platform}/${process.arch}`);
+}
+
 const EXPECTED_PACKAGES = [
   "pdf-lib",
   "@pdf-lib/standard-fonts",
   "@pdf-lib/upng",
   "@napi-rs/canvas",
-  "@napi-rs/canvas-linux-x64-gnu",
+  `@napi-rs/${nativePackage}`,
   "@fontsource/noto-sans-arabic",
   "pako",
   "tslib",
@@ -102,6 +119,24 @@ check("runtime closure matches the declared set", () => {
     if (!existsSync(join(modules, required))) throw new Error(`missing required package: ${required}`);
   }
   return EXPECTED_PACKAGES.join(", ");
+});
+
+check("exactly one native canvas binding, matching this architecture", () => {
+  // Every shipped binding is a compiled binary for a specific platform. A second one is dead
+  // weight at best; a wrong-architecture one means the build resolved for the wrong target and
+  // will fail at the first document.
+  const scope = join(appRoot, "node_modules", "@napi-rs");
+  if (!existsSync(scope)) throw new Error("no @napi-rs scope in the runtime image");
+  const present = readdirSync(scope);
+  const bindings = present.filter((name) => /^canvas-/u.test(name));
+  if (bindings.length !== 1) throw new Error(`expected exactly one canvas binding, found: ${bindings.join(", ")}`);
+  if (bindings[0] !== nativePackage) {
+    throw new Error(`native binding ${bindings[0]} does not match this image's ${process.platform}/${process.arch} (${nativePackage})`);
+  }
+  // Anything else in the scope is an unrelated native package that must not be in this image.
+  const unrelated = present.filter((name) => name !== "canvas" && !/^canvas-/u.test(name));
+  if (unrelated.length > 0) throw new Error(`unrelated native packages present: ${unrelated.join(", ")}`);
+  return `${bindings[0]} (${process.arch})`;
 });
 
 check("no database, cache or cloud SDK reached the runtime image", () => {

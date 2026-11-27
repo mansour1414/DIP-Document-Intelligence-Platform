@@ -20,7 +20,9 @@
  * | /dev/mqueue as a writable tmpfs | A writable tmpfs at a mask point is not a mask — POSIX mqueues stay usable for a denial-of-service. | mounted `ro` |
  * | no pull policy | The daemon default is `--pull missing`, so a missing image would be fetched at execution time. | `--pull never` |
  * | inherited daemon target | `DOCKER_HOST`/context from the parent could redirect to a remote daemon, outside host cgroup accounting. | `--host` fixed to the loopback socket; `DOCKER_CONFIG` pinned to a controller directory |
- * | `/work` only | The approved profile bounds `/tmp` specifically. | bounded `/tmp` tmpfs, and `TMPDIR` points at it |
+ * | `/work` 48 MiB **plus** `/tmp` 16 MiB | Two tmpfs allocations silently totalled 64 MiB against an approved 48 MiB writable budget. The page cache backing a tmpfs is charged to the container, so the second tmpfs was an unbudgeted allocation. | one 48 MiB budget split 32 + 16, enforced as a sum |
+ * | `TMPDIR=/tmp` override | `/tmp` is already the process default inside the container; setting it added an env key for no benefit and made the working directory look configurable. | override removed; `/tmp` is the tmpfs by virtue of being mounted there |
+ * | floating base tag | `node:22-bookworm-slim` is a moving tag. Two builds of the same Dockerfile can resolve to different filesystems. | tag retained for readability, digest recorded and required for the acceptance build |
  * | one label | Ownership could not be tied to boot, supervisor instance, image or profile. | five derived labels, all verified on inspect |
  * | `rm`/`kill` by name | A name is not an identity; another container could hold it after a race. | exact 64-hex container id, validated |
  * | shape-only validation | Only digest form and profile names were checked. | every policy field range-checked |
@@ -182,10 +184,18 @@ export type ExecutionPolicy = {
   cpuPeriodMicros: number;
   /** PID/thread ceiling for the container's cgroup. */
   pidsLimit: number;
-  /** Private tmpfs size in bytes, mounted at the working directory. */
-  tmpfsBytes: number;
-  /** Private bounded `/tmp` size in bytes. */
-  tmpBytes: number;
+  /**
+   * Approved total writable tmpfs budget in bytes.
+   *
+   * The page cache backing a tmpfs is charged against the container's memory cgroup, so every
+   * tmpfs is an allocation from the same 384 MiB. This is the *sum* bound, and the split below
+   * must fit inside it.
+   */
+  tmpfsBudgetBytes: number;
+  /** Portion of the budget mounted at the working directory. */
+  workTmpfsBytes: number;
+  /** Portion of the budget mounted at `/tmp`. */
+  tmpTmpfsBytes: number;
   /** The dedicated cgroup parent this system created and verified. */
   cgroupParent: string;
   /** Seccomp profile, by name. Must be an approved profile, never `unconfined`. */
@@ -208,8 +218,10 @@ export const SYNTHETIC_PROFILE = Object.freeze({
   cpuPeriodMicros: 100_000,
   memoryBytes: 384 * 1024 * 1024,
   pidsLimit: 48,
-  tmpfsBytes: 48 * 1024 * 1024,
-  tmpBytes: 16 * 1024 * 1024,
+  // The approved 48 MiB writable budget, split rather than doubled. 32 + 16 = 48.
+  tmpfsBudgetBytes: 48 * 1024 * 1024,
+  workTmpfsBytes: 32 * 1024 * 1024,
+  tmpTmpfsBytes: 16 * 1024 * 1024,
   v8OldSpaceMb: 256,
   processingTimeoutMs: 20_000,
   maxFixtureBytes: 1024 * 1024,
@@ -289,8 +301,17 @@ export function assertExecutionPolicy(policy: ExecutionPolicy): void {
     throw new Error("cpuQuotaMicros must not exceed cpuPeriodMicros (that would exceed one core)");
   }
   assertIntegerInRange(policy.pidsLimit, 8, 4_096, "pidsLimit");
-  assertIntegerInRange(policy.tmpfsBytes, 1024 * 1024, 1024 * 1024 * 1024, "tmpfsBytes");
-  assertIntegerInRange(policy.tmpBytes, 1024 * 1024, 1024 * 1024 * 1024, "tmpBytes");
+  assertIntegerInRange(policy.tmpfsBudgetBytes, 1024 * 1024, 1024 * 1024 * 1024, "tmpfsBudgetBytes");
+  assertIntegerInRange(policy.workTmpfsBytes, 1024 * 1024, policy.tmpfsBudgetBytes, "workTmpfsBytes");
+  assertIntegerInRange(policy.tmpTmpfsBytes, 1024 * 1024, policy.tmpfsBudgetBytes, "tmpTmpfsBytes");
+  // The sum is the real constraint. Checking each half against the budget independently would
+  // accept 48 + 48 against an approved 48, which is exactly the defect this corrects.
+  if (policy.workTmpfsBytes + policy.tmpTmpfsBytes > policy.tmpfsBudgetBytes) {
+    throw new Error(
+      `tmpfs split ${policy.workTmpfsBytes} + ${policy.tmpTmpfsBytes} exceeds the approved `
+      + `${policy.tmpfsBudgetBytes} byte writable budget`,
+    );
+  }
   assertIntegerInRange(policy.v8OldSpaceMb, 32, 4_096, "v8OldSpaceMb");
   // V8 heap must sit below the cgroup limit, or the OOM killer arrives before the heap cap
   // and the failure looks like a host problem instead of a document problem.
@@ -352,10 +373,10 @@ export function buildCreateArgv(policy: ExecutionPolicy): string[] {
     "--security-opt", `apparmor=${policy.apparmorProfile}`,
     "--read-only",
     // The work directory: writable, but never executable and never setuid.
-    "--tmpfs", `/work:rw,noexec,nosuid,nodev,size=${policy.tmpfsBytes}`,
+    "--tmpfs", `/work:rw,noexec,nosuid,nodev,size=${policy.workTmpfsBytes}`,
     // The approved bounded /tmp profile. TMPDIR points here so nothing falls back to a path
     // that does not exist in a read-only root.
-    "--tmpfs", `/tmp:rw,noexec,nosuid,nodev,size=${policy.tmpBytes}`,
+    "--tmpfs", `/tmp:rw,noexec,nosuid,nodev,size=${policy.tmpTmpfsBytes}`,
     // A *read-only* mount at /dev/mqueue. A writable tmpfs there would not be a mask at all:
     // POSIX message queues would remain usable as a denial-of-service channel.
     "--tmpfs", "/dev/mqueue:ro,nosuid,nodev,noexec",
@@ -375,7 +396,9 @@ export function buildCreateArgv(policy: ExecutionPolicy): string[] {
     // a JavaScript heap error, which is diagnosable, instead of being OOM-killed at the cgroup
     // boundary, which looks like a host fault.
     "--env", `NODE_OPTIONS=--max-old-space-size=${policy.v8OldSpaceMb}`,
-    "--env", "TMPDIR=/tmp",
+    // No TMPDIR override. `/tmp` is already the default, it is a tmpfs because it is mounted
+    // there, and an env key that restates the default invites the belief that it is a
+    // configurable boundary. The mount is the boundary.
     "--env", "NODE_ENV=production",
     ...ownershipLabels(policy).flatMap((label) => ["--label", label]),
     policy.image,

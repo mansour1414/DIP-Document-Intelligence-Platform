@@ -38,18 +38,53 @@
 # than musl because `@napi-rs/canvas` publishes a gnu binding for this platform and because the
 # application's worker image is already glibc; two libc families in one product is a source of
 # defects that only appear in one of them.
-FROM node:22-bookworm-slim AS deps
+#
+# ## Base image identity
+#
+# `node:22-bookworm-slim` is a *moving tag*. Two builds of this Dockerfile a month apart can
+# resolve to different filesystems, so the tag is a readability aid and not an identity. The
+# acceptance build must pin the digest:
+#
+#   docker build --build-arg NODE_BASE=node:22-bookworm-slim@sha256:<digest> -f Dockerfile.executor .
+#
+# recorded digests are in docs/r7d-executor-artifact.md. This environment has no Docker daemon,
+# so the digest below is NOT resolved here and the default remains the tag; that is stated
+# rather than papered over.
+ARG NODE_BASE=node:22-bookworm-slim
+
+# ## Target architecture
+#
+# The acceptance host is native ARM64 and this development environment is x64. The canvas
+# binding is a compiled `.node` binary selected by npm from `optionalDependencies` according to
+# the *target* platform, so the closure must be resolved for the target rather than for the
+# builder. `--os/--cpu` select from the existing lockfile only — no package is added and the
+# lockfile is untouched. Building an arm64 image then uses the arm64 binding even when the build
+# runs on an x64 machine with emulation.
+FROM ${NODE_BASE} AS deps
 WORKDIR /build
+
+ARG TARGETOS=linux
+# Supplied by BuildKit from the target platform (modern Docker default). It is deliberately not
+# defaulted: a silently-wrong architecture produces an image that builds and then fails on the
+# first document, which is exactly the class of defect this file is meant to prevent. The guard
+# below fails closed with a readable message instead.
+ARG TARGETARCH
 
 # The lockfile is the authority. `npm ci` installs exactly it and fails if package.json and the
 # lockfile disagree, so the artifact cannot silently contain a different graph than CI tested.
 COPY package.json package-lock.json ./
-RUN npm ci --no-audit --no-fund --ignore-scripts
+RUN case "${TARGETARCH}" in \
+      arm64|x64) echo "resolving native closure for ${TARGETOS}/${TARGETARCH}" ;; \
+      *) echo "FATAL: TARGETARCH='${TARGETARCH}' is not a supported canvas target." >&2; \
+         echo "BuildKit supplies this automatically. With the classic builder pass" >&2; \
+         echo "  --build-arg TARGETARCH=arm64   (or x64)." >&2; exit 1 ;; \
+    esac \
+ && npm ci --no-audit --no-fund --ignore-scripts --os=${TARGETOS} --cpu=${TARGETARCH}
 
 # ---------------------------------------------------------------------------------------
 # Stage 2 — precompile the executor
 # ---------------------------------------------------------------------------------------
-FROM node:22-bookworm-slim AS builder
+FROM ${NODE_BASE} AS builder
 WORKDIR /build
 
 COPY --from=deps /build/node_modules ./node_modules
@@ -74,7 +109,7 @@ RUN node -e "const m = require('./dist/executor-child.js'); if (m.WORKER_PROTOCO
 # ---------------------------------------------------------------------------------------
 # Stage 3 — runtime
 # ---------------------------------------------------------------------------------------
-FROM node:22-bookworm-slim AS runtime
+FROM ${NODE_BASE} AS runtime
 
 # A real non-root identity with a real passwd entry and home directory.
 #
@@ -101,11 +136,16 @@ COPY --from=deps /build/node_modules/pdf-lib ./node_modules/pdf-lib
 COPY --from=deps /build/node_modules/@pdf-lib/standard-fonts ./node_modules/@pdf-lib/standard-fonts
 COPY --from=deps /build/node_modules/@pdf-lib/upng ./node_modules/@pdf-lib/upng
 # Only the two @napi-rs packages the canvas actually needs. Copying the whole `@napi-rs` scope
-# dragged in `keyring`, `keyring-linux-x64-gnu` and `lzma-linux-x64-gnu` — packages pulled by
-# unrelated parts of the application graph, none of which the executor uses. A credential
-# helper in the untrusted image is exactly the kind of inclusion this closure exists to prevent.
+# dragged in `keyring`, `keyring-linux-*-gnu` and `lzma-linux-*-gnu` — packages pulled by
+# unrelated parts of the application graph, none of which the executor uses. A credential helper
+# in the untrusted image is exactly the kind of inclusion this closure exists to prevent.
+#
+# The native binding name is derived from the target architecture rather than written as
+# `linux-x64-gnu`. Hard-coding x64 produced an image that would have failed on the native ARM64
+# acceptance host with a `MODULE_NOT_FOUND` for the .node file — after a successful build, and
+# only at the first document.
 COPY --from=deps /build/node_modules/@napi-rs/canvas ./node_modules/@napi-rs/canvas
-COPY --from=deps /build/node_modules/@napi-rs/canvas-linux-x64-gnu ./node_modules/@napi-rs/canvas-linux-x64-gnu
+COPY --from=deps /build/node_modules/@napi-rs/canvas-${TARGETOS}-${TARGETARCH}-gnu ./node_modules/@napi-rs/canvas-${TARGETOS}-${TARGETARCH}-gnu
 COPY --from=deps /build/node_modules/@fontsource/noto-sans-arabic ./node_modules/@fontsource/noto-sans-arabic
 COPY --from=deps /build/node_modules/pako ./node_modules/pako
 COPY --from=deps /build/node_modules/tslib ./node_modules/tslib

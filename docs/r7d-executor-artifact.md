@@ -42,7 +42,7 @@ to confirm the gate actually fails. A verifier that cannot fail is not a verifie
 | `@pdf-lib/standard-fonts` | 1.0.0 | MIT | pdf-lib's standard-14 font metrics |
 | `@pdf-lib/upng` | 1.0.1 | MIT | pdf-lib's PNG encoder |
 | `@napi-rs/canvas` | 1.0.9 | MIT | Raster appearance fallback for non-WinAnsi values |
-| `@napi-rs/canvas-linux-x64-gnu` | 1.0.9 | MIT | The platform native binding for that canvas |
+| `@napi-rs/canvas-<os>-<arch>-gnu` | 1.0.9 | MIT | The native binding, selected for the **target** architecture |
 | `@fontsource/noto-sans-arabic` | 5.3.0 | OFL-1.1 | Arabic and Latin glyphs |
 | `pako` | 1.0.11 | MIT AND Zlib | Flate streams (pdf-lib dependency) |
 | `tslib` | 2.8.1 | 0BSD | Import helpers (pdf-lib dependency) |
@@ -51,6 +51,51 @@ Excluded, and asserted absent by the artifact verifier: `@prisma/client`, `prism
 `bullmq`, `@aws-sdk/*`, `openai`, `groq-sdk`. The executor parses documents; it has no business
 holding a database client or a cloud credential, and a credential reaching this image is a much
 worse defect than a slow build.
+
+## Base image identity
+
+`node:22-bookworm-slim` is a moving tag. Two builds a month apart can resolve to different
+filesystems, so the tag is a readability aid, not an identity. The acceptance build must pin:
+
+```
+docker build --build-arg NODE_BASE=node:22-bookworm-slim@sha256:<digest> \
+             -f Dockerfile.executor .
+```
+
+**No digest is recorded here, because no Docker daemon is available to resolve one.** Writing a
+plausible-looking digest would be worse than writing none: it would be a fabricated identity
+claim in a document whose purpose is to record verified facts.
+
+## Target architecture
+
+The acceptance host is native ARM64; this development environment is x64. The canvas binding is a
+compiled `.node` binary that npm selects from `optionalDependencies` by **target** platform, so
+the closure is resolved for the target:
+
+```
+RUN npm ci --os=${TARGETOS} --cpu=${TARGETARCH} ...
+COPY --from=deps /build/node_modules/@napi-rs/canvas-${TARGETOS}-${TARGETARCH}-gnu ...
+```
+
+`--os/--cpu` select from the existing lockfile only. No package is added, nothing is upgraded, and
+`package-lock.json` is untouched. `@napi-rs/canvas-linux-arm64-gnu@1.0.9` is already a locked
+optional entry.
+
+`TARGETARCH` has no default. A silently-wrong architecture produces an image that builds cleanly
+and fails at the first document, so a missing value fails the build with a readable message:
+
+```
+FATAL: TARGETARCH='' is not a supported canvas target.
+```
+
+This was verified locally: `npm ci --os=linux --cpu=arm64` installs `canvas-linux-arm64-gnu` and
+`keyring-linux-arm64-gnu`, and the artifact verifier derives its one allowed binding from
+`process.platform`/`process.arch` instead of naming x64. Swapping an ARM64 binding into an x64
+runtime root makes the verifier fail three checks, which is the behaviour that matters — an image
+carrying the wrong binary is caught at build time rather than at the first PDF.
+
+**No ARM64 acceptance is claimed.** Everything above is x64-host evidence about a cross-build
+configuration. Nothing here exercised an ARM64 kernel, and an x64 simulated filesystem cannot.
 
 ## The one non-obvious build flag
 
@@ -73,7 +118,7 @@ font file passes an existence check and fails both.
 | CPU | 0.75 (quota 75 000 µs / period 100 000 µs) |
 | Memory | 384 MiB, swap 0 |
 | PIDs | 48 |
-| tmpfs | 48 MiB `/work`, 16 MiB `/tmp`, both `noexec,nosuid,nodev` |
+| tmpfs | **48 MiB total** writable budget, split 32 MiB `/work` + 16 MiB `/tmp`, both `noexec,nosuid,nodev` |
 | V8 old space | 256 MiB |
 | Deadline | 20 s |
 | Fixtures | ≤ 1 MiB |

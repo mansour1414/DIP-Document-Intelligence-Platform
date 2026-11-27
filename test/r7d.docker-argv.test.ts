@@ -15,6 +15,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   assertDedicatedCgroupParent,
+  assertExecutionPolicy,
   assertDigestPinnedImage,
   assertNoForbiddenFlags,
   buildCreateArgv,
@@ -46,8 +47,9 @@ function policy(overrides: Partial<ExecutionPolicy> = {}): ExecutionPolicy {
     cpuQuotaMicros: SYNTHETIC_PROFILE.cpuQuotaMicros,
     cpuPeriodMicros: SYNTHETIC_PROFILE.cpuPeriodMicros,
     pidsLimit: SYNTHETIC_PROFILE.pidsLimit,
-    tmpfsBytes: SYNTHETIC_PROFILE.tmpfsBytes,
-    tmpBytes: SYNTHETIC_PROFILE.tmpBytes,
+    tmpfsBudgetBytes: SYNTHETIC_PROFILE.tmpfsBudgetBytes,
+    workTmpfsBytes: SYNTHETIC_PROFILE.workTmpfsBytes,
+    tmpTmpfsBytes: SYNTHETIC_PROFILE.tmpTmpfsBytes,
     v8OldSpaceMb: SYNTHETIC_PROFILE.v8OldSpaceMb,
     cgroupParent: "/dip-executor-abcdef0123456789",
     seccompProfile: "runtime/default",
@@ -165,10 +167,14 @@ test("R7D.1-P-3: the root filesystem is read-only and the scratch mount is harde
   const tmpfs = allValuesOf(argv, "--tmpfs");
   assert.equal(tmpfs.length, 3, "expected work, the bounded /tmp profile, and the masked mqueue mount");
   const [work, tmp, mqueue] = tmpfs;
-  assert.match(work, /^\/work:rw,noexec,nosuid,nodev,size=50331648$/u);
-  // The approved profile bounds /tmp specifically; the root is read-only so nothing can
-  // fall back to a path that does not exist.
-  assert.match(tmp, /^\/tmp:rw,noexec,nosuid,nodev,size=/u);
+  // C-F01: the two tmpfs mounts are a split of one approved budget, not two independent
+  // allocations. 32 + 16 = 48 MiB.
+  assert.match(work, /^\/work:rw,noexec,nosuid,nodev,size=33554432$/u);
+  assert.match(tmp, /^\/tmp:rw,noexec,nosuid,nodev,size=16777216$/u);
+  const workBytes = Number(/size=(\d+)$/u.exec(work)?.[1]);
+  const tmpBytes = Number(/size=(\d+)$/u.exec(tmp)?.[1]);
+  assert.equal(workBytes + tmpBytes, SYNTHETIC_PROFILE.tmpfsBudgetBytes, "the split must equal the approved budget");
+  assert.ok(workBytes + tmpBytes <= SYNTHETIC_PROFILE.tmpfsBudgetBytes, "never above the approved budget");
   // F01: a *writable* tmpfs at /dev/mqueue is not a mask. It must be read-only.
   assert.match(mqueue, /^\/dev\/mqueue:ro,/u, "the mqueue mask must be read-only");
 });
@@ -317,4 +323,39 @@ test("R7D.1-V-1: the Docker environment is an allowlist and cannot redirect the 
   assert.deepEqual(keys.sort(), ["DOCKER_CLI_HINTS", "DOCKER_CONFIG", "NODE_ENV", "PATH"]);
   // No proxy variable may influence how the client reaches the socket.
   for (const key of keys) assert.doesNotMatch(key, /PROXY/iu);
+});
+
+// ---------------------------------------------------------------------------------------
+// C-F01 — the writable budget is a sum, not a per-mount ceiling
+// ---------------------------------------------------------------------------------------
+
+test("R7D.1-CF01-1: the tmpfs split may not exceed the approved writable budget", () => {
+  // The defect: /work 48 MiB and /tmp 16 MiB were each validated against a maximum
+  // independently, so the container received 64 MiB against an approved 48. The page cache
+  // backing a tmpfs is charged to the memory cgroup, so the second mount was an unbudgeted
+  // allocation, not a separate resource.
+  assert.throws(
+    () => assertExecutionPolicy(policy({ workTmpfsBytes: 48 * 1024 * 1024, tmpTmpfsBytes: 16 * 1024 * 1024 })),
+    /exceeds the approved/u,
+  );
+  // Exactly at the budget is acceptable.
+  assert.doesNotThrow(() => assertExecutionPolicy(policy({ workTmpfsBytes: 32 * 1024 * 1024, tmpTmpfsBytes: 16 * 1024 * 1024 })));
+});
+
+test("R7D.1-CF01-2: every tmpfs in the create argv is accounted for in the budget", () => {
+  // /dev/mqueue is a mask, not scratch: it is read-only, so it cannot grow. Anything writable
+  // must be part of the 48 MiB.
+  const argv = buildCreateArgv(policy());
+  const writable = allValuesOf(argv, "--tmpfs").filter((value) => value.includes(":rw,"));
+  assert.equal(writable.length, 2, "only the two budgeted mounts may be writable");
+  const total = writable.reduce((sum, value) => sum + Number(/size=(\d+)/u.exec(value)?.[1] ?? 0), 0);
+  assert.equal(total, SYNTHETIC_PROFILE.tmpfsBudgetBytes);
+});
+
+test("R7D.1-CF01-3: no TMPDIR override is injected", () => {
+  // `/tmp` is the process default and is a tmpfs because it is mounted there. An env key that
+  // restates the default invites the belief that the boundary is configurable; the mount is
+  // the boundary.
+  const argv = buildCreateArgv(policy());
+  assert.equal(argv.some((arg) => arg.startsWith("TMPDIR=")), false);
 });

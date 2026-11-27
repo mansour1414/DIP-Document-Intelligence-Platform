@@ -29,6 +29,22 @@ import { captureBaseline, compare } from "../src/lib/pdf/form-verify";
 
 const BUNDLE = join(process.cwd(), "dist", "executor-child.js");
 
+/**
+ * The native canvas package this host needs.
+ *
+ * Derived rather than hard-coded to x64, for the same reason the Dockerfile now derives it: a
+ * test that asserts an x64 name passes on x64 and tells you nothing about the ARM64 acceptance
+ * host. Where the host has no mapping, the test fails rather than silently picking one.
+ */
+function nativeCanvasPackage(): string {
+  const mapping: Record<string, Partial<Record<string, string>>> = {
+    linux: { x64: "@napi-rs/canvas-linux-x64-gnu", arm64: "@napi-rs/canvas-linux-arm64-gnu" },
+  };
+  const name = mapping[process.platform]?.[process.arch];
+  if (name === undefined) throw new Error(`no canvas mapping for ${process.platform}/${process.arch}`);
+  return name;
+}
+
 /** The newest mtime across the sources the bundle is built from. */
 function newestSourceMtime(): number {
   let newest = 0;
@@ -375,13 +391,14 @@ test("R7D.1-X-9: the artifact verifier passes against the packaged runtime closu
     join(appRoot, "dist", "verify-executor-artifact.mjs"),
   );
 
-  // Exactly the packages the Dockerfile's runtime stage copies.
+  // Exactly the packages the Dockerfile's runtime stage copies, with the native binding
+  // resolved for *this* host so the fixture is not silently x64-only.
   for (const name of [
     "pdf-lib",
     "@pdf-lib/standard-fonts",
     "@pdf-lib/upng",
     "@napi-rs/canvas",
-    "@napi-rs/canvas-linux-x64-gnu",
+    nativeCanvasPackage(),
     "@fontsource/noto-sans-arabic",
     "pako",
     "tslib",
@@ -395,10 +412,12 @@ test("R7D.1-X-9: the artifact verifier passes against the packaged runtime closu
     encoding: "utf8",
     timeout: 120_000,
   });
-  assert.match(output, /9\/9 artifact checks passed/u, output);
+  assert.match(output, /10\/10 artifact checks passed/u, output);
   // The specific defect that was found: pdf-lib's transitive closure.
   assert.match(output, /@pdf-lib\/standard-fonts/u);
   assert.match(output, /@pdf-lib\/upng/u);
+  // C-F01: the binding must be the one for this architecture, and only one may exist.
+  assert.match(output, /exactly one native canvas binding, matching this architecture/u);
 });
 
 test("R7D.1-X-10: the verifier fails when a transitive dependency is missing", async () => {
@@ -413,7 +432,7 @@ test("R7D.1-X-10: the verifier fails when a transitive dependency is missing", a
   for (const name of [
     "pdf-lib",
     "@napi-rs/canvas",
-    "@napi-rs/canvas-linux-x64-gnu",
+    nativeCanvasPackage(),
     "@fontsource/noto-sans-arabic",
     "pako",
     "tslib",
@@ -437,4 +456,60 @@ test("R7D.1-X-10: the verifier fails when a transitive dependency is missing", a
     assert.match(stderr, /standard-fonts|upng/u, stderr);
   }
   assert.equal(exitCode, 1, "the verifier must exit non-zero when the closure is incomplete");
+});
+
+test("R7D.1-CF01-4: a wrong-architecture native binding is rejected at build time", async () => {
+  // The acceptance host is native ARM64. A Dockerfile that copied `canvas-linux-x64-gnu`
+  // unconditionally produced an image that built cleanly and then failed at the first document
+  // with a MODULE_NOT_FOUND for the .node file. This asserts the verifier catches that, by
+  // putting a foreign binding into the runtime root.
+  const appRoot = join(workdir, "app-foreign-arch");
+  mkdirSync(join(appRoot, "dist"), { recursive: true });
+  mkdirSync(join(appRoot, "node_modules"), { recursive: true });
+  copyFileSync(BUNDLE, join(appRoot, "dist", "executor-child.js"));
+  copyFileSync(join(process.cwd(), "package.json"), join(appRoot, "package.json"));
+  copyFileSync(join(process.cwd(), "scripts", "verify-executor-artifact.mjs"), join(appRoot, "dist", "verify-executor-artifact.mjs"));
+
+  const foreign = process.arch === "x64" ? "canvas-linux-arm64-gnu" : "canvas-linux-x64-gnu";
+  // The lockfile carries every platform's binding, but `npm ci` installs only the host's. The
+  // foreign one is materialised on demand from the same locked graph, into the scratch tree,
+  // rather than being vendored into the repository.
+  const foreignPath = join(workdir, "foreign", foreign);
+  mkdirSync(dirname(foreignPath), { recursive: true });
+  const cpu = process.arch === "x64" ? "arm64" : "x64";
+  execFileSync(
+    "npm",
+    ["pack", `@napi-rs/${foreign}@1.0.9`, "--pack-destination", join(workdir, "foreign")],
+    { cwd: workdir, stdio: "pipe", timeout: 120_000, env: { ...process.env, npm_config_cpu: cpu } },
+  );
+  const tarball = readdirSync(join(workdir, "foreign")).find((name) => name.endsWith(".tgz"));
+  if (tarball === undefined) throw new Error("could not fetch the foreign binding tarball");
+  mkdirSync(foreignPath, { recursive: true });
+  execFileSync("tar", ["-xzf", join(workdir, "foreign", tarball), "-C", foreignPath, "--strip-components=1"], {
+    stdio: "pipe",
+    timeout: 60_000,
+  });
+  for (const name of ["pdf-lib", "@napi-rs/canvas", nativeCanvasPackage(), "@fontsource/noto-sans-arabic", "pako", "tslib"]) {
+    const target = join(appRoot, "node_modules", name);
+    mkdirSync(dirname(target), { recursive: true });
+    cpSync(join(process.cwd(), "node_modules", name), target, { recursive: true });
+  }
+  // Replace the correct binding with the foreign one.
+  cpSync(foreignPath, join(appRoot, "node_modules", "@napi-rs", foreign), { recursive: true });
+
+  let exitCode = 0;
+  let stderr = "";
+  try {
+    execFileSync(process.execPath, [join(appRoot, "dist", "verify-executor-artifact.mjs"), appRoot], {
+      encoding: "utf8",
+      stdio: "pipe",
+      timeout: 120_000,
+    });
+  } catch (error) {
+    exitCode = (error as { status?: number }).status ?? 1;
+    stderr = String((error as { stderr?: string }).stderr ?? "");
+  }
+  // It must exit non-zero and name the architecture problem, not merely "some check failed".
+  assert.equal(exitCode, 1, "a foreign-architecture binding must fail the artifact verifier");
+  assert.match(stderr, /native binding|canvas binding/u, stderr);
 });
