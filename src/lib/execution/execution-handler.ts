@@ -231,14 +231,22 @@ export async function composeExecution(options: ComposeOptions): Promise<Executi
     // The caller receives the executor's frame incrementally: `STREAM_CHUNK` per validated slice,
     // then `STREAM_END` with the totals. Nothing here retains the frame — the supervisor holds only
     // the digest and length, and the bytes have already passed to the caller by the time the commit
-    // is authorized. `send` is the transport's write; a `false` result is reported as a stall so a
-    // peer that stops reading slows the executor rather than growing a queue in this process.
+    // is authorized.
+    //
+    // ## The await is the backpressure, and it is the transport's
+    //
+    // This used to yield with `setImmediate` and call a `send` that returned `void`. Neither half
+    // exerted any pressure: a macrotask yield lets the loop rotate, but it does not wait for the
+    // socket, and the discarded `socket.write()` result meant a full kernel buffer simply moved the
+    // remainder into this process. `send` now resolves on `drain` and rejects on a dead peer, so
+    // awaiting it is what makes the executor slow down: the next chunk is not read from the result
+    // stream until this one has actually been taken by the socket.
+    //
+    // A rejection propagates. A peer that disappeared mid-result must stop the execution, not leave
+    // it draining into a socket that will never accept another byte.
     await execution.collectResult({
       onChunk: async (chunk) => {
-        session.send({ kind: "STREAM_CHUNK", data: chunk.toString("base64") });
-        // Yield to the event loop so the socket's buffer drains. The transport is a stream, and a
-        // tight loop writing megabytes would fill it faster than the peer can consume.
-        await new Promise<void>((resolve) => setImmediate(resolve));
+        await session.send({ kind: "STREAM_CHUNK", data: chunk.toString("base64") });
       },
     });
 

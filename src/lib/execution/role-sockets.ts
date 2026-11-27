@@ -332,8 +332,22 @@ export type AdmittedSession = {
   operation: IpcOperation;
   executionId: string;
   socket: Socket;
-  /** Write one control frame. Refuses if the peer has gone. */
-  send: (message: unknown) => void;
+  /**
+   * Write one control frame, resolving when the socket has taken it.
+   *
+   * ## Why this is a promise now
+   *
+   * It returned `void`, so a caller streaming a document had no way to know whether the peer was
+   * keeping up. `socket.write()` returns `false` once the kernel buffer is full, and the previous
+   * implementation discarded that boolean; a fast producer then queued the entire result in
+   * userspace while the event loop rotated, which is the same unbounded growth the streaming
+   * contract exists to prevent, one layer down.
+   *
+   * The promise resolves on `drain` when the write buffer is full, and rejects if the socket is
+   * closed or errors first. A caller that ignores the rejection cannot silently continue: the
+   * stream is already torn down.
+   */
+  send: (message: unknown) => Promise<void>;
   /** Resolve admission. Called exactly once by the handler, with evidence. */
   release: (resolved: boolean) => void;
   /** Control messages after the handshake, in order. */
@@ -438,18 +452,95 @@ export async function startRoleSockets(options: RoleServerOptions): Promise<Role
       }, IPC_LIMITS.authTimeoutMs);
       handshakeTimer.unref();
 
-      const send = (message: unknown): void => {
-        if (closed) return;
+      /**
+       * Write one frame, honouring the socket's own backpressure.
+       *
+       * `socket.write()` is synchronous only in the sense that it hands bytes to the kernel. Once
+       * the kernel buffer is full it returns `false` and buffers the remainder *in Node*, so a
+       * loop that ignores the return value converts a bounded pipe into an unbounded queue. The
+       * awaiting here is what makes `STREAM_CHUNK` pacing real: the next chunk is not read from the
+       * executor until this one has been accepted.
+       *
+       * Rejection, not silence, on a dead peer. A caller must not interpret "the socket went away"
+       * as "the frame was delivered", and the commit path in particular depends on knowing that
+       * the terminal message actually left this process.
+       */
+      const send = (message: unknown): Promise<void> => {
+        // ## A write to a closed connection is a no-op, not a rejection
+        //
+        // The handler's own teardown calls `release`, which ends the socket, and then finishes its
+        // `finally` block. A message composed after that point was never going anywhere, and
+        // reporting it as a failure would surface as an unhandled rejection in every normal
+        // shutdown. Rejection is reserved for the case that matters: a write *attempted on a live
+        // connection* whose peer then disappeared before the frame was accepted.
+        if (closed) return Promise.resolve();
+        let frame: Buffer;
         try {
-          socket.write(encodeControlFrame(message));
-        } catch {
+          frame = encodeControlFrame(message);
+        } catch (error) {
+          return Promise.reject(error instanceof Error ? error : new Error("the frame could not be encoded"));
+        }
+        // A peer that accepts bytes but never drains them must not be able to make this process
+        // grow a queue. The ceiling is per connection and shared by every frame type, because the
+        // sum is what is charged to memory, not any one message.
+        if (socket.writableLength > IPC_LIMITS.maxSendBufferBytes) {
           closed = true;
           socket.destroy();
+          return Promise.reject(new Error("the peer is not draining the connection"));
         }
+        return new Promise<void>((resolve, reject) => {
+          const onDrain = (): void => { cleanup(); resolve(); };
+          const onClose = (): void => { cleanup(); reject(new Error("the connection closed before the frame was written")); };
+          const cleanup = (): void => {
+            socket.off("drain", onDrain);
+            socket.off("close", onClose);
+            socket.off("error", onClose);
+          };
+          socket.once("drain", onDrain);
+          socket.once("close", onClose);
+          socket.once("error", onClose);
+          try {
+            // `true` means the kernel buffer is below its high-water mark: it is safe to write
+            // again immediately, and no event will follow. `false` means "buffered", and `drain`
+            // is the only correct way to learn when to pace again — waiting on anything else,
+            // including `writableLength`, can hang, because `drain` does not fire when the buffer
+            // empties on its own after a write that was already accepted.
+            const accepted = socket.write(frame);
+            if (accepted) { cleanup(); resolve(); }
+          } catch (error) {
+            cleanup();
+            closed = true;
+            socket.destroy();
+            reject(error instanceof Error ? error : new Error("the frame could not be written"));
+          }
+        });
+      };
+
+      /**
+       * Send a handshake frame without awaiting delivery.
+       *
+       * The handshake is a synchronous state machine: each frame is followed immediately by a state
+       * change that depends on the frame having been *composed*, not on the peer having read it.
+       * Awaiting here would make the frame parser re-entrant for no benefit, and the reply's
+       * ordering is already guaranteed because `socket.write` preserves it.
+       *
+       * The rejection is still handled — `send` rejects on a dead peer, and an unhandled rejection
+       * would take down the process over a connection that has already gone.
+       */
+      const post = (message: unknown): void => {
+        void send(message).catch(() => {
+          closed = true;
+          socket.destroy();
+          notifyControl?.();
+          notifyBody?.();
+        });
       };
 
       const refuse = (code: RoleRefusal): void => {
-        send({ kind: "REFUSED", code } satisfies ServerRefusal);
+        // The refusal frame is best-effort by definition: the connection is ended immediately
+        // afterwards, so a peer that has already gone cannot be told anything. The rejection is
+        // swallowed rather than left unhandled, which would crash the process on a dead socket.
+        void send({ kind: "REFUSED", code } satisfies ServerRefusal).catch(() => {});
         // Ended rather than destroyed: the peer is owed the refusal frame before the connection goes.
         closed = true;
         socket.end();
@@ -582,7 +673,7 @@ export async function startRoleSockets(options: RoleServerOptions): Promise<Role
             controlBlockBytes = isRecord(message.control) ? Buffer.from(JSON.stringify(message.control), "utf8") : Buffer.alloc(0);
             serverNonce = newNonce();
             challenges.issue(Buffer.from(serverNonce, "hex"));
-            send({
+            post({
               kind: "CHALLENGE",
               protocolVersion: IPC_PROTOCOL_VERSION,
               serverNonce,
@@ -647,7 +738,7 @@ export async function startRoleSockets(options: RoleServerOptions): Promise<Role
             // admit this execution. Refusing before proving itself would leave a caller unable to
             // distinguish "busy" from "wrong process answered the inode", which are different
             // incidents with different responses.
-            send({
+            post({
               kind: "AUTH_OK",
               proof: serverProof.toString("hex"),
               supervisorInstance: options.supervisorInstance,
@@ -681,12 +772,12 @@ export async function startRoleSockets(options: RoleServerOptions): Promise<Role
             admitted = { executionId: decision.executionId, released: false };
             state.connections.set(role, (state.connections.get(role) ?? 0) + 1);
 
-            send({ kind: "ADMITTED", executionId: decision.executionId } satisfies ServerAdmitted);
+            post({ kind: "ADMITTED", executionId: decision.executionId } satisfies ServerAdmitted);
             // The body region follows the invitation, not the admission: the caller may not write a
             // document byte until preflight has passed and the watchdog is armed, and `READY_FOR_BODY`
             // is the supervisor's evidence that both happened.
             readyNonce = newNonce();
-            send({ kind: "READY_FOR_BODY", nonce: readyNonce } satisfies ServerReady);
+            post({ kind: "READY_FOR_BODY", nonce: readyNonce } satisfies ServerReady);
             startSession();
             // Bytes that arrived with the AUTH frame are the session's from here.
             if (step.leftover.byteLength > 0) deliverSessionData(step.leftover);

@@ -97,6 +97,21 @@ export const IPC_LIMITS = Object.freeze({
   maxActiveExecutionsPerConnection: 4,
   /** Distinct request ids remembered for replay rejection. */
   maxRememberedRequests: 1_024,
+  /**
+   * Bytes a single connection may have buffered for a peer that is not draining.
+   *
+   * ## Why a byte ceiling and not a promise
+   *
+   * `socket.write()` returns `false` when the kernel buffer is full and then buffers the rest in
+   * this process. A producer that ignores that return value — as the streaming path did — turns a
+   * bounded pipe into an unbounded queue, and the queue is charged to the supervisor's heap rather
+   * than the peer's. The streaming contract bounds the *document*; this bounds the *transport*, and
+   * without it the first bound is decorative.
+   *
+   * Sized above one maximum control frame (256 KiB) so a legitimate large frame is never refused,
+   * and far below the profile's memory ceiling so a stalled peer cannot approach it.
+   */
+  maxSendBufferBytes: 1024 * 1024,
 });
 
 /** Nonce width. 32 bytes is the SHA-256 block size and far past guessing. */
