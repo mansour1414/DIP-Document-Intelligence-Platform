@@ -28,6 +28,9 @@ import {
   newNonce,
   releaseResolved,
   reserve,
+  reserveForWorker,
+  sequenceFor,
+  advanceSequence,
   startRoleSockets,
   type AdmittedSession,
   type RoleServer,
@@ -509,33 +512,74 @@ test("R7D.1-D2R-7: a reservation is single-use, expires, and is bound to the wor
   const now = 1_000;
   const limits = { reservationTtlMs: 1_000, maxConnections: 16 };
 
-  const { reservationId } = reserve(state, "worker", now, 1_000);
-  const accepted = admit(state, { role: "worker", operation: "fill", requestId: rid("a"), reservationId }, now + 10, limits);
+  // Issued through the real path, because a worker reservation is bound to the identity that asked
+  // and to one operation. Minting it with the generic helper would produce a reservation no worker
+  // could use — which is the binding working, not a shortcut being unavailable.
+  const issue = (operation: "inspect" | "fill" | "verify", at: number, ttl = 1_000, identity = "worker-a") => {
+    const grant = reserveForWorker(state, {
+      callerIdentity: identity,
+      operation,
+      sequence: sequenceFor(state, identity),
+      now: at,
+      ttlMs: ttl,
+      idleMs: ttl,
+      maxPerCaller: 2,
+    });
+    if (!grant.ok) throw new Error(`issuance refused: ${grant.code}`);
+    advanceSequence(state, identity, operation);
+    return grant.reservationId;
+  };
+  // The sequence starts at `inspect`: a worker may not begin with a fill, because there is no
+  // enumerated form to fill. `issue` advances the caller's position, so the fill below is legal.
+  issue("inspect", now, 1_000, "worker-a");
+  const reservationId = issue("fill", now);
+  const accepted = admit(state, {
+    role: "worker", operation: "fill", requestId: rid("a"), reservationId, callerIdentity: "worker-a",
+  }, now + 10, limits);
   assert.equal(accepted.ok, true, "a live worker reservation is accepted");
 
   if (accepted.ok) releaseResolved(state, accepted.executionId, true);
 
   // Replay of the same reservation. It was consumed on acceptance, so it is now simply unknown.
-  const replayed = admit(state, { role: "worker", operation: "fill", requestId: rid("b"), reservationId }, now + 20, limits);
+  const replayed = admit(state, {
+    role: "worker", operation: "fill", requestId: rid("b"), reservationId, callerIdentity: "worker-a",
+  }, now + 20, limits);
   assert.equal(replayed.ok, false);
   assert.equal(replayed.ok === false ? replayed.code : null, "RESERVATION_REQUIRED");
 
   // Expiry: a reservation that was live when it was minted is not live a year later.
-  const fresh = reserve(state, "worker", now, 500);
-  const expired = admit(state, { role: "worker", operation: "fill", requestId: rid("c"), reservationId: fresh.reservationId }, now + 10_000, limits);
+  issue("inspect", now, 1_000, "worker-b");
+  const fresh = issue("fill", now, 500, "worker-b");
+  const expired = admit(state, {
+    role: "worker", operation: "fill", requestId: rid("c"), reservationId: fresh, callerIdentity: "worker-b",
+  }, now + 10_000, limits);
   assert.equal(expired.ok, false);
   assert.equal(expired.ok === false ? expired.code : null, "RESERVATION_INVALID");
 
   // An `app` needs no reservation, and must not be able to burn a worker's by presenting it.
-  const forWorker = reserve(state, "worker", now, 10_000);
-  const appDecision = admit(state, { role: "app", operation: "inspect", requestId: rid("d"), reservationId: forWorker.reservationId }, now, limits);
+  const forWorker = issue("inspect", now, 10_000, "worker-c");
+  const appDecision = admit(state, { role: "app", operation: "inspect", requestId: rid("d"), reservationId: forWorker }, now, limits);
   assert.equal(appDecision.ok, true);
-  assert.ok(state.reservations.has(forWorker.reservationId), "an app cannot consume a worker reservation");
+  assert.ok(state.reservations.has(forWorker), "an app cannot consume a worker reservation");
 
   // A reservation minted for the worker role, presented on the app socket, is not the app's to use.
+  // A fill reservation for a caller that has only reached `fill`; the app-minted one below must
+  // still be refused, because role is bound at issuance and not inferable from the id.
+  // The slot from `appDecision` is still held, deliberately: a reservation is not issued while the
+  // executor is occupied, so issuance here must refuse with `BUSY` before anything else is checked.
+  assert.throws(
+    () => issue("inspect", now, 10_000, "worker-d"),
+    /BUSY/u,
+    "no reservation is issued while the executor slot is occupied",
+  );
+  releaseResolved(state, (appDecision as { executionId: string }).executionId, true);
+  issue("inspect", now, 10_000, "worker-d");
+  issue("fill", now, 10_000, "worker-d");
   const wrongRole = reserve(state, "app", now, 10_000);
   releaseResolved(state, (appDecision as { executionId: string }).executionId, true);
-  const workerWithAppReservation = admit(state, { role: "worker", operation: "fill", requestId: rid("e"), reservationId: wrongRole.reservationId }, now, limits);
+  const workerWithAppReservation = admit(state, {
+    role: "worker", operation: "fill", requestId: rid("e"), reservationId: wrongRole.reservationId, callerIdentity: "worker-c",
+  }, now, limits);
   assert.equal(workerWithAppReservation.ok, false);
   assert.equal(workerWithAppReservation.ok === false ? workerWithAppReservation.code : null, "RESERVATION_INVALID");
 });
@@ -615,6 +659,8 @@ test("R7D.1-D2R-11: the connecting caller transport performs the full handshake 
       secret: fixture.secrets.app,
       supervisorInstance: SUPERVISOR,
       bootId: BOOT,
+      // The caller's own identity, supplied rather than invented by the client.
+      clientInstance: "socket-test-app",
     };
     declareBody(options, { length: body.byteLength, sha256: digest });
 
@@ -653,6 +699,7 @@ test("R7D.1-D2R-12: a caller that expects the wrong supervisor instance is refus
         // instance it did not intend, which is how a stale socket becomes a data leak.
         supervisorInstance: "sv-ffffffffffff",
         bootId: BOOT,
+        clientInstance: "socket-test-app",
       }),
       (error: unknown) => (error as { message?: string }).message?.includes("different supervisor instance") === true,
     );

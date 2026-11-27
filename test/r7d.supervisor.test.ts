@@ -28,7 +28,16 @@ import {
   type SupervisorOptions,
 } from "../src/lib/execution/supervisor";
 import { preflightContainer, preflightKernel } from "../src/lib/execution/preflight";
-import { admit, newAdmissionState, releaseResolved, reserve, startRoleSockets } from "../src/lib/execution/role-sockets";
+import {
+  admit,
+  advanceSequence,
+  newAdmissionState,
+  releaseResolved,
+  reserve,
+  reserveForWorker,
+  sequenceFor,
+  startRoleSockets,
+} from "../src/lib/execution/role-sockets";
 import { OwnershipJournal } from "../src/lib/execution/ownership-journal";
 import { INSPECT_FORMAT, SYNTHETIC_PROFILE, ownershipLabels, type ExecutionPolicy, type DockerOutcome } from "../src/lib/execution/docker-lifecycle";
 import { signDisarmGrant, type ArmAck } from "../src/lib/execution/watchdog-protocol";
@@ -503,10 +512,38 @@ test("R7D.1-SV-11: an ambiguous removal is a refusal, not an assumption", async 
   }
 });
 
+/**
+ * Issue a worker reservation through the real path.
+ *
+ * The generic `reserve()` mints one with no caller identity and no operation, which the identity and
+ * operation bindings in `admit` now correctly refuse. A test that wants a *usable* worker
+ * reservation has to ask the way a worker asks.
+ */
+function issueWorker(
+  state: ReturnType<typeof newAdmissionState>,
+  operation: "inspect" | "fill" | "verify",
+  identity: string,
+  now = 1_000,
+): string {
+  const grant = reserveForWorker(state, {
+    callerIdentity: identity,
+    operation,
+    sequence: sequenceFor(state, identity),
+    now,
+    ttlMs: 30_000,
+    idleMs: 30_000,
+    maxPerCaller: 4,
+  });
+  if (!grant.ok) throw new Error(`issuance refused: ${grant.code}`);
+  advanceSequence(state, identity, operation);
+  return grant.reservationId;
+}
+
 test("R7D.1-SV-12: admission allows one active executor and refuses the second", () => {
   const state = newAdmissionState();
   const now = 1_000;
-  const workerReservation = reserve(state, "worker", now, 30_000);
+  // A reservation names one operation, so the caller's sequence is walked explicitly.
+  const workerReservation = { reservationId: issueWorker(state, "inspect", "sv12-worker") };
 
   const first = admit(state, { role: "app", operation: "inspect", requestId: "1".repeat(16), executionId: "a".repeat(32) }, now, { reservationTtlMs: 30_000, maxConnections: 4 });
   assert.equal(first.ok, true);
@@ -516,6 +553,7 @@ test("R7D.1-SV-12: admission allows one active executor and refuses the second",
   const second = admit(state, {
     role: "worker", operation: "fill", requestId: "2".repeat(16),
     reservationId: workerReservation.reservationId, executionId: "b".repeat(32),
+    callerIdentity: "sv12-worker",
   }, now, { reservationTtlMs: 30_000, maxConnections: 4 });
   assert.equal(second.ok, false);
   assert.equal((second as { code: string }).code, "BUSY");
@@ -523,10 +561,11 @@ test("R7D.1-SV-12: admission allows one active executor and refuses the second",
   releaseResolved(state, "a".repeat(32), true);
   // A reservation is single-use, so the third request needs a fresh one — the first was consumed
   // when the second request was *processed*, even though that request was then refused as BUSY.
-  const thirdReservation = reserve(state, "worker", now, 30_000);
+  const thirdReservation = { reservationId: issueWorker(state, "fill", "sv12-worker") };
   const third = admit(state, {
     role: "worker", operation: "fill", requestId: "3".repeat(16),
     reservationId: thirdReservation.reservationId, executionId: "c".repeat(32),
+    callerIdentity: "sv12-worker",
   }, now, { reservationTtlMs: 30_000, maxConnections: 4 });
   assert.equal(third.ok, true);
 });

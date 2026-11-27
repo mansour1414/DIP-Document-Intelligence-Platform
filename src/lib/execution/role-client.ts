@@ -61,6 +61,20 @@ export type RoleClientOptions = {
   /** The instance the caller expects to be talking to. A different one is refused, not accepted. */
   supervisorInstance: string;
   bootId: string;
+  /**
+   * This caller's own identity, bound into the transcript.
+   *
+   * ## Why this is not a constant
+   *
+   * It was `"worker-client"` / `"app-client"` — the same string for every caller of a role. A worker
+   * reservation is bound to the identity that asked, so a constant would make every worker
+   * indistinguishable and the binding worthless: any worker could present any other's reservation.
+   *
+   * Required, because a default would silently re-create the constant. A deployment supplies the
+   * process or agent identity it already has, and the supervisisor treats it as an opaque label
+   * whose only guarantee is that two connections presenting the same value are the same caller.
+   */
+  clientInstance: string;
   /** Unpredictable, and unique per request; the supervisor remembers it, so replay is detectable. */
   requestId?: string;
   /** Required for `worker`: minted by the supervisor, single-use. */
@@ -88,6 +102,173 @@ export type RoleClientSession = {
   declaredControl: { length: number; sha256: string };
   /** Close everything. Idempotent. */
   destroy: () => void;
+};
+
+/**
+ * Ask the supervisor for a worker reservation.
+ *
+ * ## What this exchange is, and is not
+ *
+ * It is a short authenticated conversation: connect, HELLO declaring the operation this worker
+ * intends, prove the transcript, and receive either `RESERVED` with a single-use id or
+ * `RESERVATION_REFUSED` with a closed code. It is **not** an execution. No body is declared, no
+ * container is created, and the connection ends as soon as the answer arrives.
+ *
+ * Asking for authority before needing it is what lets the sequence be enforced: the supervisor
+ * decides `inspect` → `fill` → `verify` server-side, per caller, and a worker cannot reach `fill`
+ * with a credential alone.
+ *
+ * The identity in the HELLO is the one the reservation is bound to, so a reservation obtained here
+ * can only be exercised by a channel opened with the same `clientInstance`.
+ */
+export async function requestWorkerReservation(options: ReservationRequestOptions): Promise<WorkerReservation> {
+  const socket = await dial(options.socketPath, options.connectTimeoutMs ?? 5_000).catch(() => {
+    throw new CallerError("TRANSPORT_CLOSED", `could not connect to ${options.socketPath}`);
+  });
+  const requestId = options.requestId ?? randomBytes(16).toString("hex");
+  const clientNonce = newNonce();
+  // The reservation request travels inside the authenticated control block, so it is covered by the
+  // digest the transcript binds and cannot be changed after the proof.
+  const control = Buffer.from(JSON.stringify({ ...(options.control ?? {}), reserve: true }), "utf8");
+  const declaredControl = { length: control.byteLength, sha256: createHash("sha256").update(control).digest("hex") };
+  const emptyDigest = createHash("sha256").digest("hex");
+  const frames = new FrameBufferLite();
+  const queue: Record<string, unknown>[] = [];
+  let notify: (() => void) | null = null;
+  let closed = false;
+  let serverNonce: string | null = null;
+
+  socket.on("data", (chunk: Buffer) => {
+    frames.append(chunk);
+    for (;;) {
+      const step = frames.next();
+      if (step === null) break;
+      // Control frames only: this exchange declares an empty body and consumes no document bytes,
+      // so a body frame would be a protocol violation rather than data to forward.
+      queue.push(step.message as Record<string, unknown>);
+      notify?.();
+    }
+  });
+  socket.on("close", () => { closed = true; notify?.(); });
+  socket.on("error", () => { closed = true; notify?.(); });
+
+  const next = async (): Promise<Record<string, unknown>> => {
+    for (;;) {
+      const queued = queue.shift();
+      if (queued !== undefined) return queued;
+      if (closed) return { kind: "__CLOSED__" };
+      await new Promise<void>((resolve) => { notify = resolve; });
+      notify = null;
+    }
+  };
+
+  try {
+    socket.write(encodeControlFrame({
+      kind: "HELLO",
+      protocolVersion: IPC_PROTOCOL_VERSION,
+      clientNonce,
+      clientInstance: options.clientInstance,
+      role: "worker",
+      operation: options.operation,
+      requestId,
+      // No reservation is presented: this exchange is the request for one.
+      reservationId: null,
+      controlLength: declaredControl.length,
+      controlSha256: declaredControl.sha256,
+      bodyLength: 0,
+      bodySha256: emptyDigest,
+      control: { ...(options.control ?? {}), reserve: true },
+    }));
+
+    const challenge = await next();
+    if (challenge.kind === "REFUSED") {
+      throw new CallerError("NOT_READY", `the supervisor refused the request: ${String(challenge.code)}`);
+    }
+    if (challenge.kind !== "CHALLENGE" || typeof challenge.serverNonce !== "string") {
+      throw new CallerError("TRANSPORT_CLOSED", "the supervisor did not send a challenge");
+    }
+    serverNonce = challenge.serverNonce;
+    // The server's identity is proved by the proof it returns in `AUTH_OK`, over the same transcript.
+    const transcript = (direction: "client-to-server" | "server-to-client"): Buffer => buildTranscript({
+      direction,
+      protocolVersion: IPC_PROTOCOL_VERSION,
+      supervisorInstance: options.supervisorInstance,
+      bootId: options.bootId,
+      // Nonces are raw bytes in the transcript; the wire carries hex.
+      clientNonce: Buffer.from(clientNonce, "hex"),
+      serverNonce: Buffer.from(serverNonce!, "hex"),
+      role: "worker",
+      requestId,
+      operation: options.operation,
+      reservationId: null,
+      controlLength: declaredControl.length,
+      controlSha256: declaredControl.sha256,
+      bodyLength: 0,
+      bodySha256: emptyDigest,
+    });
+    socket.write(encodeControlFrame({
+      kind: "AUTH",
+      proof: computeProof(options.secret, transcript("client-to-server")).toString("hex"),
+    }));
+
+    // The answer arrives after `AUTH_OK`; a server that refuses before proving itself is not trusted.
+    const authOk = await next();
+    if (authOk.kind === "REFUSED") {
+      throw new CallerError("NOT_READY", `the supervisor refused authentication: ${String(authOk.code)}`);
+    }
+    if (authOk.kind !== "AUTH_OK" || typeof authOk.proof !== "string") {
+      throw new CallerError("TRANSPORT_CLOSED", "the supervisor did not acknowledge authentication");
+    }
+    if (authOk.supervisorInstance !== options.supervisorInstance || authOk.bootId !== options.bootId) {
+      throw new CallerError("NOT_READY", "a different supervisor instance answered");
+    }
+    if (!verifyProof(options.secret, transcript("server-to-client"), Buffer.from(authOk.proof, "hex"))) {
+      throw new CallerError("NOT_READY", "the supervisor failed to prove itself");
+    }
+
+    const answer = await next();
+    if (answer.kind === "RESERVATION_REFUSED") {
+      throw new CallerError("NOT_READY", `the supervisor refused a reservation: ${String(answer.code)}`);
+    }
+    if (answer.kind !== "RESERVED"
+      || typeof answer.reservationId !== "string"
+      || typeof answer.expiresAt !== "number"
+      || typeof answer.idleExpiresAt !== "number") {
+      throw new CallerError("TRANSPORT_CLOSED", "the supervisor did not answer the reservation request");
+    }
+    return {
+      reservationId: answer.reservationId,
+      operation: options.operation,
+      expiresAt: answer.expiresAt,
+      idleExpiresAt: answer.idleExpiresAt,
+    };
+  } finally {
+    closed = true;
+    socket.destroy();
+  }
+}
+
+/** A reservation, as the worker holds it. */
+export type WorkerReservation = {
+  reservationId: string;
+  operation: IpcOperation;
+  expiresAt: number;
+  idleExpiresAt: number;
+};
+
+export type ReservationRequestOptions = {
+  socketPath: string;
+  /** The worker credential. The role is fixed: only a worker may be reserved. */
+  secret: Buffer;
+  supervisorInstance: string;
+  bootId: string;
+  /** The identity the reservation will be bound to. */
+  clientInstance: string;
+  /** The operation this reservation will authorize. Enforced against the caller's sequence. */
+  operation: IpcOperation;
+  requestId?: string;
+  connectTimeoutMs?: number;
+  control?: Record<string, unknown>;
 };
 
 /**
@@ -192,7 +373,7 @@ export async function openRoleChannel(options: RoleClientOptions): Promise<RoleC
     kind: "HELLO",
     protocolVersion: IPC_PROTOCOL_VERSION,
     clientNonce,
-    clientInstance: options.role === "app" ? "app-client" : "worker-client",
+    clientInstance: options.clientInstance,
     role: options.role,
     operation: options.operation,
     requestId,

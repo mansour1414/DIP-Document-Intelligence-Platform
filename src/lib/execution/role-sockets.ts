@@ -89,12 +89,50 @@ export type RoleRefusal =
   | "REJECTED"
   | "QUARANTINED";
 
+/**
+ * One issued reservation.
+ *
+ * ## Why every field is here
+ *
+ * A reservation is an *authorization to ask* — it does not admit anything by itself and cannot
+ * occupy the executor slot. That limited authority is still authority, so it is bounded on every
+ * axis that could otherwise be turned into a resource:
+ *
+ * - `role` — a worker reservation is not an app reservation, so a captured one cannot cross roles.
+ * - `operation` — the specific operation in the sequence this reservation authorizes. A fill
+ *   reservation does not authorize a verify.
+ * - `callerIdentity` — the authenticated `clientInstance` that asked. Presenting the id from a
+ *   different connection is a refusal, so a leaked id is not a transferable capability.
+ * - `expiresAt` — the total lifetime. Bounds the window in which a captured id is useful at all.
+ * - `idleExpiresAt` — a shorter lifetime that is *not* extended by use. Bounds the queue of
+ *   reservations a caller can accumulate and then abandon.
+ * - `sequence` — the position in the operation chain, so issuance is ordered and auditable.
+ */
+export type Reservation = {
+  role: IpcRole;
+  operation: IpcOperation;
+  callerIdentity: string;
+  expiresAt: number;
+  idleExpiresAt: number;
+  sequence: number;
+};
+
 /** What admission knows about the one executor it may admit. */
 export type AdmissionState = {
   activeExecution: string | null;
   activeSince: number | null;
   connections: Map<IpcRole, number>;
-  reservations: Map<string, { role: IpcRole; expiresAt: number; sequence: number }>;
+  reservations: Map<string, Reservation>;
+  /** Monotonic issuance counter. Never reused, so a sequence number identifies one issuance. */
+  reservationSequence: number;
+  /**
+   * How far each authenticated caller has advanced through the worker sequence.
+   *
+   * Keyed by `clientInstance`, which the transcript proved. Bounded implicitly: only identities that
+   * have actually completed a handshake appear, and entries are reset when a reservation is issued
+   * for `inspect` (the start of a new pipeline).
+   */
+  callerSequence: Map<string, number>;
   /** Execution ids whose lifecycle has not positively resolved. Nothing is admitted while non-empty. */
   unresolved: Set<string>;
 };
@@ -105,19 +143,165 @@ export function newAdmissionState(): AdmissionState {
     activeSince: null,
     connections: new Map(),
     reservations: new Map(),
+    reservationSequence: 0,
+    callerSequence: new Map(),
     unresolved: new Set(),
   };
 }
 
-/** A reservation: unpredictable, finite, single-use, and bound to one role. */
-export function reserve(state: AdmissionState, role: IpcRole, now: number, ttlMs: number): { reservationId: string; expiresAt: number } {
+/**
+ * The authorized operation sequence a worker may walk.
+ *
+ * ## Why a sequence and not a set
+ *
+ * Inspect → Fill → Verify is a pipeline, not three interchangeable powers. Fill without a preceding
+ * inspect means filling fields the worker never enumerated; verify without a fill means attesting to
+ * a document that was never produced. Encoding the order server-side means a worker cannot skip a
+ * step by requesting the later operation first, even with a valid credential.
+ *
+ * A worker may repeat an operation (inspect twice is meaningful, as is fill then fill) but may not
+ * *reverse* one: after a fill, an inspect would be inspecting a different document than the one the
+ * pipeline is committed to.
+ */
+export const WORKER_OPERATION_SEQUENCE = Object.freeze(["inspect", "fill", "verify"] as const);
+
+/** How far a worker's operations may advance between reservations. */
+export type SequencePosition = { last: number };
+
+/**
+ * Why a reservation was refused.
+ *
+ * Separate from `RoleRefusal` because these are *issuance* outcomes, reported to the caller before
+ * admission, not admission refusals for a request that was otherwise well-formed.
+ */
+export type ReservationRefusal =
+  /** The worker asked for an operation before the one its sequence has reached. */
+  | "OUT_OF_SEQUENCE"
+  /** The worker already holds as many reservations as it may. */
+  | "RESERVATION_LIMIT"
+  /** The supervisor is at capacity; a reservation would promise a slot it cannot deliver. */
+  | "BUSY";
+
+export type ReservationGrant =
+  | { ok: true; reservationId: string; expiresAt: number; idleExpiresAt: number; operation: IpcOperation }
+  | { ok: false; code: ReservationRefusal };
+
+/**
+ * Issue one worker reservation.
+ *
+ * ## What this does *not* do
+ *
+ * It does not admit anything. A reservation authorizes a future admission request; the executor
+ * slot is still decided by `admit`, which enforces one global active execution and holds the slot
+ * while any lifecycle is unresolved. A worker holding three reservations cannot run three
+ * executions, and this function does not create a second slot.
+ *
+ * ## The bounds, and what each prevents
+ *
+ * - **Count** (`maxPerCaller`) bounds what one caller can accumulate, so a caller that requests in a
+ *   loop without connecting cannot make the supervisor hold unbounded state.
+ * - **Total TTL** (`ttlMs`) bounds the window a captured id is useful in.
+ * - **Idle TTL** (`idleMs`, shorter) bounds an abandoned reservation. It is *not* extended by use,
+ *   so reconnecting does not let a caller keep a reservation alive forever.
+ * - **Caller identity** makes an id non-transferable: another connection presenting it is refused.
+ * - **Single use** is enforced in `admit`, which deletes on acceptance.
+ */
+export function reserveForWorker(
+  state: AdmissionState,
+  input: {
+    callerIdentity: string;
+    operation: IpcOperation;
+    sequence: SequencePosition;
+    now: number;
+    ttlMs: number;
+    idleMs: number;
+    maxPerCaller: number;
+  },
+): ReservationGrant {
+  // Sweep first, so an expired reservation does not consume the caller's allowance. Sweeping on
+  // every issuance is what keeps the map bounded without a timer: nothing else has to run for this
+  // state to stay finite.
   for (const [id, record] of state.reservations) {
-    if (record.expiresAt <= now) state.reservations.delete(id);
+    if (record.expiresAt <= input.now || record.idleExpiresAt <= input.now) state.reservations.delete(id);
   }
+
+  const target = WORKER_OPERATION_SEQUENCE.indexOf(input.operation);
+  if (target < 0) return { ok: false, code: "OUT_OF_SEQUENCE" };
+  // A worker may repeat the operation the sequence has reached, or advance one step. It may not
+  // jump ahead: requesting `verify` before any `fill` is a pipeline that skipped the work.
+  if (target > input.sequence.last + 1) return { ok: false, code: "OUT_OF_SEQUENCE" };
+  if (target < input.sequence.last) return { ok: false, code: "OUT_OF_SEQUENCE" };
+
+  // A reservation is a promise that a slot can be offered. Issuing one while the executor is
+  // occupied would let a worker queue up authority it cannot exercise, and would make "BUSY" arrive
+  // at admission time, after the caller had already prepared a document.
+  if (state.activeExecution !== null || state.unresolved.size > 0) return { ok: false, code: "BUSY" };
+
+  let held = 0;
+  for (const record of state.reservations.values()) {
+    if (record.callerIdentity === input.callerIdentity) held += 1;
+  }
+  if (held >= input.maxPerCaller) return { ok: false, code: "RESERVATION_LIMIT" };
+
+  const reservationId = randomBytes(24).toString("hex");
+  const expiresAt = input.now + input.ttlMs;
+  // Shorter than the total, and independent of it: an idle reservation dies sooner, and using one
+  // does not extend either clock.
+  const idleExpiresAt = input.now + Math.min(input.idleMs, input.ttlMs);
+  state.reservationSequence += 1;
+  state.reservations.set(reservationId, {
+    role: "worker",
+    operation: input.operation,
+    callerIdentity: input.callerIdentity,
+    expiresAt,
+    idleExpiresAt,
+    sequence: state.reservationSequence,
+  });
+  return { ok: true, reservationId, expiresAt, idleExpiresAt, operation: input.operation };
+}
+
+/**
+ * The sequence position for a caller.
+ *
+ * Absent means "-1": nothing has been issued yet, so the caller may ask for `inspect` (position 0)
+ * but not `fill`. A caller that has never inspected has no pipeline to continue.
+ */
+export function sequenceFor(state: AdmissionState, callerIdentity: string): SequencePosition {
+  return { last: state.callerSequence.get(callerIdentity) ?? -1 };
+}
+
+/**
+ * Record that a reservation was issued for an operation.
+ *
+ * Only advances. Issuing `inspect` again resets to 0, because that is what starting a new pipeline
+ * looks like — a worker that finished one document and begins another. Anything else moves forward
+ * by one, so the index always names the step actually reached.
+ */
+export function advanceSequence(state: AdmissionState, callerIdentity: string, operation: IpcOperation): void {
+  const target = WORKER_OPERATION_SEQUENCE.indexOf(operation);
+  const current = state.callerSequence.get(callerIdentity) ?? -1;
+  state.callerSequence.set(callerIdentity, operation === "inspect" ? 0 : Math.max(current, target));
+}
+
+/**
+ * A general reservation for a non-worker role.
+ *
+ * Kept separate rather than offered as a parameter, because "which role may be reserved" is a policy
+ * question and a boolean argument invites the wrong answer. `app` cannot fill, so it needs no
+ * reservation at all; this exists for tests and for a future role that does.
+ */
+export function reserve(state: AdmissionState, role: IpcRole, now: number, ttlMs: number): { reservationId: string; expiresAt: number } {
   const reservationId = randomBytes(24).toString("hex");
   const expiresAt = now + ttlMs;
-  const sequence = state.reservations.size + 1;
-  state.reservations.set(reservationId, { role, expiresAt, sequence });
+  state.reservationSequence += 1;
+  state.reservations.set(reservationId, {
+    role,
+    operation: "inspect",
+    callerIdentity: "",
+    expiresAt,
+    idleExpiresAt: expiresAt,
+    sequence: state.reservationSequence,
+  });
   return { reservationId, expiresAt };
 }
 
@@ -127,6 +311,13 @@ export type AdmissionRequest = {
   requestId: unknown;
   reservationId?: unknown;
   executionId?: unknown;
+  /**
+   * The authenticated `clientInstance`, from the HELLO that the transcript bound.
+   *
+   * Required for a worker, because a reservation is issued to one caller and accepting it from
+   * another would make the id a transferable capability. Optional for `app`, which presents none.
+   */
+  callerIdentity?: unknown;
 };
 
 export type AdmissionDecision = { ok: true; executionId: string } | { ok: false; code: RoleRefusal };
@@ -145,11 +336,15 @@ export function admit(
   options: { reservationTtlMs: number; maxConnections: number },
 ): AdmissionDecision {
   let role: IpcRole;
+  let operation: IpcOperation;
   try {
     role = parseRole(request.role);
     // Shape-checked only: which operations a role may invoke is the server's decision, made after
     // authentication, so that a policy refusal is never reported as a handshake failure.
-    parseOperation(request.operation);
+    //
+    // Retained rather than discarded, because the reservation names one operation and the binding
+    // has to be compared, not assumed.
+    operation = parseOperation(request.operation);
     // Validated for shape, and then deliberately not used as the execution id: an execution id is
     // minted here, never taken from the wire, so a peer cannot choose the id it is recorded under.
     parseRequestId(request.requestId);
@@ -163,27 +358,57 @@ export function admit(
   const connectionCount = state.connections.get(role) ?? 0;
   if (connectionCount >= options.maxConnections) return { ok: false, code: "TOO_MANY_CONNECTIONS" };
 
-  // A worker must present a live reservation for the worker role. The reservation is what makes
-  // "who may fill" a server-side fact rather than a claim on the wire.
-  if (role === "worker") {
-    const reservationId = typeof request.reservationId === "string" ? request.reservationId : "";
-    const reservation = state.reservations.get(reservationId);
-    if (reservation === undefined) return { ok: false, code: "RESERVATION_REQUIRED" };
-    if (reservation.role !== "worker" || reservation.expiresAt <= now) {
-      state.reservations.delete(reservationId);
-      return { ok: false, code: "RESERVATION_INVALID" };
-    }
-    // Single use: consuming it here means a captured reservation cannot be replayed.
-    state.reservations.delete(reservationId);
-  }
+  const callerIdentity = typeof request.callerIdentity === "string" ? request.callerIdentity : "";
 
-  // ## Nothing is admitted while any lifecycle is unresolved
+  // ## Capacity is decided before the reservation is spent
+  //
+  // The ordering is deliberate, and it was wrong the other way round. Consuming the reservation
+  // first meant a caller refused for `BUSY` had burned its single-use authorization on a request
+  // that never had a chance: a worker that simply retried was then refused forever with
+  // `RESERVATION_REQUIRED`, and the real reason was never reported. Nothing is admitted either way,
+  // so refusing earlier is also the cheaper answer.
   //
   // This is stricter than "no active execution". An execution that finished its handler but whose
   // container has not been positively removed is still using the single executor slot, and admitting
   // a second one alongside it is two containers under one profile.
   if (state.unresolved.size > 0) return { ok: false, code: "BUSY" };
   if (state.activeExecution !== null) return { ok: false, code: "BUSY" };
+
+  // A worker must present a live reservation for the worker role. The reservation is what makes
+  // "who may fill" a server-side fact rather than a claim on the wire.
+  if (role === "worker") {
+    const reservationId = typeof request.reservationId === "string" ? request.reservationId : "";
+    const reservation = state.reservations.get(reservationId);
+    if (reservation === undefined) return { ok: false, code: "RESERVATION_REQUIRED" };
+    // ## Every binding is checked, in the order that costs least
+    //
+    // Expiry first: an expired record is deleted whatever else is wrong with the request, so a
+    // caller cannot probe the other predicates with a stale id.
+    if (reservation.expiresAt <= now || reservation.idleExpiresAt <= now) {
+      state.reservations.delete(reservationId);
+      return { ok: false, code: "RESERVATION_INVALID" };
+    }
+    if (reservation.role !== role) {
+      state.reservations.delete(reservationId);
+      return { ok: false, code: "RESERVATION_INVALID" };
+    }
+    // The operation must be the one this reservation names. Checking only the role would let a
+    // reservation issued for `inspect` authorize a `fill`, which is the whole pipeline bypass the
+    // sequence exists to prevent.
+    if (reservation.operation !== operation) {
+      state.reservations.delete(reservationId);
+      return { ok: false, code: "RESERVATION_INVALID" };
+    }
+    // The reservation belongs to the caller it was issued to. Without this, an id observed on the
+    // wire is a capability any authenticated worker could present.
+    if (reservation.callerIdentity === "" || reservation.callerIdentity !== callerIdentity) {
+      state.reservations.delete(reservationId);
+      return { ok: false, code: "RESERVATION_INVALID" };
+    }
+    // Single use, and consumed only now that every other check has passed: a refusal for a binding
+    // failure is a probe, and a refusal for capacity is not the caller's mistake.
+    state.reservations.delete(reservationId);
+  }
 
   const executionId = typeof request.executionId === "string" && /^[a-f0-9]{32}$/u.test(request.executionId)
     ? request.executionId
@@ -244,6 +469,30 @@ export type ServerChallenge = {
 };
 
 export type ClientAuth = { kind: "AUTH"; proof: string };
+/**
+ * Ask for a worker reservation, after authenticating.
+ *
+ * ## Why a distinct verb rather than a field on HELLO
+ *
+ * A reservation is authority granted by the supervisor, and the HELLO is the caller's claim. Putting
+ * the request in the HELLO would mean the handshake both asks for and consumes authority in one
+ * round trip, with no point at which the supervisor can decide independently. As a post-auth verb it
+ * is a answered request with a refusal vocabulary of its own.
+ *
+ * It travels on a connection that has completed authentication, so the identity the reservation is
+ * bound to is the one the transcript already proved.
+ */
+export type ClientReserve = { kind: "RESERVE"; operation: IpcOperation };
+export type ServerReserved = {
+  kind: "RESERVED";
+  reservationId: string;
+  operation: IpcOperation;
+  /** Total lifetime. The reservation dies at this instant regardless of use. */
+  expiresAt: number;
+  /** Idle lifetime, always <= `expiresAt`. Using the reservation does not extend either. */
+  idleExpiresAt: number;
+};
+export type ServerReservationRefused = { kind: "RESERVATION_REFUSED"; code: ReservationRefusal };
 export type ServerAuthOk = { kind: "AUTH_OK"; proof: string; supervisorInstance: string; bootId: string };
 export type ServerAdmitted = { kind: "ADMITTED"; executionId: string };
 export type ServerReady = { kind: "READY_FOR_BODY"; nonce: string };
@@ -322,6 +571,15 @@ export type RoleServerOptions = {
   handle: (session: AdmittedSession) => Promise<void>;
   now?: () => number;
   reservationTtlMs?: number;
+  /**
+   * Idle lifetime for a reservation.
+   *
+   * Shorter than the total, and deliberately not extended by use: it bounds an abandoned
+   * reservation, which is the state a caller leaves behind when it asks and then gives up.
+   */
+  reservationIdleMs?: number;
+  /** How many live reservations one authenticated caller may hold. */
+  maxReservationsPerCaller?: number;
   maxConnectionsPerRole?: number;
   log?: (line: string) => void;
 };
@@ -754,12 +1012,55 @@ export async function startRoleSockets(options: RoleServerOptions): Promise<Role
               refuse("OPERATION_NOT_PERMITTED");
               return;
             }
+
+            // ## Issuance happens here, on the authenticated connection, and then the frame continues
+            //
+            // A worker arriving to *ask* for a reservation (rather than to present one) is a
+            // distinct exchange: it authenticates, asks, is answered, and disconnects. The request
+            // travels in the authenticated `control` block as `reserve: true`, so it is covered by
+            // `controlLength`/`controlSha256` and cannot be altered after the proof.
+            //
+            // It is answered on this socket and the connection ends. There is no admission of an
+            // execution, so nothing occupies the executor slot while a worker negotiates.
+            if (role === "worker" && controlBlock.reserve === true && (hello.reservationId ?? null) === null) {
+              const grant = reserveForWorker(state, {
+                callerIdentity: hello.clientInstance,
+                operation: hello.operation,
+                // A fresh worker has done nothing yet; the sequence is per caller and held below.
+                sequence: sequenceFor(state, hello.clientInstance),
+                now: now(),
+                ttlMs: options.reservationTtlMs ?? 30_000,
+                idleMs: options.reservationIdleMs ?? 10_000,
+                maxPerCaller: options.maxReservationsPerCaller ?? 2,
+              });
+              if (!grant.ok) {
+                post({ kind: "RESERVATION_REFUSED", code: grant.code } satisfies ServerReservationRefused);
+              } else {
+                advanceSequence(state, hello.clientInstance, grant.operation);
+                post({
+                  kind: "RESERVED",
+                  reservationId: grant.reservationId,
+                  operation: grant.operation,
+                  expiresAt: grant.expiresAt,
+                  idleExpiresAt: grant.idleExpiresAt,
+                } satisfies ServerReserved);
+              }
+              // No admission, no body, no executor: the asked-for reservation is the whole exchange.
+              closed = true;
+              socket.end();
+              notifyControl?.();
+              notifyBody?.();
+              return;
+            }
+
             const decision = admit(state, {
               role,
               operation: hello.operation,
               requestId: hello.requestId,
               reservationId: hello.reservationId ?? undefined,
               executionId: hello.executionId,
+              // The authenticated identity, which a worker's reservation is bound to.
+              callerIdentity: hello.clientInstance,
             }, now(), {
               reservationTtlMs: options.reservationTtlMs ?? 30_000,
               maxConnections: options.maxConnectionsPerRole ?? IPC_LIMITS.maxConnectionsPerRole,

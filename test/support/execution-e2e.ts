@@ -67,6 +67,13 @@ export type E2EEnvironment = {
   secrets: { app: string; worker: string; watchdog: string };
   supervisorInstance: string;
   watchdogInstance: string;
+  /**
+   * The identity a caller presents, and that a worker reservation is bound to.
+   *
+   * Distinct per role would be more faithful, but these tests open one role at a time; what matters
+   * is that it is a value the *caller* supplies, because the client no longer invents a constant.
+   */
+  clientInstance: string;
   cleanup: () => void;
 };
 
@@ -488,6 +495,7 @@ export function makeEnvironment(): E2EEnvironment {
       watchdog: randomBytes(32).toString("hex"),
     },
     supervisorInstance: "sv-0123456789ab",
+    clientInstance: "e2e-worker-01",
     watchdogInstance: "wd-0123456789ab",
     cleanup: () => rmSync(root, { recursive: true, force: true }),
   };

@@ -118,6 +118,9 @@ test("R7D.1-D2E-1: a real PDF is inspected through real processes and returns a 
       secret: Buffer.from(env.secrets.app, "hex"),
       supervisorInstance: env.supervisorInstance,
       bootId: BOOT_ID,
+      // The identity this caller presents. A worker reservation is bound to it, so it must be a
+      // real per-caller value rather than a constant the client used to invent.
+      clientInstance: env.clientInstance,
       control: CONTROL,
     };
     declareBody(options, { length: frame.byteLength, sha256: digest });
@@ -197,6 +200,9 @@ test("R7D.1-D2E-2: a real PDF is filled and verified through the same plane", as
       secret: Buffer.from(env.secrets.app, "hex"),
       supervisorInstance: env.supervisorInstance,
       bootId: BOOT_ID,
+      // The identity this caller presents. A worker reservation is bound to it, so it must be a
+      // real per-caller value rather than a constant the client used to invent.
+      clientInstance: env.clientInstance,
       control: CONTROL,
     };
     declareBody(options, { length: frame.byteLength, sha256: createHash("sha256").update(frame).digest("hex") });
@@ -253,6 +259,9 @@ test("R7D.1-D2E-4: a caller that dies mid-body leaves the execution to reconcili
       secret: Buffer.from(env.secrets.app, "hex"),
       supervisorInstance: env.supervisorInstance,
       bootId: BOOT_ID,
+      // The identity this caller presents. A worker reservation is bound to it, so it must be a
+      // real per-caller value rather than a constant the client used to invent.
+      clientInstance: env.clientInstance,
       control: CONTROL,
     };
     declareBody(options, { length: frame.byteLength, sha256: createHash("sha256").update(frame).digest("hex") });
@@ -307,6 +316,9 @@ test("R7D.1-D2E-5: an abnormal executor exit after a valid frame is never commit
       secret: Buffer.from(env.secrets.app, "hex"),
       supervisorInstance: env.supervisorInstance,
       bootId: BOOT_ID,
+      // The identity this caller presents. A worker reservation is bound to it, so it must be a
+      // real per-caller value rather than a constant the client used to invent.
+      clientInstance: env.clientInstance,
       control: CONTROL,
     };
     declareBody(options, { length: frame.byteLength, sha256: createHash("sha256").update(frame).digest("hex") });
@@ -372,6 +384,8 @@ test("R7D.1-D2E-7: the two role credentials are separate and neither is a fallba
         secret: Buffer.from(env.secrets.worker, "hex"),
         supervisorInstance: env.supervisorInstance,
         bootId: BOOT_ID,
+        // A distinct identity per role, so a test that cross-wires credentials also cross-wires names.
+        clientInstance: env.clientInstance,
         control: CONTROL,
       }),
       (error: unknown) => String((error as { message?: string }).message).includes("AUTH_FAILED")
