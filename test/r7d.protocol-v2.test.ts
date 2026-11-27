@@ -18,6 +18,7 @@ import {
   WorkerProtocolError,
 } from "../src/lib/pdf/worker-protocol-v2";
 import { WORKER_LIMITS, WORKER_PROTOCOL_VERSION, encodeControl, decodeControl } from "../src/lib/pdf/worker-protocol";
+import { ProvisionalResultStream, StreamError } from "../src/lib/execution/provisional-stream";
 
 const body = Buffer.from("PDFBODY");
 
@@ -171,3 +172,116 @@ test("R7D.1-V2-18: v2 reuses v1's limits rather than defining its own", () => {
   header.writeUInt32BE(WORKER_LIMITS.controlBytes + 1, 0);
   assert.equal(faultOf(() => decodeControlV2(Buffer.concat([header, Buffer.alloc(8)]), 1024)), "CONTROL_TOO_LARGE");
 });
+
+// ---------------------------------------------------------------------------------------
+// F02 — strict metadata validation. Each of these passed under the old cast.
+// ---------------------------------------------------------------------------------------
+
+const FILL_OK = {
+  ok: true as const,
+  op: "fill" as const,
+  pages: 1,
+  outBytes: 4,
+  checksum: "0".repeat(64),
+  report: { filled: 1, untouched: 0, rasterAppearances: 0, flatten: false },
+};
+
+test("R7D.1-F02-1: a fill result missing outBytes is rejected", () => {
+  // The old decoder returned `raw as WorkerMetaV2`, so this shape was accepted.
+  const withoutLength = { ...FILL_OK } as Record<string, unknown>;
+  delete withoutLength.outBytes;
+  assert.equal(faultOf(() => decodeResultV2(frameOf(withoutLength, Buffer.alloc(4)), 1024, "fill")), "INVALID_META");
+});
+
+test("R7D.1-F02-2: a fill result missing checksum or report is rejected", () => {
+  const noChecksum = { ...FILL_OK } as Record<string, unknown>;
+  delete noChecksum.checksum;
+  assert.equal(faultOf(() => decodeResultV2(frameOf(noChecksum, Buffer.alloc(4)), 1024, "fill")), "INVALID_META");
+  const noReport = { ...FILL_OK } as Record<string, unknown>;
+  delete noReport.report;
+  assert.equal(faultOf(() => decodeResultV2(frameOf(noReport, Buffer.alloc(4)), 1024, "fill")), "INVALID_META");
+});
+
+test("R7D.1-F02-3: a fill result whose outBytes disagrees with the frame is rejected", () => {
+  // Declared 4, carried 3. The old code never compared them, so a truncated document would
+  // have been forwarded as complete.
+  assert.equal(faultOf(() => decodeResultV2(frameOf(FILL_OK, Buffer.alloc(3)), 1024, "fill")), "OUTPUT_LENGTH_MISMATCH");
+  // Declared 4, carried 5: bytes nobody accounted for.
+  assert.equal(faultOf(() => decodeResultV2(frameOf(FILL_OK, Buffer.alloc(5)), 1024, "fill")), "OUTPUT_LENGTH_MISMATCH");
+});
+
+test("R7D.1-F02-4: a non-boolean outcome discriminator is rejected", () => {
+  for (const ok of ["false", 0, 1, null, undefined]) {
+    const frame = frameOf({ ...FILL_OK, ok }, Buffer.alloc(4));
+    assert.equal(faultOf(() => decodeResultV2(frame, 1024, "fill")), "INVALID_DISCRIMINATOR", `ok=${String(ok)}`);
+  }
+});
+
+test("R7D.1-F02-5: a refusal carrying output bytes is rejected", () => {
+  // Refusals are metadata-only. Bytes behind a failure marker are either corruption or an
+  // attempt to have content accepted under a failure the caller will not inspect.
+  const refusal = { ok: false, op: "fill", code: "FORM_UNSUPPORTED", details: { reason: "ENCRYPTED" } };
+  assert.equal(faultOf(() => decodeResultV2(frameOf(refusal, Buffer.alloc(16)), 1024, "fill")), "UNEXPECTED_OUTPUT");
+  // Without bytes the same refusal is accepted.
+  assert.doesNotThrow(() => decodeResultV2(frameOf(refusal), 1024, "fill"));
+});
+
+test("R7D.1-F02-6: a refusal with an unknown code is rejected", () => {
+  const refusal = { ok: false, op: "fill", code: "SOMETHING_NEW", details: {} };
+  assert.equal(faultOf(() => decodeResultV2(frameOf(refusal), 1024, "fill")), "UNKNOWN_ERROR_CODE");
+});
+
+test("R7D.1-F02-7: a verify result with unexpected properties is rejected", () => {
+  const withExtra = { ok: true, op: "verify", pages: 1, widgets: 0, preserved: 0, note: "extra" };
+  assert.equal(faultOf(() => decodeResultV2(frameOf(withExtra), 1024, "verify")), "INVALID_META");
+});
+
+test("R7D.1-F02-8: verify counters must be non-negative integers", () => {
+  for (const bad of [-1, 1.5, "3", null]) {
+    const frame = frameOf({ ok: true, op: "verify", pages: 1, widgets: bad, preserved: 0 });
+    assert.equal(faultOf(() => decodeResultV2(frame, 1024, "verify")), "INVALID_META", `widgets=${String(bad)}`);
+  }
+});
+
+test("R7D.1-F02-9: a verify answer to a fill request is rejected", () => {
+  const frame = frameOf({ ok: true, op: "verify", pages: 1, widgets: 0, preserved: 0 });
+  assert.equal(faultOf(() => decodeResultV2(frame, 1024, "fill")), "OP_MISMATCH");
+});
+
+test("R7D.1-F02-10: the buffered and streaming decoders agree on every malformed frame", () => {
+  // The review asked for identical semantics. They share one validator, so this asserts the
+  // sharing holds rather than that two implementations happen to agree today.
+  const cases: Array<[string, unknown, number]> = [
+    ["missing outBytes", { ...FILL_OK, outBytes: undefined }, 4],
+    ["length disagree", FILL_OK, 3],
+    ["bad discriminator", { ...FILL_OK, ok: "true" }, 4],
+    ["bad checksum", { ...FILL_OK, checksum: "short" }, 4],
+  ];
+  for (const [label, meta, bytes] of cases) {
+    const frame = frameOf(meta, Buffer.alloc(bytes));
+    const buffered = faultOf(() => decodeResultV2(frame, 1024, "fill"));
+    const streamed = faultOfStream(frame);
+    assert.ok(buffered !== undefined, `buffered decoder must reject: ${label}`);
+    assert.ok(streamed !== undefined, `streaming decoder must reject: ${label}`);
+  }
+});
+
+/** Build a raw result frame without going through the encoder, so invalid shapes can be sent. */
+function frameOf(meta: unknown, output?: Buffer): Buffer {
+  const json = Buffer.from(JSON.stringify(meta), "utf8");
+  const header = Buffer.alloc(4);
+  header.writeUInt32BE(json.byteLength, 0);
+  return output && output.byteLength > 0 ? Buffer.concat([header, json, output]) : Buffer.concat([header, json]);
+}
+
+/** Run a frame through the streaming validator and return its fault, if any. */
+function faultOfStream(frame: Buffer): string | undefined {
+  try {
+    const stream = new ProvisionalResultStream({ expectedOp: "fill", sink: () => {} });
+    stream.push(frame);
+    stream.finish();
+    return undefined;
+  } catch (error) {
+    return error instanceof StreamError ? error.fault : "OTHER";
+  }
+}

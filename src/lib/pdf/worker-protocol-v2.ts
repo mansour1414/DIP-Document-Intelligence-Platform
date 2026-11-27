@@ -36,6 +36,7 @@ import {
   type FillMeta,
 } from "./worker-protocol";
 import type { FormInventory } from "./form-types";
+import { validateResultMetaV2 } from "../execution/result-validation";
 
 /** The version this module encodes and accepts. */
 export const WORKER_PROTOCOL_V2 = 2;
@@ -310,22 +311,28 @@ export function decodeResultV2(buffer: Buffer, maxOutputBytes: number, expectedO
   } catch {
     throw new WorkerProtocolError("The result metadata is not valid JSON.", "INVALID_REQUEST");
   }
-  if (!isRecord(raw)) throw new WorkerProtocolError("The result metadata is not an object.", "INVALID_REQUEST");
-  const op = raw.op;
-  if (op !== "inspect" && op !== "fill" && op !== "verify") {
-    throw new WorkerProtocolError("The result operation is not supported.", "INVALID_REQUEST");
-  }
-  if (expectedOp !== null && op !== expectedOp) {
-    throw new WorkerProtocolError("The result operation does not match the request.", "OP_MISMATCH");
-  }
   const output = buffer.subarray(4 + metaLength);
-  if (raw.ok === true && op !== "fill" && output.byteLength > 0) {
-    throw new WorkerProtocolError("Only fill carries output bytes.", "UNEXPECTED_OUTPUT");
-  }
   if (output.byteLength > maxOutputBytes) {
     throw new WorkerProtocolError("The output exceeds the transport limit.", "OUTPUT_TOO_LARGE");
   }
-  return { meta: raw as WorkerMetaV2, output };
+  // F02: this previously ended with `return raw as WorkerMetaV2`, which asserts a shape to the
+  // compiler having verified almost nothing. The same validator the streaming reader uses is
+  // applied here, so the two decoders cannot disagree about what a valid result is.
+  const validated = validateResultMetaV2(raw, expectedOp ?? guessOp(raw), output.byteLength);
+  return { meta: validated.meta as WorkerMetaV2, output: validated.kind === "fill" ? output : new Uint8Array(0) };
+}
+
+/**
+ * The operation to validate against when the caller did not supply one.
+ *
+ * Used only by callers that decode a result without a request context. The validator still
+ * checks every operation-specific rule; the only thing missing is the cross-check that the
+ * answer matches the question.
+ */
+function guessOp(raw: unknown): WorkerOpV2 {
+  const op = (raw as { op?: unknown } | null)?.op;
+  if (op === "inspect" || op === "fill" || op === "verify") return op;
+  throw new WorkerProtocolError("The result names an unexpected operation.", "UNKNOWN_OP");
 }
 
 /** Narrow a v2 metadata record to `VerifyMeta`, rejecting a mismatched shape. */

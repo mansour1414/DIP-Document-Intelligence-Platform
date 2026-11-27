@@ -35,6 +35,7 @@
 import { createHash, type Hash } from "node:crypto";
 import { WORKER_LIMITS } from "../pdf/worker-protocol";
 import type { WorkerOpV2 } from "../pdf/worker-protocol-v2";
+import { validateResultMetaV2 } from "./result-validation";
 
 /** Why a stream was rejected. Closed vocabulary, safe to log. */
 export type StreamFault =
@@ -77,6 +78,25 @@ export type StreamCompletion = {
 
 export type ProvisionalSink = (chunk: ProvisionalChunk) => void;
 
+/**
+ * Map a protocol reason onto this module's fault vocabulary.
+ *
+ * The shared validator speaks in `WorkerProtocolError.reason` codes; the stream speaks in
+ * `StreamFault`. Keeping one translation here means a caller that branches on faults does not
+ * have to know which internal rule rejected the frame.
+ */
+function faultFor(error: unknown, fallback: StreamFault = "META_INVALID_SHAPE"): StreamFault {
+  const reason = (error as { reason?: unknown } | null)?.reason;
+  switch (reason) {
+    case "OP_MISMATCH": return "OP_MISMATCH";
+    case "UNEXPECTED_OUTPUT": return "UNEXPECTED_OUTPUT";
+    case "OUTPUT_LENGTH_MISMATCH": return fallback;
+    case "META_TOO_LARGE": return "META_TOO_LARGE";
+    case "UNKNOWN_OP": return "META_INVALID_SHAPE";
+    default: return fallback;
+  }
+}
+
 export type ProvisionalStreamOptions = {
   /** The operation the request asked for. A mismatched answer is rejected on the header. */
   expectedOp: WorkerOpV2;
@@ -111,6 +131,10 @@ export class ProvisionalResultStream {
   /** Bytes pushed to the sink since the last `drainCount`, for backpressure accounting. */
   private pendingBytes = 0;
   private ended = false;
+  /** The fill header's declared output length, reconciled at `finish()`. */
+  private declaredOutputBytes: number | null = null;
+  /** Set by any framing fault; a dead stream never accepts another byte. */
+  private invalidated = false;
 
   constructor(options: ProvisionalStreamOptions) {
     this.options = options;
@@ -139,6 +163,7 @@ export class ProvisionalResultStream {
    */
   push(input: Buffer | Uint8Array): void {
     if (this.ended) throw new StreamError("CLOSED", "the stream already ended");
+    if (this.invalidated) throw new StreamError("CLOSED", "the stream was invalidated by an earlier framing fault");
     let view = Buffer.isBuffer(input) ? input : Buffer.from(input.buffer, input.byteOffset, input.byteLength);
     this.frameBytes += view.byteLength;
 
@@ -183,25 +208,30 @@ export class ProvisionalResultStream {
   }
 
   private validateMeta(parsed: unknown): Record<string, unknown> {
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-      throw new StreamError("META_INVALID_SHAPE", "the result metadata is not an object");
+    // F02: one validator, shared with `decodeResultV2`. The two decoders previously had
+    // different opinions — this one checked `outputBytes`, while the fill contract uses
+    // `outBytes`, so a well-formed fill result was misread and a malformed one could pass.
+    //
+    // At header time the output count is not yet known, so the length reconciliation is
+    // deferred to `finish()`, where the real total is available. Every shape rule is enforced
+    // now, before a single output byte is forwarded.
+    // At header time the body has not arrived, so the *length equality* rule cannot run: it
+    // would compare the declaration against zero. Passing the declared count satisfies the
+    // shape checks without weakening them, and `finish()` re-runs the same validator against
+    // the real total, where a truncated or over-long frame is caught.
+    const declared = (parsed as { outBytes?: unknown }).outBytes;
+    const headerClaim = typeof declared === "number" && Number.isSafeInteger(declared) ? declared : 0;
+    let validated;
+    try {
+      validated = validateResultMetaV2(parsed, this.options.expectedOp, headerClaim);
+    } catch (error) {
+      // Translate the shared validator's protocol errors into this module's fault vocabulary,
+      // so every framing fault surfaces the same way regardless of which rule caught it. The
+      // underlying reason is preserved in the message.
+      throw new StreamError(faultFor(error), error instanceof Error ? error.message : "the result metadata is invalid");
     }
-    const meta = parsed as Record<string, unknown>;
-    const op = meta.op;
-    if (op !== "inspect" && op !== "fill" && op !== "verify") {
-      throw new StreamError("META_INVALID_SHAPE", "the result operation is not supported");
-    }
-    if (op !== this.options.expectedOp) {
-      // Header-first rejection: this fires before a single output byte is forwarded.
-      throw new StreamError("OP_MISMATCH", `expected ${this.options.expectedOp}, received ${op}`);
-    }
-    if (meta.ok === true && op !== "fill") {
-      // inspect and verify are metadata-only by definition. If output arrives later, the
-      // body regime will not catch the *intent*, so it is refused as soon as the header says
-      // the operation is not fill.
-      // Nothing to do here: any body bytes are still counted, and finish() asserts zero.
-    }
-    return meta;
+    if (validated.kind === "fill") this.declaredOutputBytes = (validated.meta as { outBytes: number }).outBytes;
+    return parsed as Record<string, unknown>;
   }
 
   /**
@@ -218,12 +248,12 @@ export class ProvisionalResultStream {
       // The header never completed. Either the process died early or the frame is short.
       throw new StreamError("TRUNCATED", `the result frame ended after ${this.frameBytes} bytes without a complete header`);
     }
-    if (this.meta.op !== "fill" && this.outputBytes > 0) {
-      throw new StreamError("UNEXPECTED_OUTPUT", `${String(this.meta.op)} carried ${this.outputBytes} output bytes`);
-    }
-    const declared = this.meta.outputBytes;
-    if (declared !== undefined && declared !== this.outputBytes) {
-      throw new StreamError("TRUNCATED", `the result declared ${String(declared)} output bytes and carried ${this.outputBytes}`);
+    // Re-validate against the real byte count. This is where a truncated or over-long frame
+    // is caught, using the same function as the buffered decoder so the two cannot disagree.
+    try {
+      validateResultMetaV2(this.meta, this.options.expectedOp, this.outputBytes);
+    } catch (error) {
+      throw new StreamError(faultFor(error, "TRUNCATED"), error instanceof Error ? error.message : "the result failed validation");
     }
     return {
       outputBytes: this.outputBytes,

@@ -22,7 +22,16 @@ function frame(meta: Record<string, unknown>, output?: Uint8Array): Buffer {
   return output && output.byteLength > 0 ? Buffer.concat([header, json, Buffer.from(output)]) : Buffer.concat([header, json]);
 }
 
-const fillMeta = (outputBytes: number) => ({ ok: true, op: "fill", pages: 1, fields: 1, outputBytes });
+const fillMeta = (outBytes: number) => ({
+  ok: true,
+  op: "fill",
+  pages: 1,
+  // F02: the fill contract field is `outBytes`, not `outputBytes`. The streaming validator
+  // previously looked for the wrong one.
+  outBytes,
+  checksum: "0".repeat(64),
+  report: { filled: 1, untouched: 0, rasterAppearances: 0, flatten: false },
+});
 const verifyMeta = { ok: true, op: "verify", pages: 1, widgets: 0, preserved: 2 };
 
 // ---------------------------------------------------------------------------------------
@@ -141,8 +150,11 @@ test("R7D.1-S-11: output beyond the configured ceiling is refused", () => {
 });
 
 test("R7D.1-S-12: the stream is single-use", () => {
-  const stream = new ProvisionalResultStream({ expectedOp: "inspect", sink: () => {} });
-  stream.push(frame({ ok: true, op: "inspect", pages: 1 }));
+  // A fill frame, because its metadata contract is the simplest complete one. The point of
+  // this test is lifecycle, not inventory shape.
+  const output = Buffer.alloc(16, 6);
+  const stream = new ProvisionalResultStream({ expectedOp: "fill", sink: () => {} });
+  stream.push(frame(fillMeta(output.byteLength), output));
   stream.finish();
   assert.throws(() => stream.push(Buffer.alloc(1)), (error: unknown) => error instanceof StreamError && error.fault === "CLOSED");
   assert.throws(() => stream.finish(), (error: unknown) => error instanceof StreamError && error.fault === "CLOSED");
