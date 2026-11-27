@@ -14,3 +14,6 @@ next-env.d.ts
 # application build.
 __pycache__/
 *.py[cod]
+
+# R7D.1: precompiled executor bundle (build output, produced by scripts/esbuild-executor.mjs)
+/dist/

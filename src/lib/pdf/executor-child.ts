@@ -34,6 +34,8 @@
 import { writeSync } from "node:fs";
 import { WORKER_LIMITS, WorkerProtocolError } from "./worker-protocol";
 import type { FormInventory } from "./form-types";
+import { FORM_ERROR_MESSAGES, isFormFillErrorCode } from "./form-types";
+import { FormFillError } from "./form-validation";
 import { encodeResultV2, decodeControlV2, WORKER_PROTOCOL_V2, type WorkerRequestV2 } from "./worker-protocol-v2";
 
 // ---------------------------------------------------------------------------------------
@@ -86,16 +88,29 @@ async function fill(bytes: Uint8Array, request: Extract<WorkerRequestV2, { op: "
   const { fillFormPdf } = await import("./form-fill");
   const { sha256Hex } = await import("../execution/provisional-stream");
   const result = await fillFormPdf(bytes, request.fields, { flatten: request.flatten });
+  const pages = result.report.pages;
+  if (typeof pages !== "number" || !Number.isSafeInteger(pages) || pages <= 0) {
+    throw new FormFillError("FORM_OUTPUT_UNVERIFIED", FORM_ERROR_MESSAGES.FORM_OUTPUT_UNVERIFIED);
+  }
   return {
     meta: {
       ok: true as const,
       op: "fill" as const,
-      pages: result.report.pages,
+      pages,
       outBytes: result.bytes.byteLength,
       // The digest of the produced document, computed here so the supervisor can bind the
       // terminal commit to the exact bytes rather than to a claim about them.
       checksum: sha256Hex(result.bytes),
-      report: result.report,
+      // The wire report is counts, matching what `form-worker-child` emits. `FillReport.filled`
+      // is the detail array and `rasterAppearances` is a list of field names; sending either
+      // straight through would fail the decoder's "is this an integer" check — which is what it
+      // is for. The projection is explicit so the two shapes cannot silently diverge.
+      report: {
+        filled: result.report.filled.length,
+        untouched: result.report.untouched,
+        rasterAppearances: result.report.rasterAppearances.length,
+        flatten: result.report.flatten,
+      },
     },
     output: result.bytes,
   };
@@ -160,13 +175,26 @@ async function verify(bytes: Uint8Array, request: Extract<WorkerRequestV2, { op:
  * `details` field that echoed a message could quote document content into a log or an API
  * response. An unexpected throw is reported as `UNEXPECTED` with no borrowing of its text.
  */
+/**
+ * The refusal frame for a failed operation.
+ *
+ * The code must come from the closed `FormFillErrorCode` set — the supervisor's decoder rejects
+ * anything else, which is the behaviour that caught `FORM_TOO_LARGE` here: it looked plausible
+ * and is not a member. Mapping through `isFormFillErrorCode` means a wrong guess fails at the
+ * boundary rather than producing a refusal the supervisor cannot parse.
+ *
+ * A document that exceeds the transport limit is not a form the engine could not read; it is
+ * input this endpoint will not accept at all, so it reports the same content-free refusal as
+ * any other unreadable input rather than inventing a code.
+ */
 function failureMeta(op: WorkerRequestV2["op"] | undefined, error: unknown) {
   const known = error instanceof WorkerProtocolError;
+  const code = error instanceof FormFillError && isFormFillErrorCode(error.code) ? error.code : "FORM_UNSUPPORTED";
   return {
     ok: false as const,
     op: (op ?? "inspect") as "inspect" | "fill" | "verify",
-    code: (known && (error.reason === "PDF_TOO_LARGE" ? "FORM_TOO_LARGE" : "FORM_UNSUPPORTED")) as never,
-    details: { reason: known ? error.reason : "UNEXPECTED" },
+    code,
+    details: { reason: known ? error.reason : error instanceof FormFillError ? error.code : "UNEXPECTED" },
   };
 }
 
@@ -175,51 +203,100 @@ function failureMeta(op: WorkerRequestV2["op"] | undefined, error: unknown) {
 // ---------------------------------------------------------------------------------------
 
 /**
- * The declared input ceiling, learned from the control header.
+ * The input bound, learned from the frame as it arrives.
  *
- * Until the header is readable the bound is the header plus the transport maximum, which is
- * large enough for any legal frame and small enough that a peer which never finishes its header
- * cannot make this process buffer without limit.
+ * ## Why this is not simply "buffer until stdin ends"
+ *
+ * The child runs inside the untrusted boundary and the supervisor may be compromised or simply
+ * crash. Buffering without a bound means a peer that never finishes its frame can make this
+ * process allocate until the container's memory limit kills it — which the supervisor would
+ * then have to distinguish from a document that is genuinely too large.
+ *
+ * So the bound tightens in steps, and is *exact* at each step:
+ *
+ *   1. before the length prefix: `4 + controlBytes` — enough for any legal header, no more;
+ *   2. once the prefix is readable: `4 + controlLen`, so the control frame can complete;
+ *   3. once the control JSON is complete: `4 + controlLen + bodyBytes`, the exact frame.
+ *
+ * The declared body length is read from `bodyBytes` — the field the codec actually writes. An
+ * earlier version looked for `maxInputBytes`, which no encoder produces, so every legal frame
+ * was treated as a protocol violation and every real request was refused.
  */
 let effectiveLimit = 4 + WORKER_LIMITS.controlBytes;
-let headerRead = false;
+let controlLength: number | null = null;
+let controlComplete = false;
 const chunks: Buffer[] = [];
 let received = 0;
 let overLimit = false;
 
-function adoptDeclaredBound(): void {
-  if (headerRead || received < 4) return;
+function tightenedBound(): void {
+  if (overLimit) return;
   const head = chunks.length === 1 ? chunks[0] : Buffer.concat(chunks);
-  const controlLen = head.readUInt32BE(0);
-  if (controlLen === 0 || controlLen > WORKER_LIMITS.controlBytes) {
-    overLimit = true;
-    return;
-  }
-  if (received < 4 + controlLen) {
-    effectiveLimit = 4 + controlLen + WORKER_LIMITS.maxInputBytesCeiling;
-    return;
-  }
-  headerRead = true;
-  let declared: number;
-  try {
-    const parsed = JSON.parse(head.subarray(4, 4 + controlLen).toString("utf8")) as { maxInputBytes?: unknown };
-    if (typeof parsed.maxInputBytes !== "number" || !Number.isSafeInteger(parsed.maxInputBytes) || parsed.maxInputBytes <= 0) {
-      overLimit = true;
+
+  if (controlLength === null) {
+    if (head.byteLength < 4) return;
+    const declared = head.readUInt32BE(0);
+    // Zero or oversized control metadata cannot be a legal frame in any version, so the bound
+    // does not need to grow to discover that.
+    if (declared === 0 || declared > WORKER_LIMITS.controlBytes) {
+      fail();
       return;
     }
-    declared = parsed.maxInputBytes;
-  } catch {
-    overLimit = true;
-    return;
+    controlLength = declared;
+    // The bound deliberately stays at the pre-auth ceiling until the control frame is
+    // *complete*. The body length is not known yet, and the control ceiling already bounds how
+    // much can arrive before it is. Tightening to `4 + controlLength` here was a real bug: a
+    // frame delivered in a single write — the common case — was flagged as oversized because
+    // the body arrived in the same chunk the bound was tightened for.
+    effectiveLimit = 4 + WORKER_LIMITS.controlBytes;
   }
-  effectiveLimit = declared + 4 + controlLen;
+
+  if (!controlComplete) {
+    if (head.byteLength < 4 + controlLength) return;
+    controlComplete = true;
+    try {
+      const parsed = JSON.parse(head.subarray(4, 4 + controlLength).toString("utf8")) as { bodyBytes?: unknown };
+      const declaredBody = parsed.bodyBytes;
+      if (typeof declaredBody !== "number" || !Number.isSafeInteger(declaredBody) || declaredBody < 0) {
+        fail();
+        return;
+      }
+      if (declaredBody > WORKER_LIMITS.maxInputBytesCeiling) {
+        fail();
+        return;
+      }
+      // The exact frame length, now that both halves are declared.
+      effectiveLimit = 4 + controlLength + declaredBody;
+    } catch {
+      // Not JSON. The decoder rejects it; a malformed frame must not widen the allocation bound.
+      return;
+    }
+  }
+
+  if (received > effectiveLimit) fail();
 }
 
-process.stdin.on("data", (chunk: Buffer) => {
+/** Record a bound violation and drop what was buffered, defeating the bound it just broke. */
+function fail(): void {
+  overLimit = true;
+  chunks.length = 0;
+}
+
+/**
+ * Self-check mode: load the module, prove the engine imports, exit.
+ *
+ * Declared before the stdin wiring because that wiring must not run in this mode. Registering
+ * it anyway meant the self-check decoded an empty stdin frame, failed, and exited 1 while
+ * printing a success line — a build gate that could never pass, and worse, one that would have
+ * "failed" for a reason unrelated to the artifact it checks.
+ */
+const SELF_CHECK = process.argv.includes("--self-check");
+
+if (!SELF_CHECK) process.stdin.on("data", (chunk: Buffer) => {
   if (overLimit) return;
   received += chunk.byteLength;
   chunks.push(chunk);
-  if (!headerRead) adoptDeclaredBound();
+  if (!overLimit) tightenedBound();
   if (received > effectiveLimit) {
     // Discard what was buffered: keeping it would defeat the bound it just violated.
     overLimit = true;
@@ -227,7 +304,7 @@ process.stdin.on("data", (chunk: Buffer) => {
   }
 });
 
-process.stdin.on("end", () => {
+if (!SELF_CHECK) process.stdin.on("end", () => {
   void (async () => {
     let op: WorkerRequestV2["op"] | undefined;
     try {
@@ -259,3 +336,30 @@ process.stdin.on("end", () => {
 
 // Exported for the artifact verifier, which loads this module to prove it resolves.
 export { WORKER_PROTOCOL_V2 };
+
+// ---------------------------------------------------------------------------------------
+// Build-time self-check
+// ---------------------------------------------------------------------------------------
+//
+// The artifact verifier executes the built bundle rather than reading it, because a module that
+// imports cleanly and crashes on first use is exactly the failure a file-existence check misses.
+// `--self-check` proves the module loads, its protocol constant is the expected one, and the
+// heavy native surface resolves — without opening fd 3 or waiting for stdin.
+//
+// This runs at image build time only. It is not an IPC path and accepts no input.
+if (SELF_CHECK) {
+  void (async () => {
+    try {
+      // Force the three lazy engine imports, which is what a real request would touch. A
+      // missing font, a wrong-libc native binary or an ESM/CJS mismatch throws here.
+      await import("./form-inspection");
+      await import("./form-fill");
+      await import("./form-verify");
+      process.stdout.write(JSON.stringify({ selfCheck: true, protocolVersion: WORKER_PROTOCOL_V2 }) + "\n");
+      process.exitCode = 0;
+    } catch (error) {
+      process.stderr.write(`self-check failed: ${error instanceof Error ? error.message : String(error)}\n`);
+      process.exitCode = 1;
+    }
+  })();
+}
