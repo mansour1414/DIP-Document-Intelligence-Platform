@@ -42,7 +42,17 @@
 import { spawn, spawnSync } from "node:child_process";
 
 /** The fixed absolute path to the Docker CLI. Never resolved from `PATH`. */
-export const DOCKER_BIN = "/usr/bin/docker";
+/**
+ * The Docker CLI, at a fixed absolute path.
+ *
+ * Never resolved through `PATH`: a control plane that runs whatever `docker` happens to be
+ * first on the path is one `PATH` edit away from executing something else.
+ *
+ * `DIP_DOCKER_BIN` exists so the asynchronous operations can be exercised against a stand-in
+ * process in tests. It redirects a *fixed, typed* call — it is not a way to pass arbitrary argv,
+ * which the typed operations and `assertNoForbiddenFlags` still prevent.
+ */
+export const DOCKER_BIN = process.env.DIP_DOCKER_BIN ?? "/usr/bin/docker";
 
 /** The loopback socket this system is allowed to talk to. */
 export const DOCKER_SOCKET = "unix:///var/run/docker.sock";
@@ -581,43 +591,318 @@ export function startContainerAttached(name: string) {
 // ---------------------------------------------------------------------------------------
 // Asynchronous operations for the supervisor and watchdog
 // ---------------------------------------------------------------------------------------
+//
+// ## The property that makes these different from `runFixed`
+//
+// These run on the control-plane event loop, which is also serving authenticated sockets,
+// streaming a document and enforcing deadlines. Every call therefore needs a hard deadline, a
+// bounded capture and a guaranteed reap, or one slow daemon stalls everything at once.
+//
+// ## Definite versus ambiguous
+//
+// The distinction that matters for recovery is not "did it fail" but "can the daemon still act".
+//
+//   - A non-zero exit *after* the client connected and the daemon answered is a **definite**
+//     rejection: the operation did not happen.
+//   - A timeout, a signal, or an exit before the daemon answered is **ambiguous**. Killing the
+//     Docker CLI client does not cancel an outstanding request in the daemon — the daemon may
+//     complete the create moments later, and the caller will never learn the id. Treating that
+//     as "nothing happened" is how an unowned container is created.
+//
+// An ambiguous outcome must leave the journal intent in place and quarantine. It is reported as
+// `ambiguous: true` and the caller is required to reconcile rather than proceed.
+
+/** How long any single Docker CLI invocation may run before it is killed and reaped. */
+export const DOCKER_DEADLINE_MS = Object.freeze({
+  create: 30_000,
+  remove: 20_000,
+  inspect: 10_000,
+  kill: 10_000,
+});
 
 /**
- * Asynchronous `docker create`.
+ * Bytes of stdout/stderr retained per operation.
  *
- * The supervisor and watchdog are long-lived event-loop processes. Every Docker call they
- * make must be async, or a slow daemon stalls authentication, streaming and deadline
- * enforcement for every other connection at once.
+ * A daemon can emit arbitrarily long diagnostics — a failed pull is the obvious case. Capturing
+ * without a bound lets a remote peer's error text grow the supervisor's heap. Excess is counted
+ * and discarded, never silently truncated into something that looks complete.
  */
-export function createContainerAsync(policy: ExecutionPolicy): Promise<{ ok: true; containerId: string } | { ok: false; error: string }> {
-  const argv = buildCreateArgv(policy);
+export const DOCKER_CAPTURE_BYTES = 64 * 1024;
+
+/**
+ * The closed set of failure categories.
+ *
+ * Free-form messages are what leak into logs and telemetry, and a message assembled by a daemon
+ * from container input is not something the control plane should retain verbatim. The category
+ * is what recovery branches on; the detail is for the caller's immediate decision and is
+ * deliberately not persisted.
+ */
+export type DockerFaultCategory =
+  | "BINARY_MISSING"
+  | "SPAWN_FAILED"
+  | "DAEMON_UNAVAILABLE"
+  | "PERMISSION_DENIED"
+  | "NOT_FOUND"
+  | "CONFLICT"
+  | "INVALID_ARGUMENT"
+  | "TIMEOUT"
+  | "SIGNALLED"
+  | "BAD_OUTPUT"
+  | "DAEMON_ERROR";
+
+export type DockerOutcome<T> =
+  | { ok: true; value: T }
+  | {
+      ok: false;
+      fault: DockerFaultCategory;
+      /** True when the daemon may still act. The caller must quarantine and reconcile. */
+      ambiguous: boolean;
+      /** Short, sanitized, non-persisted detail. Never a full daemon transcript. */
+      detail: string;
+    };
+
+type Capture = { chunks: Buffer[]; bytes: number; truncated: boolean };
+
+function newCapture(): Capture {
+  return { chunks: [], bytes: 0, truncated: false };
+}
+
+function appendBounded(capture: Capture, chunk: Buffer): void {
+  const room = DOCKER_CAPTURE_BYTES - capture.bytes;
+  if (room <= 0) {
+    capture.truncated = true;
+    return;
+  }
+  if (chunk.byteLength > room) {
+    capture.chunks.push(chunk.subarray(0, room));
+    capture.bytes += room;
+    capture.truncated = true;
+    return;
+  }
+  capture.chunks.push(chunk);
+  capture.bytes += chunk.byteLength;
+}
+
+function readCapture(capture: Capture): string {
+  const text = Buffer.concat(capture.chunks).toString("utf8");
+  return capture.truncated ? `${text}\n[diagnostics truncated at ${DOCKER_CAPTURE_BYTES} bytes]` : text;
+}
+
+/**
+ * Map a Docker CLI failure onto a closed category.
+ *
+ * The daemon's own wording is matched loosely and only to categorize. Anything unrecognised
+ * becomes `DAEMON_ERROR`, which is the honest answer: the control plane does not understand it,
+ * so it must not pretend to.
+ */
+function categorize(stderr: string): DockerFaultCategory {
+  const text = stderr.toLowerCase();
+  if (text.includes("cannot connect to the docker daemon") || text.includes("is the docker daemon running")) return "DAEMON_UNAVAILABLE";
+  if (text.includes("permission denied")) return "PERMISSION_DENIED";
+  if (text.includes("no such container") || text.includes("no such object")) return "NOT_FOUND";
+  if (text.includes("already in use") || text.includes("conflict")) return "CONFLICT";
+  if (text.includes("is not a valid") || text.includes("invalid")) return "INVALID_ARGUMENT";
+  return "DAEMON_ERROR";
+}
+
+/** Categories that prove the requested operation did not take effect. */
+function definiteCategory(fault: DockerFaultCategory): boolean {
+  return fault === "NOT_FOUND"
+    || fault === "DAEMON_UNAVAILABLE"
+    || fault === "PERMISSION_DENIED"
+    || fault === "INVALID_ARGUMENT"
+    || fault === "BINARY_MISSING";
+}
+
+/**
+ * Run one Docker CLI invocation with a deadline, a bounded capture and a guaranteed reap.
+ *
+ * `resolveWith` decides what a clean exit means. Everything that is not a clean exit becomes a
+ * categorized fault with an explicit ambiguity flag.
+ */
+function runDockerAsync<T>(
+  argv: readonly string[],
+  deadlineMs: number,
+  resolveWith: (stdout: string, stderr: string) => T,
+  /** True when a non-zero exit proves the requested operation did not take effect. */
+  definiteOnFailure: boolean,
+): Promise<DockerOutcome<T>> {
   return new Promise((resolve) => {
-    const child = spawn(DOCKER_BIN, [...argv], { shell: false, env: { ...DOCKER_ENV }, stdio: ["ignore", "pipe", "pipe"] });
-    const out: Buffer[] = [];
-    const err: Buffer[] = [];
-    child.stdout.on("data", (chunk: Buffer) => out.push(chunk));
-    child.stderr.on("data", (chunk: Buffer) => err.push(chunk));
-    child.on("error", (error) => resolve({ ok: false, error: `docker create could not start: ${error.message}` }));
-    child.on("close", (code) => {
-      if (code !== 0) return resolve({ ok: false, error: `docker create failed (${code}): ${Buffer.concat(err).toString("utf8").trim().slice(0, 4_000)}` });
-      const id = Buffer.concat(out).toString("utf8").trim();
-      if (!/^[a-f0-9]{64}$/u.test(id)) return resolve({ ok: false, error: "docker create returned no valid container id" });
-      resolve({ ok: true, containerId: id });
+    assertNoForbiddenFlags(argv);
+
+    let settled = false;
+    const finish = (outcome: DockerOutcome<T>): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(outcome);
+    };
+
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(DOCKER_BIN, [...argv], {
+        shell: false,
+        env: { ...DOCKER_ENV },
+        stdio: ["ignore", "pipe", "pipe"],
+        // Own process group, so a deadline can kill the client *and* anything it started.
+        // Without this, killing the CLI leaves its children holding the stdout/stderr pipes
+        // open, `close` never fires, and the deadline only takes effect once the grandchildren
+        // happen to exit — which for a hung operation is never.
+        detached: true,
+      });
+    } catch (error) {
+      // `spawn` itself throwing means the binary could not be started at all. That is definite:
+      // nothing reached the daemon.
+      finish({
+        ok: false,
+        fault: "SPAWN_FAILED",
+        ambiguous: false,
+        detail: error instanceof Error ? error.message.slice(0, 200) : "spawn failed",
+      });
+      return;
+    }
+
+    const out = newCapture();
+    const err = newCapture();
+    let killedByDeadline = false;
+    let signalled: string | null = null;
+
+    const timer = setTimeout(() => {
+      killedByDeadline = true;
+      // Killing the client does not cancel an in-flight request in the daemon. The outcome is
+      // therefore ambiguous regardless of what the exit code turns out to be.
+      //
+      // The group is signalled, not just the child, because a CLI that spawned helpers would
+      // otherwise leave them holding the pipes and `close` would never fire.
+      try {
+        if (child.pid !== undefined) process.kill(-child.pid, "SIGKILL");
+        else child.kill("SIGKILL");
+      } catch {
+        // The group is already gone, or the platform refused. Fall back to the direct child.
+        try { child.kill("SIGKILL"); } catch { /* already dead */ }
+      }
+      // Do not wait for `close` to settle the promise. A detached grandchild can hold the pipes
+      // open indefinitely, and the caller's deadline is the promise that must be kept.
+      finish({
+        ok: false,
+        fault: "TIMEOUT",
+        ambiguous: true,
+        detail: `no answer within ${deadlineMs} ms; the daemon may still be acting`,
+      });
+    }, deadlineMs);
+
+    child.stdout?.on("data", (chunk: Buffer) => appendBounded(out, chunk));
+    child.stderr?.on("data", (chunk: Buffer) => appendBounded(err, chunk));
+
+    child.on("error", (error: NodeJS.ErrnoException) => {
+      // ENOENT is the common one: the CLI is not installed where the policy says it is.
+      const fault: DockerFaultCategory = error.code === "ENOENT" ? "BINARY_MISSING" : "SPAWN_FAILED";
+      finish({ ok: false, fault, ambiguous: false, detail: error.code ?? "spawn error" });
+    });
+
+    child.on("close", (code, signal) => {
+      if (signal) signalled = signal;
+      const stderrText = readCapture(err);
+      const stdoutText = readCapture(out);
+
+      if (killedByDeadline) {
+        finish({
+          ok: false,
+          fault: "TIMEOUT",
+          ambiguous: true,
+          detail: `no answer within ${deadlineMs} ms; the daemon may still be acting`,
+        });
+        return;
+      }
+      if (signalled !== null) {
+        finish({ ok: false, fault: "SIGNALLED", ambiguous: true, detail: `terminated by ${signalled}` });
+        return;
+      }
+      if (code !== 0) {
+        const fault = categorize(stderrText);
+        finish({
+          ok: false,
+          fault,
+          // A non-zero exit is only definite where the caller says so *and* the category proves
+          // nothing happened. `NOT_FOUND` from `docker rm` is definite — the container is gone
+          // either way. `DAEMON_UNAVAILABLE` and `PERMISSION_DENIED` are definite too: the
+          // request never reached an acting daemon. Anything else may have been half-applied,
+          // because the operation can complete and the client fail while reporting it.
+          ambiguous: !definiteOnFailure && !definiteCategory(fault),
+          detail: stderrText.replace(/\s+/gu, " ").trim().slice(0, 300),
+        });
+        return;
+      }
+      try {
+        finish({ ok: true, value: resolveWith(stdoutText, stderrText) });
+      } catch (error) {
+        // A clean exit whose output the caller cannot use. The operation may have happened, so
+        // this is ambiguous: a `create` that reported a malformed id still created a container.
+        finish({
+          ok: false,
+          fault: "BAD_OUTPUT",
+          ambiguous: true,
+          detail: error instanceof Error ? error.message.slice(0, 200) : "unusable output",
+        });
+      }
     });
   });
 }
 
-/** Asynchronous `docker rm` by exact id. */
-export function removeContainerAsync(containerId: string): Promise<{ ok: boolean; error?: string }> {
-  const argv = buildRemoveArgv(containerId);
-  return new Promise((resolve) => {
-    const child = spawn(DOCKER_BIN, [...argv], { shell: false, env: { ...DOCKER_ENV }, stdio: ["ignore", "ignore", "pipe"] });
-    const err: Buffer[] = [];
-    child.stderr.on("data", (chunk: Buffer) => err.push(chunk));
-    child.on("error", (error) => resolve({ ok: false, error: `docker rm could not start: ${error.message}` }));
-    child.on("close", (code) => {
-      if (code === 0) return resolve({ ok: true });
-      resolve({ ok: false, error: `docker rm failed (${code}): ${Buffer.concat(err).toString("utf8").trim().slice(0, 4_000)}` });
-    });
-  });
+/**
+ * Asynchronous `docker create`.
+ *
+ * A timeout here is the single most dangerous outcome in the system: the daemon may create the
+ * container after the client is gone, and nobody will ever learn its id. Callers must treat
+ * `ambiguous: true` as "a container may exist that I cannot name" and reconcile, never as
+ * "nothing happened".
+ */
+export function createContainerAsync(policy: ExecutionPolicy): Promise<DockerOutcome<{ containerId: string }>> {
+  return runDockerAsync(
+    buildCreateArgv(policy),
+    DOCKER_DEADLINE_MS.create,
+    (stdout) => {
+      const id = stdout.trim();
+      if (!/^[a-f0-9]{64}$/u.test(id)) throw new Error("docker create returned no valid container id");
+      return { containerId: id };
+    },
+    true,
+  );
+}
+
+/** Asynchronous `docker rm` by exact id, idempotent for an already-removed container. */
+export function removeContainerAsync(containerId: string): Promise<DockerOutcome<{ removed: boolean }>> {
+  return runDockerAsync(
+    buildRemoveArgv(containerId),
+    DOCKER_DEADLINE_MS.remove,
+    () => ({ removed: true }),
+    // A non-zero exit may mean "no such container", which is success for a cleanup path, so the
+    // category decides. Anything else is definite for removal semantics: `rm` either removed it
+    // or did not, and the journal keeps the intent until an inspect positively confirms absence.
+    false,
+  );
+}
+
+/** Asynchronous `docker inspect`. Used for preflight and for recovery reconciliation. */
+export function inspectContainerAsync(containerId: string): Promise<DockerOutcome<{ raw: string }>> {
+  return runDockerAsync(
+    buildInspectArgv(containerId),
+    DOCKER_DEADLINE_MS.inspect,
+    (stdout) => {
+      if (stdout.trim() === "") throw new Error("docker inspect returned nothing");
+      return { raw: stdout };
+    },
+    // `inspect` is read-only, so a failure is definite: no state changed.
+    true,
+  );
+}
+
+/** Asynchronous `docker kill` by exact id. */
+export function killContainerAsync(containerId: string): Promise<DockerOutcome<{ killed: boolean }>> {
+  return runDockerAsync(
+    buildKillArgv(containerId),
+    DOCKER_DEADLINE_MS.kill,
+    () => ({ killed: true }),
+    false,
+  );
 }
