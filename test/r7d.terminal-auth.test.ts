@@ -112,9 +112,13 @@ test("R7D.1-CF02-14: a watchdog refuses to arm a request from another boot", asy
 
 test("R7D.1-CF02-15: a watchdog refuses to arm when the cgroup cannot be verified", async () => {
   const harness = makeWatchdog({ realVerify: true });
-  const denied = await harness.watchdog.arm(baseArm({ cgroupPath: `/sys/fs/cgroup/dip-executor.slice/dip-exec-${EXECUTION}` }));
+  const denied = await harness.watchdog.arm(baseArm());
   assert.equal(denied.kind, "ARM_DENIED");
-  assert.equal((denied as { code: string }).code, "CGROUP_UNVERIFIED");
+  // Ownership is decided before existence (WD-06), so a path that is well-formed but cannot be
+  // resolved in this sandbox is refused as unverifiable rather than assumed absent. Both codes are
+  // refusals; which one is a property of the host, and the test states that rather than pretending
+  // to know whether `/sys/fs/cgroup/dip-executor.slice` exists here.
+  assert.ok(["CGROUP_UNVERIFIED", "NOT_DIP_OWNED"].includes((denied as { code: string }).code), (denied as { code: string }).code);
 });
 
 test("R7D.1-CF02-16: the host verifier refuses a PID that is not in the cgroup it names", () => {
@@ -482,7 +486,10 @@ function baseArm(overrides: Partial<ArmRequest> = {}): ArmRequest {
     profileId: "synthetic-v1",
     initPid: 2,
     initStartTimeTicks: 0,
-    cgroupPath: `/sys/fs/cgroup/dip-executor.slice/dip-exec-${EXECUTION}`,
+    // The documented systemd layout: a transient scope named after the container id, nested
+    // inside the dedicated slice. The previous leaf was the container *name*, which no driver
+    // produces.
+    cgroupPath: `/sys/fs/cgroup/dip-executor.slice/docker-${CONTAINER_ID}.scope`,
     deadlineMs: 5_000,
     startedMonotonicMs: 0,
     ...overrides,

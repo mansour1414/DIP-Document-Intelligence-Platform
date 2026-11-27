@@ -165,13 +165,28 @@ export function verifyArmIdentity(request: ArmRequest, bootId: string): HostVeri
   if (!request.cgroupPath.startsWith(expectedPrefix) || request.cgroupPath.split("/").includes("..")) {
     return { ok: false, code: "NOT_DIP_OWNED" };
   }
-  // The cgroup leaf must derive from the execution id, so a request cannot name another
-  // execution's cgroup and have this watchdog adopt it.
-  const leaf = request.cgroupPath.slice(expectedPrefix.length);
-  if (leaf !== request.containerName && leaf !== `dip-exec-${request.executionId}`) {
+
+  // ## The layout is the driver's, and only two layouts exist
+  //
+  // A container's cgroup is created by the daemon, not by this system, so the leaf cannot be
+  // dictated — but it *is* predictable from the driver, and accepting exactly the two documented
+  // forms is stricter than accepting any leaf that happens to contain a known string.
+  //
+  //   systemd   <mount>/dip-executor.slice/docker-<container id>.scope
+  //   cgroupfs  <mount>/dip-executor.slice/<container id>
+  //
+  // The container id here is the one already corroborated: it must equal the journal intent's
+  // recorded id and the id the daemon was queried by, both checked before this function is reached.
+  // A leaf that encodes any other container is foreign, and a leaf that encodes nothing is refused.
+  // The container *name* is deliberately not accepted: no driver uses it, so accepting it would
+  // only widen what may be signalled.
+  if (request.containerName !== `dip-exec-${request.executionId}`) {
     return { ok: false, code: "NOT_DIP_OWNED" };
   }
-  if (request.containerName !== `dip-exec-${request.executionId}`) {
+  const relative = request.cgroupPath.slice(mount.path.length);
+  const isSystemdScope = relative === `/${DIP_CGROUP_SUBTREE}/docker-${request.containerId}.scope`;
+  const isCgroupfsDir = relative === `/${DIP_CGROUP_SUBTREE}/${request.containerId}`;
+  if (!isSystemdScope && !isCgroupfsDir) {
     return { ok: false, code: "NOT_DIP_OWNED" };
   }
 

@@ -30,7 +30,7 @@ import {
 import { preflightContainer, preflightKernel } from "../src/lib/execution/preflight";
 import { admit, newAdmissionState, releaseResolved, reserve, startRoleSockets } from "../src/lib/execution/role-sockets";
 import { OwnershipJournal } from "../src/lib/execution/ownership-journal";
-import { INSPECT_FORMAT, SYNTHETIC_PROFILE, type ExecutionPolicy, type DockerOutcome } from "../src/lib/execution/docker-lifecycle";
+import { INSPECT_FORMAT, SYNTHETIC_PROFILE, ownershipLabels, type ExecutionPolicy, type DockerOutcome } from "../src/lib/execution/docker-lifecycle";
 import { signDisarmGrant, type ArmAck } from "../src/lib/execution/watchdog-protocol";
 import type { TerminalRequest } from "../src/lib/execution/terminal-auth";
 
@@ -41,7 +41,7 @@ const CALLER_SECRET = randomBytes(32);
 function policy(overrides: Partial<ExecutionPolicy> = {}): ExecutionPolicy {
   const executionId = "a".repeat(32);
   return {
-    image: `sha256:${"d".repeat(64)}`,
+    image: `ghcr.io/dip/executor@sha256:${"d".repeat(64)}`,
     name: `dip-exec-${executionId}`,
     executionId,
     bootId: "boot-0123456789",
@@ -97,14 +97,28 @@ function conformingInspect(overrides: Record<string, string> = {}): Record<strin
       "/work": `rw,noexec,nosuid,nodev,size=${SYNTHETIC_PROFILE.workTmpfsBytes}`,
       "/tmp": `rw,noexec,nosuid,nodev,size=${SYNTHETIC_PROFILE.tmpTmpfsBytes}`,
     }),
-    "Config.Labels": JSON.stringify({ "dip.execution.id": "a".repeat(32), "dip.profile.id": "synthetic-v1" }),
+    // The exact labels the create argv writes, derived from the same function the daemon layer uses.
+    // Hand-written labels here were the reason a wrong label key could pass a test that claimed to
+    // check ownership.
+    "Config.Labels": JSON.stringify(
+      Object.fromEntries(ownershipLabels(policy()).map((label) => {
+        const at = label.indexOf("=");
+        return [label.slice(0, at), label.slice(at + 1)];
+      })),
+    ),
     "Config.Env": '["NODE_OPTIONS=--max-old-space-size=256","HOME=/work","LANG=C.UTF-8"]',
     ...overrides,
   };
   return base;
 }
 
-const EXPECTED_LABELS = ["dip.execution.id", "dip.profile.id"];
+/**
+ * The labels `ownershipLabels` actually writes.
+ *
+ * Derived from the function rather than restated: the previous literal named two keys that nothing
+ * writes, which is how the preflight check and the label writer came to disagree.
+ */
+const EXPECTED_LABELS = ownershipLabels(policy());
 
 /** A journal in a temporary directory, bound to this test's instances. */
 function makeJournal(): { journal: OwnershipJournal; cleanup: () => void } {
@@ -717,7 +731,7 @@ test("R7D.1-SV-21: a result that does not match its declaration is discarded, no
     await armToReady(execution);
     await execution.streamInput(emptyStream());
     await assert.rejects(
-      execution.collectResult({ bytes: 0, digest: "0".repeat(64) }),
+      execution.collectResult(),
       (error: unknown) => error instanceof LifecycleError,
     );
     assert.equal(execution.refusal, "RESULT_INVALID");

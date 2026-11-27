@@ -58,9 +58,17 @@ import { readBootId } from "../src/lib/execution/host-facts";
 import { OwnershipJournal } from "../src/lib/execution/ownership-journal";
 import { reconcile, admissionAllowed } from "../src/lib/execution/reconciliation";
 import { startRoleSockets } from "../src/lib/execution/role-sockets";
+import { composeExecution, type ControlMetadata } from "../src/lib/execution/execution-handler";
+import { SupervisorExecution } from "../src/lib/execution/supervisor";
+import { preflightContainer } from "../src/lib/execution/preflight";
+
 import { AuthenticatedWatchdogClient } from "../src/lib/execution/watchdog-client";
 import {
+  SYNTHETIC_PROFILE,
   createContainerAsync,
+  startContainerAttachedAsync,
+  ownershipLabels,
+  type ExecutionPolicy,
   inspectContainerAsync,
   killContainerAsync,
   removeContainerAsync,
@@ -112,23 +120,9 @@ function dockerSeam(): DockerSeam {
     remove: (id) => removeContainerAsync(id),
     kill: (id) => killContainerAsync(id),
     state: (id) => inspectStateAsync(id),
-    // The attached session is a `docker start -a -i` child whose fd 3 carries the result frame.
-    // `startContainerAttached` is synchronous in this adapter, so it is wrapped to keep the seam's
-    // asynchronous shape.
-    start: async (name) => {
-      const { startContainerAttached } = await import("../src/lib/execution/docker-lifecycle");
-      const child = startContainerAttached(name);
-      const exited = new Promise<number>((resolve) => {
-        child.once("close", (code: number | null) => resolve(code ?? -1));
-      });
-      return {
-        stdin: child.stdin,
-        stdout: child.stdout,
-        stderr: child.stderr,
-        result: child.stdout,
-        exited,
-      };
-    },
+    // The attached session: a `docker start -a -i` child, reaped, with the exit code resolved on
+    // `exit` rather than `close` so a lingering grandchild holding a pipe cannot postpone it.
+    start: async (name) => startContainerAttachedAsync(name),
   };
 }
 
@@ -149,6 +143,26 @@ async function main(): Promise<void> {
   // both roles while believing it had two.
   const callerSecrets = { app: hexSecret("DIP_CALLER_APP_SECRET"), worker: hexSecret("DIP_CALLER_WORKER_SECRET") };
   const deadlineMs = Number(process.env.DIP_SUPERVISOR_DEADLINE_MS ?? "120000");
+  // ## Bounds, with hard ceilings
+  //
+  // These are the only places a document can be refused for size. The defaults come from the
+  // approved profile; the environment may lower them but not raise them past the profile, because a
+  // raised ceiling is a configuration change to the isolation contract rather than a tuning knob.
+  const maxInputBytes = Math.min(
+    Number(process.env.DIP_SUPERVISOR_MAX_INPUT_BYTES ?? String(512 * 1024 * 1024)),
+    SYNTHETIC_PROFILE.maxFixtureBytes * 512,
+  );
+  const maxOutputBytes = Math.min(
+    Number(process.env.DIP_SUPERVISOR_MAX_OUTPUT_BYTES ?? String(384 * 1024 * 1024)),
+    SYNTHETIC_PROFILE.memoryBytes,
+  );
+  const maxBufferedBytes = 1024 * 1024;
+  for (const [name, value] of [["DIP_SUPERVISOR_MAX_INPUT_BYTES", maxInputBytes], ["DIP_SUPERVISOR_MAX_OUTPUT_BYTES", maxOutputBytes]] as const) {
+    if (!Number.isSafeInteger(value) || value <= 0) {
+      process.stderr.write(`FATAL: ${name} must be a positive integer\n`);
+      process.exit(1);
+    }
+  }
   if (!Number.isSafeInteger(deadlineMs) || deadlineMs <= 0) {
     process.stderr.write("FATAL: DIP_SUPERVISOR_DEADLINE_MS must be a positive integer\n");
     process.exit(1);
@@ -246,21 +260,89 @@ async function main(): Promise<void> {
     supervisorInstance,
     bootId,
     handle: async (session) => {
+      // ## One execution, composed
+      //
+      // The whole sequence lives in `execution-handler.ts`, because it is the one place that must
+      // know about the lifecycle, the authenticated channel and the daemon at once. This adapter
+      // supplies the three things only the process knows: the journal, the Docker seam and the
+      // watchdog channel — then reports what happened.
       emit({ event: "connection", role: session.role, operation: session.operation, executionId: session.executionId });
-      // ## The executor handler is R7D.2
-      //
-      // Everything above this line is the authenticated control plane: the caller proved which role
-      // it is, the supervisor proved which instance it is, admission was granted against a
-      // single-executor profile, and `READY_FOR_BODY` has been sent. What is *not* here is the
-      // composition of a container: that needs the image, the profile, the cgroup pin and the
-      // operation-specific argv, all of which arrive with the web/API integration in R7D.2.
-      //
-      // So the handler refuses, and refuses **unresolved**: `release(false)` keeps the executor
-      // slot held rather than implying that an execution happened and finished. A slot released
-      // without evidence is the defect this class of code exists to avoid.
-      session.send({ kind: "REFUSED", code: "REJECTED" });
-      session.release(false);
-      emit({ event: "refused", executionId: session.executionId, detail: "the executor handler lands with R7D.2" });
+      const execution = new SupervisorExecution(
+        session.executionId,
+        session.executionId,
+        session.operation,
+        {
+          journal,
+          supervisorInstance,
+          bootId,
+          watchdogInstance: watchdogIdentity.watchdogInstance,
+          watchdogSecret,
+          // One role's secret signs the commit for the caller of that role. A worker never has to
+          // hold the app's key, so a commit it cannot verify is one it must not accept.
+          callerSecret: callerSecrets[session.role],
+          limits: {
+            deadlineMs,
+            maxInputBytes,
+            maxOutputBytes,
+            maxBufferedBytes,
+          },
+          docker,
+          watchdog: watchdogClient,
+        },
+      );
+
+      const outcome = await composeExecution({
+        session,
+        execution,
+        control: session.controlBlock() as unknown as ControlMetadata,
+        preflight: (observation) => {
+          // ## Two independent readings, one verdict
+          //
+          // The daemon's effective configuration is judged by `preflightContainer` against the
+          // approved policy and the exact ownership labels the journal recorded; the kernel's view
+          // of the init process is judged separately by `observeEffective`, which already
+          // cross-checked the PID against `/proc`. A disagreement between them is a failure, not a
+          // preference for the more convenient reading.
+          // The policy the container was created from, not a reconstruction of it. The labels
+          // check compares the container's labels against the policy's identity, so a rebuilt
+          // policy with empty ids would report every correctly-owned container as foreign.
+          const policy = execution.executionPolicy;
+          const verdict = preflightContainer({
+            containerId: observation.containerId,
+            effective: observation.effective,
+            policy,
+            expectedLabels: ownershipLabels(policy),
+          });
+          if (verdict.ok) return { ok: true };
+          // The first failure names what was wrong. Reporting all of them would surface container
+          // configuration to a caller that has not been admitted to see it.
+          return { ok: false, code: verdict.failures[0]?.code ?? "PREFLIGHT_FAILED" };
+        },
+        limits: { maxInputBytes, maxOutputBytes },
+      });
+
+      if (outcome.kind === "refused") {
+        // Nothing was created. The refusal is reported and the slot is genuinely free — holding it
+        // would block admission forever for a request that needs no cleanup.
+        session.send({ kind: "REFUSED", code: "REJECTED" });
+        session.release(true);
+        emit({ event: "refused", executionId: session.executionId, code: outcome.code, detail: outcome.detail });
+        return;
+      }
+      if (outcome.kind === "quarantined") {
+        // A container may exist and this process cannot prove otherwise. The slot stays held; the
+        // journal already names the container, so reconciliation owns the cleanup.
+        session.send({ kind: "REFUSED", code: "REJECTED" });
+        session.release(false);
+        emit({ event: "quarantined", executionId: session.executionId, code: outcome.code, detail: outcome.detail });
+        return;
+      }
+
+      // The result reaches the caller as the same frame the executor wrote, which its own decoder
+      // re-validates; the commit is what makes those bytes publishable.
+      session.send({ kind: "TERMINAL_COMMIT", message: outcome.frame.toString("base64"), proof: outcome.commitProof });
+      session.release(true);
+      emit({ event: "committed", executionId: session.executionId, resultBytes: outcome.resultBytes, metaBytes: outcome.metaBytes });
     },
     log: (line) => emit({ event: "log", line }),
   });

@@ -36,6 +36,7 @@ import {
   WATCHDOG_INSTANCE,
   armRequest,
   cgroupPathFor,
+  DEFAULT_CONTAINER_ID,
   makeWatchdog,
   terminalRequest,
   type Harness,
@@ -111,7 +112,7 @@ test("R7D.1-D2C-2: an arm over the real channel is acknowledged and the ack proo
   const fixture = await startFixture();
   try {
     await fixture.client.connect();
-    const request = armRequest(EXECUTION, { cgroupPath: cgroupPathFor(EXECUTION) });
+    const request = armRequest(EXECUTION, { cgroupPath: cgroupPathFor(DEFAULT_CONTAINER_ID) });
     const answer = await fixture.client.arm(request);
     assert.equal(answer.kind, "ARM_ACK");
     if (answer.kind === "ARM_ACK") {

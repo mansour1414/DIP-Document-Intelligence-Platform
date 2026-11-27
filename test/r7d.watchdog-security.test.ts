@@ -62,6 +62,7 @@ import {
   armAndAssert,
   armRequest,
   cgroupPathFor,
+  DEFAULT_CONTAINER_ID,
   makeClock,
   makeWatchdog,
   terminalRequest,
@@ -784,7 +785,7 @@ test("R7D.1-WD06-2: a cgroup whose leaf does not derive from the execution id is
 test("R7D.1-WD06-3: a container name that does not derive from the execution id is refused", () => {
   const request = armRequest(EXECUTION, {
     containerName: `dip-exec-${"b".repeat(32)}`,
-    cgroupPath: cgroupPathFor("b".repeat(32)),
+    cgroupPath: cgroupPathFor(DEFAULT_CONTAINER_ID),
   });
   const verdict = verifyArmIdentity(request, BOOT);
   assert.equal(verdict.ok, false);
@@ -806,7 +807,10 @@ test("R7D.1-WD06-5: a PID whose start time does not match is refused", () => {
   // a mismatched start time on a legitimate path is a reused PID.
   const mount = "/sys/fs/cgroup";
   const request = armRequest(EXECUTION, {
-    cgroupPath: `${mount}/${DIP_CGROUP_SUBTREE}/dip-exec-${EXECUTION}`,
+    // The documented systemd layout: the container id names the transient scope inside the slice.
+    // A leaf that no driver produces is refused by ownership, which would make this test report an
+    // ownership failure while claiming to test the PID check.
+    cgroupPath: `${mount}/${DIP_CGROUP_SUBTREE}/docker-${"c".repeat(64)}.scope`,
     initPid: process.pid,
     initStartTimeTicks: readProcessStartTimeTicks(process.pid) + 1,
   });
@@ -870,7 +874,7 @@ function validRecord(overrides: Partial<WatchdogArmRecord> = {}): WatchdogArmRec
     profileId: "synthetic-v1",
     initPid: 4_242,
     initStartTimeTicks: 100,
-    cgroupPath: cgroupPathFor(EXECUTION),
+    cgroupPath: cgroupPathFor(DEFAULT_CONTAINER_ID),
     cgroupDevice: "0:25",
     cgroupDirInode: 4_001,
     cgroupEventsInode: 4_002,

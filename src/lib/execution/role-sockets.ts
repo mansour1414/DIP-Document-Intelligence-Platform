@@ -55,7 +55,7 @@
 
 import { createServer, type Server, type Socket } from "node:net";
 import { chmodSync, existsSync, unlinkSync } from "node:fs";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   ChallengeRegistry,
   IPC_LIMITS,
@@ -348,6 +348,26 @@ export type AdmittedSession = {
   body: AsyncIterable<Buffer>;
   /** The declared body length and digest, which the supervisor reconciles. */
   declared: { bodyBytes: number; bodySha256: string };
+  /**
+   * The nonce issued with `READY_FOR_BODY`.
+   *
+   * The terminal commit must echo a value the caller can correlate with the invitation it received,
+   * so that a commit minted for a different execution cannot be replayed into this one. It is issued
+   * by the server, at the gate, and never chosen by the peer.
+   */
+  readyNonce: () => string;
+  /**
+   * The authenticated control block the caller declared in its HELLO.
+   *
+   * ## Why it is opaque here
+   *
+   * The socket layer authenticates these fields — they are bound into the transcript — but it does
+   * not interpret them. Whether an image spec is digest-pinned, or a cgroup parent is a dedicated
+   * slice, are questions for the execution plane. Keeping them as opaque strings means the
+   * transport cannot acquire an opinion about container policy, and the plane cannot weaken the
+   * binding by re-reading them from somewhere unauthenticated.
+   */
+  controlBlock: () => Record<string, unknown>;
 };
 
 export type RoleServer = {
@@ -398,6 +418,12 @@ export async function startRoleSockets(options: RoleServerOptions): Promise<Role
       let attempts = 0;
       let closed = false;
       let admitted: { executionId: string; released: boolean } | null = null;
+      /** The nonce sent with READY_FOR_BODY. Empty until the gate opens. */
+      let readyNonce = "";
+      /** The authenticated control fields, as declared in the HELLO. */
+      let controlBlock: Record<string, unknown> = {};
+      /** The exact bytes whose digest the transcript bound. */
+      let controlBlockBytes: Buffer = Buffer.alloc(0);
 
       // Session queues. The consumer is the handler; the producer is the socket.
       const controlQueue: Record<string, unknown>[] = [];
@@ -546,6 +572,14 @@ export async function startRoleSockets(options: RoleServerOptions): Promise<Role
               refuse("BAD_REQUEST");
               return;
             }
+            controlBlock = isRecord(message.control) ? message.control : {};
+            // ## The control block is authenticated by its digest, not its position
+            //
+            // `controlLength` and `controlSha256` are already bound into the transcript, so a peer
+            // that alters the block after proving itself produces a digest the server never agreed
+            // to. Recomputing it here is what makes that check real rather than decorative: without
+            // it the declared digest would be a number the peer chose and nothing compared.
+            controlBlockBytes = isRecord(message.control) ? Buffer.from(JSON.stringify(message.control), "utf8") : Buffer.alloc(0);
             serverNonce = newNonce();
             challenges.issue(Buffer.from(serverNonce, "hex"));
             send({
@@ -597,6 +631,13 @@ export async function startRoleSockets(options: RoleServerOptions): Promise<Role
               refuse("AUTH_FAILED");
               return;
             }
+            // The control block must be exactly what the transcript bound. A peer that proved itself
+            // and then supplied a different block is refused before any executor is considered.
+            if (controlBlockBytes.byteLength !== hello.controlLength
+              || createHash("sha256").update(controlBlockBytes).digest("hex") !== hello.controlSha256) {
+              refuse("BAD_REQUEST");
+              return;
+            }
             const serverProof = computeProof(options.secrets[role], transcriptFor("server-to-client"));
 
             // Authentication is acknowledged *before* admission is decided.
@@ -644,7 +685,8 @@ export async function startRoleSockets(options: RoleServerOptions): Promise<Role
             // The body region follows the invitation, not the admission: the caller may not write a
             // document byte until preflight has passed and the watchdog is armed, and `READY_FOR_BODY`
             // is the supervisor's evidence that both happened.
-            send({ kind: "READY_FOR_BODY", nonce: newNonce() } satisfies ServerReady);
+            readyNonce = newNonce();
+            send({ kind: "READY_FOR_BODY", nonce: readyNonce } satisfies ServerReady);
             startSession();
             // Bytes that arrived with the AUTH frame are the session's from here.
             if (step.leftover.byteLength > 0) deliverSessionData(step.leftover);
@@ -682,6 +724,8 @@ export async function startRoleSockets(options: RoleServerOptions): Promise<Role
           control: controlStream(),
           body: bodyStream(),
           declared: { bodyBytes: hello.bodyLength, bodySha256: hello.bodySha256 },
+          readyNonce: () => readyNonce,
+          controlBlock: () => ({ ...controlBlock }),
         };
 
         void options.handle(session)

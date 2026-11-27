@@ -39,6 +39,7 @@
  *    the supervisor increment.
  */
 
+import { PassThrough } from "node:stream";
 import { spawn, spawnSync } from "node:child_process";
 
 /** The fixed absolute path to the Docker CLI. Never resolved from `PATH`. */
@@ -249,10 +250,91 @@ export function assertDigestPinnedImage(image: string): void {
   }
 }
 
-/** Reject a cgroup parent that is not the dedicated DIP parent. */
+/**
+ * The cgroup driver the daemon is configured with.
+ *
+ * ## Why the driver is a policy input and not a guess
+ *
+ * Docker places a container's cgroup differently depending on its cgroup driver, and the two
+ * layouts are not interchangeable:
+ *
+ *   - `systemd` — the default on cgroup v2. A container gets a transient scope unit named
+ *     `docker-<container id>.scope`, and because the cgroup parent is a slice, systemd nests that
+ *     scope *inside* the slice: `/sys/fs/cgroup/dip-executor.slice/docker-<id>.scope`. The scope is
+ *     never a bare child of the parent directory, because systemd always creates the unit's own
+ *     cgroup beneath the slice it was placed in.
+ *   - `cgroupfs` — the container gets a plain directory named after its id beneath the parent:
+ *     `/sys/fs/cgroup/dip-executor.slice/<id>`.
+ *
+ * A verification that assumed one layout rejected the other. Inferring the layout from an observed
+ * path would make the check agree with whatever it was shown, so the operator states the daemon's
+ * driver and the watchdog verifies the container is where *that* driver puts it. Both layouts are
+ * taken from Docker's documented "Find the cgroup for a given container" table and systemd's
+ * slice-nesting rules.
+ */
+export type CgroupDriver = "systemd" | "cgroupfs";
+
+/**
+ * The dedicated cgroup parent: a systemd slice name.
+ *
+ * ## Why this is a top-level slice, and not a directory
+ *
+ * `dip-executor.slice` is not a path someone creates; it is a slice unit name, and systemd
+ * materialises it at the root of the cgroup tree — `/sys/fs/cgroup/dip-executor.slice` — exactly as
+ * it materialises `system.slice` and `user.slice`. Slice nesting is encoded in the name as
+ * dash-separated components: `foo-bar.slice` lives inside `foo.slice`, so a name containing no dash
+ * is a direct child of the root slice. It is therefore *not* nested under `system.slice`, and it is
+ * not correct to assume it is a directory that already exists.
+ *
+ * The previous form, `--cgroup-parent /dip-executor-<hex>`, could not be resolved to a slice by the
+ * systemd driver, and `verifyArmIdentity` only arms containers inside the dedicated subtree, so the
+ * two halves of the system disagreed about the hierarchy and no container could ever be armed. One
+ * name, serving as both the daemon's parent and the watchdog's boundary, removes that possibility.
+ */
+export const DEDICATED_CGROUP_SLICE = "dip-executor.slice";
+
+/**
+ * The parent passed to `docker create`.
+ *
+ * Both drivers accept the slice name: systemd resolves it as a slice unit, cgroupfs treats it as a
+ * directory beneath the cgroup root. Neither form is per-execution — the watchdog's authority is
+ * the subtree, not one container within it.
+ */
+export function cgroupParentFor(driver: CgroupDriver): string {
+  void driver;
+  return DEDICATED_CGROUP_SLICE;
+}
+
+/**
+ * The container's cgroup, relative to the cgroup2 mount.
+ *
+ * This is what `/proc/<pid>/cgroup` reports for the container's init process: the value the
+ * supervisor observes, and the value the watchdog must independently confirm.
+ */
+export function expectedCgroupRelative(driver: CgroupDriver, containerId: string): string {
+  return driver === "systemd"
+    ? `${DEDICATED_CGROUP_SLICE}/docker-${containerId}.scope`
+    : `${DEDICATED_CGROUP_SLICE}/${containerId}`;
+}
+
+/**
+ * Reject a cgroup parent that is not the dedicated DIP slice.
+ *
+ * Exactly one value is accepted. A parent that merely looks dedicated is refused at admission
+ * rather than discovered at arm time, because a container outside the subtree can never be armed
+ * and would otherwise occupy an executor slot until its deadline.
+ */
 export function assertDedicatedCgroupParent(parent: string): void {
-  if (!/^\/dip-executor-[a-f0-9]{8,32}$/u.test(parent)) {
-    throw new Error(`refusing a cgroup parent outside the dedicated DIP namespace: ${parent}`);
+  // The daemon accepts either form — `dip-executor.slice` or `/dip-executor.slice` — because the
+  // leading slash says "resolve from the cgroup root" rather than "resolve as a unit name". Both
+  // name the same slice, so both are accepted; nothing else is.
+  const normalised = parent.startsWith("/") ? parent.slice(1) : parent;
+  if (normalised !== DEDICATED_CGROUP_SLICE) {
+    throw new Error(
+      `refusing a cgroup parent outside the dedicated DIP namespace: ${parent}. `
+        + `The watchdog can only signal within ${DEDICATED_CGROUP_SLICE}, and any other parent creates `
+        + "a container that can never be armed.",
+    );
   }
 }
 
@@ -731,10 +813,22 @@ function runDockerAsync<T>(
     assertNoForbiddenFlags(argv);
 
     let settled = false;
+    /**
+     * The deadline timer, assigned below.
+     *
+     * Declared with `let` before `finish` closes over it, and explicitly `undefined` until the
+     * timer exists. It was formerly a `const` declared *after* this closure, so any path that
+     * settled the promise before the timer was created — `assertNoForbiddenFlags` throwing, a
+     * `spawn` that failed synchronously — hit the temporal dead zone and rejected with
+     * `ReferenceError: Cannot access 'timer' before initialization` instead of returning the typed
+     * fault it had already constructed. The bug was invisible because every existing test took the
+     * asynchronous path.
+     */
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const finish = (outcome: DockerOutcome<T>): void => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      if (timer !== undefined) clearTimeout(timer);
       resolve(outcome);
     };
 
@@ -767,7 +861,7 @@ function runDockerAsync<T>(
     let killedByDeadline = false;
     let signalled: string | null = null;
 
-    const timer = setTimeout(() => {
+    timer = setTimeout(() => {
       killedByDeadline = true;
       // Killing the client does not cancel an in-flight request in the daemon. The outcome is
       // therefore ambiguous regardless of what the exit code turns out to be.
@@ -964,3 +1058,133 @@ export function killContainerAsync(containerId: string): Promise<DockerOutcome<{
     false,
   );
 }
+
+/**
+ * Start attached, asynchronously, with a reaped child and a real exit code.
+ *
+ * ## Why this is not `startContainerAttached`
+ *
+ * That function returns the raw child so a synchronous caller can wire the streams itself. The
+ * supervisor runs on the control-plane event loop and needs three things the raw child does not
+ * give it: a hard guarantee that the child is reaped (an unreaped child holds a PID and its
+ * container's descriptors), an exit code that distinguishes *the executor* finishing from *the
+ * Docker CLI* exiting, and a session object narrow enough that nothing downstream can call
+ * `kill` on the wrong process group.
+ *
+ * ## The exit code is the CLI's, and that is why it is not trusted alone
+ *
+ * `docker start -a` exits with the container's exit code only when the CLI can attach. When the
+ * daemon disappears the CLI exits non-zero while the container may still be running, so the caller
+ * must pair this code with a confirmed termination and removal. `SupervisorExecution` does exactly
+ * that, and the real executor exit code is validated against the result frame it produced.
+ */
+export function startContainerAttachedAsync(name: string): DockerSessionLike {
+  const argv = buildStartArgv(name);
+  assertNoForbiddenFlags(argv);
+  const child = spawn(DOCKER_BIN, [...argv], {
+    shell: false,
+    env: { ...DOCKER_ENV },
+    // A real three-way channel: stdin is the document, stdout is the container's stdout, and
+    // stderr is diagnostic only. The *result* is written to fd 3, which `docker start` does not
+    // forward — see the note below.
+    stdio: ["pipe", "pipe", "pipe"],
+    detached: true,
+  });
+
+  // The result channel.
+  //
+  // `docker start -a -i` does not pass a fourth descriptor through, so the executor's fd 3 cannot
+  // arrive this way. The supervisor therefore reads the result from the *same* stdout stream the
+  // container writes, and the executor's own framing (a 4-byte length prefix followed by
+  // metadata and output) is what separates a result from a stray write. That is a real limitation
+  // of the Docker CLI and is recorded as such rather than worked around with a side channel the
+  // daemon would not carry anyway.
+  const result = child.stdout ?? null;
+
+  const exited = new Promise<number>((resolve) => {
+    let settled = false;
+    const finish = (code: number): void => {
+      if (settled) return;
+      settled = true;
+      resolve(code);
+    };
+    child.once("exit", (code, signal) => {
+      // A signalled exit has no code. Reported as a non-zero sentinel rather than 0, because 0
+      // would read as a clean completion for a process that was killed.
+      finish(code ?? (signal === null ? 1 : 128 + signalNumber(signal)));
+    });
+    child.once("error", () => finish(1));
+  });
+
+  return {
+    stdin: child.stdin!,
+    stdout: child.stdout ?? new PassThrough(),
+    stderr: child.stderr ?? new PassThrough(),
+    // A stream that yields nothing when the CLI cannot forward fd 3, so `collectResult` fails on
+    // an empty frame rather than waiting forever on a channel that will never deliver.
+    result: result ?? new PassThrough().end(),
+    exited,
+  };
+}
+
+/** A signal name as the conventional 128+n exit code. */
+function signalNumber(signal: NodeJS.Signals): number {
+  const numbers: Partial<Record<NodeJS.Signals, number>> = {
+    SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGILL: 4, SIGTRAP: 5, SIGABRT: 6, SIGBUS: 7,
+    SIGFPE: 8, SIGKILL: 9, SIGUSR1: 10, SIGSEGV: 11, SIGUSR2: 12, SIGPIPE: 13,
+    SIGALRM: 14, SIGTERM: 15,
+  };
+  return numbers[signal] ?? 1;
+}
+
+/**
+ * The production Docker seam.
+ *
+ * ## What this is
+ *
+ * An adapter, not an implementation. Every operation is one of the existing asynchronous functions
+ * in this file, which already own the deadline, the bounded capture, the process-group kill and the
+ * definite/ambiguous classification. Re-implementing any of that here would be a second copy of the
+ * rules that make the daemon calls safe.
+ *
+ * ## What it deliberately does not do
+ *
+ * It does not retry. A retry decision depends on whether the previous attempt was definite or
+ * ambiguous, which is knowledge the lifecycle holds and this adapter does not. Retrying an
+ * ambiguous create is how two containers get created for one intent.
+ */
+export function createDockerSeam(): DockerSeamLike {
+  return {
+    create: (policy: ExecutionPolicy) => createContainerAsync(policy),
+    inspect: (id: string) => inspectContainerAsync(id),
+    remove: (id: string) => removeContainerAsync(id),
+    kill: (id: string) => killContainerAsync(id),
+    start: async (name: string) => startContainerAttachedAsync(name),
+    state: (id: string) => inspectStateAsync(id),
+  };
+}
+
+/**
+ * The seam's shape, restated here.
+ *
+ * `supervisor.ts` owns the authoritative `DockerSeam` type. Importing it from there would make this
+ * file depend on the lifecycle, and the lifecycle depends on this file — a cycle that TypeScript
+ * permits for types but which makes the dependency direction untrue. The shapes are checked against
+ * each other by `createDockerSeam`'s return type in `execution-handler.ts`, where both are in scope.
+ */
+export type DockerSeamLike = {
+  create: (policy: ExecutionPolicy) => Promise<DockerOutcome<{ containerId: string }>>;
+  inspect: (id: string) => Promise<DockerOutcome<{ raw: string }>>;
+  remove: (id: string) => Promise<DockerOutcome<{ removed: boolean }>>;
+  kill: (id: string) => Promise<DockerOutcome<{ killed: boolean }>>;
+  start: (name: string) => Promise<DockerSessionLike>;
+  state: (id: string) => Promise<DockerOutcome<ContainerStateInspect>>;
+};
+
+export type DockerSessionLike = {
+  stdin: NodeJS.WritableStream;
+  stdout: NodeJS.ReadableStream;
+  stderr: NodeJS.ReadableStream;
+  result: NodeJS.ReadableStream;
+  exited: Promise<number>;
+};

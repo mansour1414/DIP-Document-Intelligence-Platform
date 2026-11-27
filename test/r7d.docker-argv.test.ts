@@ -51,7 +51,7 @@ function policy(overrides: Partial<ExecutionPolicy> = {}): ExecutionPolicy {
     workTmpfsBytes: SYNTHETIC_PROFILE.workTmpfsBytes,
     tmpTmpfsBytes: SYNTHETIC_PROFILE.tmpTmpfsBytes,
     v8OldSpaceMb: SYNTHETIC_PROFILE.v8OldSpaceMb,
-    cgroupParent: "/dip-executor-abcdef0123456789",
+    cgroupParent: "/dip-executor.slice",
     seccompProfile: "runtime/default",
     apparmorProfile: "dip-executor",
     ...overrides,
@@ -133,7 +133,7 @@ test("R7D.1-P-1: every mandatory control appears in the create argv", () => {
   const argv = buildCreateArgv(policy());
   const required: Array<[string, string]> = [
     ["--name", "dip-exec-0123456789abcdef0123456789abcdef"],
-    ["--cgroup-parent", "/dip-executor-abcdef0123456789"],
+    ["--cgroup-parent", "/dip-executor.slice"],
     ["--network", "none"],
     ["--ipc", "none"],
     // F01: --userns/--uts/--pid take no `private` value. --cgroupns does, and it is the
@@ -255,7 +255,11 @@ test("R7D.1-E-2: a cgroup parent outside the dedicated namespace is refused", ()
   assert.throws(() => assertDedicatedCgroupParent("/"), /dedicated DIP namespace/u);
   assert.throws(() => assertDedicatedCgroupParent("/system.slice"), /dedicated DIP namespace/u);
   assert.throws(() => assertDedicatedCgroupParent("/dip-executor-../etc"), /dedicated DIP namespace/u);
-  assert.doesNotThrow(() => assertDedicatedCgroupParent("/dip-executor-abcdef0123456789"));
+  // A per-execution parent under the namespace is refused too: the container would be created
+  // *beside* the dedicated subtree rather than inside it, and the watchdog refuses to arm anything
+  // outside that subtree. Failing at admission is better than failing at arm, with a slot held.
+  assert.throws(() => assertDedicatedCgroupParent("/dip-executor-a1b2c3d4"), /dedicated DIP namespace/u);
+  assert.doesNotThrow(() => assertDedicatedCgroupParent("/dip-executor.slice"));
 });
 
 test("R7D.1-E-3: an unconfined security profile is refused at construction", () => {

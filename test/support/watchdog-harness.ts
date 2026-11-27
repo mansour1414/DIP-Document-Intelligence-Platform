@@ -66,10 +66,19 @@ export function verifiedHost(overrides: Partial<Extract<HostVerification, { ok: 
   };
 }
 
-/** The cgroup path a conforming arm would name, derived from the execution id. */
-export function cgroupPathFor(executionId: string, mountPath = "/sys/fs/cgroup"): string {
-  return `${mountPath}/dip-executor.slice/${containerNameFor(executionId)}`;
+/**
+ * The cgroup path a conforming arm would name.
+ *
+ * The documented systemd layout: the daemon names the container's cgroup after the *container id*
+ * as a transient scope inside the dedicated slice. A leaf named after the container *name* is
+ * matched by no driver, so a fixture that used one was testing a layout that cannot exist.
+ */
+export function cgroupPathFor(containerId: string, mountPath = "/sys/fs/cgroup"): string {
+  return `${mountPath}/dip-executor.slice/docker-${containerId}.scope`;
 }
+
+/** The container id `armRequest` uses by default. */
+export const DEFAULT_CONTAINER_ID = "c".repeat(64);
 
 export function armRequest(executionId: string, overrides: Partial<ArmRequest> = {}): ArmRequest {
   return {
@@ -81,13 +90,13 @@ export function armRequest(executionId: string, overrides: Partial<ArmRequest> =
     operation: "fill",
     supervisorInstance: SUPERVISOR,
     bootId: BOOT,
-    containerId: "c".repeat(64),
+    containerId: DEFAULT_CONTAINER_ID,
     containerName: containerNameFor(executionId),
     imageDigest: IMAGE_DIGEST,
     profileId: "synthetic-v1",
     initPid: 4_242,
     initStartTimeTicks: 100,
-    cgroupPath: cgroupPathFor(executionId),
+    cgroupPath: cgroupPathFor(DEFAULT_CONTAINER_ID),
     deadlineMs: 20_000,
     startedMonotonicMs: 0,
     ...overrides,
@@ -103,7 +112,7 @@ export function terminalRequest(executionId: string, overrides: Partial<Terminal
     resultDigest: "e".repeat(64),
     resultBytes: 1_024,
     metaBytes: 128,
-    containerId: "c".repeat(64),
+    containerId: DEFAULT_CONTAINER_ID,
     containerName: containerNameFor(executionId),
     containerRemoved: true,
     outcome: "committed",
@@ -298,7 +307,7 @@ export function makeWatchdog(options: HarnessOptions = {}): Harness {
         bootId,
         supervisorInstance: SUPERVISOR,
         containerName: containerNameFor(executionId),
-        containerId: "c".repeat(64),
+        containerId: DEFAULT_CONTAINER_ID,
         imageDigest: IMAGE_DIGEST,
         profileId: "synthetic-v1",
       }))),
@@ -378,7 +387,7 @@ export async function armAndAssert(harness: Harness, executionId: string, overri
   // The record must name the mount the descriptors were taken from. Only the mount prefix is
   // rewritten; the leaf, which carries the ownership meaning, is the test's to choose.
   const cgroupPath = overrides.cgroupPath
-    ?? cgroupPathFor(executionId, harness.cgroupMount());
+    ?? cgroupPathFor(overrides.containerId ?? DEFAULT_CONTAINER_ID, harness.cgroupMount());
   const answer = await harness.watchdog.arm(armRequest(executionId, { ...overrides, cgroupPath }));
   if (answer.kind !== "ARM_ACK") {
     throw new Error(`the arm was denied: ${answer.code}`);

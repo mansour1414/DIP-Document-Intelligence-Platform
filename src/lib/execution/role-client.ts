@@ -65,6 +65,17 @@ export type RoleClientOptions = {
   requestId?: string;
   /** Required for `worker`: minted by the supervisor, single-use. */
   reservationId?: string;
+  /**
+   * The authenticated control block: which image, which profile, which cgroup parent.
+   *
+   * ## Why it travels here and not in the body
+   *
+   * It is bound into the handshake transcript by `controlLength`/`controlSha256`, so the supervisor
+   * knows the image *before* it creates anything and knows the caller cannot change it afterwards.
+   * Carrying it in the body would mean the container already exists by the time anyone could read
+   * which container it should be.
+   */
+  control?: Record<string, unknown>;
   /** How long to wait for a connection and for the handshake. */
   connectTimeoutMs?: number;
 };
@@ -98,9 +109,9 @@ export async function openRoleChannel(options: RoleClientOptions): Promise<RoleC
 
   const requestId = options.requestId ?? randomBytes(16).toString("hex");
   const clientNonce = newNonce();
-  // The control block is empty in this version: the caller sends no control payload, and declaring
-  // a digest of the empty string is an honest declaration rather than a zero the server skips.
-  const control = Buffer.alloc(0);
+  // The control block, as exact bytes. An absent block is the empty block, and its digest of the
+  // empty string is honest rather than a zero the server skips.
+  const control = Buffer.from(JSON.stringify(options.control ?? {}), "utf8");
   const declaredControl = { length: control.byteLength, sha256: createHash("sha256").update(control).digest("hex") };
 
   const frames = new FrameBufferLite();
@@ -190,6 +201,7 @@ export async function openRoleChannel(options: RoleClientOptions): Promise<RoleC
     controlSha256: declaredControl.sha256,
     bodyLength: optionsBodyLength(options),
     bodySha256: optionsBodyDigest(options),
+    control: options.control ?? {},
   }));
   void requestId;
 

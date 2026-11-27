@@ -79,7 +79,7 @@ test("R7D.1-CF03-1: a clean create returns the daemon id", async () => {
     workTmpfsBytes: SYNTHETIC_PROFILE.workTmpfsBytes,
     tmpTmpfsBytes: SYNTHETIC_PROFILE.tmpTmpfsBytes,
     v8OldSpaceMb: SYNTHETIC_PROFILE.v8OldSpaceMb,
-    cgroupParent: "/dip-executor-abcdef0123456789",
+    cgroupParent: "/dip-executor.slice",
     seccompProfile: "runtime/default",
     apparmorProfile: "dip-executor",
   };
@@ -111,7 +111,7 @@ test("R7D.1-CF03-2: an unusable create id from a clean exit is ambiguous, not a 
     workTmpfsBytes: SYNTHETIC_PROFILE.workTmpfsBytes,
     tmpTmpfsBytes: SYNTHETIC_PROFILE.tmpTmpfsBytes,
     v8OldSpaceMb: SYNTHETIC_PROFILE.v8OldSpaceMb,
-    cgroupParent: "/dip-executor-abcdef0123456789",
+    cgroupParent: "/dip-executor.slice",
     seccompProfile: "runtime/default",
     apparmorProfile: "dip-executor",
   });
@@ -141,7 +141,7 @@ test("R7D.1-CF03-3: a definite rejection is reported as definite", async () => {
     workTmpfsBytes: SYNTHETIC_PROFILE.workTmpfsBytes,
     tmpTmpfsBytes: SYNTHETIC_PROFILE.tmpTmpfsBytes,
     v8OldSpaceMb: SYNTHETIC_PROFILE.v8OldSpaceMb,
-    cgroupParent: "/dip-executor-abcdef0123456789",
+    cgroupParent: "/dip-executor.slice",
     seccompProfile: "runtime/default",
     apparmorProfile: "dip-executor",
   });

@@ -188,6 +188,18 @@ export class SupervisorExecution {
   private containerId: string | null = null;
   private policy: ExecutionPolicy | null = null;
   private output: BoundedProvisionalOutput | null = null;
+  /**
+   * The complete result frame: length prefix, metadata, output.
+   *
+   * ## Why this is retained separately from the output
+   *
+   * `BoundedProvisionalOutput` keeps the output slice, because that is what a caller would publish.
+   * The *commit* binds the whole frame, so the caller needs those bytes to verify its own copy.
+   * Accumulating the frame here is bounded by `maxOutputBytes` plus the metadata ceiling — both
+   * already enforced by the stream — so this is not a second bound, it is the same one applied to
+   * the whole file rather than to a slice of it.
+   */
+  private frameBytes: Buffer | null = null;
   private refused: LifecycleRefusal | null = null;
 
   constructor(
@@ -197,6 +209,29 @@ export class SupervisorExecution {
     readonly operation: "inspect" | "fill" | "verify",
     private readonly options: SupervisorOptions,
   ) {}
+
+  /**
+   * The exact policy this execution was created with.
+   *
+   * Exposed so the preflight gate can judge the container against *the same* policy the daemon was
+   * given, rather than against a reconstruction. A reconstructed policy is how the labels check
+   * failed during the first end-to-end run: the ids and the boot were empty, so every container
+   * looked foreign. There is exactly one policy per execution and this is it.
+   */
+  get executionPolicy(): ExecutionPolicy {
+    if (this.policy === null) throw new LifecycleError("NOT_ADMITTED", "no policy was recorded");
+    return this.policy;
+  }
+
+  /** The boot this execution is bound to. Part of its identity, and of the policy's labels. */
+  get bootId(): string {
+    return this.options.bootId;
+  }
+
+  /** The supervisor instance that owns this execution, for the same reason. */
+  get supervisorInstance(): string {
+    return this.options.supervisorInstance;
+  }
 
   get currentPhase(): SupervisorPhase {
     return this.phase;
@@ -221,7 +256,13 @@ export class SupervisorExecution {
       supervisorInstance: this.options.supervisorInstance,
       containerName: containerNameFor(this.executionId),
       containerId: null,
-      imageDigest: input.image,
+      // ## Normalised here, at the one place the field is written first
+      //
+      // The record's `imageDigest` is a digest, while the policy's `image` is a full digest-pinned
+      // reference. They are different fields that shared a value once, and every later write site
+      // had to remember to convert. Converting at the first write means the invariant holds from
+      // the moment the record exists, rather than being re-established at every subsequent write.
+      imageDigest: digestOf(input.image),
       profileId: input.profileId,
       deadlineMs: this.options.limits.deadlineMs,
       startedMonotonicMs: input.startedMonotonicMs,
@@ -339,7 +380,7 @@ export class SupervisorExecution {
 
     // The init process, by exact id, from the daemon.
     const state = await docker.state(containerId);
-    if (!state.ok) throw new LifecycleError("PREFLIGHT_FAILED", `state inspect failed: ${state.fault}`);
+    if (!state.ok) throw new LifecycleError("PREFLIGHT_FAILED", `state inspect failed: ${state.fault} (${"detail" in state ? String(state.detail) : ""})`);
     if (!state.value.running) throw new LifecycleError("PREFLIGHT_FAILED", "the container is not running");
     if (state.value.containerId !== containerId) {
       throw new LifecycleError("PREFLIGHT_FAILED", "the daemon answered for a different container id");
@@ -420,7 +461,7 @@ export class SupervisorExecution {
       bootId: this.options.bootId,
       containerId: this.containerId!,
       containerName: containerNameFor(this.executionId),
-      imageDigest: this.policy!.image,
+      imageDigest: digestOf(this.policy!.image),
       profileId: this.policy!.profileId,
       initPid: observation.initPid,
       initStartTimeTicks: observation.initStartTimeTicks,
@@ -537,10 +578,12 @@ export class SupervisorExecution {
    * fault — framing, digest, length, timeout — the output is discarded here and never reaches a
    * caller.
    */
-  async collectResult(declared: { bytes: number; digest: string }): Promise<{ bytes: number; digest: string }> {
+  async collectResult(): Promise<{ bytes: number; digest: string }> {
     this.requirePhase("streaming", "INPUT_MISMATCH");
     const result = this.session?.result;
     if (result === undefined) throw new LifecycleError("RESULT_INVALID", "no result stream is attached");
+    const frameParts: Buffer[] = [];
+    this.frameBytes = null;
     this.output = new BoundedProvisionalOutput(this.options.limits.maxOutputBytes);
     const stream = new ProvisionalResultStream({
       expectedOp: this.operation,
@@ -553,11 +596,21 @@ export class SupervisorExecution {
       for await (const chunk of result) {
         const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string);
         stream.push(buffer);
+        // The frame is retained only after the stream has accepted the bytes, so a fault can never
+        // leave a partial frame behind that a later step might mistake for a complete one.
+        frameParts.push(buffer);
       }
+      // ## The frame is reconciled against itself, not against an invented pair
+      //
+      // This used to take `declared: { bytes, digest }` from its caller and compare the parsed frame
+      // against it. Nothing could supply those values: the executor's frame *declares its own*
+      // output length in its header, and the digest exists only after the frame is parsed. A caller
+      // that passed the observed values made the comparison a tautology, and one that passed
+      // guesses made it a rejection of every correct result. `ProvisionalResultStream.finish()`
+      // already reconciles the frame's header against the bytes it actually carried — that is the
+      // declaration that means something, because the executor wrote it before it wrote the bytes.
       const completion = stream.finish();
-      if (completion.outputBytes !== declared.bytes || completion.outputSha256 !== declared.digest) {
-        throw new LifecycleError("RESULT_INVALID", "the result did not match the declaration");
-      }
+      this.frameBytes = Buffer.concat(frameParts);
       this.output.seal(this.executionId, completion.outputSha256);
       this.transition("sealed");
       return { bytes: completion.outputBytes, digest: completion.outputSha256 };
@@ -723,6 +776,42 @@ export class SupervisorExecution {
     return { commit: verified, message };
   }
 
+  /**
+   * The validated result frame, exactly as the executor wrote it.
+   *
+   * ## Why the frame and not the output slice
+   *
+   * The caller verifies its commit against the *complete frame* — a 4-byte length prefix, the
+   * metadata block, then the output — because that is what the terminal chain binds. Handing back
+   * only the output slice would leave the caller unable to reconstruct the bytes the commit
+   * describes, and the natural next step would be for the caller to trust the supervisor's claim
+   * about them, which is the one thing the caller must not do.
+   *
+   * The frame was already reconciled against its own header by `collectResult`, and the stream that
+   * produced it faults permanently on any framing error, so a frame returned here is one that
+   * matched the declaration its author wrote before the bytes.
+   */
+  sealedFrame(): Buffer {
+    if (this.frameBytes === null) throw new LifecycleError("RESULT_INVALID", "no result frame was retained");
+    return Buffer.from(this.frameBytes);
+  }
+
+  /**
+   * The executor's own exit code.
+   *
+   * ## Why the supervisor must be asked and not the Docker CLI
+   *
+   * `docker start -a` exits with the container's code while it can attach, and with its own code
+   * when it cannot. A caller that read the CLI's status would accept a frame from a process that
+   * died after writing it, and would reject a clean result whenever the daemon hiccuped on the way
+   * out. The session's `exited` promise is the child's, and `terminateAndRemove` already waits on
+   * it — so by the time a commit is possible this resolves without blocking.
+   */
+  async executorExitCode(): Promise<number> {
+    if (this.session === undefined) throw new LifecycleError("RESULT_INVALID", "no executor session was started");
+    return this.session.exited;
+  }
+
   /** The retained output, for the caller that has a verified commit. */
   takeOutput(): BoundedProvisionalOutput {
     if (this.output === null) throw new LifecycleError("RESULT_INVALID", "no output was retained");
@@ -793,7 +882,11 @@ export class SupervisorExecution {
         supervisorInstance: this.options.supervisorInstance,
         containerName: containerNameFor(this.executionId),
         containerId: this.containerId,
-        imageDigest: this.policy?.image ?? `sha256:${"0".repeat(64)}`,
+        // A digest, from the digest-pinned reference: the same normalisation every other write
+        // site uses. A full reference here was rejected by the journal's validator, and because
+        // quarantine swallows journal errors the failure was silent — the phase stayed at `intent`
+        // while the in-memory refusal said CREATE_AMBIGUOUS.
+        imageDigest: this.policy === null ? `sha256:${"0".repeat(64)}` : digestOf(this.policy.image),
         profileId: this.policy?.profileId ?? "unknown",
         deadlineMs: this.options.limits.deadlineMs,
         startedMonotonicMs: this.now(),
@@ -816,7 +909,12 @@ export class SupervisorExecution {
       supervisorInstance: this.options.supervisorInstance,
       containerName: containerNameFor(this.executionId),
       containerId: this.containerId,
-      imageDigest: this.policy!.image,
+      // The journal records the *digest*, not the reference. `policy.image` is
+      // `repo@sha256:<hex>`, which the journal's validator rejects — and rightly so: a recovery
+      // compares a live container's immutable digest, and a repository name is not an identity.
+      // The bug this replaces wrote the full reference into a digest field and only surfaced at
+      // the first durable write after `create`.
+      imageDigest: digestOf(this.policy!.image),
       profileId: this.policy!.profileId,
       deadlineMs: this.options.limits.deadlineMs,
       startedMonotonicMs: this.now(),
@@ -836,7 +934,12 @@ export class SupervisorExecution {
       supervisorInstance: this.options.supervisorInstance,
       containerName: containerNameFor(this.executionId),
       containerId: this.containerId,
-      imageDigest: this.policy!.image,
+      // The journal records the *digest*, not the reference. `policy.image` is
+      // `repo@sha256:<hex>`, which the journal's validator rejects — and rightly so: a recovery
+      // compares a live container's immutable digest, and a repository name is not an identity.
+      // The bug this replaces wrote the full reference into a digest field and only surfaced at
+      // the first durable write after `create`.
+      imageDigest: digestOf(this.policy!.image),
       profileId: this.policy!.profileId,
       deadlineMs: this.options.limits.deadlineMs,
       startedMonotonicMs: this.now(),
@@ -857,6 +960,20 @@ export class SupervisorExecution {
 }
 
 /** What preflight is given. Derived from the daemon's inspect output, not from the policy. */
+/**
+ * The digest from a digest-pinned reference.
+ *
+ * Kept next to the record writer because the record's `imageDigest` field and the policy's `image`
+ * field are different things that were once the same value. A full reference can never satisfy the
+ * digest pattern, so a single call site that forgot this produced a write failure at exactly the
+ * moment the container already existed — the least convenient place to discover it.
+ */
+function digestOf(reference: string): string {
+  const at = reference.indexOf("@");
+  if (at < 0) throw new LifecycleError("INTENT_NOT_DURABLE", "the policy image carries no digest");
+  return reference.slice(at + 1);
+}
+
 export type PreflightObservation = {
   containerId: string;
   imageDigest: string;

@@ -94,8 +94,42 @@ export function preflightContainer(input: {
 
   // Identity first. A container whose id does not match the one the journal recorded is not this
   // execution's container, and nothing downstream is meaningful.
-  if (field("Config.Labels") !== "" && !hasLabel(input.effective, "dip.execution.id", input.policy.executionId)) {
+  // ## The label key, and why this was wrong
+  //
+  // `ownershipLabels` writes `dip.execution`, `container-identity.ts` reads `dip.execution` — and
+  // this check read `dip.execution.id`, which nothing ever writes. A correctly owned container was
+  // therefore reported as `LABELS_MISMATCH` at preflight, while the watchdog accepted the same
+  // container as ours. Two components disagreeing about the name of the ownership label is the
+  // worst kind of disagreement: each is internally consistent and the pair is not.
+  //
+  // `container-identity.ts` is the authority, because it is what decides whether a signal may be
+  // sent; this check now agrees with it.
+  if (field("Config.Labels") !== "" && !hasLabel(input.effective, OWNERSHIP_LABEL, input.policy.executionId)) {
     add("LABELS_MISMATCH", "the ownership label for this execution is missing");
+  }
+
+  // ## The expected label set is enforced, not merely accepted
+  //
+  // `expectedLabels` was declared and never read: a parameter that promised an exact-set check and
+  // performed none. A container carrying *only* the ownership label satisfied preflight even though
+  // the journal recorded five. The set is now compared exactly, in both directions, so a missing
+  // label and an unexpected one are both failures — the unexpected one matters because a container
+  // labelled as belonging to some other execution or profile is not this execution's container.
+  if (field("Config.Labels") !== "") {
+    const expected = new Set(input.expectedLabels);
+    for (const label of input.expectedLabels) {
+      const [key, ...rest] = label.split("=");
+      if (key === undefined) continue;
+      if (!hasLabel(input.effective, key, rest.join("="))) {
+        add("LABELS_MISMATCH", `the label ${key} does not carry the recorded value`);
+      }
+    }
+    const actual = new Set(Object.keys(labelsOf(input.effective)));
+    for (const key of actual) {
+      if (![...expected].some((label) => label.startsWith(`${key}=`))) {
+        add("LABELS_MISMATCH", `the container carries an unexpected label ${key}`);
+      }
+    }
   }
   const image = field("Image");
   if (image !== "" && image !== input.policy.image) {
@@ -198,13 +232,38 @@ export function preflightContainer(input: {
   if (Array.isArray(env)) {
     for (const entry of env) {
       const text = String(entry);
-      if (!/^(NODE_OPTIONS|DIP_PROFILE|DIP_EXECUTION_ID|HOME|PATH|LANG|TZ)=/u.test(text)) {
+      // ## The allowlist, and why NODE_ENV is on it
+      //
+      // `buildCreateArgv` sets `NODE_ENV=production` on every container. It was missing here, so
+      // preflight reported `ENV_LEAKS_HOST` for the environment this system itself creates — the
+      // check was correct in spirit and had simply drifted from the argv it is meant to verify.
+      // The allowlist is now exactly what `buildCreateArgv` sets, and nothing else may appear.
+      if (!/^(NODE_ENV|NODE_OPTIONS|DIP_PROFILE|DIP_EXECUTION_ID|HOME|PATH|LANG|TZ)=/u.test(text)) {
         add("ENV_LEAKS_HOST", `unexpected environment key ${text.split("=")[0]}`);
       }
     }
   }
 
   return { ok: failures.length === 0, failures };
+}
+
+/**
+ * The ownership label key.
+ *
+ * One constant, exported, so the writer (`ownershipLabels`), the reader that decides about signals
+ * (`container-identity.ts`) and this preflight check cannot disagree again.
+ */
+export const OWNERSHIP_LABEL = "dip.execution";
+
+/** The container's labels, or an empty set when the blob is absent or unparseable. */
+function labelsOf(effective: Record<string, string>): Record<string, string> {
+  const raw = effective["Config.Labels"] ?? "";
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return typeof parsed === "object" && parsed !== null ? (parsed as Record<string, string>) : {};
+  } catch {
+    return {};
+  }
 }
 
 function hasLabel(effective: Record<string, string>, key: string, value: string): boolean {
