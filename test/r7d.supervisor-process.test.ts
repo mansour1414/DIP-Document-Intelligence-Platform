@@ -107,6 +107,7 @@ type Environment = {
   workerSocket: string;
   watchdogSecret: string;
   callerSecret: string;
+  workerSecret: string;
   bootId: string;
   cleanup: () => void;
 };
@@ -122,6 +123,7 @@ function makeEnvironment(): Environment {
     workerSocket: join(root, "worker.sock"),
     watchdogSecret: randomBytes(32).toString("hex"),
     callerSecret: randomBytes(32).toString("hex"),
+    workerSecret: randomBytes(32).toString("hex"),
     bootId: BOOT,
     cleanup: () => rmSync(root, { recursive: true, force: true }),
   };
@@ -163,7 +165,9 @@ function supervisorEnv(env: Environment): Record<string, string> {
     DIP_SUPERVISOR_WORKER_SOCKET: env.workerSocket,
     DIP_WATCHDOG_SOCKET: env.watchdogSocket,
     DIP_WATCHDOG_SECRET: env.watchdogSecret,
-    DIP_CALLER_SECRET: env.callerSecret,
+    // Two role credentials, not one shared key.
+    DIP_CALLER_APP_SECRET: env.callerSecret,
+    DIP_CALLER_WORKER_SECRET: env.workerSecret,
     DIP_SUPERVISOR_DEADLINE_MS: "60000",
   };
 }
@@ -373,7 +377,7 @@ test("R7D.1-D2S-7: a supervisor with a short caller secret refuses to start", as
   try {
     const supervisor = spawnNode("workers/supervisor.ts", {
       ...supervisorEnv(env),
-      DIP_CALLER_SECRET: "0011223344",
+      DIP_CALLER_WORKER_SECRET: "0011223344",
     });
     const code = await new Promise<number | null>((resolve) => supervisor.child.once("exit", resolve));
     assert.notEqual(code, 0);

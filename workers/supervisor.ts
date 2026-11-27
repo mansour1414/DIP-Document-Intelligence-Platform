@@ -4,7 +4,7 @@
  * ## What was missing
  *
  * Every part of the supervisor existed and none of it ran. `supervisor.ts` described a lifecycle,
- * `supervisor-server.ts` described role sockets, `caller.ts` described a caller, and nothing
+ * the role sockets described a preamble format, `caller.ts` described a caller, and nothing
  * composed them: no process created a journal, reconciled it, bound a watchdog channel, or served a
  * socket. Every test substituted its own wiring, so the wiring was the one part of the design with
  * no evidence behind it at all.
@@ -34,7 +34,8 @@
  *   DIP_SUPERVISOR_WORKER_SOCKET the worker role socket path (required)
  *   DIP_WATCHDOG_SOCKET        the watchdog control socket    (required)
  *   DIP_WATCHDOG_SECRET        hex, >= 32 bytes               (required)
- *   DIP_CALLER_SECRET          hex, >= 32 bytes               (required)
+ *   DIP_CALLER_APP_SECRET      hex, >= 32 bytes, app role     (required)
+ *   DIP_CALLER_WORKER_SECRET   hex, >= 32 bytes, worker role  (required)
  *   DIP_SUPERVISOR_DEADLINE_MS the per-execution budget       (default 120000)
  * ```
  *
@@ -56,7 +57,7 @@ import { dirname } from "node:path";
 import { readBootId } from "../src/lib/execution/host-facts";
 import { OwnershipJournal } from "../src/lib/execution/ownership-journal";
 import { reconcile, admissionAllowed } from "../src/lib/execution/reconciliation";
-import { startSupervisorServer } from "../src/lib/execution/supervisor-server";
+import { startRoleSockets } from "../src/lib/execution/role-sockets";
 import { AuthenticatedWatchdogClient } from "../src/lib/execution/watchdog-client";
 import {
   createContainerAsync,
@@ -139,7 +140,14 @@ async function main(): Promise<void> {
   const workerSocket = required("DIP_SUPERVISOR_WORKER_SOCKET");
   const watchdogSocket = required("DIP_WATCHDOG_SOCKET");
   const watchdogSecret = hexSecret("DIP_WATCHDOG_SECRET");
-  const callerSecret = hexSecret("DIP_CALLER_SECRET");
+  // ## Two credentials, not one
+  //
+  // The app process renders forms; the worker process fills them. One shared key would mean that
+  // compromising the web tier yields the worker's authority, so each role has its own secret and a
+  // proof made with one fails on the other's socket. The former single `DIP_CALLER_SECRET` is not
+  // accepted as a fallback: silently accepting it would let a deployment keep one credential for
+  // both roles while believing it had two.
+  const callerSecrets = { app: hexSecret("DIP_CALLER_APP_SECRET"), worker: hexSecret("DIP_CALLER_WORKER_SECRET") };
   const deadlineMs = Number(process.env.DIP_SUPERVISOR_DEADLINE_MS ?? "120000");
   if (!Number.isSafeInteger(deadlineMs) || deadlineMs <= 0) {
     process.stderr.write("FATAL: DIP_SUPERVISOR_DEADLINE_MS must be a positive integer\n");
@@ -232,14 +240,27 @@ async function main(): Promise<void> {
   // The handler composes one execution per connection. It is deliberately a thin adapter here: the
   // order of the lifecycle is `supervisor.ts`'s, and repeating it would create two places for it to
   // drift.
-  const server = await startSupervisorServer({
+  const server = await startRoleSockets({
     socketPaths: { app: appSocket, worker: workerSocket } as Record<IpcRole, string>,
-    handle: async ({ role, operation, executionId, socket }) => {
-      // Until the authenticated role transport of the next increment lands, this handler refuses
-      // rather than pretending to serve. A refused connection is legible; a handler that accepted
-      // and did nothing would hold admission until the idle timeout on every request.
-      emit({ event: "connection", role, operation, executionId });
-      socket.end(`${JSON.stringify({ kind: "UNSUPPORTED", detail: "the authenticated role transport is not enabled" })}\n`);
+    secrets: callerSecrets,
+    supervisorInstance,
+    bootId,
+    handle: async (session) => {
+      emit({ event: "connection", role: session.role, operation: session.operation, executionId: session.executionId });
+      // ## The executor handler is R7D.2
+      //
+      // Everything above this line is the authenticated control plane: the caller proved which role
+      // it is, the supervisor proved which instance it is, admission was granted against a
+      // single-executor profile, and `READY_FOR_BODY` has been sent. What is *not* here is the
+      // composition of a container: that needs the image, the profile, the cgroup pin and the
+      // operation-specific argv, all of which arrive with the web/API integration in R7D.2.
+      //
+      // So the handler refuses, and refuses **unresolved**: `release(false)` keeps the executor
+      // slot held rather than implying that an execution happened and finished. A slot released
+      // without evidence is the defect this class of code exists to avoid.
+      session.send({ kind: "REFUSED", code: "REJECTED" });
+      session.release(false);
+      emit({ event: "refused", executionId: session.executionId, detail: "the executor handler lands with R7D.2" });
     },
     log: (line) => emit({ event: "log", line }),
   });
@@ -249,7 +270,7 @@ async function main(): Promise<void> {
     bootId,
     sockets: { app: appSocket, worker: workerSocket },
     watchdog: watchdogIdentity.watchdogInstance,
-    callerSecretBytes: callerSecret.byteLength,
+    callerSecretBytes: { app: callerSecrets.app.byteLength, worker: callerSecrets.worker.byteLength },
   });
 
   const shutdown = async (signal: string): Promise<void> => {

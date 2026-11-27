@@ -15,7 +15,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { connect } from "node:net";
-import { mkdtempSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
@@ -28,7 +28,7 @@ import {
   type SupervisorOptions,
 } from "../src/lib/execution/supervisor";
 import { preflightContainer, preflightKernel } from "../src/lib/execution/preflight";
-import { admit, newAdmissionState, release, reserve, startSupervisorServer } from "../src/lib/execution/supervisor-server";
+import { admit, newAdmissionState, releaseResolved, reserve, startRoleSockets } from "../src/lib/execution/role-sockets";
 import { OwnershipJournal } from "../src/lib/execution/ownership-journal";
 import { INSPECT_FORMAT, SYNTHETIC_PROFILE, type ExecutionPolicy, type DockerOutcome } from "../src/lib/execution/docker-lifecycle";
 import { signDisarmGrant, type ArmAck } from "../src/lib/execution/watchdog-protocol";
@@ -506,10 +506,13 @@ test("R7D.1-SV-12: admission allows one active executor and refuses the second",
   assert.equal(second.ok, false);
   assert.equal((second as { code: string }).code, "BUSY");
 
-  release(state, "a".repeat(32));
+  releaseResolved(state, "a".repeat(32), true);
+  // A reservation is single-use, so the third request needs a fresh one — the first was consumed
+  // when the second request was *processed*, even though that request was then refused as BUSY.
+  const thirdReservation = reserve(state, "worker", now, 30_000);
   const third = admit(state, {
     role: "worker", operation: "fill", requestId: "3".repeat(16),
-    reservationId: workerReservation.reservationId, executionId: "c".repeat(32),
+    reservationId: thirdReservation.reservationId, executionId: "c".repeat(32),
   }, now, { reservationTtlMs: 30_000, maxConnections: 4 });
   assert.equal(third.ok, true);
 });
@@ -519,10 +522,12 @@ test("R7D.1-SV-13: admission enforces role × operation and a live reservation",
   const now = 1_000;
   const limits = { reservationTtlMs: 30_000, maxConnections: 4 };
 
-  // The app role may inspect and nothing else. A fill from the web process is refused before it
-  // can occupy the executor.
-  const appFill = admit(state, { role: "app", operation: "fill", requestId: "1".repeat(16), executionId: "a".repeat(32) }, now, limits);
-  assert.equal((appFill as { code: string }).code, "OPERATION_NOT_PERMITTED");
+  // ## Role × operation is no longer enforced here
+  //
+  // It is checked by the socket server *after* it has authenticated the peer, so that a policy
+  // refusal is never reported as a handshake failure — a caller must be able to tell "I am not
+  // allowed to do this" from "I did not prove who I am". `admit` therefore only sees requests that
+  // passed that check; the enforcement itself is asserted against a real socket in D2R-4.
 
   // A worker without a reservation is refused: the reservation is what makes "who may fill" a
   // server-side fact rather than a claim.
@@ -564,104 +569,63 @@ test("R7D.1-SV-15: reservations are unpredictable and distinct", () => {
 });
 
 test("R7D.1-SV-16: the role sockets are real, separate, and mode 0600", async () => {
+  // ## Why this is no longer a preamble test
+  //
+  // The sockets used to dispatch on a newline-terminated JSON preamble that any peer could write.
+  // They now require the full authenticated handshake, so the old version of this test — write a
+  // preamble, read `ADMITTED` — would be testing a protocol that no longer exists. What survives
+  // and still matters is the filesystem property: two sockets, separate, not world-readable. The
+  // handshake is `r7d.role-sockets.test.ts`'s subject, and is tested there against real sockets.
   const root = mkdtempSync(join(tmpdir(), "dip-sock-"));
   const paths = { app: join(root, "app.sock"), worker: join(root, "worker.sock") };
-  const handled: string[] = [];
-  const server = await startSupervisorServer({
+  const server = await startRoleSockets({
     socketPaths: paths,
-    handle: async ({ role, socket }) => {
-      handled.push(role);
-      socket.write(`${JSON.stringify({ kind: "DONE", role })}\n`);
-    },
+    secrets: { app: randomBytes(32), worker: randomBytes(32) },
+    supervisorInstance: "sv-0123456789ab",
+    bootId: "b".repeat(32),
+    handle: async () => { /* never reached: no peer authenticates here */ },
   });
   try {
+    assert.notEqual(paths.app, paths.worker, "the roles must not share an inode");
+    assert.equal(existsSync(paths.app), true);
+    assert.equal(existsSync(paths.worker), true);
     for (const path of Object.values(paths)) {
       const mode = statSync(path).mode & 0o777;
       assert.equal(mode, 0o600, `${path} must not be group- or world-accessible`);
     }
+  } finally {
+    await server.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
-    // Connect to the app socket and identify as a worker. The role must come from the socket.
-    const reply = await new Promise<string>((resolve, reject) => {
+test("R7D.1-SV-17: an unauthenticated peer that writes a preamble is refused, not dispatched", async () => {
+  // The exact bytes the old protocol accepted. Under the authenticated transport they are not even
+  // a frame: the first four bytes are read as a length prefix and the message is refused.
+  const root = mkdtempSync(join(tmpdir(), "dip-sock-"));
+  const paths = { app: join(root, "app.sock"), worker: join(root, "worker.sock") };
+  let handled = 0;
+  const server = await startRoleSockets({
+    socketPaths: paths,
+    secrets: { app: randomBytes(32), worker: randomBytes(32) },
+    supervisorInstance: "sv-0123456789ab",
+    bootId: "b".repeat(32),
+    handle: async () => { handled += 1; },
+  });
+  try {
+    const reply = await new Promise<string>((resolve) => {
       const socket = connect(paths.app, () => {
         socket.write(`${JSON.stringify({ operation: "inspect", requestId: "1".repeat(16), executionId: "a".repeat(32) })}\n`);
       });
       let buffer = "";
-      socket.on("data", (chunk: Buffer) => {
-        buffer += chunk.toString("utf8");
-        if (buffer.includes("\n")) {
-          socket.destroy();
-          resolve(buffer);
-        }
-      });
-      socket.on("error", reject);
+      socket.on("data", (chunk: Buffer) => { buffer += chunk.toString("utf8"); });
+      socket.on("close", () => resolve(buffer));
+      socket.on("error", () => resolve(buffer));
+      setTimeout(() => { socket.destroy(); resolve(buffer); }, 2_000).unref();
     });
-    assert.match(reply, /ADMITTED/u);
-    assert.match(reply, /"role":"app"/u, "the app socket must produce the app role");
+    assert.equal(handled, 0, "no handler may run for an unauthenticated peer");
+    assert.equal(reply.includes("ADMITTED"), false, "and nothing may be admitted");
   } finally {
-    await server.stop();
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("R7D.1-SV-17: an over-long preamble closes the connection without work", async () => {
-  const root = mkdtempSync(join(tmpdir(), "dip-sock-"));
-  const paths = { app: join(root, "app.sock"), worker: join(root, "worker.sock") };
-  let handled = 0;
-  const server = await startSupervisorServer({
-    socketPaths: paths,
-    handle: async () => { handled += 1; },
-  });
-  try {
-    const closed = await new Promise<boolean>((resolve) => {
-      const socket = connect(paths.app, () => {
-        // No newline, and more than the preamble bound: an unauthenticated peer must not be able
-        // to make the server buffer.
-        socket.write("x".repeat(2_000));
-      });
-      socket.on("close", () => resolve(true));
-      socket.on("error", () => resolve(true));
-      setTimeout(() => resolve(false), 2_000).unref();
-    });
-    assert.equal(closed, true);
-    assert.equal(handled, 0);
-  } finally {
-    await server.stop();
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("R7D.1-SV-18: a second connection is refused while an execution is active", async () => {
-  const root = mkdtempSync(join(tmpdir(), "dip-sock-"));
-  const paths = { app: join(root, "app.sock"), worker: join(root, "worker.sock") };
-  let releaseFirst: (() => void) | null = null as (() => void) | null;
-  const server = await startSupervisorServer({
-    socketPaths: paths,
-    handle: async () => {
-      await new Promise<void>((resolve) => { releaseFirst = resolve as () => void; });
-    },
-  });
-  const open = (path: string): Promise<string> => new Promise((resolve, reject) => {
-    const socket = connect(path, () => {
-      socket.write(`${JSON.stringify({ operation: "inspect", requestId: randomBytes(8).toString("hex"), executionId: randomBytes(16).toString("hex") })}\n`);
-    });
-    let buffer = "";
-    socket.on("data", (chunk: Buffer) => {
-      buffer += chunk.toString("utf8");
-      if (buffer.includes("\n")) {
-        socket.destroy();
-        resolve(buffer);
-      }
-    });
-    socket.on("error", reject);
-  });
-  try {
-    const first = await open(paths.app);
-    assert.match(first, /ADMITTED/u);
-    // The handler is still running, so the executor slot is occupied.
-    const second = await open(paths.app);
-    assert.match(second, /BUSY/u);
-  } finally {
-    (releaseFirst as (() => void) | null)?.();
     await server.stop();
     rmSync(root, { recursive: true, force: true });
   }
