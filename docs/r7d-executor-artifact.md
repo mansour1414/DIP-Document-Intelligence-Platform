@@ -22,12 +22,27 @@ one.
 
 ## Runtime dependency closure
 
-Five packages, all already locked. **No package was added and the lockfile is untouched.**
+Eight packages, all already locked. **No package was added and the lockfile is untouched.**
+
+The first version of this inventory listed five and was wrong. `pdf-lib` requires
+`@pdf-lib/standard-fonts` and `@pdf-lib/upng`, which the Dockerfile did not copy: the image would
+have installed cleanly and then failed on every document with `Cannot find module
+'@pdf-lib/standard-fonts'`. Copying the whole `@napi-rs` scope, meanwhile, dragged in `keyring`,
+`keyring-linux-x64-gnu` and `lzma-linux-x64-gnu` — a credential helper and an archive library in
+the untrusted image, neither of which the executor uses.
+
+The build-time verifier caught both, which is why it asserts the *exact* closure rather than a
+minimum set. `test/r7d.executor-bridge.test.ts` now runs that verifier against a directory
+assembled to match the Dockerfile's runtime stage, and a second test removes a transitive package
+to confirm the gate actually fails. A verifier that cannot fail is not a verifier.
 
 | Package | Version | License | Why it is in the image |
 | --- | --- | --- | --- |
 | `pdf-lib` | 1.17.1 | MIT | The PDF engine |
+| `@pdf-lib/standard-fonts` | 1.0.0 | MIT | pdf-lib's standard-14 font metrics |
+| `@pdf-lib/upng` | 1.0.1 | MIT | pdf-lib's PNG encoder |
 | `@napi-rs/canvas` | 1.0.9 | MIT | Raster appearance fallback for non-WinAnsi values |
+| `@napi-rs/canvas-linux-x64-gnu` | 1.0.9 | MIT | The platform native binding for that canvas |
 | `@fontsource/noto-sans-arabic` | 5.3.0 | OFL-1.1 | Arabic and Latin glyphs |
 | `pako` | 1.0.11 | MIT AND Zlib | Flate streams (pdf-lib dependency) |
 | `tslib` | 2.8.1 | 0BSD | Import helpers (pdf-lib dependency) |

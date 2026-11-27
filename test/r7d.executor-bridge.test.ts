@@ -18,7 +18,8 @@
 
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
@@ -347,4 +348,93 @@ test("R7D.1-F03-7: an unchanged untouched field counts as preserved", () => {
   const result = compare(baseline, after, new Map());
   assert.deepEqual(result.findings, []);
   assert.equal(result.preserved, 2);
+});
+
+// ---------------------------------------------------------------------------------------
+// The runtime closure, checked by simulating the Dockerfile's runtime stage
+// ---------------------------------------------------------------------------------------
+
+test("R7D.1-X-9: the artifact verifier passes against the packaged runtime closure", async () => {
+  // ## Why this is a test and not only a build step
+  //
+  // The verifier runs at image build time, and no image can be built here. Left at that, a
+  // broken closure would be discovered by whoever first built the image — and this closure *was*
+  // broken: `pdf-lib` needs `@pdf-lib/standard-fonts` and `@pdf-lib/upng`, which the Dockerfile
+  // did not copy. The image would have installed cleanly and failed on every document.
+  //
+  // So the same verifier is run here against a directory assembled to match what the runtime
+  // stage produces. That does not prove the image builds; it proves the *file layout the
+  // Dockerfile describes* is sufficient, which is the part this environment can establish.
+  const appRoot = join(workdir, "app");
+  mkdirSync(join(appRoot, "dist"), { recursive: true });
+  mkdirSync(join(appRoot, "node_modules"), { recursive: true });
+  copyFileSync(BUNDLE, join(appRoot, "dist", "executor-child.js"));
+  copyFileSync(join(process.cwd(), "package.json"), join(appRoot, "package.json"));
+  copyFileSync(
+    join(process.cwd(), "scripts", "verify-executor-artifact.mjs"),
+    join(appRoot, "dist", "verify-executor-artifact.mjs"),
+  );
+
+  // Exactly the packages the Dockerfile's runtime stage copies.
+  for (const name of [
+    "pdf-lib",
+    "@pdf-lib/standard-fonts",
+    "@pdf-lib/upng",
+    "@napi-rs/canvas",
+    "@napi-rs/canvas-linux-x64-gnu",
+    "@fontsource/noto-sans-arabic",
+    "pako",
+    "tslib",
+  ]) {
+    const target = join(appRoot, "node_modules", name);
+    mkdirSync(dirname(target), { recursive: true });
+    cpSync(join(process.cwd(), "node_modules", name), target, { recursive: true });
+  }
+
+  const output = execFileSync(process.execPath, [join(appRoot, "dist", "verify-executor-artifact.mjs"), appRoot], {
+    encoding: "utf8",
+    timeout: 120_000,
+  });
+  assert.match(output, /9\/9 artifact checks passed/u, output);
+  // The specific defect that was found: pdf-lib's transitive closure.
+  assert.match(output, /@pdf-lib\/standard-fonts/u);
+  assert.match(output, /@pdf-lib\/upng/u);
+});
+
+test("R7D.1-X-10: the verifier fails when a transitive dependency is missing", async () => {
+  // A verifier that cannot fail is not a verifier. Remove one transitive package the previous
+  // Dockerfile omitted, and confirm the build gate would have caught it.
+  const appRoot = join(workdir, "app-incomplete");
+  mkdirSync(join(appRoot, "dist"), { recursive: true });
+  mkdirSync(join(appRoot, "node_modules"), { recursive: true });
+  copyFileSync(BUNDLE, join(appRoot, "dist", "executor-child.js"));
+  copyFileSync(join(process.cwd(), "package.json"), join(appRoot, "package.json"));
+  copyFileSync(join(process.cwd(), "scripts", "verify-executor-artifact.mjs"), join(appRoot, "dist", "verify-executor-artifact.mjs"));
+  for (const name of [
+    "pdf-lib",
+    "@napi-rs/canvas",
+    "@napi-rs/canvas-linux-x64-gnu",
+    "@fontsource/noto-sans-arabic",
+    "pako",
+    "tslib",
+  ]) {
+    const target = join(appRoot, "node_modules", name);
+    mkdirSync(dirname(target), { recursive: true });
+    cpSync(join(process.cwd(), "node_modules", name), target, { recursive: true });
+  }
+
+  let exitCode = 0;
+  try {
+    execFileSync(process.execPath, [join(appRoot, "dist", "verify-executor-artifact.mjs"), appRoot], {
+      encoding: "utf8",
+      stdio: "pipe",
+      timeout: 120_000,
+    });
+  } catch (error) {
+    exitCode = (error as { status?: number }).status ?? 1;
+    const stderr = String((error as { stderr?: string }).stderr ?? "");
+    // The failure must name the actual cause, not a generic "checks failed".
+    assert.match(stderr, /standard-fonts|upng/u, stderr);
+  }
+  assert.equal(exitCode, 1, "the verifier must exit non-zero when the closure is incomplete");
 });

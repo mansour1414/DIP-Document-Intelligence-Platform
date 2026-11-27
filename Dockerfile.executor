@@ -65,9 +65,11 @@ COPY scripts/esbuild-executor.mjs ./scripts/esbuild-executor.mjs
 # into JavaScript and break the one thing that must keep working on the target architecture.
 RUN node scripts/esbuild-executor.mjs --outdir dist
 
-# The build fails here if the bundle does not load, rather than producing an image that fails
-# at the first document.
-RUN node -e "require('./dist/executor-child.js'); console.log('executor bundle loads')"
+# The build fails here if the bundle does not load or the engine cannot be imported, rather
+# than producing an image that fails at the first document. This runs before the engine is
+# available in the runtime stage, so it only proves the bundle's own syntax and its internal
+# graph; the engine is proven by the artifact verifier in the runtime stage, as `executor`.
+RUN node -e "const m = require('./dist/executor-child.js'); if (m.WORKER_PROTOCOL_V2 !== 2) process.exit(1); console.log('executor bundle loads')"
 
 # ---------------------------------------------------------------------------------------
 # Stage 3 — runtime
@@ -83,30 +85,48 @@ FROM node:22-bookworm-slim AS runtime
 RUN groupadd --system --gid 10001 executor \
  && useradd --system --uid 10001 --gid 10001 --create-home --home-dir /home/executor --shell /usr/sbin/nologin executor
 
+# `/app` is the single root for the runtime closure, the bundle and the verifier. The earlier
+# version mixed `/app` and `/build` and pointed the entrypoint at a path that was never
+# populated, so the image would have failed to start — a defect that only a build would reveal,
+# and one worth fixing here rather than discovering later.
+WORKDIR /app
+
 # The runtime closure, selected by name. Each of these is a locked package from the resolved
 # graph; none is added to package.json.
+# pdf-lib's own runtime dependencies are part of the closure. Omitting them produced an image
+# that installed cleanly and then failed to parse anything with `Cannot find module
+# '@pdf-lib/standard-fonts'` — a whole-closure defect, not a first-missing-module defect, so
+# both are listed and both are asserted at build time.
 COPY --from=deps /build/node_modules/pdf-lib ./node_modules/pdf-lib
-COPY --from=deps /build/node_modules/@napi-rs ./node_modules/@napi-rs
+COPY --from=deps /build/node_modules/@pdf-lib/standard-fonts ./node_modules/@pdf-lib/standard-fonts
+COPY --from=deps /build/node_modules/@pdf-lib/upng ./node_modules/@pdf-lib/upng
+# Only the two @napi-rs packages the canvas actually needs. Copying the whole `@napi-rs` scope
+# dragged in `keyring`, `keyring-linux-x64-gnu` and `lzma-linux-x64-gnu` — packages pulled by
+# unrelated parts of the application graph, none of which the executor uses. A credential
+# helper in the untrusted image is exactly the kind of inclusion this closure exists to prevent.
+COPY --from=deps /build/node_modules/@napi-rs/canvas ./node_modules/@napi-rs/canvas
+COPY --from=deps /build/node_modules/@napi-rs/canvas-linux-x64-gnu ./node_modules/@napi-rs/canvas-linux-x64-gnu
 COPY --from=deps /build/node_modules/@fontsource/noto-sans-arabic ./node_modules/@fontsource/noto-sans-arabic
 COPY --from=deps /build/node_modules/pako ./node_modules/pako
 COPY --from=deps /build/node_modules/tslib ./node_modules/tslib
 
 COPY --from=builder /build/dist/executor-child.js ./dist/executor-child.js
 COPY --from=builder /build/package.json ./package.json
+COPY scripts/verify-executor-artifact.mjs ./dist/verify-executor-artifact.mjs
 
 # The work directory is the only writable path, and it is a tmpfs at run time. Creating it here
 # with the executor's ownership means the container does not need to be root to start.
-RUN mkdir -p /work && chown executor:executor /work
+RUN mkdir -p /work && chown -R executor:executor /work /app
 WORKDIR /work
 
 # A start-up assertion that fails the build if the closure is incomplete.
 #
 # This runs as `executor`, so it also proves the identity can read every path the executor
-# needs — which a root-time check would not.
-COPY --chown=executor:executor scripts/verify-executor-artifact.mjs ./dist/verify-executor-artifact.mjs
-RUN node dist/verify-executor-artifact.mjs /app
-
+# needs — which a root-time check would not. `--self-check` inside it forces the three lazy
+# engine imports, so a missing font or a wrong-libc native binary fails the build instead of the
+# first document.
 USER executor
+RUN node /app/dist/verify-executor-artifact.mjs /app
 
 # Fixed entrypoint. The fd-3 protocol is the only way data leaves this process; stdout and
 # stderr stay diagnostic.

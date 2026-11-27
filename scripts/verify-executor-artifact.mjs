@@ -68,18 +68,40 @@ check("child answers the protocol version", () => {
 // 2. The runtime dependency closure is exactly what was intended.
 // ---------------------------------------------------------------------------------------
 
-const EXPECTED_PACKAGES = ["pdf-lib", "@napi-rs/canvas", "@fontsource/noto-sans-arabic", "pako", "tslib"];
+/**
+ * The exact runtime closure, including pdf-lib's own dependencies.
+ *
+ * The first version listed only the five direct packages and passed while the image was
+ * missing `@pdf-lib/standard-fonts` and `@pdf-lib/upng`. The check is "the closure is complete",
+ * not "these names are present", so the transitive entries are enumerated rather than assumed.
+ */
+const EXPECTED_PACKAGES = [
+  "pdf-lib",
+  "@pdf-lib/standard-fonts",
+  "@pdf-lib/upng",
+  "@napi-rs/canvas",
+  "@napi-rs/canvas-linux-x64-gnu",
+  "@fontsource/noto-sans-arabic",
+  "pako",
+  "tslib",
+];
 
 check("runtime closure matches the declared set", () => {
   const modules = join(appRoot, "node_modules");
   if (!existsSync(modules)) throw new Error("no node_modules in the runtime image");
   const present = readdirSync(modules).filter((name) => !name.startsWith("."));
-  const unexpected = present.filter((name) => !EXPECTED_PACKAGES.includes(name) && !name.startsWith("@"));
+  const unexpected = present.flatMap((name) => {
+    if (!name.startsWith("@")) return EXPECTED_PACKAGES.includes(name) ? [] : [name];
+    // A scope directory is not a package. Expand it, so `@pdf-lib/upng` being absent is caught
+    // rather than the scope merely existing.
+    return readdirSync(join(modules, name)).map((child) => `${name}/${child}`)
+      .filter((scoped) => !EXPECTED_PACKAGES.includes(scoped));
+  });
   if (unexpected.length > 0) throw new Error(`unexpected packages: ${unexpected.join(", ")}`);
   for (const required of EXPECTED_PACKAGES) {
     if (!existsSync(join(modules, required))) throw new Error(`missing required package: ${required}`);
   }
-  return present.join(", ");
+  return EXPECTED_PACKAGES.join(", ");
 });
 
 check("no database, cache or cloud SDK reached the runtime image", () => {
