@@ -127,6 +127,24 @@ function makeEnvironment(): Environment {
   };
 }
 
+/**
+ * A labelled stand-in for the Docker CLI.
+ *
+ * `DIP_DOCKER_BIN` exists in the adapter for exactly this: the asynchronous operations are exercised
+ * against a stand-in where no daemon is available. The stub is **labelled** — the two answers it can
+ * give are the two answers a real daemon gives for an exact id, and a test that uses it is testing
+ * what the control plane does with that answer, not whether a container exists.
+ */
+function dockerStub(answer: "not-found" | "daemon-unavailable"): { path: string; cleanup: () => void } {
+  const dir = mkdtempSync(join(tmpdir(), "dip-docker-stub-"));
+  const path = join(dir, "docker");
+  const stderr = answer === "not-found"
+    ? 'Error response from daemon: No such object: "$@"'
+    : "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?";
+  writeFileSync(path, `#!/bin/sh\necho ${JSON.stringify(stderr)} >&2\nexit 1\n`, { mode: 0o700 });
+  return { path, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+}
+
 function watchdogEnv(env: Environment): Record<string, string> {
   return {
     DIP_WATCHDOG_SOCKET: env.watchdogSocket,
@@ -242,19 +260,30 @@ test("R7D.1-D2S-3: a missing watchdog is a start-up failure, before any socket l
 test("R7D.1-D2S-4: an unresolved record blocks admission instead of being ignored", async () => {
   // ## The property
   //
-  // A previous supervisor created a container and died. The daemon is not reachable here, so its
-  // container cannot be shown absent. The supervisor must refuse to admit new work: the profile
-  // allows one executor, and the predecessor's may still be running.
+  // A previous supervisor created a container and died. The daemon cannot be asked, so the container
+  // cannot be shown absent. The supervisor must refuse to admit new work: the profile allows one
+  // executor, and the predecessor's may still be running.
+  //
+  // ## Why the daemon answer is pinned
+  //
+  // The first version of this test relied on Docker being *unavailable*, which was true in the
+  // development sandbox and false on CI, where a live daemon answers `NOT_FOUND` — a correct
+  // resolution, so reconciliation cleared and this assertion failed. The test was wrong, not the
+  // code: an assertion about fail-closed behaviour must supply the answer that requires failing
+  // closed. `DIP_DOCKER_BIN` is pinned to a labelled stub so the answer is explicit and identical
+  // everywhere. The complementary case — the daemon positively reports the container gone — is
+  // D2S-8.
   const env = makeEnvironment();
   const executionId = "e".repeat(32);
   seedSupervisorRecord(env, executionId);
+  const docker = dockerStub("daemon-unavailable");
   const watchdog = spawnNode("workers/watchdog.ts", watchdogEnv(env));
   let supervisor: Proc | null = null;
   try {
     await watchdog.waitFor("ready");
-    supervisor = spawnNode("workers/supervisor.ts", supervisorEnv(env));
+    supervisor = spawnNode("workers/supervisor.ts", { ...supervisorEnv(env), DIP_DOCKER_BIN: docker.path });
     const reconciled = await supervisor.waitFor("reconciled");
-    assert.equal(reconciled.clear, false, "an unaccounted container must not be treated as clear");
+    assert.equal(reconciled.clear, false, "an unaccountable container must not be treated as clear");
     const blocked = await supervisor.waitFor("admission-blocked");
     assert.ok(Array.isArray(blocked.quarantine) && blocked.quarantine.includes(executionId));
     const code = await new Promise<number | null>((resolve) => supervisor!.child.once("exit", resolve));
@@ -263,6 +292,35 @@ test("R7D.1-D2S-4: an unresolved record blocks admission instead of being ignore
   } finally {
     await supervisor?.stop();
     await watchdog.stop();
+    docker.cleanup();
+    env.cleanup();
+  }
+});
+
+test("R7D.1-D2S-8: a record the daemon positively reports gone is resolved, not quarantined", async () => {
+  // The other side of D2S-4, and the case a live CI daemon actually produces. `docker inspect` for
+  // the exact id reports `No such object`, which is the one observation that proves absence. The
+  // predecessor's container really is gone, so there is no debt to block on: refusing here would
+  // make every supervisor permanently unstartable after any crash that happened to run on a host
+  // whose container had since been reaped.
+  const env = makeEnvironment();
+  const executionId = "e".repeat(32);
+  seedSupervisorRecord(env, executionId);
+  const docker = dockerStub("not-found");
+  const watchdog = spawnNode("workers/watchdog.ts", watchdogEnv(env));
+  let supervisor: Proc | null = null;
+  try {
+    await watchdog.waitFor("ready");
+    supervisor = spawnNode("workers/supervisor.ts", { ...supervisorEnv(env), DIP_DOCKER_BIN: docker.path });
+    const reconciled = await supervisor.waitFor("reconciled");
+    assert.equal(reconciled.clear, true, "a positively absent container discharges the debt");
+    assert.equal(reconciled.quarantined, 0);
+    // And admission proceeds.
+    await supervisor.waitFor("ready");
+  } finally {
+    await supervisor?.stop();
+    await watchdog.stop();
+    docker.cleanup();
     env.cleanup();
   }
 });
