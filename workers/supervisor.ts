@@ -70,7 +70,6 @@ import {
   createContainerAsync,
   startContainerAttachedAsync,
   ownershipLabels,
-  type ExecutionPolicy,
   inspectContainerAsync,
   killContainerAsync,
   removeContainerAsync,

@@ -24,7 +24,10 @@ main({
   // The fixture's device, in the `major:minor` form records carry. Stable for the fixture's life,
   // and distinct from any real device so a record from one hierarchy cannot be replayed in another.
   cgroupMountDevice: () => fixture.mount().device,
-  actualCgroupPath: (pid, _mountPath) => {
+  // The mount path is the fixture's own, so the second argument is deliberately ignored: the
+  // supervisor passes the mount it discovered, and answering from the fixture's tree regardless is
+  // what keeps this seam honest about where its evidence comes from.
+  actualCgroupPath: (pid) => {
     const relative = fixtureMembership(fixture.root, pid);
     if (relative === null) return null;
     return { path: `${fixture.root}/${relative}`, relative: `/${relative}` };

@@ -47,7 +47,6 @@
  */
 
 import type { Readable } from "node:stream";
-import { createHash } from "node:crypto";
 import {
   LifecycleError,
   type PreflightObservation,
@@ -59,7 +58,6 @@ import {
   SYNTHETIC_PROFILE,
   assertDigestPinnedImage,
   assertDedicatedCgroupParent,
-  DEDICATED_CGROUP_SLICE,
   type ExecutionPolicy,
 } from "./docker-lifecycle";
 import { containerNameFor } from "./ownership-journal";
@@ -392,18 +390,6 @@ function digestOfImage(reference: string): string {
   const at = reference.indexOf("@");
   if (at < 0) throw new LifecycleError("NOT_ADMITTED", "the image reference carries no digest");
   return reference.slice(at + 1);
-}
-
-/** The metadata block length the commit binds, from the frame's own 4-byte prefix. */
-function frameMetaBytes(frame: Buffer): number {
-  if (frame.byteLength < 4) throw new LifecycleError("RESULT_INVALID", "the result frame is truncated");
-  const declared = frame.readUInt32BE(0);
-  if (4 + declared > frame.byteLength) throw new LifecycleError("RESULT_INVALID", "the result frame is truncated");
-  return declared;
-}
-
-function sha256Hex(bytes: Buffer): string {
-  return createHash("sha256").update(bytes).digest("hex");
 }
 
 function refusalOf(error: unknown, fallback: string): string {

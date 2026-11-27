@@ -824,6 +824,10 @@ function runDockerAsync<T>(
      * fault it had already constructed. The bug was invisible because every existing test took the
      * asynchronous path.
      */
+    // `let`, not `const`: the declaration must precede the closure (TDZ, above) and the assignment
+    // must follow the `spawn` that can settle the promise synchronously. Reacting to this warning
+    // by hoisting the assignment is what produced the ReferenceError it exists to prevent.
+    // eslint-disable-next-line prefer-const
     let timer: ReturnType<typeof setTimeout> | undefined;
     const finish = (outcome: DockerOutcome<T>): void => {
       if (settled) return;
