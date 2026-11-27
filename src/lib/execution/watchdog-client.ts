@@ -88,6 +88,46 @@ export type WatchdogClientError =
   /** The connection closed mid-exchange. */
   | "CLOSED";
 
+/**
+ * The refusal codes the watchdog may answer with.
+ *
+ * Enumerated here so the supervisor can branch on them exhaustively rather than treating any
+ * non-grant as "retry". They mean different things, and conflating them is how a lost grant gets
+ * re-minted:
+ *
+ * - `DURABILITY_FAILED` — the watchdog could not record the decision. **Never** retry the request:
+ *   the watchdog may have acted, and a second request is a second authoritative outcome.
+ * - `UNCERTAIN` — the watchdog cannot tell whether the execution is still live. Terminate, do not
+ *   commit.
+ * - `TERMINATION_PENDING` — a kill was signalled and descendants remain. Wait for the watchdog's
+ *   own confirmation; the supervisor does not signal again on its own authority here.
+ * - `NOT_DIP_OWNED` — the container does not match the recorded identity. Quarantine, never signal.
+ * - `CGROUP_UNVERIFIED` — the container is running outside the pinned cgroup, so the watchdog's
+ *   start-time authority does not cover it. Quarantine.
+ * - `EXPIRED` — the deadline passed. The outcome is expiry; there is no grant to recover.
+ * - `INSTANCE_MISMATCH` — the request named a different instance or boot.
+ */
+export type WatchdogRefusalCode =
+  | "DURABILITY_FAILED"
+  | "UNCERTAIN"
+  | "TERMINATION_PENDING"
+  | "NOT_DIP_OWNED"
+  | "CGROUP_UNVERIFIED"
+  | "EXPIRED"
+  | "INSTANCE_MISMATCH";
+
+/**
+ * Whether a refusal permits asking again.
+ *
+ * Only `TERMINATION_PENDING` does, and only because the watchdog itself is still working: it has
+ * signalled, descendants remain, and it will report again. Every other refusal is terminal for this
+ * execution. In particular a refusal that says the durable record could not be written is *not*
+ * retried, because the watchdog's decision may already have taken effect.
+ */
+export function refusalIsRetryable(code: WatchdogRefusalCode): boolean {
+  return code === "TERMINATION_PENDING";
+}
+
 export class WatchdogChannelError extends Error {
   constructor(readonly code: WatchdogClientError, message: string) {
     super(message);

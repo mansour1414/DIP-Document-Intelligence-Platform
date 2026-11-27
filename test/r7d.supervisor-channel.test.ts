@@ -26,7 +26,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { createServer, type Server, type Socket } from "node:net";
-import { AuthenticatedWatchdogClient, WatchdogChannelError, newMessageId } from "../src/lib/execution/watchdog-client";
+import { AuthenticatedWatchdogClient, WatchdogChannelError, newMessageId, refusalIsRetryable, type WatchdogRefusalCode } from "../src/lib/execution/watchdog-client";
 import { startWatchdogServer } from "../src/lib/execution/watchdog-server";
 import { encodeWatchdogFrame } from "../src/lib/execution/watchdog-protocol";
 
@@ -466,6 +466,48 @@ test("R7D.1-D2C-15: an arm denied by the watchdog is a decision, not a transport
     const answer = await fixture.client.arm(armRequest(EXECUTION));
     assert.equal(answer.kind, "ARM_DENIED");
     if (answer.kind === "ARM_DENIED") assert.equal(answer.code, "NOT_DIP_OWNED");
+  } finally {
+    fixture.client.close();
+    await fixture.stop();
+  }
+});
+
+test("R7D.1-D2C-16: a lost grant is never re-minted; only a pending termination may be asked again", async () => {
+  // ## Why this is a classification test and not a socket test
+  //
+  // The supervisor's response to a refusal is the whole point of the refusal. `DURABILITY_FAILED`
+  // means the watchdog could not record its decision — so the decision may already have *happened*,
+  // and asking again is asking for a second authoritative outcome for one execution. `EXPIRED` means
+  // the outcome is expiry and there is nothing to recover. Only `TERMINATION_PENDING` describes a
+  // watchdog that is still working on the same execution, where asking again is the same question.
+  //
+  // Conflating these is how a completion gets granted after a deadline: treat `DURABILITY_FAILED` as
+  // retryable and the retry lands after expiry.
+  assert.equal(refusalIsRetryable("DURABILITY_FAILED"), false, "a decision that may have taken effect is final");
+  assert.equal(refusalIsRetryable("EXPIRED"), false, "expiry is an outcome, not a state to poll");
+  assert.equal(refusalIsRetryable("UNCERTAIN"), false);
+  assert.equal(refusalIsRetryable("NOT_DIP_OWNED"), false);
+  assert.equal(refusalIsRetryable("CGROUP_UNVERIFIED"), false);
+  assert.equal(refusalIsRetryable("INSTANCE_MISMATCH"), false);
+  // The one exception, and the reason it is an exception: the same question, still being answered.
+  assert.equal(refusalIsRetryable("TERMINATION_PENDING"), true);
+
+  // And a live watchdog really does answer with these codes rather than closing the channel, so the
+  // classification above is about real frames. A foreign container is the cheapest to provoke.
+  const harness = makeWatchdog({
+    liveTree: { populated: false },
+    observation: () => ({ state: "present-foreign", reason: "label-mismatch", detail: "not ours" }),
+  });
+  const fixture = await startFixture({ harness });
+  try {
+    await fixture.client.connect();
+    const answer = await fixture.client.arm(armRequest(EXECUTION));
+    assert.equal(answer.kind, "ARM_DENIED");
+    if (answer.kind === "ARM_DENIED") {
+      // The denial carries a code from the closed set, not free text.
+      assert.equal(answer.code, "NOT_DIP_OWNED");
+      assert.equal(refusalIsRetryable(answer.code as WatchdogRefusalCode), false);
+    }
   } finally {
     fixture.client.close();
     await fixture.stop();
