@@ -17,8 +17,8 @@
  */
 
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
@@ -33,11 +33,19 @@ let workdir: string;
 
 before(async () => {
   workdir = mkdtempSync(join(tmpdir(), "dip-executor-"));
-  // The bundle is produced by `node scripts/esbuild-executor.mjs`, which CI runs before this
-  // suite. Fail loudly rather than skipping: a skipped test that reports green is worse than a
-  // failing one.
-  const { existsSync } = await import("node:fs");
-  if (!existsSync(BUNDLE)) throw new Error(`missing ${BUNDLE} — run: node scripts/esbuild-executor.mjs`);
+  if (!existsSync(BUNDLE)) {
+    // Build it here rather than requiring a prior step. CI runs `npm test`, which globs every
+    // suite; a test that only passes when someone remembered to build first would either fail
+    // CI or — worse, if it skipped instead — report green without running.
+    //
+    // The builder uses the esbuild already on disk as a locked transitive dependency of `tsx`.
+    // No package is added and the lockfile is untouched.
+    execFileSync(process.execPath, [join(process.cwd(), "scripts", "esbuild-executor.mjs")], {
+      stdio: "pipe",
+      timeout: 120_000,
+    });
+  }
+  if (!existsSync(BUNDLE)) throw new Error(`the executor bundle could not be built at ${BUNDLE}`);
 });
 
 after(() => {
