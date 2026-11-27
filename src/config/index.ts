@@ -291,6 +291,12 @@ export const toolsConfig = [
     supportedMimeTypes: PDF, limits: { ...BASE_LIMITS, maxFiles: 1 }, capabilities: ["qpdf", "structural-recovery"], securityClass: "isolated", aiEnabled: false, locales: ["en", "ar"],
   },
   {
+    id: "fill-forms", name: "Fill PDF Forms", nameAr: "تعبئة نماذج PDF",
+    description: "Fill existing AcroForm text, checkbox, radio, dropdown, and option-list fields in Arabic or English", descriptionAr: "تعبئة حقول النماذج الحالية في PDF من نوع نص ومربع اختيار وأزرار اختيار وقوائم منسدلة وقوائم خيارات بالعربية أو الإنجليزية",
+    icon: "TextCursorInput", category: "edit", execution: "server" as const, href: "/fill-forms", version: 1,
+    supportedMimeTypes: PDF, limits: { ...BASE_LIMITS, maxFiles: 1, maxPages: 200 }, capabilities: ["pdf-forms", "acroform", "bilingual-form-filling"], securityClass: "restricted", aiEnabled: false, locales: ["en", "ar"],
+  },
+  {
     id: "word-to-pdf",
     name: "Word to PDF",
     nameAr: "Word إلى PDF",

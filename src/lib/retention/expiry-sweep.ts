@@ -12,6 +12,7 @@ import { createQueueActivityLookup, resolveEvidence, unknownEvidence, type Queue
 import { openRetentionRedis, type RetentionRedisHandle } from "./queue-connection";
 import { applyExpiryPlan } from "./expiry-write";
 import { AI_JOB_QUEUE_NAME, JOB_QUEUE_NAME } from "@/lib/queue";
+import { purgeFormFields } from "@/lib/pdf/form-payload";
 
 /**
  * Job-expiry sweep: planning, queue evidence and the guarded apply write.
@@ -406,16 +407,37 @@ export async function expireStalledJobs(options: ExpireStalledJobsOptions = {}):
 
   // Apply only: the client is resolved here, never on the planning path.
   const { db } = await import("@/lib/db");
-  const count = await applyExpiryPlan(
-    { updateMany: (args) => db.job.updateMany(args as Parameters<typeof db.job.updateMany>[0]) },
+  // FF-03 / architect round 2 — the expiry race.
+  //
+  // The purge must follow the *write*, not the *plan*. `plan.expireIds` is a
+  // snapshot: the optimistic `updatedAt` guard may legitimately refuse a row that
+  // a worker claimed after planning, and that row's in-flight attempt still needs
+  // its encrypted payload. Reading references from the planned set and purging
+  // afterwards would therefore delete live work's data.
+  //
+  // `updateManyAndReturn` returns exactly the rows the guard accepted, in the same
+  // statement, so there is no window between "what expired" and "what we read".
+  // It needs no new privilege either: the retention role already holds column
+  // UPDATE and SELECT on `jobs`, and no migration is involved.
+  const outcome = await applyExpiryPlan(
+    { updateManyAndReturn: (args) => db.job.updateManyAndReturn(args as Parameters<typeof db.job.updateManyAndReturn>[0]) },
     { expireIds: plan.expireIds, sweepStartedAt, completedAt: now },
   );
+  const count = outcome.expired.length;
+  // Only jobs that genuinely reached EXPIRED lose their payload. A skipped row is
+  // left untouched — including its TTL backstop.
+  const fieldsRefs = outcome.expired
+    .map((row) => (row.params as { fieldsRef?: string } | null)?.fieldsRef)
+    .filter((reference): reference is string => Boolean(reference));
+  // Only reachable in `apply` mode, which the scheduler invokes after its
+  // RETENTION_APPLY gate; this adds a Redis delete per *expired* fill job and
+  // changes neither which jobs expire nor when.
+  if (fieldsRefs.length) await Promise.all(fieldsRefs.map((reference) => purgeFormFields(reference).catch(() => undefined)));
   logger.info("jobs.expired_cleanup", {
     count,
     planned: plan.expireIds.length,
-    // A shortfall means the sweep lost the race to a legitimate state change,
-    // which is the desired outcome — surface it rather than hiding it.
-    skipped_changed_since_sweep: plan.expireIds.length - count,
+    // A non-zero shortfall is the guard losing the race on purpose.
+    skipped_changed_since_sweep: outcome.skipped,
     abandoned_running: plan.counts.abandonedRunning,
     stale_queue: plan.counts.staleQueue,
   });

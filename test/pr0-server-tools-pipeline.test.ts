@@ -170,13 +170,23 @@ test("PR-0 (structure): five tools, MIME accepts, and OCR language options are p
   assert.match(read("test/merge-pdf.runtime.test.ts"), /Object\.keys\(toolRegistry\)\.length, toolsConfig\.length/);
 });
 
-test("PR-0 (structure): job ingress order is validateUpload -> requireCleanUpload -> storage.put -> enqueue", () => {
+test("PR-0 (structure): job ingress order is shape check -> requireCleanUpload -> parse stage -> storage.put -> enqueue", () => {
   const orchestrator = read("src/lib/jobs/orchestrator.ts");
-  const validateIdx = orchestrator.indexOf("validateUpload(");
+  // Round 6 split validation in two. The parser-free stage (bytes/MIME/magic/size)
+  // is the first thing that runs; the page-counting stage must still come after the
+  // malware gate, so an infected document is never parsed. Both orderings are
+  // asserted, because collapsing them back together would silently reintroduce the
+  // parse-before-screen defect.
+  const shapeIdx = orchestrator.indexOf("assertCheapPdfShape(");
+  const bytesIdx = orchestrator.indexOf("validateUploadBytes(");
   const scanIdx = orchestrator.indexOf("requireCleanUpload(");
+  const parseIdx = orchestrator.indexOf("validateUploadWithParse(");
   const storeIdx = orchestrator.indexOf("storage.put(");
   const enqueueIdx = orchestrator.indexOf("enqueueJob(");
-  assert.ok(validateIdx >= 0 && scanIdx > validateIdx && storeIdx > scanIdx && enqueueIdx > storeIdx);
+  assert.ok(shapeIdx >= 0 && scanIdx > shapeIdx, "cheap shape checks must precede screening");
+  assert.ok(bytesIdx >= 0 && bytesIdx < scanIdx, "the parser-free stage must precede screening");
+  assert.ok(parseIdx > scanIdx, "the page-counting parse must not precede screening");
+  assert.ok(storeIdx > parseIdx && enqueueIdx > storeIdx);
   const jobsRoute = read("src/app/api/jobs/[tool]/route.ts");
   assert.match(jobsRoute, /createToolJob/);
   assert.match(jobsRoute, /workerToolIds\.has\(tool\)/);

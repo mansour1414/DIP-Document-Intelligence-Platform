@@ -1,0 +1,231 @@
+# Dedicated PDF executor image (R7D.1).
+#
+# One disposable container per untrusted PDF operation. This image contains the PDF engine
+# and nothing else: no Prisma, no PostgreSQL client, no Redis or BullMQ, no object storage,
+# no AI provider, no authentication, no billing, no application routes and no server.
+#
+# ## Why the runtime closure is built, not copied
+#
+# The application image learns its closure from Next's file tracer. This image has no Next
+# build, so the closure is established twice and intersected: `npm ci` in a builder stage
+# produces exactly what the lockfile resolves, and the precompiled bundle reveals what the
+# executor actually reaches. Anything present in `node_modules` but absent from the bundle's
+# import list is a build dependency and is dropped from the runtime stage.
+#
+# ## Why precompilation, and what it does not claim
+#
+# `tsx` and `esbuild` are dev-time tools. Shipping them means shipping a TypeScript loader and
+# a native binary into the untrusted execution boundary, which is a larger attack surface than
+# a bundle of plain JavaScript. esbuild is already a locked transitive dependency of `tsx`, so
+# this adds no package and changes no lockfile entry — it only uses what is already installed.
+#
+# Precompilation does **not** resolve the historical 384 MiB memory measurement. Its root cause
+# was never established, and nothing here claims otherwise. The V8 heap bound and the cgroup
+# limit are what bound memory; bundling does not.
+#
+# ## What is verified where
+#
+# The build verifies the image contents it can see statically: that the engine, the fonts and
+# the native canvas binding are present, that `require.resolve` from the executor's own
+# directory finds them, and that the bundle loads. Whether the daemon *accepts* the runtime
+# policy, and whether the kernel *enforces* it, can only be established by executing a
+# container. That is reported BLOCKED where Docker is unavailable.
+
+# ---------------------------------------------------------------------------------------
+# Stage 1 — resolve the locked closure
+# ---------------------------------------------------------------------------------------
+# Debian/glibc Node 22, the same runtime family as the application worker image. glibc rather
+# than musl because `@napi-rs/canvas` publishes a gnu binding for this platform and because the
+# application's worker image is already glibc; two libc families in one product is a source of
+# defects that only appear in one of them.
+#
+# ## Base image identity
+#
+# `node:22-bookworm-slim` is a *moving tag*. Two builds of this Dockerfile a month apart can
+# resolve to different filesystems, so the tag is a readability aid and not an identity. The
+# acceptance build must pin the digest:
+#
+#   docker build --build-arg NODE_BASE=node:22-bookworm-slim@sha256:<digest> -f Dockerfile.executor .
+#
+# recorded digests are in docs/r7d-executor-artifact.md. This environment has no Docker daemon,
+# so the digest below is NOT resolved here and the default remains the tag; that is stated
+# rather than papered over.
+ARG NODE_BASE=node:22-bookworm-slim
+
+# ## Target architecture
+#
+# The acceptance host is native ARM64 and this development environment is x64. The canvas
+# binding is a compiled `.node` binary selected by npm from `optionalDependencies` according to
+# the *target* platform, so the closure must be resolved for the target rather than for the
+# builder. `--os/--cpu` select from the existing lockfile only — no package is added and the
+# lockfile is untouched. Building an arm64 image then uses the arm64 binding even when the build
+# runs on an x64 machine with emulation.
+FROM ${NODE_BASE} AS deps
+WORKDIR /build
+
+ARG TARGETOS=linux
+# Supplied by BuildKit from the target platform (modern Docker default). It is deliberately not
+# defaulted: a silently-wrong architecture produces an image that builds and then fails on the
+# first document, which is exactly the class of defect this file is meant to prevent. The guard
+# below fails closed with a readable message instead.
+ARG TARGETARCH
+
+# ## D2-F05: Docker's architecture names are not Node's
+#
+# BuildKit sets `TARGETARCH` to the Docker/Go spelling: `amd64`, `arm64`, `386`, `arm`. npm's
+# `--cpu` flag and the `@napi-rs/canvas-<os>-<cpu>-gnu` package name use Node's spelling: `x64`,
+# `arm64`, `ia32`, `arm`. The guard below previously accepted `arm64|x64` and then passed the value
+# straight to `npm ci --cpu`, so:
+#
+#   - a real x64 build (`TARGETARCH=amd64`) was **rejected**, because `amd64` was not in the case
+#     pattern. The documented `--build-arg TARGETARCH=x64` therefore produced a closure whose
+#     `@napi-rs/canvas-linux-x64-gnu` package was filtered out by npm's own platform check, and the
+#     image failed at the first document with `MODULE_NOT_FOUND`.
+#
+# The mapping is explicit and total: one case statement turns the Docker names into Node names, and
+# an unsupported value fails closed. Nothing is defaulted, and nothing is guessed from the builder.
+COPY package.json package-lock.json ./
+RUN case "${TARGETARCH}" in \
+      amd64)   NODE_CPU=x64   ;; \
+      x64)     NODE_CPU=x64   ;; \
+      arm64)   NODE_CPU=arm64 ;; \
+      aarch64) NODE_CPU=arm64 ;; \
+      *) echo "FATAL: TARGETARCH='${TARGETARCH}' is not a supported canvas target." >&2; \
+         echo "BuildKit supplies this automatically from the target platform." >&2; \
+         echo "With the classic builder pass --build-arg TARGETARCH=amd64 (or arm64)." >&2; \
+         exit 1 ;; \
+    esac \
+ && echo "resolving native closure for ${TARGETOS}/${TARGETARCH} as npm cpu=${NODE_CPU}" \
+ && npm ci --no-audit --no-fund --ignore-scripts --os=${TARGETOS} --cpu=${NODE_CPU}
+
+# The stage-scoped record of the resolved npm cpu, for the runtime stage.
+#
+# `ARG` is stage-scoped in Docker: an `ARG` declared in one stage does not exist in the next, which
+# is why the `COPY --from=deps .../canvas-${TARGETOS}-${TARGETARCH}-gnu` line in the runtime stage
+# below expanded `TARGETARCH` to the empty string and copied from a path that was never populated.
+# Writing the resolved value to a file lets the runtime stage read what the deps stage *decided*
+# rather than re-deriving it from an `ARG` it cannot see.
+RUN case "${TARGETARCH}" in \
+      amd64|x64)   NODE_CPU=x64   ;; \
+      arm64|aarch64) NODE_CPU=arm64 ;; \
+      *) echo "FATAL: TARGETARCH='${TARGETARCH}' is not a supported canvas target." >&2; exit 1 ;; \
+    esac \
+ && printf '%s\n' "${NODE_CPU}" > /build/.node-cpu \
+ && test -d "/build/node_modules/@napi-rs/canvas-linux-${NODE_CPU}-gnu" \
+ && cp -a "/build/node_modules/@napi-rs/canvas-linux-${NODE_CPU}-gnu" /build/native-canvas
+
+# ---------------------------------------------------------------------------------------
+# Stage 2 — precompile the executor
+# ---------------------------------------------------------------------------------------
+FROM ${NODE_BASE} AS builder
+WORKDIR /build
+
+COPY --from=deps /build/node_modules ./node_modules
+COPY package.json package-lock.json tsconfig.json ./
+COPY src ./src
+COPY scripts/esbuild-executor.mjs ./scripts/esbuild-executor.mjs
+
+# Bundle the child entrypoint and the verify helpers into plain CommonJS.
+#
+# `--packages=external` keeps third-party modules as `require()` calls resolved from
+# `node_modules` at runtime, which is what preserves `@napi-rs/canvas` native loading and
+# `@fontsource` file resolution. Bundling them would embed a platform-specific `.node` binary
+# into JavaScript and break the one thing that must keep working on the target architecture.
+RUN node scripts/esbuild-executor.mjs --outdir dist
+
+# The build fails here if the bundle does not load or the engine cannot be imported, rather
+# than producing an image that fails at the first document. This runs before the engine is
+# available in the runtime stage, so it only proves the bundle's own syntax and its internal
+# graph; the engine is proven by the artifact verifier in the runtime stage, as `executor`.
+RUN node -e "const m = require('./dist/executor-child.js'); if (m.WORKER_PROTOCOL_V2 !== 2) process.exit(1); console.log('executor bundle loads')"
+
+# ---------------------------------------------------------------------------------------
+# Stage 3 — runtime
+# ---------------------------------------------------------------------------------------
+FROM ${NODE_BASE} AS runtime
+
+# A real non-root identity with a real passwd entry and home directory.
+#
+# This is not cosmetic. `os.homedir()` and `os.userInfo()` read the passwd database; an
+# arbitrary numeric UID with no entry throws `uv_os_homedir returned ENOENT` inside the canvas
+# path, which surfaces as a masked `UNEXPECTED` and was the actual root cause of the R7C.1
+# failure. A named user avoids the need for any `HOME` or `TMPDIR` workaround.
+RUN groupadd --system --gid 10001 executor \
+ && useradd --system --uid 10001 --gid 10001 --create-home --home-dir /home/executor --shell /usr/sbin/nologin executor
+
+# `/app` is the single root for the runtime closure, the bundle and the verifier. The earlier
+# version mixed `/app` and `/build` and pointed the entrypoint at a path that was never
+# populated, so the image would have failed to start — a defect that only a build would reveal,
+# and one worth fixing here rather than discovering later.
+WORKDIR /app
+
+# The runtime closure, selected by name. Each of these is a locked package from the resolved
+# graph; none is added to package.json.
+# pdf-lib's own runtime dependencies are part of the closure. Omitting them produced an image
+# that installed cleanly and then failed to parse anything with `Cannot find module
+# '@pdf-lib/standard-fonts'` — a whole-closure defect, not a first-missing-module defect, so
+# both are listed and both are asserted at build time.
+COPY --from=deps /build/node_modules/pdf-lib ./node_modules/pdf-lib
+COPY --from=deps /build/node_modules/@pdf-lib/standard-fonts ./node_modules/@pdf-lib/standard-fonts
+COPY --from=deps /build/node_modules/@pdf-lib/upng ./node_modules/@pdf-lib/upng
+# Only the two @napi-rs packages the canvas actually needs. Copying the whole `@napi-rs` scope
+# dragged in `keyring`, `keyring-linux-*-gnu` and `lzma-linux-*-gnu` — packages pulled by
+# unrelated parts of the application graph, none of which the executor uses. A credential helper
+# in the untrusted image is exactly the kind of inclusion this closure exists to prevent.
+#
+# The native binding name is derived from the target architecture rather than written as
+# `linux-x64-gnu`. Hard-coding x64 produced an image that would have failed on the native ARM64
+# acceptance host with a `MODULE_NOT_FOUND` for the .node file — after a successful build, and
+# only at the first document.
+COPY --from=deps /build/node_modules/@napi-rs/canvas ./node_modules/@napi-rs/canvas
+
+# ## D2-F05: the native binding is placed by the name the deps stage resolved
+#
+# `ARG` is **stage-scoped**: the `TARGETOS`/`TARGETARCH` declared before the deps stage do not exist
+# here, so the previous `COPY .../canvas-${TARGETOS}-${TARGETARCH}-gnu` expanded both variables to
+# the empty string and copied from `/build/node_modules/@napi-rs/canvas--gnu`, a path that is never
+# populated. The failure is invisible at build time (an empty expansion is a normal string to
+# `COPY`) and appears only when the executor is started.
+#
+# They are therefore redeclared in this stage, so `TARGETOS` is available for the path below and an
+# invalid architecture fails here rather than producing a silently wrong image.
+ARG TARGETOS=linux
+ARG TARGETARCH
+
+# The npm `cpu` name is *not* `TARGETARCH`: Docker says `amd64`, Node says `x64`. Rather than repeat
+# that mapping in a second place — where the two could drift — the deps stage records the name it
+# resolved, and this stage reads it. The directory the loader requires is
+# `@napi-rs/canvas-linux-<cpu>-gnu`, so it is renamed into that exact position.
+COPY --from=deps /build/.node-cpu /tmp/.node-cpu
+COPY --from=deps /build/native-canvas /tmp/native-canvas
+RUN NODE_CPU="$(cat /tmp/.node-cpu)" \
+ && case "${NODE_CPU}" in x64|arm64) ;; *) echo "FATAL: the deps stage resolved an unusable cpu '${NODE_CPU}'" >&2; exit 1 ;; esac \
+ && mv /tmp/native-canvas "/app/node_modules/@napi-rs/canvas-linux-${NODE_CPU}-gnu" \
+ && rm -f /tmp/.node-cpu \
+ && test -f "/app/node_modules/@napi-rs/canvas-linux-${NODE_CPU}-gnu/package.json" \
+ && echo "native canvas binding installed for linux/${NODE_CPU} (target ${TARGETOS}/${TARGETARCH})"
+COPY --from=deps /build/node_modules/@fontsource/noto-sans-arabic ./node_modules/@fontsource/noto-sans-arabic
+COPY --from=deps /build/node_modules/pako ./node_modules/pako
+COPY --from=deps /build/node_modules/tslib ./node_modules/tslib
+
+COPY --from=builder /build/dist/executor-child.js ./dist/executor-child.js
+COPY --from=builder /build/package.json ./package.json
+COPY scripts/verify-executor-artifact.mjs ./dist/verify-executor-artifact.mjs
+
+# The work directory is the only writable path, and it is a tmpfs at run time. Creating it here
+# with the executor's ownership means the container does not need to be root to start.
+RUN mkdir -p /work && chown -R executor:executor /work /app
+WORKDIR /work
+
+# A start-up assertion that fails the build if the closure is incomplete.
+#
+# This runs as `executor`, so it also proves the identity can read every path the executor
+# needs — which a root-time check would not. `--self-check` inside it forces the three lazy
+# engine imports, so a missing font or a wrong-libc native binary fails the build instead of the
+# first document.
+USER executor
+RUN node /app/dist/verify-executor-artifact.mjs /app
+
+# Fixed entrypoint. The fd-3 protocol is the only way data leaves this process; stdout and
+# stderr stay diagnostic.
+ENTRYPOINT ["node", "/app/dist/executor-child.js"]

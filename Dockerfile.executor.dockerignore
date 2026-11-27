@@ -1,0 +1,53 @@
+# Build context for Dockerfile.executor.
+#
+# Narrow on purpose. Every file listed here is *sent to the daemon* as build context, so an
+# over-broad context ships source, test fixtures and environment files to the builder even when
+# the Dockerfile never copies them.
+#
+# The executor needs the lockfile, the PDF sources, the build script and tsconfig. It does not
+# need the application, the database schema, the tests, the docs, or any environment file.
+
+# Never. Secrets, and anything that could carry one.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# VCS and CI — large, and irrelevant to the build.
+.git
+.github
+.gitignore
+
+# Application surface the executor must not contain.
+src/app
+src/components
+src/lib/agent
+src/lib/auth
+src/lib/billing
+src/lib/db
+src/lib/jobs
+src/lib/queue
+src/lib/storage
+src/lib/uploads
+src/lib/retention
+src/lib/workflows
+src/lib/public-api
+prisma
+workers
+
+# Everything that is not a build input.
+test
+test-results
+coverage
+docs
+tmp
+node_modules
+.next
+dist
+build
+*.md
+!README.md
+Dockerfile
+Dockerfile.*
+docker-compose*.yml

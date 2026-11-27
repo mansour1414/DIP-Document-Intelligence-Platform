@@ -13,14 +13,47 @@ import { withTenant, withTenantScope } from "@/lib/db/tenant";
 import { isAuthorizedFileStorageAccess } from "@/lib/storage/metadata";
 import { isUnrecoverableAiQueueError, toAiQueueError } from "@/lib/ai/gateway/retry";
 import { isUnrecoverableQueueError, toDocumentQueueError } from "@/lib/jobs/queue-errors";
+import { classifyFailedEvent, retryTransitionTarget } from "@/lib/jobs/payload-lifecycle";
+import { purgeFormFields } from "@/lib/pdf/form-payload";
+import { verifyFormWorkerStartup } from "@/lib/pdf/form-worker";
 import { processDocumentJob } from "@/lib/jobs/document-pipeline";
+
+/**
+ * Verify the bounded PDF child at **startup**, not on the first Fill Forms job.
+ *
+ * This worker cannot do Fill Forms without the child, so a deployment that is missing
+ * any part of its launch inputs is misbuilt. Checking here turns that into one
+ * attributable boot-time signal instead of a per-request `WORKER_CRASHED` that looks
+ * like a document-specific failure. The message is sanitized by the verifier and names
+ * the missing input, never a document.
+ */
+const formWorkerReadiness = verifyFormWorkerStartup();
+if (!formWorkerReadiness.ok) logger.error("pdf_worker.unavailable", { reason: formWorkerReadiness.reason, status: "degraded" });
 
 export const documentWorker = new Worker<QueuedJob>(JOB_QUEUE_NAME, async (message) => {
   recordMetric("queue_wait_ms", Math.max(0, Date.now() - message.timestamp), "ms", { tool_id: message.data.toolId, queue: "document" });
   // An infected output is deterministic, so it is escalated to an unrecoverable
   // queue error instead of burning the three configured attempts.
-  try { return await processDocumentJob(message.data); } catch (error) { throw toDocumentQueueError(error); }
+  // `attemptsMade` is BullMQ's count of attempts already started before this one;
+  // the pipeline needs it to tell a retry (keep the encrypted payload) from a
+  // final failure (purge it) — see FF-03 in `document-pipeline.ts`.
+  try { return await processDocumentJob(message.data, { attemptsMade: message.attemptsMade, maxAttempts: message.opts.attempts ?? 1 }); } catch (error) { throw toDocumentQueueError(error); }
 }, { connection: getQueueConnection(), concurrency: runtimeLimits.documentConcurrency, stalledInterval: runtimeLimits.stalledIntervalMs, maxStalledCount: runtimeLimits.maxStalledCount, lockDuration: Math.min(runtimeLimits.jobTimeoutMs, 10 * 60_000) });
+/**
+ * Destroy the encrypted payload of a job the queue has finished with.
+ *
+ * Best-effort and idempotent: the TTL is the backstop, but ordinary terminal
+ * cleanup must not rely on it (FF-03).
+ */
+async function purgeTerminalPayload(message: QueuedJob) {
+  if (!message.userId) return;
+  await withTenant({ userId: message.userId }, async (tx) => {
+    const job = await tx.job.findUnique({ where: { id: message.jobId }, select: { params: true } });
+    const reference = (job as { params?: { fieldsRef?: string } } | null)?.params?.fieldsRef;
+    if (reference) await purgeFormFields(reference).catch(() => undefined);
+  }).catch(() => undefined);
+}
+
 async function advanceWorkflow(message: QueuedJob) { if (message.workflowRunId && message.userId) await (await import("@/lib/workflows/service")).advanceWorkflowRun(message.workflowRunId, message.userId); }
 async function recordTerminalFailure(message: QueuedJob) {
   if (!message.userId) return;
@@ -36,11 +69,42 @@ documentWorker.on("failed", async (message, error) => {
   if (!message) return;
   // Unrecoverable errors are terminal on the first attempt: without this the job
   // would be parked in RETRYING with no retry ever scheduled.
-  const terminal = isUnrecoverableQueueError(error) || message.attemptsMade >= (message.opts.attempts ?? 1);
-  if (!terminal) {
+  // BullMQ has already incremented `attemptsMade` by the time this event fires
+  // (`job.js:510` increments inside `moveToFailed`, `worker.js:651` emits after),
+  // so this is the post-increment frame — not the processor-entry one.
+  const outcome = classifyFailedEvent({
+    attemptsMade: message.attemptsMade,
+    maxAttempts: message.opts.attempts ?? 1,
+    unrecoverable: isUnrecoverableQueueError(error),
+  });
+  if (!outcome.terminal) {
     recordMetric("retry_total", 1, "count", { tool_id: message.data.toolId, status: "retrying" });
-    if (message.data.userId) await withTenant({ userId: message.data.userId }, (tx) => tx.job.update({ where: { id: message.data.jobId }, data: { status: "RETRYING" } }));
-  } else { await recordTerminalFailure(message.data); await advanceWorkflow(message.data); }
+    if (message.data.userId) {
+      await withTenant({ userId: message.data.userId }, async (tx) => {
+        const current = await tx.job.findUnique({ where: { id: message.data.jobId }, select: { status: true } });
+        const target = current ? retryTransitionTarget((current as { status: string }).status) : undefined;
+        // FF-03 / architect round 2: a retry must never revive a job another actor
+        // already finished. `update()` here rewrote CANCELLED/EXPIRED/SUCCEEDED
+        // rows back to RETRYING; the write is now guarded on the same status set
+        // the decision was made from, so a concurrent terminal transition wins.
+        if (target) {
+          await tx.job.updateMany({
+            where: { id: message.data.jobId, status: { in: ["QUEUED", "RUNNING", "RETRYING", "FAILED"] } },
+            data: { status: target },
+          });
+        }
+      });
+    }
+  } else {
+    await recordTerminalFailure(message.data);
+    // A terminal failure is the last moment this job will ever be seen by the
+    // queue, so it is where the payload must go. Done here as well as in the
+    // pipeline: an `UnrecoverableError` is raised *after* the pipeline already
+    // recorded the failure, and the worker is the only actor that knows the queue
+    // will not retry.
+    await purgeTerminalPayload(message.data);
+    await advanceWorkflow(message.data);
+  }
 });
 documentWorker.on("stalled", () => recordMetric("stalled_jobs_total", 1, "count", { status: "stalled" }));
 documentWorker.on("error", (error) => { captureOperationalError(error, { worker: "document" }); logger.error("worker.error", { error: error.message }); });

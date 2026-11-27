@@ -99,6 +99,12 @@ export type SubmitInput = {
   toolId: string;
   file: Blob & { name?: string };
   options?: Record<string, string | number | boolean>;
+  /**
+   * Typed per-field values for tools with a dedicated payload parameter
+   * (`fill-forms`). Serialised as the `fields` multipart part, never folded into
+   * `options`: the server validates the object with `parseFieldsPayload()`.
+   */
+  fields?: Record<string, unknown>;
   /** Stable per selected file so a retried submit cannot create a second job. */
   idempotencyKey: string;
   correlationId?: string;
@@ -114,6 +120,7 @@ export async function submitServerToolJob(input: SubmitInput): Promise<SubmitRes
   const form = new FormData();
   form.append("files", input.file, input.file.name ?? "document");
   form.set("options", JSON.stringify(input.options ?? {}));
+  if (input.fields) form.set("fields", JSON.stringify(input.fields));
   const response = await fetchImpl(`/api/jobs/${input.toolId}`, {
     method: "POST",
     headers: { "Idempotency-Key": input.idempotencyKey, "X-Correlation-Id": correlationId },
@@ -211,6 +218,8 @@ export async function downloadServerToolOutput(input: DownloadInput): Promise<Do
 export type SubmissionRequest = {
   toolId: string;
   options?: Record<string, string | number | boolean>;
+  /** Per-field values; part of the fingerprint so an edit is a new operation. */
+  fields?: Record<string, unknown>;
   file: { name?: string; size?: number; lastModified?: number };
   /**
    * Opaque token generated once per file selection in this tab.
@@ -241,9 +250,11 @@ export type PendingSubmission = { key: string; fingerprint: string };
  */
 export function submissionFingerprint(request: SubmissionRequest) {
   const options = Object.keys(request.options ?? {}).sort().map((name) => [name, request.options?.[name]]);
+  const fields = Object.keys(request.fields ?? {}).sort().map((name) => [name, request.fields?.[name]]);
   return JSON.stringify({
     toolId: request.toolId,
     options,
+    ...(fields.length ? { fields } : {}),
     selection: request.selectionToken,
     file: { name: request.file.name ?? "", size: request.file.size ?? 0, lastModified: request.file.lastModified ?? 0 },
   });

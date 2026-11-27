@@ -9,7 +9,7 @@ import { deletePhase1Secret, PHASE1_SECRET_TTL_SECONDS, putPhase1Secret, takePha
 import { toolRegistry, workerToolIds, isPublicApiTool } from "@/lib/tools/registry";
 import { validateToolOptions } from "@/lib/tools/options";
 import { validateWorkflowDefinition } from "@/lib/workflows/validator";
-import { validateUpload } from "@/lib/uploads/validation";
+import { validateUploadBytes, validateUploadWithParse } from "@/lib/uploads/validation";
 import { parsePublicJobRequest } from "@/lib/public-api/jobs";
 import { redactLogContext } from "@/lib/logging";
 import { scrubSentryEvent } from "@/lib/observability/sentry-scrub";
@@ -19,6 +19,29 @@ class MemoryStore implements SecretStore {
   async set(key: string, value: string, ttl: number) { assert.equal(this.values.has(key), false); this.values.set(key, value); this.ttl = ttl; }
   async take(key: string) { const value = this.values.get(key) ?? null; this.values.delete(key); return value; }
   async delete(key: string) { this.deleted += this.values.delete(key) ? 1 : 0; }
+}
+
+/**
+ * Extract a balanced `{ … }` block whose opening brace the given pattern matches.
+ *
+ * Structural assertions must not depend on how a block happens to be wrapped:
+ * `finally { await x() }` and a multi-line body are the same guarantee. Counting
+ * braces is enough here because the regions involved contain no string literal
+ * with an unbalanced brace.
+ */
+function extractBlock(source: string, opening: RegExp): string | undefined {
+  const match = opening.exec(source);
+  if (!match) return undefined;
+  let depth = 1;
+  let index = match.index + match[0].length;
+  while (index < source.length) {
+    const character = source[index];
+    if (character === "{") depth += 1;
+    else if (character === "}") depth -= 1;
+    if (depth === 0) return source.slice(match.index, index + 1);
+    index += 1;
+  }
+  return undefined;
 }
 
 const key = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
@@ -50,12 +73,56 @@ test("security tools use v1 contracts, remain public/direct, and secret-bearing 
 
 test("persisted and queued job contracts carry only opaque secret references", () => {
   const orchestrator = readFileSync(new URL("../src/lib/jobs/orchestrator.ts", import.meta.url), "utf8"); const queue = readFileSync(new URL("../src/lib/queue/index.ts", import.meta.url), "utf8"); const worker = readFileSync(new URL("../workers/document-worker.ts", import.meta.url), "utf8"); const pipeline = readFileSync(new URL("../src/lib/jobs/document-pipeline.ts", import.meta.url), "utf8"); const publicJobs = readFileSync(new URL("../src/lib/public-api/jobs.ts", import.meta.url), "utf8"); const qpdf = readFileSync(new URL("../src/lib/pdf/qpdf.ts", import.meta.url), "utf8");
-  assert.match(orchestrator, /params:\s*\{ inputFileIds:[^}]+options,[^}]+secretRef/u); assert.doesNotMatch(orchestrator, /params:\s*\{[^}]*secrets/u); assert.doesNotMatch(queue, /password|secretRef|secrets/u);
+  // Only opaque references may be persisted. The previous assertion pinned the
+  // *order* of keys inside the params literal (`options,` immediately followed by
+  // `secretRef`), which broke the moment a second reference (`fieldsRef`) was added
+  // between them — a false red that said nothing about security. The guarantee is
+  // order-independent, so it is asserted that way: every spread into `params` must
+  // be a `...Ref` reference, and no plaintext secret or field value may appear.
+  // Extract each `params: { ... }` literal with brace balancing, because the value
+  // itself contains braces: `...(fieldsRef ? { fieldsRef } : {})`.
+  const paramsLiterals: string[] = [];
+  for (const start of [...orchestrator.matchAll(/params:\s*\{/gu)].map((match) => match.index + match[0].length)) {
+    let depth = 1;
+    let index = start;
+    while (index < orchestrator.length && depth > 0) {
+      if (orchestrator[index] === "{") depth += 1;
+      else if (orchestrator[index] === "}") depth -= 1;
+      index += 1;
+    }
+    paramsLiterals.push(orchestrator.slice(start, index - 1));
+  }
+  assert.ok(paramsLiterals.length > 0, "the job params literal must exist");
+  for (const literal of paramsLiterals) {
+    const spreads = [...literal.matchAll(/\.\.\.\(?([A-Za-z]+)/gu)].map((match) => match[1]);
+    for (const spread of spreads) {
+      // `fieldsRef` / `secretRef` are opaque handles; `fields` / `secrets` are values.
+      assert.match(spread, /Ref$/u, `params may only spread opaque references, found "${spread}" in: ${literal.slice(0, 120)}`);
+    }
+  }
+  assert.doesNotMatch(orchestrator, /params:\s*\{[^}]*\bsecrets\b/u, "raw secrets must never be persisted");
+  // Raw field values and raw secrets share one rule: neither may be spread or
+  // assigned into `params`. Asserting on the spread names above already covers it,
+  // because a value would have to arrive as `...fields` or `fields:`.
+  assert.doesNotMatch(orchestrator, /params:\s*\{[^}]*\bfields\s*[,}]/u, "raw field values must never be persisted");
+  assert.doesNotMatch(queue, /password|secretRef|secrets/u);
   // Phase 1 secret cleanup now lives in the document pipeline module the worker runs.
   assert.match(worker, /processDocumentJob/, "the worker must delegate to the document pipeline");
-  assert.match(pipeline, /job\.status === "CANCELLED" \|\| job\.status === "EXPIRED"[^}]+deletePhase1Secret/u);
   assert.match(pipeline, /takePhase1Secret/);
-  assert.match(pipeline, /finally \{ await deletePhase1Secret/); assert.match(publicJobs, /cancelPublicJob[\s\S]+deletePhase1Secret\(cancelled\.secretRef\)/u); assert.match(qpdf, /spawn\([^,]+, \[`@\$\{argumentFile\}`\]/u); assert.match(qpdf, /--suppress-password-recovery/u); assert.doesNotMatch(qpdf, /--force-R6/u); assert.match(qpdf, /"--json=1", "--json-key=objects", "--decode-level=none", json/u); assert.doesNotMatch(qpdf, /--json-output=\$\{json\}/u); assert.match(qpdf, /shell:\s*false/u); assert.doesNotMatch(qpdf, /exec\(|execSync|shell:\s*true/u);
+  // Phase 1 cleanup: secrets must be deleted on every exit path, including failure.
+  //
+  // This used to be asserted as `/finally \{ await deletePhase1Secret/` — a
+  // *formatting* assertion that broke when the call moved onto its own line,
+  // which says nothing about whether cleanup actually runs. The guarantee is
+  // structural, so it is asserted that way: find the `finally` block, extract it
+  // with brace balancing, and require the deletion to happen inside it.
+  const finallyBlock = extractBlock(pipeline, /finally\s*\{/u);
+  assert.ok(finallyBlock, "the pipeline must have a `finally` block so cleanup survives failure");
+  assert.match(finallyBlock, /deletePhase1Secret\s*\(/u, "the finally block must delete the phase 1 secret, or a failed job leaves it live");
+  // Not bypassed: a terminal-path purge alone would leave the secret behind on a
+  // throw, because those branches run *before* the error propagates.
+  assert.match(pipeline, /job\.status === "CANCELLED" \|\| job\.status === "EXPIRED"/u);
+  assert.match(pipeline, /deletePhase1Secret\s*\(\s*rawParams\.secretRef\s*\)/u, "cleanup must target the job's own secret reference"); assert.match(publicJobs, /cancelPublicJob[\s\S]+deletePhase1Secret\(cancelled\.secretRef\)/u); assert.match(qpdf, /spawn\([^,]+, \[`@\$\{argumentFile\}`\]/u); assert.match(qpdf, /--suppress-password-recovery/u); assert.doesNotMatch(qpdf, /--force-R6/u); assert.match(qpdf, /"--json=1", "--json-key=objects", "--decode-level=none", json/u); assert.doesNotMatch(qpdf, /--json-output=\$\{json\}/u); assert.match(qpdf, /shell:\s*false/u); assert.doesNotMatch(qpdf, /exec\(|execSync|shell:\s*true/u);
 });
 
 test("Public API transports passwords outside options and excludes them from the request hash and observability", async () => {
@@ -65,8 +132,8 @@ test("Public API transports passwords outside options and excludes them from the
 });
 
 test("encrypted/repair preflight is scoped and normal PDF validation stays strict", async () => {
-  const malformed = new TextEncoder().encode("%PDF-1.7\nmalformed"); const unlock = await validateUpload({ toolId: "unlock-pdf", declaredMime: "application/pdf", bytes: malformed }); assert.equal(unlock.controlledWorkerPreflight, true); const repair = await validateUpload({ toolId: "repair-pdf", declaredMime: "application/pdf", bytes: malformed }); assert.equal(repair.controlledWorkerPreflight, true);
-  await assert.rejects(() => validateUpload({ toolId: "protect-pdf", declaredMime: "application/pdf", bytes: malformed }), { code: "PDF_INVALID" });
+  const malformed = new TextEncoder().encode("%PDF-1.7\nmalformed"); const unlock = await validateUploadBytes({ toolId: "unlock-pdf", declaredMime: "application/pdf", bytes: malformed }); assert.equal(unlock.controlledWorkerPreflight, true); const repair = await validateUploadBytes({ toolId: "repair-pdf", declaredMime: "application/pdf", bytes: malformed }); assert.equal(repair.controlledWorkerPreflight, true);
+  await assert.rejects(() => validateUploadWithParse({ toolId: "protect-pdf", declaredMime: "application/pdf", bytes: malformed }), { code: "PDF_INVALID" });
 });
 
 test("Extract Images emits decoded embedded PNGs, deduplicates, reports policy, and never renders pages", async () => {

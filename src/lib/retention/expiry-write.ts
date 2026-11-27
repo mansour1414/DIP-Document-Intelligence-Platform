@@ -39,9 +39,17 @@ export type ExpiryPlanTarget = {
   status: string;
 };
 
-/** Minimal surface of `prisma.job.updateMany`. */
+/**
+ * Minimal surface of `prisma.$transaction`.
+ *
+ * `updateMany` alone cannot answer the question this round has to answer: *which*
+ * rows were actually transitioned. A bare count cannot be mapped back to
+ * identifiers, and re-reading the candidate set afterwards re-introduces the very
+ * race the guard exists to prevent. The `returning`-style `updateManyAndReturn`
+ * does answer it, atomically, with the write itself.
+ */
 export type ExpiryWritePort = {
-  updateMany(args: {
+  updateManyAndReturn(args: {
     where: {
       id: { in: string[] };
       status: { in: readonly string[] };
@@ -49,7 +57,8 @@ export type ExpiryWritePort = {
       updatedAt: { lte: Date };
     };
     data: { status: "EXPIRED"; errorCode: string; completedAt: Date };
-  }): Promise<{ count: number }>;
+    select: { id: true; params: true };
+  }): Promise<Array<{ id: string; params: unknown }>>;
 };
 
 export type ApplyExpiryPlanInput = {
@@ -62,17 +71,34 @@ export type ApplyExpiryPlanInput = {
   errorCode?: string;
 };
 
+export type ExpiryWriteOutcome<TExpired> = {
+  /** Rows that were still expirable and were transitioned *by this write*. */
+  expired: TExpired[];
+  /**
+   * Candidates the guard correctly skipped because something else touched them
+   * during the sweep. Reported, never acted on.
+   */
+  skipped: number;
+};
+
 /**
  * Terminally expire the planned jobs, skipping any row that changed since the
- * sweep started.
+ * sweep started, and return **the rows this write actually transitioned**.
  *
- * Returns the number of rows actually expired, which may be lower than
- * `expireIds.length` when a job was claimed, cancelled or completed during the
- * sweep — that difference is the race being correctly lost, not an error.
+ * The distinction matters for anything that must follow the transition into
+ * `EXPIRED` — specifically the encrypted form payload, which has to be destroyed
+ * for jobs that expired and preserved for jobs that a worker claimed. The
+ * previous version read references from the *planned* set and purged after a
+ * count-only write, so a job that was claimed mid-sweep lost the payload its new
+ * attempt needed. Returning the transitioned rows from the same statement makes
+ * the purge follow the write instead of the plan.
+ *
+ * The optimistic `updatedAt` guard is unchanged: this is the same predicate,
+ * only observed through its result set.
  */
-export async function applyExpiryPlan(port: ExpiryWritePort, input: ApplyExpiryPlanInput): Promise<number> {
-  if (input.expireIds.length === 0) return 0;
-  const result = await port.updateMany({
+export async function applyExpiryPlan(port: ExpiryWritePort, input: ApplyExpiryPlanInput): Promise<ExpiryWriteOutcome<{ id: string; params: unknown }>> {
+  if (input.expireIds.length === 0) return { expired: [], skipped: 0 };
+  const expired = await port.updateManyAndReturn({
     where: {
       id: { in: [...input.expireIds] },
       status: { in: EXPIRABLE_STATUSES },
@@ -83,6 +109,7 @@ export async function applyExpiryPlan(port: ExpiryWritePort, input: ApplyExpiryP
       errorCode: input.errorCode ?? "JOB_EXPIRED",
       completedAt: input.completedAt,
     },
+    select: { id: true, params: true },
   });
-  return result.count;
+  return { expired, skipped: input.expireIds.length - expired.length };
 }

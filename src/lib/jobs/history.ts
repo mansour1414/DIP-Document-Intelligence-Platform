@@ -1,5 +1,13 @@
 import { randomUUID } from "crypto";
 import { db } from "@/lib/db";
 import { enforceJobCreation } from "@/lib/usage/enforcement";
-export async function beginJob(input:{userId:string;toolId:string;filename:string;size?:number;mimeType?:string;idempotencyKey:string}){await enforceJobCreation({userId:input.userId,toolId:input.toolId,idempotencyKey:input.idempotencyKey,files:[{size:input.size??0}]});const document=await db.document.create({data:{userId:input.userId,title:input.filename.slice(0,255),files:{create:{originalName:input.filename.slice(0,255),mimeType:input.mimeType??"application/pdf",size:BigInt(input.size??0),storageKey:`ephemeral/${randomUUID()}-${input.filename.slice(0,80)}`}}},select:{files:{select:{id:true}}}});return db.job.create({data:{toolId:input.toolId,idempotencyKey:input.idempotencyKey,requesterId:input.userId,inputFileId:document.files[0].id,status:"RUNNING",startedAt:new Date(),params:{}},select:{id:true}})}
+export async function beginJob(input:{userId:string;toolId:string;filename:string;size?:number;mimeType?:string;idempotencyKey:string}){const authorization=await enforceJobCreation({userId:input.userId,toolId:input.toolId,idempotencyKey:input.idempotencyKey,files:[{size:input.size??0}]});try{return await beginAuthorizedJob(input)}catch(error){
+  // A release is safe here, unlike in `createToolJob`: this path has no enqueue
+  // step, and `beginAuthorizedJob` returns only after `job.create` resolves, so a
+  // throw means no job row exists for the charge to pay for. (It may leave an
+  // orphaned document row, which is unrelated pre-existing behaviour and not a
+  // billing question.)
+  await authorization.charge?.release().catch(()=>undefined);
+  throw error}}
+async function beginAuthorizedJob(input:{userId:string;toolId:string;filename:string;size?:number;mimeType?:string;idempotencyKey:string}){const document=await db.document.create({data:{userId:input.userId,title:input.filename.slice(0,255),files:{create:{originalName:input.filename.slice(0,255),mimeType:input.mimeType??"application/pdf",size:BigInt(input.size??0),storageKey:`ephemeral/${randomUUID()}-${input.filename.slice(0,80)}`}}},select:{files:{select:{id:true}}}});return db.job.create({data:{toolId:input.toolId,idempotencyKey:input.idempotencyKey,requesterId:input.userId,inputFileId:document.files[0].id,status:"RUNNING",startedAt:new Date(),params:{}},select:{id:true}})}
 export async function finishJob(id:string,success:boolean,error?:string){return db.job.update({where:{id},data:{status:success?"SUCCEEDED":"FAILED",completedAt:new Date(),error:error?{message:error}:undefined}})}
