@@ -82,6 +82,14 @@ export type RequestSpec = {
   /** Declared body length and digest, reconciled by the supervisor against what it received. */
   bodyBytes: number;
   bodyDigest: string;
+  /**
+   * Metadata block length the supervisor declared at admission.
+   *
+   * The caller cannot parse the frame — it has no parser by design — so it cannot derive this.
+   * It is an independent expectation supplied before the execution started, and the commit must
+   * agree with it. Taking the value from the commit instead would make the comparison circular.
+   */
+  metaBytes: number;
   /** The execution identity the caller expects. Refusing a different one is the point. */
   executionId: string;
 };
@@ -223,7 +231,7 @@ export async function executeRequest(
       // slice of it, so a commit bound to the body would not describe what the supervisor sealed.
       resultDigest: sha256Hex(frameBytes),
       resultBytes: frameBytes.byteLength,
-      metaBytes: 0,
+      metaBytes: spec.metaBytes,
       bootId: message.context.bootId,
       supervisorInstance: message.context.supervisorInstance,
     },
@@ -261,8 +269,11 @@ async function withDeadline<T>(promise: Promise<T>, deadline: number, now: () =>
     return await Promise.race([
       promise,
       new Promise<never>((_, reject) => {
+        // Deliberately not `unref`'d. An unref'd timer does not keep the event loop alive, so a
+        // caller waiting on a supervisor that never responds would have its process exit before
+        // the timeout fired — the promise would never settle and the failure would be a silent
+        // hang rather than a `NOT_READY`. The timer is cleared in `finally`.
         timer = setTimeout(() => reject(new CallerError(code, "the supervisor did not invite a body in time")), remaining);
-        timer.unref();
       }),
     ]);
   } finally {
