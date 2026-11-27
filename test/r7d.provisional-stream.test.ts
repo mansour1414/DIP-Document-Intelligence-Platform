@@ -60,7 +60,8 @@ test("R7D.1-S-1: a fill result is forwarded chunk by chunk as it arrives", () =>
   assert.equal(done.outputBytes, 3000);
   assert.ok(seen.length > 1, "output must be forwarded incrementally, not as one blob");
   assert.equal(seen.reduce((a, b) => a + b, 0), 3000);
-  assert.equal(done.outputSha256, sha256Hex(output));
+  // resultDigest/resultBytes describe the complete frame (header + metadata block + output).
+  assert.equal(done.outputSha256, sha256Hex(bytes));
 });
 
 test("R7D.1-S-2: a result much larger than the reader's capacity is never retained", () => {
@@ -89,7 +90,8 @@ test("R7D.1-S-2: a result much larger than the reader's capacity is never retain
   const done = stream.finish();
   assert.equal(forwarded, total);
   assert.equal(done.outputBytes, total);
-  assert.equal(done.outputSha256, sha256Hex(output));
+  // resultDigest/resultBytes describe the complete frame (header + metadata block + output).
+  assert.equal(done.outputSha256, sha256Hex(bytes));
   assert.ok(peakBacklog <= CAP, `peak backlog ${peakBacklog} must stay within ${CAP}`);
 });
 
@@ -181,10 +183,11 @@ test("R7D.1-S-13: the running digest matches the digest of what has arrived so f
   const first = Buffer.alloc(1024, 9);
   const header = Buffer.from(frame(fillMeta(2048), undefined));
   stream.push(Buffer.concat([header, first]));
-  assert.equal(stream.digestSoFar(), sha256Hex(first));
+  // The running digest covers every frame byte so far: header + metadata block + output.
+  assert.equal(stream.digestSoFar(), sha256Hex(Buffer.concat([header, first])));
   // The checkpoint must not disturb the running hash.
   stream.push(Buffer.alloc(1024, 9));
-  assert.equal(stream.finish().outputSha256, sha256Hex(Buffer.alloc(2048, 9)));
+  assert.equal(stream.finish().outputSha256, sha256Hex(Buffer.concat([header, first, Buffer.alloc(1024, 9)])));
 });
 
 // ---------------------------------------------------------------------------------------
