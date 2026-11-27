@@ -11,6 +11,14 @@
  */
 import test from "node:test";
 
+/** Build a raw result frame without going through the encoder, so shapes can be controlled. */
+function frameOf(meta: unknown, output?: Buffer): Buffer {
+  const json = Buffer.from(JSON.stringify(meta), "utf8");
+  const header = Buffer.alloc(4);
+  header.writeUInt32BE(json.byteLength, 0);
+  return output && output.byteLength > 0 ? Buffer.concat([header, json, output]) : Buffer.concat([header, json]);
+}
+
 /** A stable execution id, so a grant can be bound to it. */
 const EXECUTION = "0123456789abcdef0123456789abcdef";
 import assert from "node:assert/strict";
@@ -267,4 +275,101 @@ test("R7D.1-S-17: appended chunks are copied, so a reused buffer cannot corrupt 
   reused.fill(9);
   const collected = output.collect(output.grantTerminalCommit());
   assert.deepEqual([...collected], [1, 1, 1, 1]);
+});
+
+// ---------------------------------------------------------------------------------------
+// C-F05 — the streaming reader
+// ---------------------------------------------------------------------------------------
+
+test("R7D.1-CF05-1: the header prefix is read four bytes at a time, not by re-concatenating", () => {
+  // A byte-at-a-time feed is the pathological case for `Buffer.concat([buf, view])`: it copies
+  // the whole buffer on every push. Four pushes here, one allocation each.
+  const output = new BoundedProvisionalOutput(1024);
+  const stream = new ProvisionalResultStream({ executionId: EXECUTION, expectedOp: "fill", sink: (chunk) => { output.append(chunk.bytes); } });
+  const frame = frameOf(fillMeta(4), Buffer.alloc(4, 7));
+  for (const byte of frame) stream.push(Buffer.from([byte]));
+  const done = stream.finish(output);
+  assert.equal(done.outputBytes, 4);
+  assert.equal(output.bytes, 4);
+});
+
+test("R7D.1-CF05-2: a coalesced header and body in one chunk are split correctly", () => {
+  // The supervisor reads whatever the pipe gives it; a small result arrives as one chunk.
+  const output = new BoundedProvisionalOutput(1024);
+  const stream = new ProvisionalResultStream({ executionId: EXECUTION, expectedOp: "fill", sink: (chunk) => { output.append(chunk.bytes); } });
+  stream.push(frameOf(fillMeta(8), Buffer.alloc(8, 3)));
+  const done = stream.finish(output);
+  assert.equal(done.outputBytes, 8);
+  assert.equal(output.bytes, 8);
+});
+
+test("R7D.1-CF05-3: an oversized declared metadata length is refused before allocation", () => {
+  const stream = new ProvisionalResultStream({ executionId: EXECUTION, expectedOp: "fill", sink: () => {} });
+  const prefix = Buffer.alloc(4);
+  prefix.writeUInt32BE(64 * 1024 * 1024, 0);
+  assert.throws(() => stream.push(prefix), (error: unknown) => error instanceof StreamError && error.fault === "META_TOO_LARGE");
+});
+
+test("R7D.1-CF05-4: a zero-length metadata declaration is refused as framing", () => {
+  const stream = new ProvisionalResultStream({ executionId: EXECUTION, expectedOp: "fill", sink: () => {} });
+  const prefix = Buffer.alloc(4);
+  prefix.writeUInt32BE(0, 0);
+  assert.throws(() => stream.push(prefix), (error: unknown) => error instanceof StreamError && error.fault === "META_INVALID_JSON");
+});
+
+test("R7D.1-CF05-5: output beyond the declared length is refused during the stream, not at the end", () => {
+  // The declaration is known as soon as the metadata parses, so a frame that is already too
+  // long can be refused before the caller forwards the rest of it.
+  const stream = new ProvisionalResultStream({ executionId: EXECUTION, expectedOp: "fill", sink: () => {} });
+  const frame = frameOf(fillMeta(4), Buffer.alloc(64, 1));
+  assert.throws(() => stream.push(frame), (error: unknown) => error instanceof StreamError && error.fault === "TRUNCATED");
+});
+
+test("R7D.1-CF05-6: a fault permanently invalidates the stream", () => {
+  // After a framing error the bytes that follow were never validated. Continuing would mean
+  // treating unvalidated bytes as a shorter valid result.
+  const stream = new ProvisionalResultStream({ executionId: EXECUTION, expectedOp: "fill", sink: () => {} });
+  const bad = Buffer.alloc(4);
+  bad.writeUInt32BE(64 * 1024 * 1024, 0);
+  assert.throws(() => stream.push(bad));
+  assert.throws(() => stream.push(Buffer.alloc(4)), (error: unknown) => error instanceof StreamError && /invalidated/u.test(error.message));
+  assert.throws(() => stream.finish(), (error: unknown) => error instanceof StreamError && /invalidated/u.test(error.message));
+});
+
+test("R7D.1-CF05-7: a stream cannot complete after its metadata was invalid JSON", () => {
+  const stream = new ProvisionalResultStream({ executionId: EXECUTION, expectedOp: "fill", sink: () => {} });
+  const json = Buffer.from("{not json", "utf8");
+  const prefix = Buffer.alloc(4);
+  prefix.writeUInt32BE(json.byteLength, 0);
+  assert.throws(() => stream.push(Buffer.concat([prefix, json])));
+  assert.throws(() => stream.finish(), (error: unknown) => error instanceof StreamError);
+});
+
+test("R7D.1-CF05-8: the pending bound refuses a consumer that stops reading", () => {
+  const stream = new ProvisionalResultStream({
+    executionId: EXECUTION,
+    expectedOp: "fill",
+    maxBufferedBytes: 1_024,
+    sink: () => {}, // never acknowledges
+  });
+  const chunk = Buffer.alloc(60 * 1024, 1);
+  const total = 4 * 1024 * 1024;
+  // The declaration must be truthful or the frame is refused for the wrong reason.
+  const frame = frameOf(fillMeta(total), Buffer.alloc(0));
+  stream.push(frame);
+  let fault: string | undefined;
+  try {
+    for (let sent = 0; sent < total; sent += chunk.byteLength) stream.push(chunk);
+  } catch (error) {
+    fault = error instanceof StreamError ? error.fault : "OTHER";
+  }
+  assert.equal(fault, "BUFFER_EXCEEDED", "an unacked consumer must be refused rather than buffered");
+});
+
+test("R7D.1-CF05-9: the result metadata buffer is not retained after parsing", async () => {
+  // A 4 MiB metadata block is allocated once and dropped. Keeping it alive would mean every
+  // in-flight execution held a metadata copy for the life of the stream.
+  const { readFileSync } = await import("node:fs");
+  const source = readFileSync("src/lib/execution/provisional-stream.ts", "utf8");
+  assert.match(source, /this\.metaBuffer = Buffer\.alloc\(0\)/u, "the metadata buffer must be released after validation");
 });

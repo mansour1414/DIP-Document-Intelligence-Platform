@@ -143,8 +143,12 @@ export type TerminalCommitGrant = {
  */
 export class ProvisionalResultStream {
   private readonly options: ProvisionalStreamOptions;
-  private readonly header = Buffer.alloc(0);
-  private headerBuffer: Buffer = Buffer.alloc(0);
+  /** Which part of the frame the reader is in. Only two accumulate, and both are bounded. */
+  private phase: "HEADER_PREFIX" | "HEADER_BODY" | "BODY" = "HEADER_PREFIX";
+  private prefixBytes: Buffer = Buffer.alloc(0);
+  private metaLength = 0;
+  private metaFilled = 0;
+  private metaBuffer: Buffer = Buffer.alloc(0);
   private meta: Record<string, unknown> | null = null;
   private outputBytes = 0;
   private frameBytes = 0;
@@ -184,53 +188,114 @@ export class ProvisionalResultStream {
   /**
    * Feed bytes from the executor's stdout.
    *
-   * Throws `StreamError` on any fault. Once thrown the stream is dead and the caller must
-   * discard everything it emitted: a partially validated stream is not a shorter valid one.
+   * ## The state machine, and why it is not "concatenate and slice"
+   *
+   * The previous version did `this.headerBuffer = Buffer.concat([this.headerBuffer, view])` on
+   * every push. That is quadratic in the number of chunks, and it copies the whole buffer even
+   * when only four bytes are needed to learn the header length. More importantly it had no
+   * bound: a peer that sent an endless stream of bytes while declaring nothing would grow the
+   * header buffer without limit.
+   *
+   * The phases are explicit. Only `HEADER_PREFIX` and `HEADER_BODY` accumulate, and both are
+   * bounded by the control ceiling; `META` copies exactly the declared length and nothing more.
+   * A frame that declares 4 MiB of metadata allocates 4 MiB — not 4 MiB plus whatever was
+   * buffered before it was known.
+   *
+   * ## Faults are terminal
+   *
+   * Every throw sets `invalidated`. A stream that has produced a framing error has no valid
+   * continuation: the bytes after it were never validated and must not be treated as a shorter
+   * valid result. `push` refuses afterwards and `finish` refuses too, so no code path can
+   * accidentally complete a frame that already failed.
    */
   push(input: Buffer | Uint8Array): void {
-    if (this.ended) throw new StreamError("CLOSED", "the stream already ended");
+    if (this.ended) throw this.invalidate("CLOSED", "the stream already ended");
     if (this.invalidated) throw new StreamError("CLOSED", "the stream was invalidated by an earlier framing fault");
-    let view = Buffer.isBuffer(input) ? input : Buffer.from(input.buffer, input.byteOffset, input.byteLength);
+    const view = Buffer.isBuffer(input) ? input : Buffer.from(input.buffer, input.byteOffset, input.byteLength);
     this.frameBytes += view.byteLength;
+    // A single coalesced chunk may contain a header *and* a body, so the views advance through
+    // the input rather than being recursively fed back through `push`.
+    this.consume(view);
+  }
 
-    // ---- header regime -----------------------------------------------------------------
-    if (this.meta === null) {
-      this.headerBuffer = Buffer.concat([this.headerBuffer, view]);
-      if (this.headerBuffer.byteLength < 4) return;
-      const metaLength = this.headerBuffer.readUInt32BE(0);
+  /** Advance the state machine over one view, without recursion or re-copying. */
+  private consume(view: Buffer): void {
+    let offset = 0;
+
+    // ---- phase 1: the four-byte length prefix -----------------------------------------
+    if (this.phase === "HEADER_PREFIX") {
+      const need = 4 - this.prefixBytes.byteLength;
+      const take = Math.min(need, view.byteLength);
+      this.prefixBytes = Buffer.concat([this.prefixBytes, view.subarray(0, take)]);
+      offset = take;
+      if (this.prefixBytes.byteLength < 4) return;
+      const metaLength = this.prefixBytes.readUInt32BE(0);
+      if (metaLength === 0) throw this.invalidate("META_INVALID_JSON", "the result declares an empty metadata block");
       if (metaLength > WORKER_LIMITS.metaBytes) {
-        throw new StreamError("META_TOO_LARGE", `the result metadata declares ${metaLength} bytes`);
+        throw this.invalidate("META_TOO_LARGE", `the result metadata declares ${metaLength} bytes`);
       }
-      if (this.headerBuffer.byteLength < 4 + metaLength) return;
-      const metaBytes = this.headerBuffer.subarray(4, 4 + metaLength);
+      // The declared length is validated *before* anything is allocated for it.
+      this.metaLength = metaLength;
+      this.metaBuffer = Buffer.allocUnsafe(metaLength);
+      this.phase = "HEADER_BODY";
+    }
+
+    // ---- phase 2: exactly the declared metadata --------------------------------------
+    if (this.phase === "HEADER_BODY") {
+      const need = this.metaLength - this.metaFilled;
+      const take = Math.min(need, view.byteLength - offset);
+      view.copy(this.metaBuffer, this.metaFilled, offset, offset + take);
+      this.metaFilled += take;
+      offset += take;
+      if (this.metaFilled < this.metaLength) return;
+
       let parsed: unknown;
       try {
-        parsed = JSON.parse(metaBytes.toString("utf8"));
+        parsed = JSON.parse(this.metaBuffer.toString("utf8"));
       } catch {
-        throw new StreamError("META_INVALID_JSON", "the result metadata is not valid JSON");
+        throw this.invalidate("META_INVALID_JSON", "the result metadata is not valid JSON");
       }
       this.meta = this.validateMeta(parsed);
-      // Whatever follows the header is body.
-      view = Buffer.from(this.headerBuffer.subarray(4 + metaLength));
-      this.headerBuffer = Buffer.alloc(0);
-      if (view.byteLength === 0) return;
+      // The metadata buffer is dropped here; nothing needs it after validation.
+      this.metaBuffer = Buffer.alloc(0);
+      this.phase = "BODY";
     }
 
-    // ---- body regime -------------------------------------------------------------------
+    // ---- phase 3: body -----------------------------------------------------------------
+    if (offset >= view.byteLength) return;
+    const body = offset === 0 ? view : view.subarray(offset);
     const maxOutput = this.options.maxOutputBytes ?? 512 * 1024 * 1024;
-    if (this.outputBytes + view.byteLength > maxOutput) {
-      throw new StreamError("OUTPUT_TOO_LARGE", `output exceeds ${maxOutput} bytes`);
+    if (this.outputBytes + body.byteLength > maxOutput) {
+      throw this.invalidate("OUTPUT_TOO_LARGE", `output exceeds ${maxOutput} bytes`);
     }
-    if (this.pendingBytes + view.byteLength > this.maxBufferedBytes * 4) {
-      // The caller is not consuming. Refusing here is better than growing without bound in
-      // a process that is supposed to remain a thin pipe.
-      throw new StreamError("BUFFER_EXCEEDED", "the consumer is not keeping up with the result stream");
+    // The declared length is known once the metadata is parsed, so an over-long frame is
+    // refused as soon as it exceeds the declaration rather than only at `finish`.
+    if (this.declaredOutputBytes !== null && this.outputBytes + body.byteLength > this.declaredOutputBytes) {
+      throw this.invalidate("TRUNCATED", `the frame carried more than the declared ${this.declaredOutputBytes} output bytes`);
     }
-    this.hash.update(view);
-    this.outputBytes += view.byteLength;
-    this.pendingBytes += view.byteLength;
-    this.options.sink({ index: this.chunks, bytes: view });
+    if (this.pendingBytes + body.byteLength > this.maxBufferedBytes * 4) {
+      // The caller is not consuming. Refusing here is better than growing without bound in a
+      // process that is supposed to remain a thin pipe.
+      throw this.invalidate("BUFFER_EXCEEDED", "the consumer is not keeping up with the result stream");
+    }
+    this.hash.update(body);
+    this.outputBytes += body.byteLength;
+    this.pendingBytes += body.byteLength;
+    this.options.sink({ index: this.chunks, bytes: body });
     this.chunks += 1;
+  }
+
+  /**
+   * Record a terminal fault and return the error to throw.
+   *
+   * Every fault path routes through here so invalidation cannot be forgotten at one of them.
+   */
+  private invalidate(fault: StreamFault, message: string): StreamError {
+    this.invalidated = true;
+    // Release what was buffered: keeping it would defeat the bound it just violated.
+    this.metaBuffer = Buffer.alloc(0);
+    this.prefixBytes = Buffer.alloc(0);
+    return new StreamError(fault, message);
   }
 
   private validateMeta(parsed: unknown): Record<string, unknown> {
@@ -277,10 +342,23 @@ export class ProvisionalResultStream {
    */
   finish(seal?: BoundedProvisionalOutput): StreamCompletion {
     if (this.ended) throw new StreamError("CLOSED", "the stream already ended");
+    // A frame that already produced a framing fault can never be completed. Without this, a
+    // caller that caught the fault and carried on could publish a partial document.
+    if (this.invalidated) throw new StreamError("CLOSED", "the stream was invalidated by an earlier framing fault");
     this.ended = true;
     if (this.meta === null) {
       // The header never completed. Either the process died early or the frame is short.
       throw new StreamError("TRUNCATED", `the result frame ended after ${this.frameBytes} bytes without a complete header`);
+    }
+    // Trailing data past the declaration is a framing fault, not extra output. The body regime
+    // refuses it during `push` as soon as it exceeds the declaration; this catches the case
+    // where the frame ended exactly at the ceiling and the declaration was the shorter of the
+    // two numbers.
+    if (this.declaredOutputBytes !== null && this.outputBytes !== this.declaredOutputBytes) {
+      throw this.invalidate(
+        "TRUNCATED",
+        `the result declared ${this.declaredOutputBytes} output bytes and carried ${this.outputBytes}`,
+      );
     }
     // Re-validate against the real byte count. This is where a truncated or over-long frame
     // is caught, using the same function as the buffered decoder so the two cannot disagree.
@@ -382,6 +460,9 @@ export class BoundedProvisionalOutput {
 
   append(bytes: Uint8Array): void {
     if (this.discarded) throw new StreamError("CLOSED", "output was discarded");
+    // Sealed output is frozen. Appending after the digest was verified would let the bytes
+    // differ from what was authenticated while the grant still described the old content.
+    if (this.sealed !== null) throw new StreamError("CLOSED", "output was sealed and cannot accept more bytes");
     if (this.total + bytes.byteLength > this.cap) {
       throw new StreamError("OUTPUT_TOO_LARGE", `provisional output exceeds the caller's ${this.cap} byte cap`);
     }
