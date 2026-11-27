@@ -56,7 +56,20 @@ const emit = (event: Record<string, unknown>): void => {
   process.stdout.write(`${JSON.stringify(event)}\n`);
 };
 
-function main(): void {
+/**
+ * The seams a watchdog process needs from its host.
+ *
+ * The production entrypoint supplies none of them, so every fact is read from the real kernel. A
+ * test entrypoint may supply the cgroup fixtures it needs, as code, not as environment data.
+ */
+export type WatchdogSeams = {
+  cgroupMount?: () => string | null;
+  /** The `major:minor` device of an injected mount. Required with `cgroupMount`. */
+  cgroupMountDevice?: () => string | null;
+  actualCgroupPath?: (pid: number, mountPath: string) => { path: string; relative: string } | null;
+};
+
+export function main(seams: WatchdogSeams = {}): void {
   const socketPath = required("DIP_WATCHDOG_SOCKET");
   // Hex, not raw text. A shared key has to survive an environment variable, a unit file and a
   // secret store without one of them mangling a byte; and decoding it here means the bytes the
@@ -143,6 +156,10 @@ function main(): void {
     },
     // D2-F04: removal by exact id, so a stopped-but-present container's metadata can be discharged
     // rather than left owed forever. The id comes from the watchdog's own record.
+    // Present only when the entrypoint supplied them.
+    ...(seams.cgroupMount === undefined ? {} : { cgroupMount: seams.cgroupMount }),
+    ...(seams.cgroupMountDevice === undefined ? {} : { cgroupMountDevice: seams.cgroupMountDevice }),
+    ...(seams.actualCgroupPath === undefined ? {} : { actualCgroupPath: seams.actualCgroupPath }),
     removeContainer: async (containerId) => {
       const outcome = await removeContainerAsync(containerId);
       return outcome.ok ? { ok: true, detail: "removed" } : { ok: false, detail: outcome.fault };

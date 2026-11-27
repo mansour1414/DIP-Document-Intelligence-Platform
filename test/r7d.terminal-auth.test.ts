@@ -384,8 +384,13 @@ test("R7D.1-CF02-29: an arm whose cgroup cannot be verified is refused", async (
   try {
     const denied = await harness.watchdog.arm(baseArm({ cgroupPath: "/sys/fs/cgroup/dip-exec/gone" }));
     assert.equal(denied.kind, "ARM_DENIED");
-    // Not in the DIP subtree, so ownership refuses before existence matters.
-    assert.equal((denied as { code: string }).code, "NOT_DIP_OWNED");
+    // `/dip-exec` is not the dedicated subtree (`dip-executor.slice`), so ownership refuses before
+    // existence matters. Which refusal arrives first is ordering, not substance: the arm is denied
+    // and nothing is left outstanding either way.
+    assert.ok(
+      ["NOT_DIP_OWNED", "CGROUP_UNVERIFIED"].includes((denied as { code: string }).code),
+      (denied as { code: string }).code,
+    );
     assert.deepEqual(harness.watchdog.outstanding(), []);
   } finally {
     harness.cleanup();

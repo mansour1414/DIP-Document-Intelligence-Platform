@@ -43,6 +43,7 @@ import {
   type ExecutionPolicy,
 } from "./docker-lifecycle";
 import { findCgroup2Mount, readCgroupMembership, readProcessStartTimeTicks } from "./host-facts";
+import { readUptimeMs } from "./host-clock";
 import { OwnershipJournal, containerNameFor, newExecutionId, type SupervisorRecord } from "./ownership-journal";
 import { ProvisionalResultStream, BoundedProvisionalOutput, sha256Hex } from "./provisional-stream";
 import { verifyWatchdogGrant, signTerminalCommit, type CommitExpectation, type CommitResult } from "./terminal-commit";
@@ -411,7 +412,15 @@ export class SupervisorExecution {
 
     // The cgroup path is composed from the verified mount and the process's own membership. It is
     // never composed from a naming convention, and it is never asserted: it is read.
-    const cgroupPath = relative === "/" ? mount.path : `${mount.path}${relative}`;
+    //
+    // `/proc/<pid>/cgroup` reports the membership with a leading `/`, so a plain concatenation is
+    // correct for the kernel. It is *not* correct for every provider of this fact: a fixture may
+    // report `dip-executor.slice/...` without the slash, and concatenating then produced
+    // `<mount>dip-executor.slice/...` — a path that is outside the mount, so every arm was denied
+    // as foreign with no indication that the two halves had simply been joined badly.
+    const cgroupPath = relative === "/" || relative === ""
+      ? mount.path
+      : `${mount.path.replace(/\/$/u, "")}/${relative.replace(/^\//u, "")}`;
 
     // The session must be live: a preflight over a container whose streams have already closed is a
     // preflight of something that is about to be terminated.
@@ -494,8 +503,20 @@ export class SupervisorExecution {
       this.fail("ARM_REFUSED");
       throw new LifecycleError("ARM_REFUSED", "the arm ack carries no usable cgroup identity");
     }
-    // The deadline the watchdog armed must start when this supervisor's observation did, to within
-    // the exchange. A materially different start means the watchdog timed a different event.
+    // ## The armed instant, compared on a clock both processes share
+    //
+    // This compared `ack.armedAtMonotonicMs` against the supervisor's `startedMonotonicMs` and
+    // required them to agree within the deadline. Those were two clocks with two origins: the
+    // watchdog reads host uptime (`/proc/uptime`, shared by every process on the machine) because
+    // its deadline must survive its own restart, while the supervisor defaulted to
+    // `performance.now()`, which is relative to *this process's* start. The difference between them
+    // is the supervisor's uptime, so the check could only pass for a supervisor that had just
+    // booted; in any real deployment it refused every genuine arm. A same-origin test clock hid it
+    // completely.
+    //
+    // The fix is not a looser comparison but a shared one: the supervisor now reads the same host
+    // clock the watchdog does, by default, so "when this execution started" means the same thing on
+    // both sides. The tolerance remains the deadline, which is what absorbs the exchange's latency.
     if (Math.abs(ack.armedAtMonotonicMs - observation.startedMonotonicMs) > this.options.limits.deadlineMs) {
       this.fail("ARM_REFUSED");
       throw new LifecycleError("ARM_REFUSED", "the arm ack was armed outside this execution's window");
@@ -578,11 +599,28 @@ export class SupervisorExecution {
    * fault — framing, digest, length, timeout — the output is discarded here and never reaches a
    * caller.
    */
-  async collectResult(): Promise<{ bytes: number; digest: string }> {
+  async collectResult(options?: {
+    /**
+     * Called with each chunk as the stream validates it.
+     *
+     * ## Why this exists
+     *
+     * The result must reach the caller as it arrives, not as one retained frame. The supervisor is
+     * required not to buffer a complete PDF, and a 4 MiB result assembled in memory here would be
+     * exactly that regardless of how it is later sent. This sink is how the bytes travel: the
+     * stream validates framing, the sink forwards, and only the digest and length are retained.
+     *
+     * The sink reports backpressure by returning a promise; `collectResult` awaits it before
+     * reading more, so a slow caller slows the executor's drain rather than growing a queue in
+     * this process.
+     */
+    onChunk?: (chunk: Buffer) => void | Promise<void>;
+  }): Promise<{ bytes: number; digest: string }> {
     this.requirePhase("streaming", "INPUT_MISMATCH");
     const result = this.session?.result;
     if (result === undefined) throw new LifecycleError("RESULT_INVALID", "no result stream is attached");
-    const frameParts: Buffer[] = [];
+    // No frame buffer. `frameParts` used to hold every byte of the result so that
+    // `sealedFrame()` could return it whole; that is the buffering this contract forbids.
     this.frameBytes = null;
     this.output = new BoundedProvisionalOutput(this.options.limits.maxOutputBytes);
     const stream = new ProvisionalResultStream({
@@ -596,9 +634,10 @@ export class SupervisorExecution {
       for await (const chunk of result) {
         const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string);
         stream.push(buffer);
-        // The frame is retained only after the stream has accepted the bytes, so a fault can never
-        // leave a partial frame behind that a later step might mistake for a complete one.
-        frameParts.push(buffer);
+        // Forwarded only after the stream accepted the bytes, so a fault can never hand a caller a
+        // partial frame that it might mistake for a complete one. The await is the backpressure:
+        // the next read from the executor waits until the caller has taken this chunk.
+        if (options?.onChunk !== undefined) await options.onChunk(Buffer.from(buffer));
       }
       // ## The frame is reconciled against itself, not against an invented pair
       //
@@ -610,7 +649,14 @@ export class SupervisorExecution {
       // already reconciles the frame's header against the bytes it actually carried — that is the
       // declaration that means something, because the executor wrote it before it wrote the bytes.
       const completion = stream.finish();
-      this.frameBytes = Buffer.concat(frameParts);
+      // The facts, not the bytes: the frame length, the metadata length and the digest. These are
+      // what the commit binds, and none of them requires retaining the frame.
+      this.sealedCompletion = {
+        bytes: completion.outputBytes,
+        digest: completion.outputSha256,
+        frameBytes: completion.frameBytes,
+        metaBytes: metaLengthOf(completion.meta),
+      };
       this.output.seal(this.executionId, completion.outputSha256);
       this.transition("sealed");
       return { bytes: completion.outputBytes, digest: completion.outputSha256 };
@@ -791,9 +837,37 @@ export class SupervisorExecution {
    * produced it faults permanently on any framing error, so a frame returned here is one that
    * matched the declaration its author wrote before the bytes.
    */
-  sealedFrame(): Buffer {
-    if (this.frameBytes === null) throw new LifecycleError("RESULT_INVALID", "no result frame was retained");
-    return Buffer.from(this.frameBytes);
+  /**
+   * The identity of the result the stream validated, without any of its bytes.
+   *
+   * ## What replaced the whole frame
+   *
+   * `sealedFrame()` returned the entire result so a caller could send it in one message. That is
+   * precisely the buffering this contract forbids, and it was the *only* reason `collectResult`
+   * accumulated a copy of every chunk. Nothing downstream needs the bytes: the commit binds a
+   * length and a digest, and the bytes themselves have already gone to the caller as they were
+   * validated. This returns what is actually retained — the length and the digest the stream
+   * computed incrementally as it forwarded them.
+   */
+  sealedResult(): { bytes: number; digest: string } {
+    if (this.frameBytes !== null) {
+      // Only reachable from code that still retains a frame; kept so the change cannot silently
+      // resurrect buffering through a stale caller.
+      return { bytes: this.frameBytes.byteLength, digest: createHash("sha256").update(this.frameBytes).digest("hex") };
+    }
+    if (this.sealedCompletion === null) throw new LifecycleError("RESULT_INVALID", "no result was sealed");
+    return { bytes: this.sealedCompletion.frameBytes, digest: this.sealedCompletion.digest };
+  }
+
+  /**
+   * The metadata length the commit binds.
+   *
+   * Read from the validated completion rather than re-derived from a retained frame: the frame is
+   * gone by design, and the length is a fact the stream established while parsing it.
+   */
+  sealedMetaBytes(): number {
+    if (this.sealedCompletion === null) throw new LifecycleError("RESULT_INVALID", "no result was sealed");
+    return this.sealedCompletion.metaBytes;
   }
 
   /**
@@ -824,6 +898,8 @@ export class SupervisorExecution {
   private lastObservation: PreflightObservation | null = null;
   /** The monotonic instant the intent was recorded, which the deadline is measured from. */
   private startedMonotonicMs: number | null = null;
+  /** The validated result's facts. Never its bytes; see `sealedResult`. */
+  private sealedCompletion: { bytes: number; digest: string; frameBytes: number; metaBytes: number } | null = null;
 
   setObservation(observation: PreflightObservation): void {
     this.lastObservation = observation;
@@ -834,8 +910,15 @@ export class SupervisorExecution {
     return this.options.docker;
   }
 
+  /**
+   * The clock every deadline comparison uses.
+   *
+   * Defaults to host uptime rather than `performance.now()`: the watchdog arms deadlines against
+   * host uptime because they must outlive that process, and a supervisor measuring its own runtime
+   * cannot compare against those instants at all. One origin, both sides.
+   */
   private now(): number {
-    return this.options.monotonicMs?.() ?? Math.round(performance.now());
+    return this.options.monotonicMs?.() ?? readUptimeMs();
   }
 
   /**
@@ -968,7 +1051,23 @@ export class SupervisorExecution {
  * digest pattern, so a single call site that forgot this produced a write failure at exactly the
  * moment the container already existed — the least convenient place to discover it.
  */
+/**
+ * The metadata block length, from the validated metadata object.
+ *
+ * The frame carries the metadata as JSON; its length is what the commit binds. Re-serialising here
+ * is safe because the stream has already validated the object it produced, and the length is used
+ * only as a bound, never to re-read bytes.
+ */
+function metaLengthOf(meta: Record<string, unknown>): number {
+  return Buffer.byteLength(JSON.stringify(meta), "utf8");
+}
+
 function digestOf(reference: string): string {
+  // Two callers, two shapes, one field. The handler has already reduced a reference to its digest
+  // when it records intent; every later write site carries the full reference. Accepting both here
+  // — rather than at each call site — is what stops the invariant from being re-established
+  // correctly in some places and incorrectly in others, which is how the quarantine write failed.
+  if (/^sha256:[a-f0-9]{64}$/u.test(reference)) return reference;
   const at = reference.indexOf("@");
   if (at < 0) throw new LifecycleError("INTENT_NOT_DURABLE", "the policy image carries no digest");
   return reference.slice(at + 1);

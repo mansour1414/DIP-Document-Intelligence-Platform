@@ -207,7 +207,14 @@ export function matchOwnership(fields: InspectFields | null, expected: ExpectedO
   }
   // `ownershipLabels` derives `dip.image` as the digest after the `@`, so the comparison is against
   // the digest rather than the full reference.
-  const expectedImage = expected.imageDigest.slice(expected.imageDigest.indexOf("@") + 1);
+  //
+  // Callers differ on which they hold: the supervisor records and arms with the bare digest, while
+  // a journal record read back may carry the full reference. `indexOf("@")` is -1 for a bare
+  // digest, and `slice(0)` silently returned the whole string — so a container labelled with the
+  // correct digest was reported foreign whenever the expected value was already a digest. Both
+  // shapes are now normalised explicitly.
+  const at = expected.imageDigest.indexOf("@");
+  const expectedImage = at < 0 ? expected.imageDigest : expected.imageDigest.slice(at + 1);
   if (label("dip.image") !== expectedImage && label("dip.image") !== expected.imageDigest) {
     return { state: "present-foreign", reason: "image-mismatch", detail: "the container's image is not the pinned image" };
   }

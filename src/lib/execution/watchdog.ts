@@ -151,12 +151,36 @@ export const DIP_CGROUP_SUBTREE = "dip-executor.slice";
  * Exported and separately testable because it is the load-bearing part of arming: everything
  * after it assumes the identity is real.
  */
-export function verifyArmIdentity(request: ArmRequest, bootId: string): HostVerification {
+/**
+ * The host observations arming depends on.
+ *
+ * Defaulted to the real kernel so production is unchanged, and taken as a parameter so a caller can
+ * supply a fixture. Passing them explicitly is what makes the seam reachable: before this,
+ * `verifyArmIdentity` read the module-level `findCgroup2Mount`, so a watchdog configured with a
+ * mounted fixture still verified against `/sys/fs/cgroup` and denied every arm as foreign.
+ */
+export type HostEvidence = {
+  cgroup2Mount: () => { path: string; device: string } | null;
+  actualCgroupPath: (pid: number, mountPath: string) => { path: string; relative: string } | null;
+  startTimeTicks: (pid: number) => number;
+};
+
+export const realHostEvidence: HostEvidence = {
+  cgroup2Mount: findCgroup2Mount,
+  actualCgroupPath: (pid, mountPath) => actualCgroupPath(pid, mountPath),
+  startTimeTicks: readProcessStartTimeTicks,
+};
+
+export function verifyArmIdentity(
+  request: ArmRequest,
+  bootId: string,
+  evidence: HostEvidence = realHostEvidence,
+): HostVerification {
   // A request from a previous boot describes namespaces that no longer exist; arming it would
   // register a deadline against an inode number that now means something else.
   if (request.bootId !== bootId) return { ok: false, code: "BOOT_MISMATCH" };
 
-  const mount = findCgroup2Mount();
+  const mount = evidence.cgroup2Mount();
   if (mount === null) return { ok: false, code: "CGROUP_UNVERIFIED" };
 
   // WD-06: ownership before existence. A path outside the dedicated DIP subtree belongs to
@@ -201,7 +225,7 @@ export function verifyArmIdentity(request: ArmRequest, bootId: string): HostVeri
   // A PID alone is recycled; the start time is what makes the claim checkable.
   let startTime: number;
   try {
-    startTime = readProcessStartTimeTicks(request.initPid);
+    startTime = evidence.startTimeTicks(request.initPid);
   } catch {
     return { ok: false, code: "PID_UNVERIFIED" };
   }
@@ -212,7 +236,7 @@ export function verifyArmIdentity(request: ArmRequest, bootId: string): HostVeri
   // WD-F04: whole-component comparison, not a substring. The previous `includes` accepted a prefix,
   // so a process in `.../dip-exec-aaa…-sibling` satisfied a claim about `.../dip-exec-aaa…`, which
   // is exactly the unrelated-cgroup signal the requirement forbids.
-  const actual = actualCgroupPath(request.initPid, mount.path);
+  const actual = evidence.actualCgroupPath(request.initPid, mount.path);
   if (actual === null) return { ok: false, code: "PID_UNVERIFIED" };
   const expectedRelative = request.cgroupPath.slice(mount.path.length) || "/";
   if (!isExactMembership(actual.relative, expectedRelative)) return { ok: false, code: "PID_UNVERIFIED" };
@@ -289,6 +313,13 @@ export type WatchdogOptions = {
    * discovers the mount from `/proc/self/mountinfo`, and there is no option to skip verification.
    */
   cgroupMount?: () => string | null;
+  /**
+   * The `major:minor` device of an injected mount, which records carry as part of the cgroup's
+   * identity. Required alongside `cgroupMount`: a mount without its device cannot be pinned in a
+   * record that is checked later, and a fabricated device would make two different hierarchies
+   * indistinguishable.
+   */
+  cgroupMountDevice?: () => string | null;
   /**
    * Trusted supervisor intent, read from the journal. Used to corroborate ownership against a
    * record this watchdog did not write (WD-F04). Optional: without it, ownership rests on the
@@ -393,6 +424,33 @@ export class Watchdog {
   }
 
   /** The cgroup2 mount this watchdog verifies against. */
+  /**
+   * The host observations this instance verifies against.
+   *
+   * Only the two cgroup facts may be injected; the process start time always comes from the real
+   * `/proc`, because it can be read anywhere and mocking it would weaken the identity check rather
+   * than relocate its evidence.
+   */
+  private hostEvidence(): HostEvidence {
+    return {
+      // The real mount when none is configured, and the configured mount otherwise. The device is
+      // part of the mount's identity in every record that names it, so a configured mount must
+      // supply a real `major:minor`; the `device` option exists for exactly that and is never
+      // defaulted to a placeholder — a placeholder is indistinguishable from a measured device and
+      // was, briefly, written into durable records as the string "fixture".
+      cgroup2Mount: () => {
+        const configured = this.options.cgroupMount?.();
+        if (configured === null || configured === undefined) return findCgroup2Mount();
+        // A configured mount without a configured device cannot be described, and "cannot be
+        // described" is a refusal, not a fabricated identity.
+        const device = this.options.cgroupMountDevice?.() ?? null;
+        return device === null ? null : { path: configured, device };
+      },
+      actualCgroupPath: (pid, mountPath) => (this.options.actualCgroupPath ?? actualCgroupPath)(pid, mountPath),
+      startTimeTicks: readProcessStartTimeTicks,
+    };
+  }
+
   private cgroupMountPath(): string {
     return this.options.cgroupMount?.() ?? findCgroup2Mount()?.path ?? "/sys/fs/cgroup";
   }
@@ -547,7 +605,13 @@ export class Watchdog {
     // wearing the first one's identity.
     if (existing !== undefined) return deny("ALREADY_CONCLUDED");
 
-    const verified = (this.options.verifyHost ?? verifyArmIdentity)(request, this.options.identity.bootId);
+    // The evidence source is this instance's, so a watchdog configured with a fixture verifies
+    // against that fixture rather than against the module's default. `verifyHost` remains an
+    // override for tests that want to replace the verdict itself.
+    const verified = (this.options.verifyHost ?? ((rq: ArmRequest, boot: string) => verifyArmIdentity(rq, boot, this.hostEvidence())))(
+      request,
+      this.options.identity.bootId,
+    );
     if (!verified.ok) return deny(verified.code);
 
     const pinResult = this.pinCgroup(request.cgroupPath);

@@ -169,6 +169,15 @@ function supervisorEnv(env: Environment): Record<string, string> {
     DIP_CALLER_APP_SECRET: env.callerSecret,
     DIP_CALLER_WORKER_SECRET: env.workerSecret,
     DIP_SUPERVISOR_DEADLINE_MS: "60000",
+    // ## The trusted execution policy
+    //
+    // The supervisor now refuses to start without a digest-pinned executor image and a profile, and
+    // that refusal is correct: an unconfigured supervisor would run whatever image happened to be
+    // built last. These tests exercise admission, reconciliation and the socket handshake, none of
+    // which touch the daemon, so the values only have to be well-formed. The image is digest-pinned
+    // because `assertDigestPinnedImage` demands it, and `DIP_DOCKER_BIN` is pinned per-test.
+    DIP_EXECUTOR_IMAGE: `example.invalid/executor@sha256:${"a".repeat(64)}`,
+    DIP_EXECUTOR_PROFILE: "synthetic-r7d-v1",
   };
 }
 

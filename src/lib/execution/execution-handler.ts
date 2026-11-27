@@ -78,18 +78,52 @@ export type ExecutionOperation = "inspect" | "fill" | "verify";
  * and by then the container already exists.
  */
 export type ControlMetadata = {
-  /** The image to run. Digest-pinned; a tag is refused at intent time. */
+  /**
+   * The image the caller asks to run, digest-pinned.
+   *
+   * ## A request, not a decision
+   *
+   * The caller states which executor image it wants because that is a property of the work it is
+   * asking for. It does not decide the image: `TrustedExecutionPolicy` compares this against the
+   * single image the supervisor is configured to run, and a request for anything else is refused
+   * before the daemon is asked. Without that comparison the caller's authenticated string would
+   * *be* the policy, and any caller holding a valid key could run any digest-pinned image.
+   */
   image: string;
-  /** The profile id, which the watchdog compares against. */
+  /** The profile the caller expects. Compared against the trusted profile, never used directly. */
   profileId: string;
-  /** The cgroup parent the execution must be pinned to. */
+  /** The cgroup parent the caller believes the execution will run under. Advisory only. */
+  cgroupParent: string;
+};
+
+/**
+ * The execution policy the supervisor is configured with.
+ *
+ * ## Why this type exists
+ *
+ * Correction from independent review: image identity, cgroup parent, resource limits, security
+ * profiles and the execution policy must come exclusively from trusted supervisor configuration,
+ * never from authenticated caller metadata. Authenticating a field proves *who said it*, not that
+ * they had the authority to decide it.
+ *
+ * So the supervisor is configured once, from its own environment and constants, and the control
+ * block is reduced to a *request* that is compared against that configuration. A mismatch is a
+ * refusal, which is the only safe direction: there is no path by which a caller's string becomes
+ * the value the daemon is given.
+ */
+export type TrustedExecutionPolicy = {
+  /** The one digest-pinned image this supervisor may run. */
+  image: string;
+  /** The one profile id this supervisor runs. */
+  profileId: string;
+  /** The cgroup parent, from the dedicated-slice constant. */
   cgroupParent: string;
 };
 
 /** What one composed execution produced. Closed, because the caller branches on it. */
 export type ExecutionOutcome =
   /** A validated result and an authenticated commit. `frame` is what the commit describes. */
-  | { kind: "committed"; frame: Buffer; resultBytes: number; metaBytes: number; commitProof: string }
+  | { kind: "committed"; resultBytes: number; resultDigest: string; metaBytes: number; commitProof: string }
   /** Refused before any executor existed. Nothing to clean up, so the slot is released. */
   | { kind: "refused"; code: string; detail: string }
   /** Refused after an executor may have existed. The slot stays held until reconciliation. */
@@ -99,6 +133,8 @@ export type ComposeOptions = {
   session: AdmittedSession;
   execution: SupervisorExecution;
   control: ControlMetadata;
+  /** The supervisor's own policy. The control block is checked against this, never substituted for it. */
+  trusted: TrustedExecutionPolicy;
   /** The effective-state gate. Supplied by the caller so the policy lives in one place. */
   preflight: (observation: PreflightObservation) => PreflightVerdict;
   /** Bounds. `maxOutputBytes` is the only place a result is refused for size. */
@@ -124,6 +160,9 @@ export async function composeExecution(options: ComposeOptions): Promise<Executi
   // that the daemon pulls by floating tag.
   try {
     validateControl(options.control);
+    // And then the part that matters: the request must describe the policy this supervisor was
+    // configured with. A caller can ask; it cannot decide.
+    assertTrustedPolicy(options.control, options.trusted);
   } catch (error) {
     return { kind: "refused", code: refusalOf(error, "NOT_ADMITTED"), detail: messageOf(error) };
   }
@@ -132,7 +171,7 @@ export async function composeExecution(options: ComposeOptions): Promise<Executi
   //
   // Before the daemon is asked for anything. An unrecorded container is one recovery cannot find,
   // and a container recovery cannot find is one that may run forever.
-  const policy = buildPolicy(options.control, {
+  const policy = buildPolicy(options.trusted, {
     executionId: execution.executionId,
     bootId: execution.bootId,
     supervisorInstance: execution.supervisorInstance,
@@ -189,7 +228,21 @@ export async function composeExecution(options: ComposeOptions): Promise<Executi
     // The result frame is forwarded to the caller as it arrives, bounded, so the caller's own
     // decoder sees exactly what the executor wrote. Readiness was sent in step 9, so the caller's
     // result deadline is already running.
-    await execution.collectResult();
+    // ## 13. Provisional result chunks, forwarded as they validate
+    //
+    // The caller receives the executor's frame incrementally: `STREAM_CHUNK` per validated slice,
+    // then `STREAM_END` with the totals. Nothing here retains the frame — the supervisor holds only
+    // the digest and length, and the bytes have already passed to the caller by the time the commit
+    // is authorized. `send` is the transport's write; a `false` result is reported as a stall so a
+    // peer that stops reading slows the executor rather than growing a queue in this process.
+    await execution.collectResult({
+      onChunk: async (chunk) => {
+        session.send({ kind: "STREAM_CHUNK", data: chunk.toString("base64") });
+        // Yield to the event loop so the socket's buffer drains. The transport is a stream, and a
+        // tight loop writing megabytes would fill it faster than the peer can consume.
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      },
+    });
 
     // ## The real exit code, not the Docker CLI's
     //
@@ -210,13 +263,12 @@ export async function composeExecution(options: ComposeOptions): Promise<Executi
     //
     // `authorize` re-decides the deadline immediately before asking the watchdog, verifies the
     // grant's HMAC against its own record, and signs a commit the caller can verify independently.
-    const frame = execution.sealedFrame();
-    const metaBytes = frameMetaBytes(frame);
+    const sealed = execution.sealedResult();
     const terminal = await execution.authorize({
       requestId: execution.requestId,
-      resultBytes: frame.byteLength,
-      resultDigest: sha256Hex(frame),
-      metaBytes,
+      resultBytes: sealed.bytes,
+      resultDigest: sealed.digest,
+      metaBytes: execution.sealedMetaBytes(),
       outcome: "committed",
       // The nonce the caller was given with READY_FOR_BODY. It is already bound into the caller's
       // transcript, so a commit that reuses it can only be for this execution.
@@ -230,9 +282,9 @@ export async function composeExecution(options: ComposeOptions): Promise<Executi
     // resolved its lifecycle.
     return {
       kind: "committed",
-      frame,
-      resultBytes: frame.byteLength,
-      metaBytes,
+      resultBytes: sealed.bytes,
+      resultDigest: sealed.digest,
+      metaBytes: execution.sealedMetaBytes(),
       commitProof: terminal.message.proof,
     };
   } catch (error) {
@@ -244,6 +296,33 @@ export async function composeExecution(options: ComposeOptions): Promise<Executi
       // Nothing was created: the request is refused and the slot is genuinely free.
       : { kind: "refused", code, detail };
   }
+}
+
+/**
+ * Refuse a request that does not describe this supervisor's configured policy.
+ *
+ * ## Why equality, and not "the caller's choice is validated"
+ *
+ * Validating a caller-supplied image proves only that it is well-formed. Authenticating it proves
+ * only that the caller said it. Neither establishes that the caller had the authority to choose
+ * which code runs in an isolated executor. The supervisor has exactly one configured image and one
+ * configured profile, so the only acceptable request is one that names them; everything else is
+ * refused before any durable intent exists.
+ *
+ * The comparison is over the digest-pinned reference, so two spellings of the same image (a tag and
+ * a digest, or different registry aliases) are not interchangeable — the configured string is the
+ * only accepted string.
+ */
+export function assertTrustedPolicy(control: ControlMetadata, trusted: TrustedExecutionPolicy): void {
+  if (control.image !== trusted.image) {
+    throw new LifecycleError("NOT_ADMITTED", "the requested image is not the configured executor image");
+  }
+  if (control.profileId !== trusted.profileId) {
+    throw new LifecycleError("NOT_ADMITTED", "the requested profile is not the configured execution profile");
+  }
+  // The parent is not compared to the request: it is the watchdog's subtree, which the caller does
+  // not get a say in. `buildPolicy` takes it from `trusted` alone. The request's copy is advisory
+  // and is only checked for shape by `validateControl`.
 }
 
 /**
@@ -272,20 +351,21 @@ export function validateControl(control: ControlMetadata): void {
  * three authenticated fields reaches this, which is what stops a request from choosing its own
  * isolation profile.
  */
-function buildPolicy(control: ControlMetadata, identity: { executionId: string; bootId: string; supervisorInstance: string }): ExecutionPolicy {
+function buildPolicy(trusted: TrustedExecutionPolicy, identity: { executionId: string; bootId: string; supervisorInstance: string }): ExecutionPolicy {
   // The resource profile comes from the approved constant, not from the request. A caller chooses
   // the image and the profile *id*; it cannot choose a memory ceiling, a PID limit or a seccomp
   // profile, because none of those is on the wire in a form this code reads.
   return {
-    image: control.image,
+    // Every field below comes from trusted configuration or from this process's own identity.
+    // The caller's strings were compared in `assertTrustedPolicy` and appear nowhere here, so there
+    // is no expression in this file by which a request field could reach the daemon.
+    image: trusted.image,
     name: containerNameFor(identity.executionId),
     executionId: identity.executionId,
     bootId: identity.bootId,
     supervisorInstance: identity.supervisorInstance,
-    profileId: control.profileId,
-    // From the constant, never from the request: the parent must be the subtree the watchdog is
-    // allowed to signal in, and no caller gets to decide that.
-    cgroupParent: DEDICATED_CGROUP_SLICE,
+    profileId: trusted.profileId,
+    cgroupParent: trusted.cgroupParent,
     // Derived from the approved budget rather than restated, so the two cannot disagree.
     uid: 10001,
     gid: 10001,

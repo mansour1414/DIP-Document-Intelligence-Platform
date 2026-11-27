@@ -58,13 +58,15 @@ import { readBootId } from "../src/lib/execution/host-facts";
 import { OwnershipJournal } from "../src/lib/execution/ownership-journal";
 import { reconcile, admissionAllowed } from "../src/lib/execution/reconciliation";
 import { startRoleSockets } from "../src/lib/execution/role-sockets";
-import { composeExecution, type ControlMetadata } from "../src/lib/execution/execution-handler";
+import { composeExecution, type ControlMetadata, type TrustedExecutionPolicy } from "../src/lib/execution/execution-handler";
 import { SupervisorExecution } from "../src/lib/execution/supervisor";
 import { preflightContainer } from "../src/lib/execution/preflight";
 
 import { AuthenticatedWatchdogClient } from "../src/lib/execution/watchdog-client";
 import {
   SYNTHETIC_PROFILE,
+  DEDICATED_CGROUP_SLICE,
+  assertDigestPinnedImage,
   createContainerAsync,
   startContainerAttachedAsync,
   ownershipLabels,
@@ -126,7 +128,39 @@ function dockerSeam(): DockerSeam {
   };
 }
 
-async function main(): Promise<void> {
+/**
+ * The seams a supervisor process needs from its environment.
+ *
+ * ## Why the worker takes these as a parameter
+ *
+ * Everything below is either a fact about the host (the boot id) or a capability (the daemon, the
+ * watchdog channel). The production entrypoint supplies the real ones; a test entrypoint supplies
+ * a labelled substitute for exactly the capability it cannot obtain in the environment it runs in.
+ * There is no environment variable that switches a production process onto a fake path — the choice
+ * belongs to the *entrypoint*, which is code, not to the process environment, which is data.
+ */
+export type SupervisorSeams = {
+  /** The daemon. Real operations, by exact id. */
+  docker: DockerSeam;
+  /** Host kernel facts. Real `/proc` and `/sys` in production. */
+  hostFacts?: {
+    startTimeTicks: (pid: number) => number;
+    cgroupMembership: (pid: number) => string | null;
+    cgroup2Mount: () => { path: string; device: string } | null;
+  };
+};
+
+/**
+ * The production seams: the real daemon and the real kernel.
+ *
+ * Exported so a test entrypoint can build on them rather than reimplementing them — the daemon
+ * calls are the same whichever host facts are used.
+ */
+export function productionSeams(): SupervisorSeams {
+  return { docker: dockerSeam() };
+}
+
+export async function main(seams: SupervisorSeams = productionSeams()): Promise<void> {
   const root = required("DIP_SUPERVISOR_ROOT");
   const supervisorInstance = required("DIP_SUPERVISOR_INSTANCE");
   const bootId = process.env.DIP_SUPERVISOR_BOOT ?? readBootId();
@@ -142,6 +176,28 @@ async function main(): Promise<void> {
   // accepted as a fallback: silently accepting it would let a deployment keep one credential for
   // both roles while believing it had two.
   const callerSecrets = { app: hexSecret("DIP_CALLER_APP_SECRET"), worker: hexSecret("DIP_CALLER_WORKER_SECRET") };
+
+  // ── The trusted execution policy ────────────────────────────────────────────────────────────
+  //
+  // Configured once, here, from the supervisor's own environment. A caller *requests* an image and
+  // a profile; `assertTrustedPolicy` refuses anything that is not these exact values, and
+  // `buildPolicy` takes every field from this object. There is no path by which a field of the
+  // authenticated control block reaches the daemon.
+  //
+  // The image must be digest-pinned. `DIP_EXECUTOR_IMAGE` is required rather than defaulted: a
+  // default image would mean an unconfigured supervisor silently runs whatever was built last,
+  // which is exactly the drift the pinning is meant to prevent.
+  const trustedPolicy: TrustedExecutionPolicy = {
+    image: required("DIP_EXECUTOR_IMAGE").trim(),
+    profileId: required("DIP_EXECUTOR_PROFILE").trim(),
+    cgroupParent: DEDICATED_CGROUP_SLICE,
+  };
+  try {
+    assertDigestPinnedImage(trustedPolicy.image);
+  } catch (error) {
+    process.stderr.write(`FATAL: DIP_EXECUTOR_IMAGE is not usable: ${error instanceof Error ? error.message : String(error)}\n`);
+    process.exit(1);
+  }
   const deadlineMs = Number(process.env.DIP_SUPERVISOR_DEADLINE_MS ?? "120000");
   // ## Bounds, with hard ceilings
   //
@@ -204,7 +260,7 @@ async function main(): Promise<void> {
   //
   // Read-only over the journal, plus an exact-id inspection per record. The report decides whether
   // admission may start; it never authorizes a destructive action on its own.
-  const docker = dockerSeam();
+  const docker = seams.docker;
   let report: Awaited<ReturnType<typeof reconcile>>;
   try {
     report = await reconcile({
@@ -288,6 +344,8 @@ async function main(): Promise<void> {
           },
           docker,
           watchdog: watchdogClient,
+          // Only present when the entrypoint supplied it. A production process never does.
+          hostFacts: seams.hostFacts,
         },
       );
 
@@ -295,6 +353,7 @@ async function main(): Promise<void> {
         session,
         execution,
         control: session.controlBlock() as unknown as ControlMetadata,
+        trusted: trustedPolicy,
         preflight: (observation) => {
           // ## Two independent readings, one verdict
           //
@@ -338,9 +397,14 @@ async function main(): Promise<void> {
         return;
       }
 
-      // The result reaches the caller as the same frame the executor wrote, which its own decoder
-      // re-validates; the commit is what makes those bytes publishable.
-      session.send({ kind: "TERMINAL_COMMIT", message: outcome.frame.toString("base64"), proof: outcome.commitProof });
+      // ## The end of the stream, then the commit
+      //
+      // The bytes already left as `STREAM_CHUNK` frames while they were being validated, so the
+      // terminal message carries the *identity* of what was sent — its length and digest — rather
+      // than the bytes themselves. A caller reconciles what it received against these totals, and
+      // the commit is what makes the result publishable.
+      session.send({ kind: "STREAM_END", bytes: outcome.resultBytes, digest: outcome.resultDigest });
+      session.send({ kind: "TERMINAL_COMMIT", message: outcome.commitProof });
       session.release(true);
       emit({ event: "committed", executionId: session.executionId, resultBytes: outcome.resultBytes, metaBytes: outcome.metaBytes });
     },

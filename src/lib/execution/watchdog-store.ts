@@ -191,7 +191,18 @@ export function assertArmRecord(value: unknown): WatchdogArmRecord {
     profileId: text("profileId", /^[a-z0-9-]{4,64}$/u),
     initPid: int("initPid", 2),
     initStartTimeTicks: int("initStartTimeTicks", 0),
-    cgroupPath: text("cgroupPath", /^\/sys\/fs\/cgroup\/dip-executor\.slice\/[A-Za-z0-9._/-]+$/u),
+    // ## The durable record names a path, not a mount
+    //
+    // The absolute mount point is a property of the host, discovered at run time from
+    // `/proc/self/mountinfo`; `/sys/fs/cgroup` is the conventional location and not the only valid
+    // one. Pinning the literal here made a record unwritable on any host that mounts cgroup2
+    // elsewhere, and the failure surfaced as `DURABILITY_FAILED` at arm time — a durability
+    // problem that was really an address assumption.
+    //
+    // What the record must guarantee is that the path is absolute, traversal-free, and inside the
+    // dedicated subtree, because that is the boundary of what may be signalled. The mount itself is
+    // re-established and compared by the watchdog before any kill.
+    cgroupPath: text("cgroupPath", /^\/[A-Za-z0-9._/-]*\/dip-executor\.slice\/[A-Za-z0-9._/-]+$/u),
     cgroupDevice: text("cgroupDevice", /^\d+:\d+$/u),
     cgroupDirInode: int("cgroupDirInode", 1),
     cgroupEventsInode: int("cgroupEventsInode", 1),

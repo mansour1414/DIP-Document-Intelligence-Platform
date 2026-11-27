@@ -352,7 +352,19 @@ export function assertArmRequest(value: unknown): ArmRequest {
     profileId: text("profileId", /^[a-z0-9-]{4,64}$/u),
     initPid: int("initPid", 2),
     initStartTimeTicks: int("initStartTimeTicks", 0),
-    cgroupPath: text("cgroupPath", /^\/sys\/fs\/cgroup\/[A-Za-z0-9._/-]+$/u),
+    // ## Shape, not address
+    //
+    // The absolute mount point is a property of the *host*, not of the protocol: `/sys/fs/cgroup`
+    // is where a typical host mounts cgroup2, but a nested container, a test fixture or a
+    // differently-mounted host is equally valid, and the watchdog establishes the real mount itself
+    // from `/proc/self/mountinfo` before comparing anything. What the wire format must enforce is
+    // that the field is an absolute, traversal-free path of the right alphabet; whether it names a
+    // directory under the watchdog's mount is decided against that mount, not against a literal.
+    //
+    // Enforcing the literal here rejected every correct request on a host that mounts cgroup2
+    // anywhere else, and did so as `RESULT_INVALID` — a framing error, which is the most misleading
+    // possible description of "the path is fine, the host is unusual".
+    cgroupPath: text("cgroupPath", /^\/[A-Za-z0-9._/-]+$/u),
     deadlineMs: int("deadlineMs", 1),
     startedMonotonicMs: int("startedMonotonicMs", 0),
   };

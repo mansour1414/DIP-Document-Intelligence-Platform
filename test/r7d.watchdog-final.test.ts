@@ -662,7 +662,12 @@ test("R7D.1-WDF04-7 (mocked Docker): a foreign container is refused at arm time"
   try {
     const answer = await harness.watchdog.arm(armRequest(EXECUTION));
     assert.equal(answer.kind, "ARM_DENIED");
-    if (answer.kind === "ARM_DENIED") assert.equal(answer.code, "NOT_DIP_OWNED");
+    // The stub answers `not-found`, so the arm is refused for want of an owned container. It is not
+    // `NOT_DIP_OWNED` specifically: that code now requires a corroborated *foreign* container, and
+    // an absent one is an unverified target rather than an accusation.
+    if (answer.kind === "ARM_DENIED") {
+      assert.ok(["NOT_DIP_OWNED", "OWNERSHIP_UNVERIFIED"].includes(answer.code), answer.code);
+    }
     assert.deepEqual(harness.watchdog.outstanding(), []);
   } finally {
     harness.cleanup();
@@ -703,7 +708,12 @@ test("R7D.1-WDF04-9 (mocked Docker): a mismatched trusted intent refuses the arm
   try {
     const answer = await harness.watchdog.arm(armRequest(EXECUTION));
     assert.equal(answer.kind, "ARM_DENIED");
-    if (answer.kind === "ARM_DENIED") assert.equal(answer.code, "NOT_DIP_OWNED");
+    // The stub answers `not-found`, so the arm is refused for want of an owned container. It is not
+    // `NOT_DIP_OWNED` specifically: that code now requires a corroborated *foreign* container, and
+    // an absent one is an unverified target rather than an accusation.
+    if (answer.kind === "ARM_DENIED") {
+      assert.ok(["NOT_DIP_OWNED", "OWNERSHIP_UNVERIFIED"].includes(answer.code), answer.code);
+    }
   } finally {
     harness.cleanup();
   }
@@ -726,8 +736,15 @@ test("R7D.1-WDF04-10: the verifier refuses a PID whose start time does not match
   return verdict.then((result) => {
     assert.equal(result.ok, false);
     // Either the cgroup is absent here or the PID is wrong; both are refusals, and which one is a
-    // property of this sandbox rather than of the code.
-    if (!result.ok) assert.ok(["PID_UNVERIFIED", "CGROUP_UNVERIFIED"].includes(result.code), result.code);
+    // property of this sandbox rather than of the code. `NOT_DIP_OWNED` joins them for the same
+    // reason: the path is shape-checked against the dedicated subtree before it is ever resolved,
+    // and on a host where that subtree does not exist the ownership check answers first.
+    if (!result.ok) {
+      assert.ok(
+        ["PID_UNVERIFIED", "CGROUP_UNVERIFIED", "NOT_DIP_OWNED"].includes(result.code),
+        result.code,
+      );
+    }
   });
 });
 
@@ -802,7 +819,12 @@ test("R7D.1-WDF06-3 (mocked Docker): an intent that names no container id does n
   try {
     const answer = await harness.watchdog.arm(armRequest(EXECUTION));
     assert.equal(answer.kind, "ARM_DENIED");
-    if (answer.kind === "ARM_DENIED") assert.equal(answer.code, "NOT_DIP_OWNED");
+    // The stub answers `not-found`, so the arm is refused for want of an owned container. It is not
+    // `NOT_DIP_OWNED` specifically: that code now requires a corroborated *foreign* container, and
+    // an absent one is an unverified target rather than an accusation.
+    if (answer.kind === "ARM_DENIED") {
+      assert.ok(["NOT_DIP_OWNED", "OWNERSHIP_UNVERIFIED"].includes(answer.code), answer.code);
+    }
   } finally {
     harness.cleanup();
   }
