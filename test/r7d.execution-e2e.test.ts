@@ -49,7 +49,7 @@ import {
   type WorkerMetaV2,
   asVerifyMeta,
 } from "../src/lib/pdf/worker-protocol-v2";
-import { openRoleChannel, declareBody, requestWorkerReservation } from "../src/lib/execution/role-client";
+import { callSupervisor, openRoleChannel, declareBody, requestWorkerReservation } from "../src/lib/execution/role-client";
 import { executeRequest } from "../src/lib/execution/caller";
 import { createHash, randomBytes } from "node:crypto";
 import { Readable } from "node:stream";
@@ -310,6 +310,51 @@ test("R7D.1-D2E-2: a real worker runs Inspect, then Fill, then Verify, each with
     asVerifyMeta(verify.meta as unknown as WorkerMetaV2);
     assert.equal((verify.meta as { pages: number }).pages >= 1, true, "verify reports a page count");
     assert.equal(typeof (verify.meta as { widgets: number }).widgets, "number", "verify reports a widget count");
+  } finally {
+    await plane?.supervisor.stop();
+    await plane?.watchdog.stop();
+    env.cleanup();
+  }
+});
+
+test("R7D.1-D2E-9: callSupervisor binds one requestId to the channel and the commit", async () => {
+  // callSupervisor must generate the requestId once and reuse it for both the authenticated HELLO
+  // and the execution request. If it minted two different ids, the terminal commit (bound to the
+  // HELLO's authenticated requestId) would not verify against the spec's requestId.
+  const env = makeEnvironment();
+  let plane: Awaited<ReturnType<typeof startPlane>> | null = null;
+  try {
+    plane = await startPlane(env);
+    const pdf = await syntheticForm();
+    const reservation = await requestWorkerReservation({
+      socketPath: env.workerSocket,
+      secret: Buffer.from(env.secrets.worker, "hex"),
+      supervisorInstance: env.supervisorInstance,
+      bootId: BOOT_ID,
+      clientInstance: env.clientInstance,
+      operation: "inspect",
+      connectTimeoutMs: 1_000,
+    });
+    assert.equal(reservation.operation, "inspect");
+    const body = controlFrame({ op: "inspect" }, pdf);
+    const secret = Buffer.from(env.secrets.worker, "hex");
+    // No requestId: callSupervisor mints one and reuses it throughout.
+    const result = await callSupervisor({
+      socketPath: env.workerSocket,
+      role: "worker" as const,
+      operation: "inspect",
+      secret,
+      supervisorInstance: env.supervisorInstance,
+      bootId: BOOT_ID,
+      clientInstance: env.clientInstance,
+      reservationId: reservation.reservationId,
+      control: CONTROL,
+      body: Readable.from([body]),
+      bodyBytes: body.byteLength,
+      bodyDigest: createHash("sha256").update(body).digest("hex"),
+    });
+    assert.ok(Buffer.isBuffer(result.bytes) && result.bytes.byteLength > 0, "callSupervisor returns verified bytes");
+    assert.equal(result.digest.length, 64, "a digest is returned");
   } finally {
     await plane?.supervisor.stop();
     await plane?.watchdog.stop();

@@ -132,7 +132,11 @@ export type AdmissionState = {
    * have actually completed a handshake appear, and entries are reset when a reservation is issued
    * for `inspect` (the start of a new pipeline).
    */
-  callerSequence: Map<string, number>;
+  callerSequence: Map<string, { level: number; updatedAt: number }>;
+  /** Largest number of caller sequence entries the map may hold. */
+  callerSequenceCap: number;
+  /** Age after which a caller sequence entry expires and is swept. */
+  callerSequenceTtlMs: number;
   /** Execution ids whose lifecycle has not positively resolved. Nothing is admitted while non-empty. */
   unresolved: Set<string>;
 };
@@ -145,6 +149,8 @@ export function newAdmissionState(): AdmissionState {
     reservations: new Map(),
     reservationSequence: 0,
     callerSequence: new Map(),
+    callerSequenceCap: DEFAULT_CALLER_SEQUENCE_CAP,
+    callerSequenceTtlMs: DEFAULT_CALLER_SEQUENCE_TTL_MS,
     unresolved: new Set(),
   };
 }
@@ -167,6 +173,11 @@ export const WORKER_OPERATION_SEQUENCE = Object.freeze(["inspect", "fill", "veri
 
 /** How far a worker's operations may advance between reservations. */
 export type SequencePosition = { last: number };
+
+/** Default ceiling on the number of distinct callers tracked in the caller sequence map. */
+export const DEFAULT_CALLER_SEQUENCE_CAP = 1024;
+/** Default age after which a caller sequence entry expires and is swept. */
+export const DEFAULT_CALLER_SEQUENCE_TTL_MS = 5 * 60 * 1000;
 
 /**
  * Why a reservation was refused.
@@ -266,8 +277,13 @@ export function reserveForWorker(
  * Absent means "-1": nothing has been issued yet, so the caller may ask for `inspect` (position 0)
  * but not `fill`. A caller that has never inspected has no pipeline to continue.
  */
-export function sequenceFor(state: AdmissionState, callerIdentity: string): SequencePosition {
-  return { last: state.callerSequence.get(callerIdentity) ?? -1 };
+export function sequenceFor(
+  state: AdmissionState,
+  callerIdentity: string,
+  now: () => number = () => Date.now(),
+): SequencePosition {
+  sweepCallerSequence(state, now);
+  return { last: state.callerSequence.get(callerIdentity)?.level ?? -1 };
 }
 
 /**
@@ -276,11 +292,40 @@ export function sequenceFor(state: AdmissionState, callerIdentity: string): Sequ
  * Only advances. Issuing `inspect` again resets to 0, because that is what starting a new pipeline
  * looks like — a worker that finished one document and begins another. Anything else moves forward
  * by one, so the index always names the step actually reached.
+ *
+ * The map is globally bounded: adding a new caller at cap evicts the oldest entry first. Entries
+ * expire by TTL and are swept on every read and write.
  */
-export function advanceSequence(state: AdmissionState, callerIdentity: string, operation: IpcOperation): void {
+export function advanceSequence(
+  state: AdmissionState,
+  callerIdentity: string,
+  operation: IpcOperation,
+  now: () => number = () => Date.now(),
+): void {
+  sweepCallerSequence(state, now);
   const target = WORKER_OPERATION_SEQUENCE.indexOf(operation);
-  const current = state.callerSequence.get(callerIdentity) ?? -1;
-  state.callerSequence.set(callerIdentity, operation === "inspect" ? 0 : Math.max(current, target));
+  const current = state.callerSequence.get(callerIdentity)?.level ?? -1;
+  const level = operation === "inspect" ? 0 : Math.max(current, target);
+  if (!state.callerSequence.has(callerIdentity) && state.callerSequence.size >= state.callerSequenceCap) {
+    let oldest: string | null = null;
+    let oldestTime = Infinity;
+    for (const [identity, entry] of state.callerSequence) {
+      if (entry.updatedAt < oldestTime) {
+        oldestTime = entry.updatedAt;
+        oldest = identity;
+      }
+    }
+    if (oldest !== null) state.callerSequence.delete(oldest);
+  }
+  state.callerSequence.set(callerIdentity, { level, updatedAt: now() });
+}
+
+/** Remove expired caller-sequence entries so the map stays bounded without explicit removals. */
+function sweepCallerSequence(state: AdmissionState, now: () => number): void {
+  const deadline = now() - state.callerSequenceTtlMs;
+  for (const [identity, entry] of state.callerSequence) {
+    if (entry.updatedAt <= deadline) state.callerSequence.delete(identity);
+  }
 }
 
 /**
@@ -580,6 +625,10 @@ export type RoleServerOptions = {
   reservationIdleMs?: number;
   /** How many live reservations one authenticated caller may hold. */
   maxReservationsPerCaller?: number;
+  /** Largest number of caller-sequence entries the admission state may track. */
+  maxCallerSequenceEntries?: number;
+  /** Age after which a caller-sequence entry expires and is swept. */
+  callerSequenceTtlMs?: number;
   maxConnectionsPerRole?: number;
   log?: (line: string) => void;
 };
@@ -609,8 +658,14 @@ export type AdmittedSession = {
    * stream is already torn down.
    */
   send: (message: unknown) => Promise<void>;
-  /** Resolve admission. Called exactly once by the handler, with evidence. */
-  release: (resolved: boolean) => void;
+  /**
+   * Resolve admission. Called exactly once by the handler, with evidence.
+   *
+   * `committed` releases the slot and advances the caller's sequence. `refused` releases capacity
+   * (nothing was created) without advancing the sequence. `unresolved` retains the slot because a
+   * container may exist that this process cannot prove is gone.
+   */
+  release: (outcome: "committed" | "refused" | "unresolved") => void;
   /** Control messages after the handshake, in order. */
   control: AsyncIterable<Record<string, unknown>>;
   /**
@@ -667,6 +722,8 @@ export function newNonce(): string {
 export async function startRoleSockets(options: RoleServerOptions): Promise<RoleServer> {
   const state = newAdmissionState();
   const now = options.now ?? (() => Date.now());
+  state.callerSequenceCap = options.maxCallerSequenceEntries ?? DEFAULT_CALLER_SEQUENCE_CAP;
+  state.callerSequenceTtlMs = options.callerSequenceTtlMs ?? DEFAULT_CALLER_SEQUENCE_TTL_MS;
   const challenges = new ChallengeRegistry({ now });
   const servers: Server[] = [];
   /**
@@ -1125,16 +1182,22 @@ export async function startRoleSockets(options: RoleServerOptions): Promise<Role
           executionId: admitted.executionId,
           socket,
           send: (message) => send(message),
-          release: (resolved) => {
+          release: (outcome) => {
             if (admitted === null || admitted.released) return;
             admitted.released = true;
-            releaseResolved(state, admitted.executionId, resolved);
-            // A successful execution advances the caller's sequence: completing `inspect` authorizes
-            // `fill`, completing `fill` authorizes `verify`. Reservation issuance alone does not
-            // advance the sequence, so an issued-but-unused reservation never authorizes the next
-            // operation — the worker must actually execute and resolve the current step first.
-            if (resolved && admitted !== null) {
+            if (outcome === "committed") {
+              // A successful execution releases the slot and advances the caller's sequence:
+              // completing `inspect` authorizes `fill`, completing `fill` authorizes `verify`.
+              releaseResolved(state, admitted.executionId, true);
               advanceSequence(state, admitted.callerIdentity, admitted.operation);
+            } else if (outcome === "refused") {
+              // A refusal had no positive outcome, so the sequence does not advance. But nothing
+              // was created, so there is no orphan container to hold the slot for: release capacity.
+              releaseResolved(state, admitted.executionId, true);
+            } else {
+              // Unresolved or quarantined: a container may exist that this process cannot prove is
+              // gone, so the slot stays held and the id is recorded as an unresolved debt.
+              releaseResolved(state, admitted.executionId, false);
             }
             // The session is over once admission is resolved: the handler has read what it needs and
             // written what it owes. Closing here is what lets the handler's `finally` mean something

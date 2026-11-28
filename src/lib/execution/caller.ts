@@ -31,6 +31,7 @@ import {
 } from "./provisional-stream";
 import { verifyTerminalCommit, type CommitResult } from "./terminal-commit";
 import type { TerminalCommitMessage } from "./terminal-auth";
+import { WORKER_LIMITS } from "../pdf/worker-protocol";
 
 /** A bound the caller enforces on itself. Not a suggestion: exceeding it aborts. */
 export type CallerLimits = {
@@ -235,9 +236,17 @@ export async function executeRequest(
   // length prefix of the result frame the caller actually holds. It is not taken from the commit,
   // which would make the comparison circular.
   const metaBytes = frameBytes.readUInt32BE(0);
-  if (metaBytes > frameBytes.byteLength) {
+  // The metadata block starts at byte 4 (after the four-byte length prefix), so it must fit
+  // within the frame's body: metaBytes + 4 <= frameBytes.byteLength. It also must not exceed the
+  // metadata ceiling the supervisor enforces, so a caller can never be tricked into holding more
+  // metadata than the protocol allows.
+  if (metaBytes > frameBytes.byteLength - 4) {
     channel.cancel();
     throw new CallerError("RESULT_INVALID", "the result declares more metadata than the frame carries");
+  }
+  if (metaBytes > WORKER_LIMITS.metaBytes) {
+    channel.cancel();
+    throw new CallerError("RESULT_INVALID", `the result metadata declares ${metaBytes} bytes`);
   }
   const verified: CommitResult = verifyTerminalCommit(
     secret,

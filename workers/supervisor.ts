@@ -385,7 +385,7 @@ export async function main(seams: SupervisorSeams = productionSeams()): Promise<
         // `inspect` authorizes `fill`, completing `fill` authorizes `verify`, but a refusal does
         // not authorize anything.
         session.send({ kind: "REFUSED", code: "REJECTED" });
-        session.release(false);
+        session.release("refused");
         emit({ event: "refused", executionId: session.executionId, code: outcome.code, detail: outcome.detail });
         return;
       }
@@ -393,7 +393,7 @@ export async function main(seams: SupervisorSeams = productionSeams()): Promise<
         // A container may exist and this process cannot prove otherwise. The slot stays held; the
         // journal already names the container, so reconciliation owns the cleanup.
         session.send({ kind: "REFUSED", code: "REJECTED" });
-        session.release(false);
+        session.release("unresolved");
         emit({ event: "quarantined", executionId: session.executionId, code: outcome.code, detail: outcome.detail });
         return;
       }
@@ -406,7 +406,7 @@ export async function main(seams: SupervisorSeams = productionSeams()): Promise<
       // the commit is what makes the result publishable.
       session.send({ kind: "STREAM_END", bytes: outcome.resultBytes, digest: outcome.resultDigest });
       session.send({ kind: "TERMINAL_COMMIT", message: outcome.commitMessage });
-      session.release(true);
+      session.release("committed");
       emit({ event: "committed", executionId: session.executionId, resultBytes: outcome.resultBytes, metaBytes: outcome.metaBytes });
     },
     log: (line) => emit({ event: "log", line }),

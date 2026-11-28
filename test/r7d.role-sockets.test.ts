@@ -57,7 +57,7 @@ async function makeFixture(handler?: (session: AdmittedSession) => Promise<void>
     let bytes = 0;
     for await (const chunk of session.body) bytes += chunk.byteLength;
     session.send({ kind: "STREAM_END", bytes, digest: "0".repeat(64) });
-    session.release(true);
+    session.release("committed");
   });
   const server = await startRoleSockets({
     socketPaths: paths,
@@ -652,7 +652,7 @@ test("R7D.1-D2R-11: the connecting caller transport performs the full handshake 
       bytes += chunk.byteLength;
     }
     session.send({ kind: "STREAM_END", bytes, digest: "0".repeat(64) });
-    session.release(true);
+    session.release("committed");
   });
   try {
     const { callSupervisor, declareBody, openRoleChannel } = await import("../src/lib/execution/role-client");

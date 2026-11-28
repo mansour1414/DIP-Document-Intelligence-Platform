@@ -23,6 +23,7 @@ import {
   reserveForWorker,
   sequenceFor,
   WORKER_OPERATION_SEQUENCE,
+  DEFAULT_CALLER_SEQUENCE_TTL_MS,
 } from "../src/lib/execution/role-sockets";
 
 const LIMITS = { reservationTtlMs: 30_000, maxConnections: 8 };
@@ -297,4 +298,43 @@ test("R7D.1-RES-10: replaying a consumed reservation is refused", () => {
   }, 1_200, LIMITS);
   assert.equal(replay.ok, false);
   assert.equal((replay as { code: string }).code, "RESERVATION_REQUIRED");
+});
+
+test("R7D.1-SEQ-1: a caller sequence entry expires after the TTL", () => {
+  const state = newAdmissionState();
+  const now = () => 1_000;
+  advanceSequence(state, "worker-a", "inspect", now);
+  assert.equal(sequenceFor(state, "worker-a", now).last, 0);
+  // One tick past the TTL: the entry is swept and the caller is back at -1.
+  const expired = () => 1_000 + DEFAULT_CALLER_SEQUENCE_TTL_MS + 1;
+  assert.equal(sequenceFor(state, "worker-a", expired).last, -1);
+});
+
+test("R7D.1-SEQ-2: the caller sequence map is globally capped and evicts the oldest", () => {
+  const state = newAdmissionState();
+  state.callerSequenceCap = 2;
+  const now = () => 1_000;
+  advanceSequence(state, "a", "inspect", now);
+  advanceSequence(state, "b", "inspect", now);
+  assert.equal(state.callerSequence.size, 2);
+  // A third new caller evicts the oldest entry ("a"; ties keep the first inserted).
+  advanceSequence(state, "c", "inspect", now);
+  assert.equal(state.callerSequence.size, 2);
+  assert.equal(sequenceFor(state, "a", now).last, -1);
+  assert.equal(sequenceFor(state, "b", now).last, 0);
+  assert.equal(sequenceFor(state, "c", now).last, 0);
+});
+
+test("R7D.1-SEQ-3: refreshing an existing caller does not evict others", () => {
+  const state = newAdmissionState();
+  state.callerSequenceCap = 2;
+  const now = () => 1_000;
+  advanceSequence(state, "a", "inspect", now); // level 0
+  advanceSequence(state, "b", "fill", now);    // level 1, size reaches cap
+  // Updating "a" (already present) must not evict "b" just to make room: the sequence only
+  // advances, never retreats, and an in-place refresh consumes no extra slot.
+  advanceSequence(state, "a", "fill", now);
+  assert.equal(state.callerSequence.size, 2);
+  assert.equal(sequenceFor(state, "a", now).last, WORKER_OPERATION_SEQUENCE.indexOf("fill"));
+  assert.equal(sequenceFor(state, "b", now).last, WORKER_OPERATION_SEQUENCE.indexOf("fill"));
 });

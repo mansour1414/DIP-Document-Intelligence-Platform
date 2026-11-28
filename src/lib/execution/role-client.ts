@@ -732,20 +732,29 @@ function optionsBodyDigest(options: RoleClientOptions): string {
  * call; nothing above it is needed to use it.
  */
 export async function callSupervisor(options: RoleClientOptions & {
-  spec: Omit<RequestSpec, "executionId">;
+  /** Carried for interface symmetry; the request spec is built from the top-level fields above. */
+  spec?: Omit<RequestSpec, "executionId">;
   body: Readable;
   bodyBytes: number;
   bodyDigest: string;
   limits?: Partial<CallerLimits>;
 }): Promise<CallerResult> {
-  declareBody(options, { length: options.bodyBytes, sha256: options.bodyDigest });
-  const session = await openRoleChannel(options);
+  // Generate the requestId once and bind it to both the authenticated channel and the request spec,
+  // so the HELLO's authenticated requestId and the execution request's requestId are identical.
+  const requestId = options.requestId ?? newNonce().slice(0, 32);
+  // `openRoleChannel` reads the declared body length/digest from the exact object it receives
+  // (keyed by object identity in a WeakMap), so declare the body on that same object. Declaring it
+  // on the caller's `options` and then spreading a copy would lose the binding, and the HELLO
+  // would declare an empty body while the real one is sent.
+  const channelOptions = { ...options, requestId };
+  declareBody(channelOptions, { length: options.bodyBytes, sha256: options.bodyDigest });
+  const session = await openRoleChannel(channelOptions);
   try {
     const executionId = await session.executionId;
     return await executeRequest(
       session.channel,
       {
-        requestId: options.requestId ?? newNonce().slice(0, 32),
+        requestId,
         operation: options.operation,
         role: options.role,
         bodyBytes: options.bodyBytes,
