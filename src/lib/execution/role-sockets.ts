@@ -137,6 +137,8 @@ export type AdmissionState = {
   callerSequenceCap: number;
   /** Age after which a caller sequence entry expires and is swept. */
   callerSequenceTtlMs: number;
+  /** Global ceiling on live reservations across all callers. */
+  maxReservations: number;
   /** Execution ids whose lifecycle has not positively resolved. Nothing is admitted while non-empty. */
   unresolved: Set<string>;
 };
@@ -151,6 +153,7 @@ export function newAdmissionState(): AdmissionState {
     callerSequence: new Map(),
     callerSequenceCap: DEFAULT_CALLER_SEQUENCE_CAP,
     callerSequenceTtlMs: DEFAULT_CALLER_SEQUENCE_TTL_MS,
+    maxReservations: DEFAULT_MAX_RESERVATIONS,
     unresolved: new Set(),
   };
 }
@@ -178,6 +181,8 @@ export type SequencePosition = { last: number };
 export const DEFAULT_CALLER_SEQUENCE_CAP = 1024;
 /** Default age after which a caller sequence entry expires and is swept. */
 export const DEFAULT_CALLER_SEQUENCE_TTL_MS = 5 * 60 * 1000;
+/** Default global ceiling on live reservations across all callers. */
+export const DEFAULT_MAX_RESERVATIONS = 256;
 
 /**
  * Why a reservation was refused.
@@ -190,6 +195,8 @@ export type ReservationRefusal =
   | "OUT_OF_SEQUENCE"
   /** The worker already holds as many reservations as it may. */
   | "RESERVATION_LIMIT"
+  /** The supervisor is at its global reservation ceiling; no slot can be promised right now. */
+  | "RESERVATION_GLOBAL_LIMIT"
   /** The supervisor is at capacity; a reservation would promise a slot it cannot deliver. */
   | "BUSY";
 
@@ -227,6 +234,7 @@ export function reserveForWorker(
     ttlMs: number;
     idleMs: number;
     maxPerCaller: number;
+    maxReservations: number;
   },
 ): ReservationGrant {
   // Sweep first, so an expired reservation does not consume the caller's allowance. Sweeping on
@@ -247,6 +255,12 @@ export function reserveForWorker(
   // occupied would let a worker queue up authority it cannot exercise, and would make "BUSY" arrive
   // at admission time, after the caller had already prepared a document.
   if (state.activeExecution !== null || state.unresolved.size > 0) return { ok: false, code: "BUSY" };
+
+  // Global ceiling: a flood of distinct callers must not exhaust the reservation map. Swept,
+  // expired entries no longer count, so the bound is on live reservations only.
+  if (state.reservations.size >= state.maxReservations) {
+    return { ok: false, code: "RESERVATION_GLOBAL_LIMIT" };
+  }
 
   let held = 0;
   for (const record of state.reservations.values()) {
@@ -444,6 +458,15 @@ export function admit(
       state.reservations.delete(reservationId);
       return { ok: false, code: "RESERVATION_INVALID" };
     }
+    // Revalidate sequence authority at admission: the sequence may have advanced since the
+    // reservation was issued (another execution for this caller resolved), which would supersede
+    // this reservation. An expired or superseded sequence must not authorize an execution.
+    const target = WORKER_OPERATION_SEQUENCE.indexOf(reservation.operation);
+    const position = sequenceFor(state, callerIdentity, () => now);
+    if (target < position.last) {
+      state.reservations.delete(reservationId);
+      return { ok: false, code: "RESERVATION_INVALID" };
+    }
     // The reservation belongs to the caller it was issued to. Without this, an id observed on the
     // wire is a capability any authenticated worker could present.
     if (reservation.callerIdentity === "" || reservation.callerIdentity !== callerIdentity) {
@@ -625,6 +648,8 @@ export type RoleServerOptions = {
   reservationIdleMs?: number;
   /** How many live reservations one authenticated caller may hold. */
   maxReservationsPerCaller?: number;
+  /** Global ceiling on live reservations across all callers, so a flood cannot exhaust the map. */
+  maxReservations?: number;
   /** Largest number of caller-sequence entries the admission state may track. */
   maxCallerSequenceEntries?: number;
   /** Age after which a caller-sequence entry expires and is swept. */
@@ -724,6 +749,7 @@ export async function startRoleSockets(options: RoleServerOptions): Promise<Role
   const now = options.now ?? (() => Date.now());
   state.callerSequenceCap = options.maxCallerSequenceEntries ?? DEFAULT_CALLER_SEQUENCE_CAP;
   state.callerSequenceTtlMs = options.callerSequenceTtlMs ?? DEFAULT_CALLER_SEQUENCE_TTL_MS;
+  state.maxReservations = options.maxReservations ?? DEFAULT_MAX_RESERVATIONS;
   const challenges = new ChallengeRegistry({ now });
   const servers: Server[] = [];
   /**
@@ -757,6 +783,7 @@ export async function startRoleSockets(options: RoleServerOptions): Promise<Role
         released: boolean;
         callerIdentity: string;
         operation: IpcOperation;
+        role: IpcRole;
       } | null = null;
       /** The nonce sent with READY_FOR_BODY. Empty until the gate opens. */
       let readyNonce = "";
@@ -1101,6 +1128,7 @@ export async function startRoleSockets(options: RoleServerOptions): Promise<Role
                 ttlMs: options.reservationTtlMs ?? 30_000,
                 idleMs: options.reservationIdleMs ?? 10_000,
                 maxPerCaller: options.maxReservationsPerCaller ?? 2,
+                maxReservations: state.maxReservations,
               });
               if (!grant.ok) {
                 post({ kind: "RESERVATION_REFUSED", code: grant.code } satisfies ServerReservationRefused);
@@ -1148,6 +1176,7 @@ export async function startRoleSockets(options: RoleServerOptions): Promise<Role
               released: false,
               callerIdentity: hello.clientInstance,
               operation: hello.operation,
+              role,
             };
             state.connections.set(role, (state.connections.get(role) ?? 0) + 1);
 
@@ -1188,8 +1217,12 @@ export async function startRoleSockets(options: RoleServerOptions): Promise<Role
             if (outcome === "committed") {
               // A successful execution releases the slot and advances the caller's sequence:
               // completing `inspect` authorizes `fill`, completing `fill` authorizes `verify`.
+              // Only a worker may advance the sequence: an app that successfully inspects must
+              // never authorize a worker to fill. Reservation issuance alone does not advance.
               releaseResolved(state, admitted.executionId, true);
-              advanceSequence(state, admitted.callerIdentity, admitted.operation);
+              if (admitted.role === "worker") {
+                advanceSequence(state, admitted.callerIdentity, admitted.operation);
+              }
             } else if (outcome === "refused") {
               // A refusal had no positive outcome, so the sequence does not advance. But nothing
               // was created, so there is no orphan container to hold the slot for: release capacity.

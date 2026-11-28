@@ -82,6 +82,8 @@ export type LifecycleRefusal =
   | "NOT_READY"
   | "INPUT_MISMATCH"
   | "RESULT_INVALID"
+  /** The executor exited cleanly but delivered an unsuccessful result frame. Not a commit. */
+  | "RESULT_NOT_SUCCESSFUL"
   | "TERMINATION_UNCONFIRMED"
   | "REMOVAL_UNCONFIRMED"
   | "COMMIT_REFUSED"
@@ -684,11 +686,15 @@ export class SupervisorExecution {
       const completion = stream.finish();
       // The facts, not the bytes: the frame length, the metadata length and the digest. These are
       // what the commit binds, and none of them requires retaining the frame.
+      // The discriminator tells whether the executor actually processed the document or
+      // delivered a refusal frame. A failure (`ok === false`) is not a successful result and
+      // must not be committed or advance the sequence.
       this.sealedCompletion = {
         bytes: completion.outputBytes,
         digest: completion.outputSha256,
         frameBytes: completion.frameBytes,
         metaBytes: metaLengthOf(completion.meta),
+        kind: completion.meta.ok === false ? "failure" : "success",
       };
       // The digest and lengths are the seal. There is no output object to seal, and inventing one
       // would be re-creating the retention this method exists to avoid.
@@ -906,6 +912,15 @@ export class SupervisorExecution {
   }
 
   /**
+   * Whether the validated result was a successful document result or an executor refusal frame.
+   * Only a success may be committed and advance the worker's sequence.
+   */
+  sealedResultKind(): "success" | "failure" {
+    if (this.sealedCompletion === null) throw new LifecycleError("RESULT_INVALID", "no result was sealed");
+    return this.sealedCompletion.kind;
+  }
+
+  /**
    * The executor's own exit code.
    *
    * ## Why the supervisor must be asked and not the Docker CLI
@@ -930,7 +945,7 @@ export class SupervisorExecution {
   /** The monotonic instant the intent was recorded, which the deadline is measured from. */
   private startedMonotonicMs: number | null = null;
   /** The validated result's facts. Never its bytes; see `sealedResult`. */
-  private sealedCompletion: { bytes: number; digest: string; frameBytes: number; metaBytes: number } | null = null;
+  private sealedCompletion: { bytes: number; digest: string; frameBytes: number; metaBytes: number; kind: "success" | "failure" } | null = null;
 
   setObservation(observation: PreflightObservation): void {
     this.lastObservation = observation;

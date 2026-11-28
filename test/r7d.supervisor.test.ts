@@ -18,7 +18,7 @@ import { connect } from "node:net";
 import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   SupervisorExecution,
   LifecycleError,
@@ -28,6 +28,13 @@ import {
   type SupervisorOptions,
 } from "../src/lib/execution/supervisor";
 import { preflightContainer, preflightKernel } from "../src/lib/execution/preflight";
+import {
+  composeExecution,
+  type ControlMetadata,
+  type ExecutionOutcome,
+  type TrustedExecutionPolicy,
+} from "../src/lib/execution/execution-handler";
+import type { AdmittedSession } from "../src/lib/execution/role-sockets";
 import {
   admit,
   advanceSequence,
@@ -533,6 +540,7 @@ function issueWorker(
     ttlMs: 30_000,
     idleMs: 30_000,
     maxPerCaller: 4,
+    maxReservations: state.maxReservations,
   });
   if (!grant.ok) throw new Error(`issuance refused: ${grant.code}`);
   advanceSequence(state, identity, operation);
@@ -774,6 +782,87 @@ test("R7D.1-SV-21: a result that does not match its declaration is discarded, no
       (error: unknown) => error instanceof LifecycleError,
     );
     assert.equal(execution.refusal, "RESULT_INVALID");
+  } finally {
+    cleanup();
+  }
+});
+
+test("R7D.1-SV-24: an executor failure result is refused, never committed", async () => {
+  // An executor that exits 0 but delivers a failure frame (`ok: false`) did not successfully
+  // process the document. Authenticated delivery of an unsuccessful result must not produce a
+  // commit, must not advance the sequence, and must release capacity.
+  const { journal, cleanup } = makeJournal();
+  try {
+    const image = `ghcr.io/mansour1414/dip-executor@sha256:${"d".repeat(64)}`;
+    const trusted: TrustedExecutionPolicy = {
+      image,
+      profileId: "synthetic-v1",
+      cgroupParent: "dip-executor.slice",
+    };
+    const control: ControlMetadata = {
+      image,
+      profileId: "synthetic-v1",
+      cgroupParent: "dip-executor.slice",
+    };
+
+    // A failure result frame: ok: false, metadata-only, no output bytes.
+    const failureMeta = { ok: false, op: "fill", code: "FORM_UNSUPPORTED" } as const;
+    const metaBytes = Buffer.from(JSON.stringify(failureMeta), "utf8");
+    const frame = Buffer.alloc(4 + metaBytes.byteLength);
+    frame.writeUInt32BE(metaBytes.byteLength, 0);
+    metaBytes.copy(frame, 4);
+
+    // The docker seam's `start` returns a session whose result stream emits the failure frame.
+    const docker = seam({
+      inspect: sequenceInspect(),
+      start: async () => ({
+        stdin: { write: () => true, end: () => undefined, once: () => undefined } as unknown as DockerSession["stdin"],
+        stdout: { [Symbol.asyncIterator]: async function* () {} } as unknown as DockerSession["stdout"],
+        stderr: { [Symbol.asyncIterator]: async function* () {} } as unknown as DockerSession["stderr"],
+        result: (async function* () { yield frame; })() as unknown as DockerSession["result"],
+        exited: Promise.resolve(0),
+      }),
+      remove: async () => ({ ok: true, value: { removed: true } }),
+    });
+
+    const execution = new SupervisorExecution(
+      "a".repeat(32),
+      "b".repeat(16),
+      "fill",
+      options(journal, docker, ARM_ACK_STUB),
+    );
+
+    // Mock AdmittedSession: an empty input body whose declaration matches.
+    const input = Buffer.alloc(0);
+    const session: AdmittedSession = {
+      role: "worker",
+      operation: "fill",
+      requestId: "b".repeat(16),
+      executionId: "a".repeat(32),
+      socket: undefined as unknown as import("node:net").Socket,
+      send: async () => {},
+      release: () => {},
+      control: (async function* () {} )() as unknown as AsyncIterable<Record<string, unknown>>,
+      body: (async function* () { yield input; })() as unknown as AsyncIterable<Buffer>,
+      declared: {
+        bodyBytes: input.byteLength,
+        bodySha256: createHash("sha256").update(input).digest("hex"),
+      },
+      readyNonce: () => "0123456789abcdef",
+      controlBlock: () => ({}),
+    };
+
+    const outcome: ExecutionOutcome = await composeExecution({
+      session,
+      execution,
+      control,
+      trusted,
+      preflight: () => ({ ok: true }),
+      limits: { maxInputBytes: 1024, maxOutputBytes: 4096 },
+    });
+
+    assert.equal(outcome.kind, "refused");
+    assert.equal(outcome.code, "RESULT_NOT_SUCCESSFUL");
   } finally {
     cleanup();
   }

@@ -38,6 +38,7 @@ function issue(
     ttlMs?: number;
     idleMs?: number;
     maxPerCaller?: number;
+    maxReservations?: number;
   } = {},
 ): ReturnType<typeof reserveForWorker> {
   const identity = options.identity ?? "worker-a";
@@ -49,6 +50,7 @@ function issue(
     ttlMs: options.ttlMs ?? 30_000,
     idleMs: options.idleMs ?? 10_000,
     maxPerCaller: options.maxPerCaller ?? 2,
+    maxReservations: options.maxReservations ?? state.maxReservations,
   });
 }
 
@@ -64,6 +66,7 @@ test("R7D.1-RES-1: issuance requires an authenticated caller identity", () => {
     ttlMs: 30_000,
     idleMs: 10_000,
     maxPerCaller: 2,
+    maxReservations: state.maxReservations,
   });
   // The identity is not validated for emptiness here because the *socket* is what guarantees it —
   // the value comes from an authenticated HELLO. What matters is that `admit` refuses to honour a
@@ -338,3 +341,49 @@ test("R7D.1-SEQ-3: refreshing an existing caller does not evict others", () => {
   assert.equal(sequenceFor(state, "a", now).last, WORKER_OPERATION_SEQUENCE.indexOf("fill"));
   assert.equal(sequenceFor(state, "b", now).last, WORKER_OPERATION_SEQUENCE.indexOf("fill"));
 });
+
+test("R7D.1-RES-11: the global reservation ceiling refuses beyond capacity", () => {
+  const state = newAdmissionState();
+  state.maxReservations = 1;
+  const now = 1_000;
+  // One reservation consumes the global ceiling.
+  assert.equal(issue(state, { operation: "inspect", identity: "worker-a", now }).ok, true);
+  // A second reservation for any caller is refused at the global ceiling.
+  const over = issue(state, { operation: "inspect", identity: "worker-b", now });
+  assert.equal(over.ok, false);
+  assert.equal((over as { code: string }).code, "RESERVATION_GLOBAL_LIMIT");
+  // Sweeping an expired reservation frees the ceiling.
+  state.reservations.forEach((record) => {
+    record.expiresAt = now - 1;
+    record.idleExpiresAt = now - 1;
+  });
+  assert.equal(issue(state, { operation: "inspect", identity: "worker-b", now }).ok, true);
+});
+
+test("R7D.1-RES-12: a superseded sequence is refused at admission", () => {
+  const state = newAdmissionState();
+  const now = () => 2_000;
+  // Worker-a completes inspect, advancing its sequence to `inspect` (level 0).
+  const grant = issue(state, { operation: "inspect", identity: "worker-a", now: 1_000 });
+  assert.equal(grant.ok, true);
+  if (!grant.ok) return;
+  advanceSequence(state, "worker-a", "inspect", () => 1_000);
+  assert.equal(sequenceFor(state, "worker-a", now).last, WORKER_OPERATION_SEQUENCE.indexOf("inspect"));
+  // A fill reservation issued before the advance targets level 1, but the sequence is now at 0,
+  // so fill is one ahead — still issuable. The supersession check only rejects operations the
+  // sequence has already passed. Advance past fill to make the fill reservation stale.
+  advanceSequence(state, "worker-a", "fill", () => 1_000);
+  assert.equal(sequenceFor(state, "worker-a", now).last, WORKER_OPERATION_SEQUENCE.indexOf("fill"));
+  // The inspect reservation is now superseded: the sequence has passed inspect.
+  const decision = admit(state, {
+    role: "worker",
+    operation: "inspect",
+    requestId: "a".repeat(32),
+    reservationId: grant.reservationId,
+    callerIdentity: "worker-a",
+  }, now(), { reservationTtlMs: 30_000, maxConnections: 8 });
+  assert.equal(decision.ok, false);
+  assert.equal((decision as { code: string }).code, "RESERVATION_INVALID");
+});
+
+

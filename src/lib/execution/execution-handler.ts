@@ -271,6 +271,13 @@ export async function composeExecution(options: ComposeOptions): Promise<Executi
     // `authorize` re-decides the deadline immediately before asking the watchdog, verifies the
     // grant's HMAC against its own record, and signs a commit the caller can verify independently.
     const sealed = execution.sealedResult();
+    // An executor that exited 0 but delivered a failure frame (e.g. a form field that could not
+    // be filled) did not successfully process the document. Authenticated delivery of an
+    // unsuccessful result is not a commit: refuse, release capacity without advancing the
+    // sequence, and never sign a commit the caller could publish.
+    if (execution.sealedResultKind() === "failure") {
+      return { kind: "refused", code: "RESULT_NOT_SUCCESSFUL", detail: "the executor delivered an unsuccessful result" };
+    }
     const terminal = await execution.authorize({
       requestId: execution.requestId,
       resultBytes: sealed.bytes,
