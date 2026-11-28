@@ -744,6 +744,24 @@ export class Watchdog {
       return deny("DURABILITY_FAILED");
     }
 
+    // ## Deadline revalidation after durable persistence
+    //
+    // The deadline was computed before the store write; the clock has advanced while the record
+    // was being persisted. If the deadline is already due at persist time, the armed execution is
+    // already overdue — refusing is correct, because arming a deadline that is immediately
+    // expiring would hand the supervisor a grant window that has already closed.
+    const persistedComparison = compareDeadline(
+      { bootId: record.bootId, deadlineAtMs: record.deadlineAtMs },
+      this.options.clock,
+    );
+    if (persistedComparison.kind === "due") {
+      // The deadline computed before the store write is already due at persist time. The arm
+      // cannot meaningfully be enforced, so it is refused rather than granting a window that has
+      // already closed.
+      closePinned(pin);
+      return deny("INVALID");
+    }
+
     this.live.set(request.executionId, {
       record,
       // Verified by `verifyArmIdentity` plus the descriptor cross-check immediately above.
@@ -1481,13 +1499,18 @@ export class Watchdog {
       }
     }
 
-    const confirmedNow = await this.verifyContainerOwnership(entry);
-    if (confirmedNow) entry.ownershipVerified = true;
-
+    // Mandatory deadline enforcement must not depend on daemon responsiveness: an execution whose
+    // ownership was already established in this process's life is authorised by the pinned kernel
+    // descriptor alone. Docker corroboration is awaited only to establish ownership for the first
+    // time; it never gates an already-authorised signal.
     if (entry.ownershipVerified) {
-      // Ownership was established — now, or earlier in this process's life. The kernel signal is
-      // authorized whatever the daemon says at this instant.
-      return { kind: "terminate", dockerIndependent: !confirmedNow, detail: "" };
+      return { kind: "terminate", dockerIndependent: true, detail: "ownership established earlier" };
+    }
+
+    const confirmedNow = await this.verifyContainerOwnership(entry);
+    if (confirmedNow) {
+      entry.ownershipVerified = true;
+      return { kind: "terminate", dockerIndependent: false, detail: "ownership confirmed now" };
     }
 
     // Never confirmed while this process was running. The record is a claim, and a claim is not a

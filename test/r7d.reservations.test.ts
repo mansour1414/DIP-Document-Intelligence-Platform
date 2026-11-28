@@ -38,7 +38,6 @@ function issue(
     ttlMs?: number;
     idleMs?: number;
     maxPerCaller?: number;
-    maxReservations?: number;
   } = {},
 ): ReturnType<typeof reserveForWorker> {
   const identity = options.identity ?? "worker-a";
@@ -50,7 +49,6 @@ function issue(
     ttlMs: options.ttlMs ?? 30_000,
     idleMs: options.idleMs ?? 10_000,
     maxPerCaller: options.maxPerCaller ?? 2,
-    maxReservations: options.maxReservations ?? state.maxReservations,
   });
 }
 
@@ -66,7 +64,6 @@ test("R7D.1-RES-1: issuance requires an authenticated caller identity", () => {
     ttlMs: 30_000,
     idleMs: 10_000,
     maxPerCaller: 2,
-    maxReservations: state.maxReservations,
   });
   // The identity is not validated for emptiness here because the *socket* is what guarantees it —
   // the value comes from an authenticated HELLO. What matters is that `admit` refuses to honour a
@@ -384,6 +381,61 @@ test("R7D.1-RES-12: a superseded sequence is refused at admission", () => {
   }, now(), { reservationTtlMs: 30_000, maxConnections: 8 });
   assert.equal(decision.ok, false);
   assert.equal((decision as { code: string }).code, "RESERVATION_INVALID");
+});
+
+test("R7D.1-RES-13: admission refuses a reservation naming an operation beyond the current sequence", () => {
+  const state = newAdmissionState();
+  const now = () => Date.now();
+  // Advance to fill (level 1), so a verify reservation (target 2) is issuable.
+  advanceSequence(state, "worker-a", "fill", now);
+  assert.equal(sequenceFor(state, "worker-a", now).last, WORKER_OPERATION_SEQUENCE.indexOf("fill"));
+  const grant = issue(state, { operation: "verify", identity: "worker-a", now: Date.now() });
+  assert.equal(grant.ok, true);
+  if (!grant.ok) return;
+  // Reset the pipeline: a new inspect restarts the sequence at 0.
+  advanceSequence(state, "worker-a", "inspect", now);
+  assert.equal(sequenceFor(state, "worker-a", now).last, WORKER_OPERATION_SEQUENCE.indexOf("inspect"));
+  // The verify reservation now names an operation two steps ahead (target 2, last 0): too far.
+  const decision = admit(state, {
+    role: "worker", operation: "verify", requestId: "a".repeat(32),
+    reservationId: grant.reservationId, callerIdentity: "worker-a",
+  }, Date.now(), { reservationTtlMs: 30_000, maxConnections: 8 });
+  assert.equal(decision.ok, false);
+  assert.equal((decision as { code: string }).code, "RESERVATION_INVALID");
+});
+
+test("R7D.1-RES-14: an expired reservation is cancelled and refused at admission", () => {
+  const state = newAdmissionState();
+  // Issue at now=1000 with a 1000ms TTL: expires at 2000.
+  const grant = issue(state, {
+    operation: "inspect", identity: "worker-a", now: 1_000, ttlMs: 1_000, idleMs: 1_000,
+  });
+  assert.equal(grant.ok, true);
+  if (!grant.ok) return;
+  // Admit at now=3000: the reservation is past its total lifetime, so it is deleted and refused.
+  const decision = admit(state, {
+    role: "worker", operation: "inspect", requestId: "a".repeat(32),
+    reservationId: grant.reservationId, callerIdentity: "worker-a",
+  }, 3_000, { reservationTtlMs: 30_000, maxConnections: 8 });
+  assert.equal(decision.ok, false);
+  assert.equal((decision as { code: string }).code, "RESERVATION_INVALID");
+  // The expired reservation is removed from the map.
+  assert.equal(state.reservations.has(grant.reservationId), false);
+});
+
+test("R7D.1-RES-15: per-caller limits keep reservations fair — one caller at its limit cannot starve another", () => {
+  const state = newAdmissionState();
+  state.maxReservations = 10; // global ceiling not binding
+  const now = 1_000;
+  // Caller-a holds two reservations (at its per-caller limit).
+  assert.equal(issue(state, { operation: "inspect", identity: "worker-a", now }).ok, true);
+  assert.equal(issue(state, { operation: "inspect", identity: "worker-a", now }).ok, true);
+  // Caller-a cannot hold a third.
+  const third = issue(state, { operation: "inspect", identity: "worker-a", now });
+  assert.equal(third.ok, false);
+  assert.equal((third as { code: string }).code, "RESERVATION_LIMIT");
+  // Fairness: caller-b is not blocked by caller-a's reservations and can still reserve.
+  assert.equal(issue(state, { operation: "inspect", identity: "worker-b", now }).ok, true);
 });
 
 

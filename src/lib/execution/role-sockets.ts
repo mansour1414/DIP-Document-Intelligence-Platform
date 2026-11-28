@@ -234,7 +234,6 @@ export function reserveForWorker(
     ttlMs: number;
     idleMs: number;
     maxPerCaller: number;
-    maxReservations: number;
   },
 ): ReservationGrant {
   // Sweep first, so an expired reservation does not consume the caller's allowance. Sweeping on
@@ -458,12 +457,13 @@ export function admit(
       state.reservations.delete(reservationId);
       return { ok: false, code: "RESERVATION_INVALID" };
     }
-    // Revalidate sequence authority at admission: the sequence may have advanced since the
-    // reservation was issued (another execution for this caller resolved), which would supersede
-    // this reservation. An expired or superseded sequence must not authorize an execution.
+    // Revalidate sequence authority at admission: the sequence may have advanced or reset since
+    // the reservation was issued (another execution for this caller resolved, or a new inspect
+    // pipeline restarted the position), which would supersede this reservation. An expired,
+    // superseded, or too-far-ahead sequence must not authorize an execution.
     const target = WORKER_OPERATION_SEQUENCE.indexOf(reservation.operation);
     const position = sequenceFor(state, callerIdentity, () => now);
-    if (target < position.last) {
+    if (target < position.last || target > position.last + 1) {
       state.reservations.delete(reservationId);
       return { ok: false, code: "RESERVATION_INVALID" };
     }
@@ -1128,7 +1128,6 @@ export async function startRoleSockets(options: RoleServerOptions): Promise<Role
                 ttlMs: options.reservationTtlMs ?? 30_000,
                 idleMs: options.reservationIdleMs ?? 10_000,
                 maxPerCaller: options.maxReservationsPerCaller ?? 2,
-                maxReservations: state.maxReservations,
               });
               if (!grant.ok) {
                 post({ kind: "RESERVATION_REFUSED", code: grant.code } satisfies ServerReservationRefused);

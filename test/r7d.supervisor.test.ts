@@ -540,7 +540,6 @@ function issueWorker(
     ttlMs: 30_000,
     idleMs: 30_000,
     maxPerCaller: 4,
-    maxReservations: state.maxReservations,
   });
   if (!grant.ok) throw new Error(`issuance refused: ${grant.code}`);
   advanceSequence(state, identity, operation);
@@ -861,7 +860,10 @@ test("R7D.1-SV-24: an executor failure result is refused, never committed", asyn
       limits: { maxInputBytes: 1024, maxOutputBytes: 4096 },
     });
 
-    assert.equal(outcome.kind, "refused");
+    // A container was created, so the slot is held for reconciliation (quarantined) rather than
+    // released — capacity is not given up without durable cleanup evidence and independent
+    // watchdog disarm.
+    assert.equal(outcome.kind, "quarantined");
     assert.equal(outcome.code, "RESULT_NOT_SUCCESSFUL");
   } finally {
     cleanup();

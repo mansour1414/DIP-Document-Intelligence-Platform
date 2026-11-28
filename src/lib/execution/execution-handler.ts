@@ -273,10 +273,13 @@ export async function composeExecution(options: ComposeOptions): Promise<Executi
     const sealed = execution.sealedResult();
     // An executor that exited 0 but delivered a failure frame (e.g. a form field that could not
     // be filled) did not successfully process the document. Authenticated delivery of an
-    // unsuccessful result is not a commit: refuse, release capacity without advancing the
-    // sequence, and never sign a commit the caller could publish.
+    // unsuccessful result is not a commit: never sign a commit the caller could publish, and do
+    // not release capacity without durable cleanup evidence — if a container was created it may
+    // still exist, so the slot is held for reconciliation (quarantined) rather than released.
     if (execution.sealedResultKind() === "failure") {
-      return { kind: "refused", code: "RESULT_NOT_SUCCESSFUL", detail: "the executor delivered an unsuccessful result" };
+      return created
+        ? { kind: "quarantined", code: "RESULT_NOT_SUCCESSFUL", detail: "the executor delivered an unsuccessful result" }
+        : { kind: "refused", code: "RESULT_NOT_SUCCESSFUL", detail: "the executor delivered an unsuccessful result" };
     }
     const terminal = await execution.authorize({
       requestId: execution.requestId,
