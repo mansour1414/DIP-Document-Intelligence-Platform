@@ -52,4 +52,16 @@ export function createS3Storage(): ObjectStorage {
 }
 let configuredStorage: ObjectStorage | undefined;
 export function getStorage() { return configuredStorage ??= createS3Storage(); }
+/**
+ * Replace the storage implementation for a test.
+ *
+ * Mirrors `setMalwareScannerForTests` in `@/lib/malware`, which is the convention this
+ * codebase already uses for a collaborator that has no network-independent
+ * implementation. It exists so the orchestration *ordering* claims can be tested by
+ * observing real calls — "no object was written before screening passed" is an
+ * observation, not something a source-text assertion can establish.
+ *
+ * Passing `undefined` restores the real S3 client on the next `getStorage()` call.
+ */
+export function setStorageForTests(storage?: ObjectStorage) { configuredStorage = storage; }
 export async function closeStorage() { const storage = configuredStorage; configuredStorage = undefined; await storage?.close(); }

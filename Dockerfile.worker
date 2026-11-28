@@ -53,8 +53,49 @@ COPY --chown=dipworker:dipworker src ./src
 COPY --chown=dipworker:dipworker workers ./workers
 COPY --chown=dipworker:dipworker scripts/verify-ocr-runtime.py ./scripts/verify-ocr-runtime.py
 COPY --chown=dipworker:dipworker scripts/verify-qpdf-security-runtime.mjs ./scripts/verify-qpdf-security-runtime.mjs
+# B31-04: the bounded PDF child is launched with the same `--import` preloads the
+# worker itself uses. Without this file in the image, `--import
+# ./scripts/node-platform-compat.mjs` fails and *every* Fill Forms job would die
+# with WORKER_CRASHED at the first inspection — while every test here passed,
+# because the repository checkout happens to contain it. The child entry itself
+# ships inside `src/` (copied above), and `form-worker.ts` asserts its presence at
+# startup rather than failing per-request in production.
+COPY --chown=dipworker:dipworker scripts/node-platform-compat.mjs ./scripts/node-platform-compat.mjs
 
-RUN python3 scripts/verify-ocr-runtime.py \
+# Packaging verification, at build time, against the image's own files.
+# The child is launched with `tsx` and `--import ./scripts/node-platform-compat.mjs`;
+# neither is visible to a bundler, so nothing except this check would notice their
+# absence until the first Fill Forms job failed in production.
+# R7C: the verifier selects native packages per target, so it needs the selection module
+# beside it. Three small, dependency-free ESM files.
+COPY --chown=dipworker:dipworker scripts/pdf-worker-platform.mjs ./scripts/pdf-worker-platform.mjs
+COPY --chown=dipworker:dipworker scripts/write-pdf-worker-target.mjs ./scripts/write-pdf-worker-target.mjs
+COPY --chown=dipworker:dipworker scripts/verify-pdf-worker-artifact.mjs ./scripts/verify-pdf-worker-artifact.mjs
+
+# B31-04: presence is necessary and not sufficient. This script *runs* the child inside
+# the image and drives it through the real protocol — inspect, fill, flatten, and an
+# Arabic value that exercises the native canvas and the bundled font. Each of those can
+# fail at runtime with every required file present (a wrong-platform native addon, an
+# unresolvable font, an unresolved path alias), which is invisible to a file check.
+COPY --chown=dipworker:dipworker scripts/smoke-pdf-worker-artifact.mjs ./scripts/smoke-pdf-worker-artifact.mjs
+# R6.4: the production-runner scenario imports the image's own `form-worker.ts` and calls
+# the real bounded API. This module used to be composed at test time *inside* the
+# artifact, which fails here with EROFS: the runtime stage runs a read-only root
+# filesystem on purpose. Shipping the module keeps the scenario and the security
+# configuration intact instead of trading one for the other.
+COPY --chown=dipworker:dipworker scripts/pdf-worker-runner-smoke.ts ./scripts/pdf-worker-runner-smoke.ts
+
+# R7C: the native packages are selected per target now, so the check must state which
+# target it is checking. When the image is built for another CPU (`docker buildx
+# --platform`) the verifier would otherwise default to the *builder's* architecture and
+# report a foreign artifact complete while its own natives were missing — the ARM64
+# defect. TARGETARCH is BuildKit's own value for the *output* platform. The image is
+# Debian bookworm, so libc is always glibc here; TARGETVARIANT is irrelevant.
+ARG TARGETARCH
+RUN node scripts/write-pdf-worker-target.mjs --root /app --libc glibc \
+ && node scripts/verify-pdf-worker-artifact.mjs /app \
+ && node scripts/smoke-pdf-worker-artifact.mjs /app --in-place \
+ && python3 scripts/verify-ocr-runtime.py \
  && soffice --version \
  && qpdf --version \
  && tesseract --version \

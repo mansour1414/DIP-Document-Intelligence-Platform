@@ -139,6 +139,12 @@ export const toolOptionContracts: Readonly<Record<string, ToolOptionContract>> =
   "excel-to-pdf": empty(),
   "powerpoint-to-pdf": empty(),
   "ocr-pdf": { version: "1", properties: { language: { type: "string", enum: ["eng", "ara", "ara+eng"], default: "ara+eng" } } },
+  /**
+   * Stage 2 `fill-forms`. The per-field payload is deliberately *not* an option
+   * (see `toolsWithDedicatedJobParameters`): only the rendering decision is a
+   * flat option, and the schema stays versioned and closed.
+   */
+  "fill-forms": { version: "1", properties: { flatten: { type: "boolean", default: false } } },
   "summarize-pdf": { version: "1", properties: { locale, documentId: { type: "string", pattern: "^[0-9a-fA-F-]{36}$" } } },
   "chat-with-pdf": { version: "1", properties: { locale, question: { type: "string", maxLength: 4_000 }, documentId: { type: "string", pattern: "^[0-9a-fA-F-]{36}$" } } },
   "extract-data": { version: "1", properties: { locale, documentId: { type: "string", pattern: "^[0-9a-fA-F-]{36}$" } } },
@@ -182,4 +188,23 @@ export function validateToolOptions(toolId: string, value: unknown): ToolOptions
   if (!issues.length) { const custom = contract.validate?.(normalized); if (custom) issues.push(custom); }
   if (issues.length) throw new ToolOptionsValidationError(issues);
   return normalized;
+}
+
+/**
+ * Tools whose per-item payload cannot be expressed as flat options.
+ *
+ * `fill-forms` needs typed per-field values (string, boolean, or string array,
+ * keyed by an arbitrary field name). Flattening that into the options object —
+ * or re-parsing a JSON string inside it — would make field names untyped input
+ * at every boundary. Instead the payload travels in a dedicated job parameter
+ * that `@/lib/pdf/form-schema` validates with the same code the browser runs.
+ *
+ * These tools are therefore **not** expressible in persisted Workflows or Agent
+ * plans, which only carry flat options; that is recorded as pending integration
+ * in `docs/stage2-fill-forms.md` rather than faked by accepting a JSON blob.
+ */
+export const toolsWithDedicatedJobParameters = new Set(["fill-forms"]);
+
+export function requiresDedicatedJobParameters(toolId: string) {
+  return toolsWithDedicatedJobParameters.has(toolId);
 }

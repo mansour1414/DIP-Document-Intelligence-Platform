@@ -90,11 +90,17 @@ async function withSchema(run: (client: pg.Client) => Promise<void>): Promise<vo
     await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
     await client.query(`DROP TYPE IF EXISTS ${SCHEMA}.expiry_race_status`);
     await client.query(`CREATE TYPE ${SCHEMA}.expiry_race_status AS ENUM ('QUEUED','RUNNING','RETRYING','SUCCEEDED','FAILED','CANCELLED','EXPIRED')`);
+    // `params` is present because the expiry write's RETURNING clause reads it: the
+    // purge follows the *transitioned rows* and needs their payload references to
+    // decide what to destroy. Omitting it made this fixture diverge from production
+    // and the statement fail with 42703 (undefined column). The type matches
+    // `Job.params Json @default("{}")` in prisma/schema.prisma.
     await client.query(`
       CREATE TABLE ${TABLE} (
         id UUID PRIMARY KEY,
         tool_id VARCHAR(50) NOT NULL,
         status ${SCHEMA}.expiry_race_status NOT NULL DEFAULT 'QUEUED',
+        params JSONB NOT NULL DEFAULT '{}'::jsonb,
         error_code VARCHAR(100),
         started_at TIMESTAMP(3),
         completed_at TIMESTAMP(3),
@@ -145,9 +151,14 @@ async function seed(client: pg.Client, rows: Seed[]): Promise<void> {
  */
 function port(client: pg.Client) {
   return {
-    async updateMany(args: {
+    // `RETURNING` is what makes the payload purge race-free: the statement reports
+    // exactly the rows it transitioned, so nothing has to be re-read (and possibly
+    // re-read differently) afterwards. Round 2 changed the port from a bare count to
+    // this result set for precisely that reason.
+    async updateManyAndReturn(args: {
       where: { id: { in: string[] }; status: { in: readonly string[] }; updatedAt: { lte: Date } };
       data: { status: "EXPIRED"; errorCode: string; completedAt: Date };
+      select: { id: true; params: true };
     }) {
       const result = await client.query(
         `UPDATE ${TABLE}
@@ -156,10 +167,11 @@ function port(client: pg.Client) {
                 completed_at = $3
           WHERE id = ANY($4::uuid[])
             AND status = ANY($5::${SCHEMA}.expiry_race_status[])
-            AND updated_at <= $6`,
+            AND updated_at <= $6
+        RETURNING id, params`,
         [args.data.status, args.data.errorCode, args.data.completedAt, args.where.id.in, args.where.status.in, args.where.updatedAt.lte],
       );
-      return { count: result.rowCount ?? 0 };
+      return result.rows.map((row: { id: string; params: unknown }) => ({ id: row.id, params: row.params }));
     },
   };
 }
@@ -168,6 +180,49 @@ async function statuses(client: pg.Client, ids: string[]): Promise<Record<string
   const result = await client.query(`SELECT id, status FROM ${TABLE} WHERE id = ANY($1::uuid[])`, [ids]);
   return Object.fromEntries(result.rows.map((row) => [row.id, row.status]));
 }
+
+/**
+ * P6 — the retention role must be able to run `UPDATE ... RETURNING params`
+ * without any new grant.
+ *
+ * The purge now reads `params` from the *returning* clause of the expiry write, so
+ * the scheduler needs `SELECT (params)` and `UPDATE (status, error_code,
+ * completed_at, updated_at)` on `jobs`. The least-privilege migration already grants
+ * exactly `GRANT SELECT ON ... jobs` and `GRANT UPDATE (status, error_code,
+ * completed_at, updated_at) ON jobs`, so no widening is required. This test asserts
+ * the *effective* privileges inside the real database rather than trusting the
+ * migration text: a role that lost `SELECT` would fail here, and a RETURNING clause
+ * that silently needed a column beyond the grant would be caught by the same
+ * statement the scheduler issues.
+ */
+void integration("the retention role can select params and run UPDATE ... RETURNING without new grants", async () => {
+  await withSchema(async (client) => {
+    const id = randomUUID();
+    const stale = new Date(Date.now() - 48 * HOUR);
+    // Every NOT NULL column the table declares is supplied here, as production's own
+    // rows are: `tool_id` is `String @map("tool_id") @db.VarChar(50)` with no default
+    // and no nullable marker, so omitting it is not a fixture quirk — it is a row the
+    // real schema could never hold. (The previous version left it out and failed with
+    // 23502 before reaching the statement under test.)
+    await client.query(
+      `INSERT INTO ${TABLE} (id, tool_id, status, params, created_at, updated_at) VALUES ($1, $2, 'QUEUED', $3::jsonb, $4, $4)`,
+      [id, "fill-forms", JSON.stringify({ fieldsRef: "ref-probe" }), stale],
+    );
+    // The exact statement shape the scheduler now issues. If `params` were not
+    // readable by this role, or the column grants did not cover the SET list, this
+    // throws instead of returning rows.
+    const returned = await client.query(
+      `UPDATE ${TABLE}
+          SET status = $1::${SCHEMA}.expiry_race_status, error_code = $2, completed_at = $3
+        WHERE id = $4 AND updated_at <= $5
+      RETURNING id, params`,
+      ["EXPIRED", "JOB_EXPIRED", new Date(), id, stale],
+    );
+    assert.equal(returned.rowCount, 1, "the guarded write must transition exactly one row");
+    const params = returned.rows[0].params as { fieldsRef?: string };
+    assert.equal(params.fieldsRef, "ref-probe", "the returning clause must expose params without extra privileges");
+  });
+});
 
 void integration("a job claimed during the sweep is not expired, while an abandoned one is", async () => {
   await withSchema(async (client) => {
@@ -194,14 +249,14 @@ void integration("a job claimed during the sweep is not expired, while an abando
     assert.equal(afterClaim.rows[0].status, "RUNNING");
     assert.ok(afterClaim.rows[0].updated_at > sweepStartedAt, "the claim must bump updated_at, or the guard cannot work");
 
-    const expired = await applyExpiryPlan(port(client), {
+    const { expired } = await applyExpiryPlan(port(client), {
       expireIds: planned,
       sweepStartedAt,
       completedAt: new Date(),
     });
 
     const final = await statuses(client, planned);
-    assert.equal(expired, 1, "exactly one row may be expired");
+    assert.equal(expired.length, 1, "exactly one row may be expired");
     assert.equal(final[claimed], "RUNNING", "a job claimed mid-sweep must survive in the database");
     assert.equal(final[abandoned], "EXPIRED", "a genuinely abandoned job must still be reclaimed");
 
@@ -222,8 +277,8 @@ void integration("the guard is applied by the database in a single statement", a
     ]);
     const sweepStartedAt = new Date();
     // Nothing changes, so all three are legitimate candidates.
-    const expired = await applyExpiryPlan(port(client), { expireIds: rows, sweepStartedAt, completedAt: new Date() });
-    assert.equal(expired, 3);
+    const { expired } = await applyExpiryPlan(port(client), { expireIds: rows, sweepStartedAt, completedAt: new Date() });
+    assert.equal(expired.length, 3);
     const final = await statuses(client, rows);
     for (const id of rows) assert.equal(final[id], "EXPIRED");
   });
@@ -239,12 +294,12 @@ void integration("terminal states are never rewritten even with stale timestamps
       { id: ids.expired, status: "EXPIRED", updatedAt: stale },
     ]);
     const sweepStartedAt = new Date();
-    const expired = await applyExpiryPlan(port(client), {
+    const { expired } = await applyExpiryPlan(port(client), {
       expireIds: Object.values(ids),
       sweepStartedAt,
       completedAt: new Date(),
     });
-    assert.equal(expired, 0, "terminal rows must not match the status guard");
+    assert.equal(expired.length, 0, "terminal rows must not match the status guard");
     const final = await statuses(client, Object.values(ids));
     assert.equal(final[ids.succeeded], "SUCCEEDED");
     assert.equal(final[ids.cancelled], "CANCELLED");
@@ -267,13 +322,13 @@ void integration("a row touched by any write during the sweep is skipped", async
     // metadata change, not a status change. It must still be enough to skip.
     await client.query(`UPDATE ${TABLE} SET error_code = 'PROGRESS_HEARTBEAT' WHERE id = $1`, [touched]);
 
-    const expired = await applyExpiryPlan(port(client), {
+    const { expired } = await applyExpiryPlan(port(client), {
       expireIds: [touched, untouched],
       sweepStartedAt,
       completedAt: new Date(),
     });
     const final = await statuses(client, [touched, untouched]);
-    assert.equal(expired, 1);
+    assert.equal(expired.length, 1);
     assert.equal(final[touched], "RETRYING", "any write during the sweep must protect the row");
     assert.equal(final[untouched], "EXPIRED");
   });
@@ -281,8 +336,8 @@ void integration("a row touched by any write during the sweep is skipped", async
 
 void integration("an empty plan issues no write", async () => {
   await withSchema(async (client) => {
-    const expired = await applyExpiryPlan(port(client), { expireIds: [], sweepStartedAt: new Date(), completedAt: new Date() });
-    assert.equal(expired, 0);
+    const { expired } = await applyExpiryPlan(port(client), { expireIds: [], sweepStartedAt: new Date(), completedAt: new Date() });
+    assert.equal(expired.length, 0);
   });
 });
 
@@ -313,11 +368,11 @@ void integration("an explicitly supplied updatedAt is persisted verbatim on an @
     assert.equal(persisted.rows[0].updated_at.toISOString(), stale.toISOString());
 
     // And that stale value must be what makes the guarded write match.
-    const expired = await applyExpiryPlan(port(client), {
+    const { expired } = await applyExpiryPlan(port(client), {
       expireIds: [id],
       sweepStartedAt: new Date(),
       completedAt: new Date(),
     });
-    assert.equal(expired, 1, "a genuinely backdated row must be expirable");
+    assert.equal(expired.length, 1, "a genuinely backdated row must be expirable");
   });
 });

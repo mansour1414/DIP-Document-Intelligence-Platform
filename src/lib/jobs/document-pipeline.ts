@@ -4,9 +4,9 @@ import { getStorage, type ObjectStorage } from "@/lib/storage";
 import { pdfWorkerEngine, runPdfWorkerTool, type PdfWorkerTool } from "@/lib/pdf/server";
 import { processServerDocument, type ServerToolId } from "@/lib/document-processing/server";
 import { logger } from "@/lib/logging";
-import { timeoutFor } from "@/lib/runtime/config";
+import { runtimeLimits, timeoutFor } from "@/lib/runtime/config";
 import { withTimeout } from "@/lib/runtime/timeout";
-import { validateWorkerOutputs } from "@/lib/outputs/validation";
+import { OutputValidationError, validateBoundedFillOutput, validateWorkerOutputs } from "@/lib/outputs/validation";
 import { OutputCommitSupersededError, discardStoredObjects, screenAndStoreWorkerOutputs } from "@/lib/outputs/screening";
 import { recordMetric } from "@/lib/observability/metrics";
 import { configuredCostRates, estimateJobCost } from "@/lib/cost/model";
@@ -15,7 +15,14 @@ import { buildStorageObjectConnectOrCreate, isAuthorizedFileStorageAccess } from
 import type { QueuedJob } from "@/lib/queue";
 import { validateToolOptions } from "@/lib/tools/options";
 import { deletePhase1Secret, takePhase1Secret, type Phase1SecretPurpose } from "@/lib/secrets/phase1";
+import { purgeFormFields, readFormFields } from "@/lib/pdf/form-payload";
+import { jobErrorRecord, publicErrorCode } from "@/lib/jobs/error-boundary";
+import { classifyAtProcessorEntry } from "@/lib/jobs/payload-lifecycle";
+import { isUnrecoverableQueueError } from "@/lib/jobs/queue-errors";
 import { APPROVED_QPDF_VERSION, runQpdfTool } from "@/lib/pdf/qpdf";
+import { FORM_ENGINE, FORM_ENGINE_VERSION } from "@/lib/pdf/form-fill";
+import { fillPdfBounded, formWorkerLimits } from "@/lib/pdf/form-worker";
+import { parseFieldsPayload } from "@/lib/pdf/form-schema";
 import type { MalwareScanner } from "@/lib/malware";
 
 /**
@@ -44,10 +51,101 @@ export type DocumentPipelineDeps = {
   client?: PrismaClient;
   /** Test seam only: pins the attempt id that scopes output keys. Production uses a fresh uuid. */
   attemptId?: string;
+  /**
+   * BullMQ attempt accounting, passed by the worker so a terminal failure can be
+   * told apart from one that will be retried (FF-03): the encrypted form payload
+   * must survive a retry and be purged on the last attempt.
+   */
+  attemptsMade?: number;
+  maxAttempts?: number;
 };
 
 /** Job states in which no attempt may (re)enter the pipeline. */
 const CLOSED_JOB_STATES = ["SUCCEEDED", "CANCELLED", "EXPIRED"] as const;
+
+/**
+ * The job's id, typed explicitly.
+ *
+ * Prisma's row type degrades to `{}` when the generated client is unavailable, so
+ * a direct `job.id` becomes a type error in that setup. Reading it through a
+ * narrow view keeps the module type-clean in both environments.
+ */
+const jobIdOf = (job: unknown) => (job as { id: string }).id;
+
+/** Narrow, explicit view of the loaded job row (see `jobIdOf`). */
+type LoadedJob = {
+  id: string;
+  requesterId: string | null;
+  organizationId: string | null;
+  apiClientId: string | null;
+  toolId: string;
+  correlationId: string | null;
+  status: string;
+  startedAt: Date | null;
+  outputFileId: string | null;
+  params: unknown;
+  steps: Array<{ id: string; name: string; status: string; startedAt: Date | null }>;
+};
+const asJob = (row: unknown) => row as unknown as LoadedJob;
+
+/** Every state a job can never leave; a scrub is only safe once it is here. */
+const TERMINAL_JOB_STATES = ["SUCCEEDED", "FAILED", "CANCELLED", "EXPIRED"] as const;
+
+/**
+ * Remove legacy plaintext `fields` from a job row (FF-03).
+ *
+ * Before the encrypted payload existed, values were written into `Job.params`
+ * verbatim. Rows created then still exist, and they must not keep the caller's
+ * data any longer than the job needs it. This scrubs such a row once it reaches a
+ * terminal state.
+ *
+ * Written as a `updateMany` **guarded on the terminal states** rather than a
+ * plain `update`: job state is never written unconditionally in this module (see
+ * `test/pr1-output-screening.structure.test.ts`), and the guard also means a row
+ * that is still live — and may still need its values — is left alone.
+ */
+/**
+ * The JSON shape `Job.params` accepts.
+ *
+ * Declared structurally rather than as `Prisma.InputJsonValue` so this module does
+ * not need the generated `Prisma` namespace just to describe its own payload — the
+ * namespace import is unavailable whenever the client is not generated, and the
+ * resulting error would be indistinguishable from a real one. The runtime check
+ * above is what actually guarantees the value is JSON.
+ */
+type JobParamsJson = { [key: string]: string | number | boolean | null | JobParamsJson | Array<string | number | boolean | null | JobParamsJson> };
+
+/**
+ * Convert a plain object to that JSON shape.
+ *
+ * `Record<string, unknown>` is not assignable to `InputJsonValue` because `unknown`
+ * admits `undefined`, functions and symbols — values JSON cannot represent. The
+ * conversion is a round trip through `JSON`, which is what the column will do
+ * anyway, and it is *checked* rather than asserted: the result is re-validated as
+ * JSON before it is handed to Prisma. This is the contract change the CI failure
+ * (`TS2322` at this line) was reporting; casting it away would have hidden a value
+ * that Prisma would reject at runtime.
+ */
+function toJsonInput(value: Record<string, unknown>): JobParamsJson {
+  const serialised = JSON.stringify(value);
+  if (serialised === undefined) throw new Error("JSON_SERIALISATION_FAILED");
+  const parsed: unknown = JSON.parse(serialised);
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("JSON_SERIALISATION_FAILED");
+  return parsed as JobParamsJson;
+}
+
+async function scrubLegacyFields(
+  tenant: <T>(operation: Parameters<typeof withTenant<T>>[1]) => Promise<T>,
+  jobId: string,
+  params: Record<string, unknown> | undefined,
+) {
+  const { fields: _discarded, ...rest } = (params ?? {}) as Record<string, unknown>;
+  void _discarded;
+  await tenant((tx) => tx.job.updateMany({
+    where: { id: jobId, status: { in: [...TERMINAL_JOB_STATES] } },
+    data: { params: toJsonInput(rest) },
+  })).catch(() => undefined);
+}
 
 export async function processDocumentJob(message: QueuedJob, deps: DocumentPipelineDeps = {}) {
   if (!message.userId) throw Object.assign(new Error("Worker job requires a tenant identity"), { code: "TENANT_CONTEXT_REQUIRED" });
@@ -59,9 +157,26 @@ export async function processDocumentJob(message: QueuedJob, deps: DocumentPipel
   const scopedTenant = <T>(operation: Parameters<typeof withTenantScope<T>>[1]) => withTenantScope(jobExecutionScope, operation, deps.client);
   const attemptId = deps.attemptId ?? randomUUID();
   const context = { job_id: job.id, correlation_id: job.correlationId ?? message.correlationId, tool_id: job.toolId, attempt_id: attemptId };
-  const rawParams = job.params as { inputFileIds?: string[]; options?: Record<string, unknown>; secretRef?: string };
-  if (job.status === "SUCCEEDED" || job.outputFileId) { logger.info("job.idempotent_skip", context); return; }
-  if (job.status === "CANCELLED" || job.status === "EXPIRED") { await deletePhase1Secret(rawParams.secretRef).catch(() => undefined); return; }
+  const rawParams = job.params as { inputFileIds?: string[]; options?: Record<string, unknown>; secretRef?: string; fieldsRef?: string; fields?: unknown };
+  // Legacy rows created before FF-03 still carry plaintext `fields`. They are
+  // readable for exactly one reason — an already-queued job must not fail on
+  // deploy — and are scrubbed from the row on their next terminal transition.
+  const legacyFields = rawParams.fields;
+  if (job.status === "SUCCEEDED" || job.outputFileId) {
+    // Duplicate delivery of a job whose output is already committed.
+    //
+    // The commit already happened, so there is nothing to write — but the payload
+    // purge that follows a commit is *not* guaranteed to have run. The attempt that
+    // committed may have crashed between the commit and the purge, and a queue
+    // redelivery is the last moment anyone will look at this job. Cleanup is
+    // therefore retried here rather than skipped; it is idempotent, so a redelivery
+    // after a successful purge is a no-op.
+    await purgeFormFields((job as { params?: { fieldsRef?: string } | null }).params?.fieldsRef)
+      .catch(() => logger.warn("fill_forms.payload_purge_failed", { ...context, reason: "IDEMPOTENT_REDELIVERY" }));
+    logger.info("job.idempotent_skip", context);
+    return;
+  }
+  if (job.status === "CANCELLED" || job.status === "EXPIRED") { await Promise.all([deletePhase1Secret(rawParams.secretRef).catch(() => undefined), purgeFormFields(rawParams.fieldsRef).catch(() => undefined)]); return; }
   const step = job.steps.find((item) => item.name === job.toolId);
   try {
     // Atomic run claim: the fast idempotency read above is not enough on its own,
@@ -93,24 +208,86 @@ export async function processDocumentJob(message: QueuedJob, deps: DocumentPipel
     const qpdfTools = new Set(["protect-pdf", "unlock-pdf", "pdf-permissions", "repair-pdf"]);
     const documentTools = new Set(["word-to-pdf", "pdf-to-word", "excel-to-pdf", "powerpoint-to-pdf", "ocr-pdf"]);
     let outputs: Array<{ name: string; mimeType: string; bytes: Uint8Array }>;
+    // Set only by the Fill Forms branch, which is the only path whose output has been
+    // verified by the bounded child rather than by the generic validator.
+    let boundedFill: { outputCount: number; totalBytes: number; pages: number } | undefined;
     if (pdfTools.has(job.toolId)) { const pdfTool = job.toolId as PdfWorkerTool; outputs = await withTimeout(job.toolId, timeoutFor("pdf"), runPdfWorkerTool(pdfTool, bytes, options)); ({ engine, engineVersion } = pdfWorkerEngine(pdfTool)); }
+    else if (job.toolId === "fill-forms") {
+      // `fields` is a dedicated job parameter, validated here with the same
+      // schema module the browser uses. Options remain flat and versioned.
+      if (ids.length !== 1) throw Object.assign(new Error("Fill PDF Forms accepts exactly one PDF."), { code: "INPUT_FILE_COUNT_INVALID" });
+      // FF-03: the values come from the encrypted payload, not from `params`.
+      const fields = parseFieldsPayload(rawParams.fieldsRef
+        ? await readFormFields({ reference: rawParams.fieldsRef, tenantId: asJob(job).requesterId ?? "", jobId: jobIdOf(job) })
+        : legacyFields);
+      // B31-02: the fill, the appearance generation (including the native Arabic
+      // canvas) and the reopen/verification parse all run inside the bounded child.
+      // Previously the engine ran on this thread behind a Promise timeout, which
+      // cannot interrupt a synchronous parse: it bounded the *wait*, never the work.
+      // The output is now re-verified here without parsing.
+      const requestedFlatten = options.flatten === true;
+      const filled = await fillPdfBounded(bytes[0], fields, { flatten: requestedFlatten }, formWorkerLimits({ timeoutMs: runtimeLimits.formWorkerTimeoutMs, maxHeapMb: runtimeLimits.formWorkerMaxHeapMb, concurrency: runtimeLimits.formWorkerConcurrency, maxInputBytes: runtimeLimits.maxInputBytes, maxOutputBytes: runtimeLimits.maxOutputBytes }));
+      // `inputPages` is required. The page count came from the row written at
+      // submission time, after isolated inspection accepted it; if it is missing the
+      // job is not verifiable and must fail rather than skip the comparison.
+      if (!Number.isSafeInteger(files[0]?.pageCount) || (files[0]?.pageCount ?? 0) <= 0) throw new OutputValidationError("The input page count is not available for output verification.");
+      boundedFill = await validateBoundedFillOutput(filled, { inputPages: files[0].pageCount as number, requestedFlatten, maxOutputBytes: runtimeLimits.maxOutputBytes, maxOutputFiles: runtimeLimits.maxOutputFiles });
+      outputs = [{ name: `${job.toolId}.pdf`, mimeType: "application/pdf", bytes: filled.bytes }];
+      engine = FORM_ENGINE; engineVersion = FORM_ENGINE_VERSION;
+      logger.info("fill_forms.succeeded", { ...context, engine, engine_version: engineVersion, filled_fields: filled.report.filled, untouched_fields: filled.report.untouched, raster_appearances: filled.report.rasterAppearances, flatten: filled.report.flatten, status: "succeeded" });
+    }
     else if (qpdfTools.has(job.toolId)) { const secret = params.secretRef ? await takePhase1Secret({ reference: params.secretRef, tenantId: message.userId, jobId: job.id, purpose: job.toolId as Phase1SecretPurpose }) : undefined; outputs = [await withTimeout(job.toolId, timeoutFor("pdf"), runQpdfTool(job.toolId as "protect-pdf" | "unlock-pdf" | "pdf-permissions" | "repair-pdf", bytes[0], options, secret))]; engine = "qpdf"; engineVersion = APPROVED_QPDF_VERSION; }
     else if (documentTools.has(job.toolId)) { const input = inputById.get(ids[0])!; const result = await processServerDocument(job.toolId as ServerToolId, new File([bytes[0] as BlobPart], input.originalName, { type: input.mimeType }), typeof options.language === "string" ? options.language : "ara+eng"); outputs = [{ name: result.filename, mimeType: result.contentType, bytes: result.bytes }]; engine = job.toolId === "ocr-pdf" ? "ocrmypdf" : "libreoffice"; engineVersion = "host"; }
     else throw Object.assign(new Error("Tool is not enabled on this worker"), { code: "TOOL_NOT_WORKER_ENABLED" });
-    const preservePages = ["compress-pdf", "rotate-pdf", "watermark-pdf", "crop-pdf", "page-numbers", "header-footer", "resize-pages", "flip-pages", "remove-annotations", "ocr-pdf"].includes(job.toolId) ? files[0]?.pageCount ?? undefined : undefined;
-    const validated = await validateWorkerOutputs(outputs, preservePages, { encryptedPdfAlreadyValidated: job.toolId === "protect-pdf" || job.toolId === "pdf-permissions" });
+    // B31-02: Fill Forms does **not** go through `validateWorkerOutputs`.
+    //
+    // Its output was already verified by `validateBoundedFillOutput` above, which
+    // checks the same properties the generic validator would (count, bytes, magic,
+    // MIME, framing, page preservation) without a parse. Calling the generic
+    // validator afterwards re-parsed the filled PDF in this process with
+    // `PDFDocument.load()`, so the isolation the child provides was undone one line
+    // after it was established.
+    //
+    // The two paths are separate statements rather than a flag on one function. A
+    // `skipPdfValidation: true` option would be reachable by every caller and would
+    // eventually be set by one of them; a distinct branch cannot be taken by a tool
+    // whose output did not come from the bounded child.
+    let validated: { outputCount: number; totalBytes: number };
+    if (job.toolId === "fill-forms") {
+      // Page preservation was already enforced against the *input* page count, and
+      // the result is the only output. Re-deriving the numbers here would be a
+      // second, weaker opinion about the same bytes.
+      // Taken from the verification result, not recomputed here: `verified.pages` is
+      // the page count the child derived from the document it wrote, which is the only
+      // count in this process that is not just the input's own number echoed back.
+      if (!boundedFill) throw new OutputValidationError("The bounded fill output was not verified.");
+      validated = { outputCount: boundedFill.outputCount, totalBytes: boundedFill.totalBytes };
+      // `count` is the existing unit vocabulary; the metric name says what is counted.
+      recordMetric("fill_forms_verified_pages", boundedFill.pages, "count", { tool_id: job.toolId });
+    } else {
+      const preservePages = ["compress-pdf", "rotate-pdf", "watermark-pdf", "crop-pdf", "page-numbers", "header-footer", "resize-pages", "flip-pages", "remove-annotations", "ocr-pdf"].includes(job.toolId) ? files[0]?.pageCount ?? undefined : undefined;
+      validated = await validateWorkerOutputs(outputs, preservePages, { encryptedPdfAlreadyValidated: job.toolId === "protect-pdf" || job.toolId === "pdf-permissions" });
+    }
     recordMetric("storage_bytes_out", validated.totalBytes, "bytes", { tool_id: job.toolId, engine, engine_version: engineVersion, status: "succeeded" });
     if (job.toolId === "compress-pdf") recordMetric("compression_ratio", validated.totalBytes / bytes[0].byteLength, "ratio", { tool_id: job.toolId, engine, engine_version: engineVersion });
     // PR-1: every output is scanned first, then the batch is stored. A rejection
     // throws before the first object write, so no object, file row or SUCCEEDED
     // status can exist for a batch that was not explicitly declared clean.
+    // A published artifact carries the page count that was *verified* for it, so a
+    // consumer (a chained job, an agent scope, plan enforcement) does not have to
+    // re-parse it, and so `pageCount ?? 0` downstream is not silently true of
+    // everything. For fill-forms the verified count is `boundedFill.pages` — derived
+    // from the document the child wrote, and equal to the input's by the preservation
+    // check above. Any other tool's page count is not established on this path, so the
+    // column stays null rather than being guessed from the input.
+    const outputPageCount = message.toolId === "fill-forms" ? boundedFill?.pages : undefined;
     const { stored: storedOutputs } = await screenAndStoreWorkerOutputs(outputs, { job, storage, scanner: deps.scanner, attemptId });
     try {
       await scopedTenant(async (tx) => {
         const current = await tx.job.findUniqueOrThrow({ where: { id: job.id }, select: { outputFileId: true } });
         if (current.outputFileId) throw new OutputCommitSupersededError();
         const outputDocument = await tx.document.create({ data: { userId: jobExecutionScope.userId, organizationId: jobExecutionScope.organizationId, title: `${job.toolId} output` } }); const outputFileIds: string[] = [];
-        for (const item of storedOutputs) { const outputFile = await tx.file.create({ data: { document: { connect: { id: outputDocument.id } }, originalName: item.output.name, mimeType: item.output.mimeType, size: BigInt(item.output.bytes.byteLength), storageKey: item.object.key, checksum: item.checksum, storageObject: buildStorageObjectConnectOrCreate(jobExecutionScope, { provider: "s3", bucket: item.object.bucket, objectKey: item.object.key, size: BigInt(item.output.bytes.byteLength), checksum: item.checksum }) } }); await tx.fileVersion.create({ data: { fileId: outputFile.id, ownerId: jobExecutionScope.userId, version: 1, storageKey: item.object.key, checksum: item.checksum } }); outputFileIds.push(outputFile.id); }
+        for (const item of storedOutputs) { const outputFile = await tx.file.create({ data: { document: { connect: { id: outputDocument.id } }, originalName: item.output.name, mimeType: item.output.mimeType, size: BigInt(item.output.bytes.byteLength), storageKey: item.object.key, checksum: item.checksum, ...(outputPageCount === undefined ? {} : { pageCount: outputPageCount }), storageObject: buildStorageObjectConnectOrCreate(jobExecutionScope, { provider: "s3", bucket: item.object.bucket, objectKey: item.object.key, size: BigInt(item.output.bytes.byteLength), checksum: item.checksum }) } }); await tx.fileVersion.create({ data: { fileId: outputFile.id, ownerId: jobExecutionScope.userId, version: 1, storageKey: item.object.key, checksum: item.checksum } }); outputFileIds.push(outputFile.id); }
         // The commit itself is the compare-and-set. Under READ COMMITTED a second
         // attempt blocks on this row, re-evaluates `outputFileId IS NULL` after the
         // winner commits, matches nothing, and rolls its own rows back — so exactly
@@ -137,6 +314,12 @@ export async function processDocumentJob(message: QueuedJob, deps: DocumentPipel
       if (error instanceof OutputCommitSupersededError) { logger.info("job.output_commit_superseded", context); return; }
       throw error;
     }
+    // FF-03: the payload has served its purpose the moment the output is
+    // committed. Purged here, after the commit, so a failed commit (which will
+    // be retried) still has its values. Failure to purge is logged, not fatal:
+    // the TTL backstop is the guarantee, this is the immediate path.
+    await purgeFormFields(rawParams.fieldsRef).catch(() => logger.warn("fill_forms.payload_purge_failed", { ...context, reason: "SUCCESS" }));
+    if (legacyFields !== undefined) await scrubLegacyFields(tenant, jobIdOf(job), rawParams as Record<string, unknown>);
     const durationMs = Date.now() - started;
     recordMetric("job_duration_ms", durationMs, "ms", { tool_id: job.toolId, engine, engine_version: engineVersion, status: "succeeded" });
     recordMetric("tool_execution_duration_ms", durationMs, "ms", { tool_id: job.toolId, engine, engine_version: engineVersion, status: "succeeded" });
@@ -146,11 +329,31 @@ export async function processDocumentJob(message: QueuedJob, deps: DocumentPipel
     recordMetric("cost_per_successful_job", estimatedCost.costPerSuccessfulJob ?? 0, "ratio", { tool_id: job.toolId, engine, engine_version: engineVersion, status: "succeeded" });
     logger.info("job.succeeded", { ...context, engine, engine_version: engineVersion, duration_ms: durationMs, status: "succeeded" });
   } catch (error) {
-    const errorCode = typeof error === "object" && error && "code" in error ? String(error.code) : "PROCESSING_FAILED";
+    // FF-07 / architect round 2: only an allowlisted code is persisted. The raw
+    // `error.message` used to be written into both `Job.error` and `JobStep.error`,
+    // which made every native, Redis and parser message durable and user-visible.
+    // The detail stays in the log line below, which is access-controlled.
+    const errorCode = publicErrorCode(error);
     // A losing attempt must never fail a job that another attempt committed, and a
     // cancellation or expiry that arrived while the job was running must survive:
     // every terminal state is guarded, not just SUCCEEDED.
-    const failed = await tenant((tx) => tx.job.updateMany({ where: { id: job.id, outputFileId: null, status: { notIn: [...CLOSED_JOB_STATES] } }, data: { status: "FAILED", errorCode, error: { message: error instanceof Error ? error.message : "Processing failed" }, completedAt: new Date() } }));
+    const failed = await tenant((tx) => tx.job.updateMany({ where: { id: job.id, outputFileId: null, status: { notIn: [...CLOSED_JOB_STATES] } }, data: { status: "FAILED", errorCode, error: jobErrorRecord(error), completedAt: new Date() } }));
+    // FF-03: a retry still needs the values, so the payload is only removed when
+    // no further attempt can run.
+    //
+    // This runs on the **processor** side, where `attemptsMade` has not yet been
+    // incremented for the current attempt (BullMQ increments inside
+    // `moveToFailed`, after the handler throws). The classification therefore uses
+    // the processor-entry frame. A previously declared `classifyTerminal` hook was
+    // never passed by the worker and has been removed rather than left as dead
+    // wiring: the worker classifies its own `failed` event separately, with the
+    // post-increment counter, in `classifyFailedEvent`.
+    const outcome = classifyAtProcessorEntry({
+      attemptsMade: deps.attemptsMade ?? 0,
+      maxAttempts: deps.maxAttempts ?? 1,
+      unrecoverable: isUnrecoverableQueueError(error instanceof Error ? error : undefined),
+    });
+    if (outcome.terminal) await purgeFormFields(rawParams.fieldsRef).catch(() => logger.warn("fill_forms.payload_purge_failed", { ...context, reason: "FINAL_FAILURE" }));
     if (failed.count === 0) {
       // Either another attempt committed, the job was cancelled/expired mid-run, or
       // the row is gone (retention). All mean "do not write"; the log says which.
@@ -159,8 +362,18 @@ export async function processDocumentJob(message: QueuedJob, deps: DocumentPipel
     }
     // The step may only follow the job: a terminal job's step is never rewritten,
     // and a terminal step is never revived.
-    if (step && failed.count === 1) await tenant((tx) => tx.jobStep.updateMany({ where: { id: step.id, status: { notIn: [...CLOSED_JOB_STATES] } }, data: { status: "FAILED", errorCode, error: { message: error instanceof Error ? error.message : "Processing failed" }, completedAt: new Date() } }));
+    if (step && failed.count === 1) await tenant((tx) => tx.jobStep.updateMany({ where: { id: step.id, status: { notIn: [...CLOSED_JOB_STATES] } }, data: { status: "FAILED", errorCode, error: jobErrorRecord(error), completedAt: new Date() } }));
     recordMetric("jobs_failure_total", 1, "count", { tool_id: job.toolId, status: "failed" });
     logger.error("job.failed", { ...context, error_code: errorCode, status: "failed" }); throw error;
-  } finally { await deletePhase1Secret(rawParams.secretRef).catch(() => undefined); }
+  } finally {
+    await deletePhase1Secret(rawParams.secretRef).catch(() => undefined);
+    // The encrypted payload is *not* deleted here: a `finally` cannot tell a
+    // retryable failure from a final one, and deleting on a retry would break the
+    // retry. Terminal paths purge it explicitly (success, CANCELLED/EXPIRED,
+    // final failure); the TTL is the backstop for anything else.
+    if (legacyFields !== undefined) {
+      const state = await Promise.resolve(tenant((tx) => tx.job.findUnique({ where: { id: jobIdOf(job) }, select: { status: true } }))).catch(() => undefined);
+      if (state && (TERMINAL_JOB_STATES as readonly string[]).includes(String((state as { status?: string }).status))) await scrubLegacyFields(tenant, jobIdOf(job), rawParams as Record<string, unknown>);
+    }
+  }
 }

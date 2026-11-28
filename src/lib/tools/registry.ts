@@ -1,11 +1,13 @@
 import { toolsConfig } from "@/config";
-import { optionJsonSchema, toolOptionContracts } from "@/lib/tools/options";
+import { optionJsonSchema, toolOptionContracts, toolsWithDedicatedJobParameters } from "@/lib/tools/options";
 
 export type ToolDefinition = {
   toolId: string; name: string; version: string; inputSchema: Record<string, unknown>; outputSchema: Record<string, unknown>;
   executionMode: "server" | "ai" | "client"; mime: { input: string[]; output: string[] }; limits: { maxBytes: number; maxFiles: number; maxPages?: number; maxObjects?: number };
   capabilities: string[]; securityClass: "standard" | "restricted" | "isolated"; resourceCost: "low" | "medium" | "high"; aiFlag: boolean; locales: string[];
   enabled: boolean; apiEligible: boolean; optionSchemaVersion: string; optionSchema: Record<string, unknown>;
+  /** Present only for tools with a typed per-item payload (Stage 2 `fill-forms`). */
+  fieldsParameter?: string;
 };
 function outputMime(toolId: string) {
   if (toolId === "pdf-to-word") return ["application/vnd.openxmlformats-officedocument.wordprocessingml.document"];
@@ -32,7 +34,40 @@ export const toolRegistry = Object.fromEntries(toolsConfig.map((tool) => [tool.i
   executionMode: tool.execution, mime: { input: [...tool.supportedMimeTypes], output: outputMime(tool.id) }, limits: { ...tool.limits, maxObjects: tool.id === "extract-images" ? 100 : tool.limits.maxFiles },
   capabilities: [...tool.capabilities], securityClass: tool.securityClass, resourceCost: tool.aiEnabled || tool.securityClass === "isolated" ? "high" : tool.capabilities.length ? "medium" : "low",
   aiFlag: tool.aiEnabled, locales: [...tool.locales], enabled: true, apiEligible: tool.execution !== "client", optionSchemaVersion: toolOptionContracts[tool.id].version, optionSchema: optionJsonSchema(toolOptionContracts[tool.id]),
+  ...(toolsWithDedicatedJobParameters.has(tool.id) ? { fieldsParameter: "fields" } : {}),
 }])) as Record<string, ToolDefinition>;
+
+/**
+ * Tools whose *legitimate input* is a PDF that a parser would reject.
+ *
+ * `unlock-pdf` takes an undecryptable file and `repair-pdf` takes a damaged one, so
+ * generic structural parsing cannot be a gate for them — the repair tool exists
+ * precisely because the document is broken. They are validated by cheap, parser-free
+ * signature checks and by malware screening, and the authoritative structural work
+ * happens inside the contained worker.
+ *
+ * This is the single source of that fact: `validateUpload` already refused to parse
+ * for these two, and the orchestrator's shape pre-filter consults the same set
+ * instead of deciding independently. Keeping one list is what stops the two from
+ * disagreeing — which is exactly how a Fill Forms restriction leaked into Repair PDF.
+ */
+export const controlledPreflightToolIds: ReadonlySet<string> = new Set(["unlock-pdf", "repair-pdf"]);
+
+/**
+ * Tools whose PDF parsing happens in the bounded inspection child, not in the API.
+ *
+ * Fill Forms is the only tool with a dedicated isolated inspector
+ * (`processPdfBounded`). Its job-submission path previously still parsed the same
+ * document in the API process — `validateUpload` → `PDFDocument.load` — *before*
+ * reaching that child, so the isolation it appeared to have was not real: an
+ * attacker-supplied PDF was loaded once with web-server privileges and once in the
+ * child. This set is what lets `validateUpload` decline to parse for it.
+ *
+ * The authoritative page count therefore comes from the child's reply, which is
+ * shape-validated before being trusted, and is carried into plan enforcement rather
+ * than dropped.
+ */
+export const isolatedInspectionToolIds: ReadonlySet<string> = new Set(["fill-forms"]);
 
 /** Tools enabled on the unified runtime workers. */
 export const workerToolIds = new Set([
@@ -40,6 +75,7 @@ export const workerToolIds = new Set([
   "compress-pdf", "pdf-to-jpg", "watermark-pdf", "crop-pdf", "page-numbers", "header-footer", "resize-pages", "alternate-mix", "flip-pages",
   "split-pdf-by-size", "split-pdf-by-bookmarks", "split-pdf-by-text", "n-up-pdf", "remove-annotations",
   "extract-images", "protect-pdf", "unlock-pdf", "pdf-permissions", "repair-pdf",
+  "fill-forms",
   "word-to-pdf", "pdf-to-word", "excel-to-pdf", "powerpoint-to-pdf", "ocr-pdf",
   "summarize-pdf", "chat-with-pdf", "extract-data",
 ]);

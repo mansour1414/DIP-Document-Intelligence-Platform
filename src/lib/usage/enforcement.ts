@@ -1,5 +1,5 @@
 import { getToolDefinition } from "@/lib/tools/registry";
-import { consumeCreditsOnce } from "@/lib/billing/credits";
+import { consumeCreditsOnce, reverseCredits } from "@/lib/billing/credits";
 import { creditCost } from "@/lib/billing/credit-policy";
 import { effectiveToolLimits, planCanUseTool } from "@/lib/entitlements/policy";
 import { resolvePlan } from "@/lib/entitlements/service";
@@ -29,7 +29,21 @@ export async function enforceJobCreation(input:{userId:string;toolId:string;idem
  const cost=creditCost(input.toolId);if(tool.aiFlag&&cost>resolved.entitlements.maxAiCreditsPerRequest)throw new MonetizationError("PLAN_LIMIT_EXCEEDED");
  let creditReused=false;try{const credit=await consumeCreditsOnce(input.userId,input.toolId,`job:${input.toolId}:${input.idempotencyKey}`);creditReused=credit.reused}catch(error){if(error instanceof Error&&error.message==="INSUFFICIENT_CREDITS")throw new MonetizationError("INSUFFICIENT_CREDITS");throw error}
  if(!creditReused)recordMetric("credits_consumed",cost,"count",{tool_id:input.toolId});
- logger.info("monetization.job_authorized",{user_id:input.userId,tool_id:input.toolId,plan:resolved.code,cost,correlation_id:input.correlationId});return resolved;
+ logger.info("monetization.job_authorized",{user_id:input.userId,tool_id:input.toolId,plan:resolved.code,cost,correlation_id:input.correlationId});
+ // FF-06 / architect round 2 — no charge without a job.
+ //
+ // Authorization happens before storage and job creation by design: a restricted
+ // or oversized document must be refused before anything durable exists. The
+ // consequence is that a failure *after* this point (storage rejected, transaction
+ // failed, enqueue failed) has already consumed a credit and written a
+ // `job.created` usage event for a job that will never exist. The caller
+ // compensates through the returned handle, keyed idempotently so a retried
+ // creation cannot refund twice.
+ return { plan: resolved, charge: creditReused ? undefined : { release: async () => {
+   await reverseCredits({ userId: input.userId, amount: cost, originalReference: `job:${input.toolId}:${input.idempotencyKey}`, idempotencyKey: `job-release:${input.toolId}:${input.idempotencyKey}` });
+   recordMetric("credits_released", cost, "count", { tool_id: input.toolId });
+   logger.info("monetization.charge_released", { user_id: input.userId, tool_id: input.toolId, cost, correlation_id: input.correlationId });
+ } } };
 }
 
 export async function usageSummary(userId:string){const resolved=await resolvePlan(userId);const now=new Date(),day=new Date(now);day.setUTCHours(0,0,0,0);const month=new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),1));return withTenant({userId},async tx=>{const [daily,monthly,concurrent]=await Promise.all([tx.usageEvent.aggregate({_sum:{quantity:true},where:{userId,kind:"job.created",occurredAt:{gte:day}}}),tx.usageEvent.aggregate({_sum:{quantity:true},where:{userId,kind:"job.created",occurredAt:{gte:month}}}),tx.job.count({where:{requesterId:userId,status:{in:[...running]}}})]);return{plan:resolved.code,subscriptionStatus:resolved.subscriptionStatus,limits:resolved.entitlements,usage:{dailyJobs:daily._sum.quantity??0,monthlyJobs:monthly._sum.quantity??0,concurrentJobs:concurrent}}})}

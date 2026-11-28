@@ -1,0 +1,515 @@
+/**
+ * R7D.1 — the real executor child over the real fd 3 bridge (F02 executor evidence).
+ *
+ * ## Why this test spawns a process
+ *
+ * Every other suite exercises functions. This one runs the actual built bundle as a child
+ * process, sends it a real control frame over stdin, and reads the result frame off file
+ * descriptor 3 — the same three-way arrangement the supervisor will use. That is the only way
+ * to establish the things that are properties of the *arrangement* rather than of any function:
+ * that fd 3 is the result channel and stdout is not, that a short write is retried rather than
+ * silently truncating a document, and that a closed pipe fails rather than spins.
+ *
+ * ## What this still does not prove
+ *
+ * No container, no namespace, no seccomp profile. Docker is unavailable, so isolation remains
+ * NOT TESTED. This proves the child's I/O contract; it says nothing about the box it will run in.
+ */
+
+import assert from "node:assert/strict";
+import { execFileSync, spawn } from "node:child_process";
+import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { dirname } from "node:path";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { after, before, test } from "node:test";
+import { PDFDocument, StandardFonts } from "pdf-lib";
+import { decodeResultV2, encodeControlV2 } from "../src/lib/pdf/worker-protocol-v2";
+import { captureBaseline, compare } from "../src/lib/pdf/form-verify";
+
+const BUNDLE = join(process.cwd(), "dist", "executor-child.js");
+
+/**
+ * The native canvas package this host needs.
+ *
+ * Derived rather than hard-coded to x64, for the same reason the Dockerfile now derives it: a
+ * test that asserts an x64 name passes on x64 and tells you nothing about the ARM64 acceptance
+ * host. Where the host has no mapping, the test fails rather than silently picking one.
+ */
+function nativeCanvasPackage(): string {
+  const mapping: Record<string, Partial<Record<string, string>>> = {
+    linux: { x64: "@napi-rs/canvas-linux-x64-gnu", arm64: "@napi-rs/canvas-linux-arm64-gnu" },
+  };
+  const name = mapping[process.platform]?.[process.arch];
+  if (name === undefined) throw new Error(`no canvas mapping for ${process.platform}/${process.arch}`);
+  return name;
+}
+
+/** The newest mtime across the sources the bundle is built from. */
+function newestSourceMtime(): number {
+  let newest = 0;
+  const walk = (dir: string): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) walk(path);
+      else if (/\.(ts|mjs)$/u.test(entry.name)) newest = Math.max(newest, statSync(path).mtimeMs);
+    }
+  };
+  walk(join(process.cwd(), "src", "lib", "pdf"));
+  walk(join(process.cwd(), "src", "lib", "execution"));
+  return newest;
+}
+/** The hard input ceiling, so the fixture is never silently clipped. */
+const MAX_BODY = 512 * 1024 * 1024;
+
+let workdir: string;
+
+before(async () => {
+  workdir = mkdtempSync(join(tmpdir(), "dip-executor-"));
+  // Rebuild when any source is newer than the bundle. A stale artifact is worse than a missing
+  // one: it passes, and it passes against code that was replaced. This bit during development —
+  // a contract change was masked by a bundle built before it.
+  const stale = !existsSync(BUNDLE) || newestSourceMtime() > statSync(BUNDLE).mtimeMs;
+  if (stale) {
+    // Build it here rather than requiring a prior step. CI runs `npm test`, which globs every
+    // suite; a test that only passes when someone remembered to build first would either fail
+    // CI or — worse, if it skipped instead — report green without running.
+    //
+    // The builder uses the esbuild already on disk as a locked transitive dependency of `tsx`.
+    // No package is added and the lockfile is untouched.
+    execFileSync(process.execPath, [join(process.cwd(), "scripts", "esbuild-executor.mjs")], {
+      stdio: "pipe",
+      timeout: 120_000,
+    });
+  }
+  if (!existsSync(BUNDLE)) throw new Error(`the executor bundle could not be built at ${BUNDLE}`);
+});
+
+after(() => {
+  rmSync(workdir, { recursive: true, force: true });
+});
+
+/** A small form with one text field and one checkbox, built in-process. */
+async function fixturePdf(): Promise<Buffer> {
+  const document = await PDFDocument.create();
+  const page = document.addPage([300, 400]);
+  const font = await document.embedFont(StandardFonts.Helvetica);
+  page.drawText("Synthetic fixture", { x: 20, y: 360, size: 12, font });
+  const form = document.getForm();
+  const text = form.createTextField("applicant.name");
+  text.addToPage(page, { x: 20, y: 320, width: 200, height: 20 });
+  const check = form.createCheckBox("applicant.consent");
+  check.addToPage(page, { x: 20, y: 290, width: 12, height: 12 });
+  return Buffer.from(await document.save());
+}
+
+type ChildOutcome = {
+  exitCode: number | null;
+  fd3: Buffer;
+  stdout: string;
+  stderr: string;
+};
+
+/**
+ * Run the child, write the frame to stdin, collect fd 3.
+ *
+ * `stdio[3]` is the whole point: the child writes results there and diagnostics to stdout and
+ * stderr. If the child wrote the document to stdout instead, the frame would not decode here.
+ */
+function runChild(frame: Buffer, options: { timeoutMs?: number } = {}): Promise<ChildOutcome> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [BUNDLE], {
+      stdio: ["pipe", "pipe", "pipe", "pipe"],
+      env: { PATH: process.env.PATH ?? "/usr/bin:/bin", NODE_ENV: "production" },
+    });
+    const fd3: Buffer[] = [];
+    const out: Buffer[] = [];
+    const err: Buffer[] = [];
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error("child did not exit within the budget"));
+    }, options.timeoutMs ?? 20_000);
+
+    (child.stdio[3] as NodeJS.ReadableStream).on("data", (chunk: Buffer) => fd3.push(chunk));
+    child.stdout?.on("data", (chunk: Buffer) => out.push(chunk));
+    child.stderr?.on("data", (chunk: Buffer) => err.push(chunk));
+    child.on("error", reject);
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolve({
+        exitCode: code,
+        fd3: Buffer.concat(fd3),
+        stdout: Buffer.concat(out).toString("utf8"),
+        stderr: Buffer.concat(err).toString("utf8"),
+      });
+    });
+
+    // Explicit end of body: the child decodes on stdin end, so closing the stream is part of
+    // the protocol rather than an optimization.
+    child.stdin?.end(frame);
+  });
+}
+
+// ---------------------------------------------------------------------------------------
+// The bridge
+// ---------------------------------------------------------------------------------------
+
+test("R7D.1-X-1: a real inspect request travels stdin → child → fd 3", async () => {
+  const pdf = await fixturePdf();
+  const frame = encodeControlV2({ v: 2, op: "inspect" }, pdf, MAX_BODY);
+  const outcome = await runChild(frame);
+
+  assert.equal(outcome.exitCode, 0, `child failed: ${outcome.stderr}`);
+  assert.ok(outcome.fd3.byteLength > 0, "the result must arrive on fd 3");
+  // stdout is for diagnostics. A document on stdout would be indistinguishable in structure
+  // from a result on fd 3, which is why the two channels are kept strictly separate.
+  assert.equal(outcome.stdout.includes("applicant.name"), false, "the inventory must not leak to stdout");
+
+  const { meta, output } = decodeResultV2(outcome.fd3, 1 << 20, "inspect");
+  assert.equal(meta.ok, true);
+  assert.equal(meta.op, "inspect");
+  if (meta.op !== "inspect") throw new Error("unreachable");
+  assert.ok(meta.inventory.fields.length >= 2, "both fixture fields must be found");
+  const names = meta.inventory.fields.map((field) => field.name).sort();
+  assert.deepEqual(names, ["applicant.consent", "applicant.name"]);
+  // A metadata-only result carries no document bytes.
+  assert.equal(output.byteLength, 0);
+});
+
+test("R7D.1-X-2: a real fill request returns the document on fd 3 and metadata that matches it", async () => {
+  const pdf = await fixturePdf();
+  const frame = encodeControlV2(
+    { v: 2, op: "fill", fields: { "applicant.name": "Layla", "applicant.consent": true }, flatten: false },
+    pdf,
+    MAX_BODY,
+  );
+  const outcome = await runChild(frame);
+  assert.equal(outcome.exitCode, 0, `child failed: ${outcome.stderr}`);
+
+  const { meta, output } = decodeResultV2(outcome.fd3, 1 << 20, "fill");
+  assert.equal(meta.ok, true);
+  if (meta.op !== "fill") throw new Error("unreachable");
+  // The declaration must match the bytes that actually arrived. This is the F02 rule, checked
+  // here against a real subprocess rather than a constructed frame.
+  assert.equal(meta.outBytes, output.byteLength);
+  assert.ok(output.byteLength > 0, "the filled document must be on fd 3");
+  assert.equal(meta.report.filled, 2);
+
+  // The bytes really are a PDF, and really contain the value.
+  const reopened = await PDFDocument.load(output);
+  assert.equal(reopened.getPageCount(), 1);
+  const field = reopened.getForm().getTextField("applicant.name");
+  assert.equal(field.getText(), "Layla");
+});
+
+test("R7D.1-X-3: a real verify request confirms the filled document and returns no bytes", async () => {
+  const pdf = await fixturePdf();
+  const fillFrame = encodeControlV2(
+    { v: 2, op: "fill", fields: { "applicant.name": "Layla", "applicant.consent": true }, flatten: false },
+    pdf,
+    MAX_BODY,
+  );
+  const filled = await runChild(fillFrame);
+  assert.equal(filled.exitCode, 0, filled.stderr);
+  const filledResult = decodeResultV2(filled.fd3, 1 << 20, "fill");
+
+  // A second, independent process verifies the output. "Fresh parser" is not a slogan here:
+  // it is a different OS process that has never seen the input document.
+  const verifyFrame = encodeControlV2(
+    {
+      v: 2,
+      op: "verify",
+      // F03: only the kind travels. The expected values stay in the trusted worker's memory.
+      kind: "fill",
+    },
+    Buffer.from(filledResult.output),
+    512 * 1024 * 1024,
+  );
+  const verified = await runChild(verifyFrame);
+  assert.equal(verified.exitCode, 0, verified.stderr);
+  const { meta, output } = decodeResultV2(verified.fd3, 1 << 20, "verify");
+  assert.equal(meta.ok, true);
+  if (meta.op !== "verify") throw new Error("unreachable");
+  assert.equal(meta.pages, 1);
+  assert.ok(meta.preserved >= 0);
+  assert.equal(output.byteLength, 0, "verify is metadata-only");
+});
+
+test("R7D.1-X-4: a document the engine refuses produces a refusal frame, not a crash", async () => {
+  // Not a PDF at all. The executor must report this as data, so the supervisor can distinguish
+  // "the executor refused" from "the executor died" without inspecting exit codes alone.
+  const garbage = Buffer.from("this is not a pdf", "utf8");
+  const frame = encodeControlV2({ v: 2, op: "inspect" }, garbage, MAX_BODY);
+  const outcome = await runChild(frame);
+
+  assert.equal(outcome.exitCode, 0, `a refusal is not a crash: ${outcome.stderr}`);
+  const { meta, output } = decodeResultV2(outcome.fd3, 1 << 20, "inspect");
+  assert.equal(meta.ok, false, "a refusal must be reported as a failure, not as success");
+  if (meta.ok) throw new Error("unreachable");
+  assert.equal(typeof meta.code, "string");
+  // An FF-08 style refusal is content-free: no field value, no document fragment.
+  assert.equal(JSON.stringify(meta).includes("not a pdf"), false, "the refusal must not echo the document");
+  assert.equal(output.byteLength, 0);
+});
+
+test("R7D.1-X-5: a truncated input is refused before the engine sees it", async () => {
+  const pdf = await fixturePdf();
+  // Declare more bytes than are sent. The child must notice the short body rather than parse a
+  // document that is missing its tail.
+  const complete = encodeControlV2({ v: 2, op: "inspect" }, pdf, MAX_BODY);
+  const frame = complete.subarray(0, complete.byteLength - 1_000);
+  const outcome = await runChild(frame);
+  assert.equal(outcome.exitCode, 0, outcome.stderr);
+  const { meta } = decodeResultV2(outcome.fd3, 1 << 20, "inspect");
+  assert.equal(meta.ok, false, "a short body must be refused");
+});
+
+test("R7D.1-X-6: the child exits rather than hanging when stdin closes with no frame", async () => {
+  // A supervisor that dies leaves the child with an empty stdin. Exiting promptly is what lets
+  // the watchdog's deadline be the only thing that ever needs to fire.
+  const outcome = await runChild(Buffer.alloc(0), { timeoutMs: 10_000 });
+  assert.notEqual(outcome.exitCode, null, "the child must exit on its own");
+  assert.equal(outcome.stdout.includes("Error"), false, "an empty request is not an uncaught exception");
+});
+
+test("R7D.1-X-7: the artifact self-check passes on the built bundle", async () => {
+  // Executes the bundle rather than reading it. A module that imports and crashes on first use
+  // is exactly what a file-existence check misses.
+  const child = spawn(process.execPath, [BUNDLE, "--self-check"], { stdio: ["ignore", "pipe", "pipe"] });
+  const out: Buffer[] = [];
+  const err: Buffer[] = [];
+  child.stdout.on("data", (chunk: Buffer) => out.push(chunk));
+  child.stderr.on("data", (chunk: Buffer) => err.push(chunk));
+  const code = await new Promise<number | null>((resolve) => child.on("close", resolve));
+  assert.equal(code, 0, `self-check failed: ${Buffer.concat(err).toString("utf8")}`);
+  const parsed = JSON.parse(Buffer.concat(out).toString("utf8")) as { selfCheck: boolean; protocolVersion: number };
+  assert.equal(parsed.selfCheck, true);
+  assert.equal(parsed.protocolVersion, 2);
+});
+
+test("R7D.1-X-8: the bundle contains no TypeScript loader and no test surface", async () => {
+  // The executor runs where input is hostile. Shipping a TypeScript loader or a mock framework
+  // into it would be a needless surface, and the point of precompiling is that it is not there.
+  const source = readFileSync(BUNDLE, "utf8");
+  for (const forbidden of ["tsx", "esbuild", "node:test", "require(\"typescript\")"]) {
+    assert.equal(source.includes(forbidden), false, `the executor bundle must not contain ${forbidden}`);
+  }
+});
+
+// ---------------------------------------------------------------------------------------
+// F03 — the trusted-side comparison
+// ---------------------------------------------------------------------------------------
+
+test("R7D.1-F03-2: a baseline cannot be consumed twice", () => {
+  // A second comparison against the same baseline would be a second opinion from a stale
+  // snapshot; the execution it described has already been judged.
+  const baseline = captureBaseline({
+    pages: 1,
+    fields: [{ name: "a", kind: "text", value: "x" }],
+  });
+  const after = { pages: 1, fields: [{ name: "a", kind: "text" as const, value: "x" }] };
+  assert.deepEqual(compare(baseline, after, new Map()).findings, []);
+  assert.throws(() => compare(baseline, after, new Map()), /could not be verified/u);
+});
+
+test("R7D.1-F03-3: the comparison uses the engine's equality, including the two empty spellings", () => {
+  // `valuesEqual` treats a text field's `/V ()` and its absent `/V` as the same empty value.
+  // Re-deriving that rule here would have produced a false mismatch on a cleared field.
+  const baseline = captureBaseline({ pages: 1, fields: [{ name: "a", kind: "text", value: null }] });
+  const after = { pages: 1, fields: [{ name: "a", kind: "text" as const, value: "" }] };
+  assert.deepEqual(compare(baseline, after, new Map()).findings, []);
+});
+
+test("R7D.1-F03-4: a modified untouched field is reported by code, not by name or value", () => {
+  const baseline = captureBaseline({ pages: 1, fields: [{ name: "secret.field", kind: "text", value: "before" }] });
+  const after = { pages: 1, fields: [{ name: "secret.field", kind: "text" as const, value: "after" }] };
+  const result = compare(baseline, after, new Map());
+  assert.deepEqual(result.findings, ["UNTOUCHED_FIELD_MODIFIED"]);
+  // FF-08: findings carry no field name and no value.
+  assert.equal(JSON.stringify(result).includes("secret.field"), false);
+  assert.equal(JSON.stringify(result).includes("before"), false);
+  // Nothing was preserved, because the one untouched field changed.
+  assert.equal(result.preserved, 0);
+});
+
+test("R7D.1-F03-5: a field that disappears or appears is reported", () => {
+  const baseline = captureBaseline({ pages: 1, fields: [{ name: "a", kind: "text", value: "x" }] });
+  assert.deepEqual(compare(baseline, { pages: 1, fields: [] }, new Map()).findings.sort(), ["FIELD_MISSING"]);
+  const fresh = captureBaseline({ pages: 1, fields: [] });
+  assert.deepEqual(compare(fresh, { pages: 1, fields: [{ name: "b", kind: "text" as const, value: "y" }] }, new Map()).findings, ["FIELD_ADDED"]);
+});
+
+test("R7D.1-F03-6: an expected value that does not round-trip is reported", () => {
+  const baseline = captureBaseline({ pages: 1, fields: [{ name: "a", kind: "text", value: null }] });
+  const after = { pages: 1, fields: [{ name: "a", kind: "text" as const, value: "wrong" }] };
+  const expected = new Map<string, string | boolean | string[]>([["a", "Layla"]]);
+  assert.deepEqual(compare(baseline, after, expected).findings, ["VALUE_NOT_ROUND_TRIPPED"]);
+});
+
+test("R7D.1-F03-7: an unchanged untouched field counts as preserved", () => {
+  const baseline = captureBaseline({
+    pages: 1,
+    fields: [
+      { name: "a", kind: "text", value: "keep" },
+      { name: "b", kind: "checkbox", value: true },
+    ],
+  });
+  const after = {
+    pages: 1,
+    fields: [
+      { name: "a", kind: "text" as const, value: "keep" },
+      { name: "b", kind: "checkbox" as const, value: true },
+    ],
+  };
+  const result = compare(baseline, after, new Map());
+  assert.deepEqual(result.findings, []);
+  assert.equal(result.preserved, 2);
+});
+
+// ---------------------------------------------------------------------------------------
+// The runtime closure, checked by simulating the Dockerfile's runtime stage
+// ---------------------------------------------------------------------------------------
+
+test("R7D.1-X-9: the artifact verifier passes against the packaged runtime closure", async () => {
+  // ## Why this is a test and not only a build step
+  //
+  // The verifier runs at image build time, and no image can be built here. Left at that, a
+  // broken closure would be discovered by whoever first built the image — and this closure *was*
+  // broken: `pdf-lib` needs `@pdf-lib/standard-fonts` and `@pdf-lib/upng`, which the Dockerfile
+  // did not copy. The image would have installed cleanly and failed on every document.
+  //
+  // So the same verifier is run here against a directory assembled to match what the runtime
+  // stage produces. That does not prove the image builds; it proves the *file layout the
+  // Dockerfile describes* is sufficient, which is the part this environment can establish.
+  const appRoot = join(workdir, "app");
+  mkdirSync(join(appRoot, "dist"), { recursive: true });
+  mkdirSync(join(appRoot, "node_modules"), { recursive: true });
+  copyFileSync(BUNDLE, join(appRoot, "dist", "executor-child.js"));
+  copyFileSync(join(process.cwd(), "package.json"), join(appRoot, "package.json"));
+  copyFileSync(
+    join(process.cwd(), "scripts", "verify-executor-artifact.mjs"),
+    join(appRoot, "dist", "verify-executor-artifact.mjs"),
+  );
+
+  // Exactly the packages the Dockerfile's runtime stage copies, with the native binding
+  // resolved for *this* host so the fixture is not silently x64-only.
+  for (const name of [
+    "pdf-lib",
+    "@pdf-lib/standard-fonts",
+    "@pdf-lib/upng",
+    "@napi-rs/canvas",
+    nativeCanvasPackage(),
+    "@fontsource/noto-sans-arabic",
+    "pako",
+    "tslib",
+  ]) {
+    const target = join(appRoot, "node_modules", name);
+    mkdirSync(dirname(target), { recursive: true });
+    cpSync(join(process.cwd(), "node_modules", name), target, { recursive: true });
+  }
+
+  const output = execFileSync(process.execPath, [join(appRoot, "dist", "verify-executor-artifact.mjs"), appRoot], {
+    encoding: "utf8",
+    timeout: 120_000,
+  });
+  assert.match(output, /10\/10 artifact checks passed/u, output);
+  // The specific defect that was found: pdf-lib's transitive closure.
+  assert.match(output, /@pdf-lib\/standard-fonts/u);
+  assert.match(output, /@pdf-lib\/upng/u);
+  // C-F01: the binding must be the one for this architecture, and only one may exist.
+  assert.match(output, /exactly one native canvas binding, matching this architecture/u);
+});
+
+test("R7D.1-X-10: the verifier fails when a transitive dependency is missing", async () => {
+  // A verifier that cannot fail is not a verifier. Remove one transitive package the previous
+  // Dockerfile omitted, and confirm the build gate would have caught it.
+  const appRoot = join(workdir, "app-incomplete");
+  mkdirSync(join(appRoot, "dist"), { recursive: true });
+  mkdirSync(join(appRoot, "node_modules"), { recursive: true });
+  copyFileSync(BUNDLE, join(appRoot, "dist", "executor-child.js"));
+  copyFileSync(join(process.cwd(), "package.json"), join(appRoot, "package.json"));
+  copyFileSync(join(process.cwd(), "scripts", "verify-executor-artifact.mjs"), join(appRoot, "dist", "verify-executor-artifact.mjs"));
+  for (const name of [
+    "pdf-lib",
+    "@napi-rs/canvas",
+    nativeCanvasPackage(),
+    "@fontsource/noto-sans-arabic",
+    "pako",
+    "tslib",
+  ]) {
+    const target = join(appRoot, "node_modules", name);
+    mkdirSync(dirname(target), { recursive: true });
+    cpSync(join(process.cwd(), "node_modules", name), target, { recursive: true });
+  }
+
+  let exitCode = 0;
+  try {
+    execFileSync(process.execPath, [join(appRoot, "dist", "verify-executor-artifact.mjs"), appRoot], {
+      encoding: "utf8",
+      stdio: "pipe",
+      timeout: 120_000,
+    });
+  } catch (error) {
+    exitCode = (error as { status?: number }).status ?? 1;
+    const stderr = String((error as { stderr?: string }).stderr ?? "");
+    // The failure must name the actual cause, not a generic "checks failed".
+    assert.match(stderr, /standard-fonts|upng/u, stderr);
+  }
+  assert.equal(exitCode, 1, "the verifier must exit non-zero when the closure is incomplete");
+});
+
+test("R7D.1-CF01-4: a wrong-architecture native binding is rejected at build time", async () => {
+  // The acceptance host is native ARM64. A Dockerfile that copied `canvas-linux-x64-gnu`
+  // unconditionally produced an image that built cleanly and then failed at the first document
+  // with a MODULE_NOT_FOUND for the .node file. This asserts the verifier catches that, by
+  // putting a foreign binding into the runtime root.
+  const appRoot = join(workdir, "app-foreign-arch");
+  mkdirSync(join(appRoot, "dist"), { recursive: true });
+  mkdirSync(join(appRoot, "node_modules"), { recursive: true });
+  copyFileSync(BUNDLE, join(appRoot, "dist", "executor-child.js"));
+  copyFileSync(join(process.cwd(), "package.json"), join(appRoot, "package.json"));
+  copyFileSync(join(process.cwd(), "scripts", "verify-executor-artifact.mjs"), join(appRoot, "dist", "verify-executor-artifact.mjs"));
+
+  const foreign = process.arch === "x64" ? "canvas-linux-arm64-gnu" : "canvas-linux-x64-gnu";
+  // The lockfile carries every platform's binding, but `npm ci` installs only the host's. The
+  // foreign one is materialised on demand from the same locked graph, into the scratch tree,
+  // rather than being vendored into the repository.
+  const foreignPath = join(workdir, "foreign", foreign);
+  mkdirSync(dirname(foreignPath), { recursive: true });
+  const cpu = process.arch === "x64" ? "arm64" : "x64";
+  execFileSync(
+    "npm",
+    ["pack", `@napi-rs/${foreign}@1.0.9`, "--pack-destination", join(workdir, "foreign")],
+    { cwd: workdir, stdio: "pipe", timeout: 120_000, env: { ...process.env, npm_config_cpu: cpu } },
+  );
+  const tarball = readdirSync(join(workdir, "foreign")).find((name) => name.endsWith(".tgz"));
+  if (tarball === undefined) throw new Error("could not fetch the foreign binding tarball");
+  mkdirSync(foreignPath, { recursive: true });
+  execFileSync("tar", ["-xzf", join(workdir, "foreign", tarball), "-C", foreignPath, "--strip-components=1"], {
+    stdio: "pipe",
+    timeout: 60_000,
+  });
+  for (const name of ["pdf-lib", "@napi-rs/canvas", nativeCanvasPackage(), "@fontsource/noto-sans-arabic", "pako", "tslib"]) {
+    const target = join(appRoot, "node_modules", name);
+    mkdirSync(dirname(target), { recursive: true });
+    cpSync(join(process.cwd(), "node_modules", name), target, { recursive: true });
+  }
+  // Replace the correct binding with the foreign one.
+  cpSync(foreignPath, join(appRoot, "node_modules", "@napi-rs", foreign), { recursive: true });
+
+  let exitCode = 0;
+  let stderr = "";
+  try {
+    execFileSync(process.execPath, [join(appRoot, "dist", "verify-executor-artifact.mjs"), appRoot], {
+      encoding: "utf8",
+      stdio: "pipe",
+      timeout: 120_000,
+    });
+  } catch (error) {
+    exitCode = (error as { status?: number }).status ?? 1;
+    stderr = String((error as { stderr?: string }).stderr ?? "");
+  }
+  // It must exit non-zero and name the architecture problem, not merely "some check failed".
+  assert.equal(exitCode, 1, "a foreign-architecture binding must fail the artifact verifier");
+  assert.match(stderr, /native binding|canvas binding/u, stderr);
+});
