@@ -755,10 +755,21 @@ export class Watchdog {
       this.options.clock,
     );
     if (persistedComparison.kind === "due") {
-      // The deadline computed before the store write is already due at persist time. The arm
-      // cannot meaningfully be enforced, so it is refused rather than granting a window that has
-      // already closed.
-      closePinned(pin);
+      // The deadline computed before the store write is already due at persist time. Refusing the
+      // ARM_ACK is correct — the supervisor must not proceed on a closed window — but closing the
+      // pin and dropping the execution would abandon an already-created executor with no live entry
+      // to terminate it. Register it so independent mandatory termination (dueForTermination /
+      // terminate) can still reach it through the pinned descriptor.
+      this.live.set(request.executionId, {
+        record,
+        ownershipVerified: true,
+        terminationAttempts: 0,
+        lastTerminationAtMs: null,
+        pin,
+        heartbeatsSeen: 0,
+        lastHeartbeatMs: nowMs,
+        issuedGrants: new Set(),
+      });
       return deny("INVALID");
     }
 
@@ -988,6 +999,20 @@ export class Watchdog {
       return deny("DURABILITY_FAILED");
     }
     entry.record = concluded;
+
+    // ## Final deadline redecision after durable persistence
+    //
+    // The deadline was last checked before the store write. The write itself takes time, and the
+    // deadline does not pause for it. A grant signed after expiry would be a completion granted
+    // after the authority had already changed hands — the one outcome that must never happen.
+    // Re-decide from the clock immediately before signing, so a grant is never minted for an
+    // execution whose deadline has passed.
+    const expiredFinal = compareDeadline(
+      { bootId: entry.record.bootId, deadlineAtMs: entry.record.deadlineAtMs },
+      this.options.clock,
+    );
+    if (expiredFinal.kind === "stale-boot") return deny("MISMATCH");
+    if (expiredFinal.kind === "due") return deny("EXPIRED");
 
     const grant = signDisarmGrant(this.options.secret, { ...context, watchdogInstance: this.options.identity.instance });
     entry.issuedGrants.add(grant.proof);
@@ -1239,20 +1264,14 @@ export class Watchdog {
    * them.
    */
   async terminate(due: TurnToTerminate): Promise<TerminationReport> {
-    // WD-F02: the same lane as disarm. A termination and a disarm for one execution are mutually
-    // exclusive, so neither can write a conclusion computed from pre-await state.
-    const arbitrated = await this.arbiter.run(due.executionId, () => this.terminateLocked(due));
-    if (!arbitrated.ok) {
-      return {
-        executionId: due.executionId,
-        killWritten: false,
-        processTerminationConfirmed: false,
-        containerRemovalConfirmed: false,
-        resolved: false,
-        detail: "another operation holds this execution; the deadline is still owed",
-      };
-    }
-    return arbitrated.value;
+    // Mandatory deadline termination must not be postponed by the arbitration lane. A disarm
+    // that is stalled awaiting Docker observations holds the per-execution lane; if termination
+    // had to acquire the same lane, a wedged daemon could defer a pinned-kernel kill indefinitely.
+    // The kill is written through the pinned descriptor — an operation this watchdog alone is
+    // authorised to perform — so it does not need the lane. The phase checks inside terminateLocked
+    // (disarmed / terminated short-circuits) and the phase rechecks in disarmLocked after its
+    // awaits together make concurrent terminate/disarm safe without serialisation.
+    return this.terminateLocked(due);
   }
 
   private async terminateLocked(due: TurnToTerminate): Promise<TerminationReport> {

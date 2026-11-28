@@ -860,10 +860,10 @@ test("R7D.1-SV-24: an executor failure result is refused, never committed", asyn
       limits: { maxInputBytes: 1024, maxOutputBytes: 4096 },
     });
 
-    // A container was created, so the slot is held for reconciliation (quarantined) rather than
-    // released — capacity is not given up without durable cleanup evidence and independent
-    // watchdog disarm.
-    assert.equal(outcome.kind, "quarantined");
+    // Termination and exact removal were confirmed in step 15, so the cleanup evidence exists and
+    // the slot is released. A routine document failure is refused, never committed, never
+    // quarantined permanently — capacity recovers once the container is positively gone.
+    assert.equal(outcome.kind, "refused");
     assert.equal(outcome.code, "RESULT_NOT_SUCCESSFUL");
   } finally {
     cleanup();

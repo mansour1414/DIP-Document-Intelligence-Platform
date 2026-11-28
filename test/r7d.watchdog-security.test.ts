@@ -1097,3 +1097,125 @@ test("R7D.1-WD04-15 (mocked cgroup): a full termination closes both debts and qu
     harness.cleanup();
   }
 });
+
+test("R7D.1-WD06-1 (mocked cgroup): ARM with deadline already due at persist time registers in the live map, not abandoned", async () => {
+  // Defect #1: the arm refuses because the deadline is already due at persist time, but must not
+  // close the pin and drop the execution — an already-created executor would be left with no live
+  // entry to terminate it. The execution stays registered so independent mandatory termination can
+  // still reach it through the pinned descriptor.
+  const harness = makeWatchdog();
+  try {
+    // deadlineMs: 0 → the deadline is due at the instant it is computed.
+    const answer = await harness.watchdog.arm(armRequest(EXECUTION, { deadlineMs: 0 }));
+    assert.equal(answer.kind, "ARM_DENIED");
+    if ("code" in answer) assert.equal(answer.code, "INVALID");
+
+    // Not abandoned: the execution is held in the live map with verified ownership.
+    assert.equal(harness.watchdog.state(EXECUTION).phase, "armed");
+    assert.equal(harness.watchdog.state(EXECUTION).armed, true);
+
+    // Due for termination: the deadline is past, so the mandatory termination path lists it.
+    const due = harness.watchdog.dueForTermination();
+    assert.deepEqual(due.map((entry) => entry.executionId), [EXECUTION]);
+
+    // Independent termination can still reach it through the pinned descriptor.
+    const [turn] = due;
+    assert.ok(turn !== undefined);
+    const report = await harness.watchdog.terminate(turn);
+    assert.equal(report.killWritten, true, "the pinned descriptor must be signalled");
+    assert.equal(report.dockerIndependent, true, "kernel authority, not the daemon");
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test("R7D.1-WD06-2 (mocked cgroup): DISARM never mints a grant after expiry, even after durability", async () => {
+  // Defect #2: the deadline must be re-decided after durable persistence, immediately before the
+  // grant is signed. If the deadline is due at that point, no grant is minted.
+  //
+  // A live tree gives a valid pin so process termination can be confirmed through the kernel.
+  // `inDisarm` gates the clock advance so it only happens during disarm's Docker observations,
+  // not during arm's (arm's `observeOwnership` also calls `observeContainer` and would otherwise
+  // advance the clock and recompute the deadline). The first disarm observation advances past the
+  // deadline; the second reports absence so the disarm reaches the deadline redecision.
+  let inDisarm = false;
+  let disarmObservationCount = 0;
+  const harness = makeWatchdog({
+    liveTree: { populated: false },
+    observation: async (expected) => {
+      if (!inDisarm) return { state: "present", containerId: expected.containerId, labels: {}, detail: "injected present" };
+      disarmObservationCount += 1;
+      if (disarmObservationCount === 1) {
+        // Armed at clock 10_000 with deadlineMs 5_000 → due at 15_000. Advance to 16_000 so the
+        // post-await redecision sees an expired deadline.
+        harness.clock.advance(6_000);
+        return { state: "present", containerId: expected.containerId, labels: {}, detail: "injected present" };
+      }
+      return { state: "absent", detail: "injected absent" };
+    },
+  });
+  try {
+    await armAndAssert(harness, EXECUTION, { deadlineMs: 5_000 });
+    // deadlineAtMs = 15_000, clock = 10_000.
+    inDisarm = true;
+    // expiredEarly passes (10_000 < 15_000). The first disarm observation advances the clock to
+    // 16_000 while disarm awaits Docker; the second reports absence. expiredLate must see
+    // 16_000 > 15_000 and refuse — no grant is minted.
+    const denial = await harness.watchdog.disarm(terminalRequest(EXECUTION), randomBytes(8).toString("hex"), 2);
+    assert.equal("code" in denial, true, "an expired disarm must not be granted");
+    if ("code" in denial) assert.equal(denial.code, "EXPIRED");
+    // No grant was issued: the execution is still armed, not disarmed.
+    assert.equal(harness.watchdog.state(EXECUTION).phase, "armed");
+    assert.deepEqual(harness.watchdog.state(EXECUTION).record?.issuedGrants?.size ?? 0, 0);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test("R7D.1-WD06-3 (mocked cgroup): mandatory pinned-kernel termination is not postponed by the arbitration lane", async () => {
+  // Defect #3: `terminate` no longer routes through `arbiter.run`, so a disarm that holds the
+  // per-execution lane (e.g. stalled awaiting Docker observations) cannot postpone a mandatory
+  // pinned-kernel kill. `terminate` calls `terminateLocked` directly.
+  //
+  // The two properties this proves:
+  // 1. `terminate` writes the kill through the pinned descriptor when the deadline is due,
+  //    regardless of any other operation holding the arbitration lane.
+  // 2. `terminate` never mints a grant — it returns a TerminationReport, not a grant.
+  const harness = makeWatchdog({ liveTree: { populated: false } });
+  try {
+    await armAndAssert(harness, EXECUTION, { deadlineMs: 5_000 });
+    harness.clock.advance(6_000); // deadline was 15_000, now 16_000 → due
+
+    // The execution is due for mandatory termination.
+    const [due] = harness.watchdog.dueForTermination();
+    assert.ok(due !== undefined, "the expired execution must be due for termination");
+
+    // Terminate directly — no arbiter, no disarm in the way.
+    const report = await harness.watchdog.terminate(due);
+    assert.equal(report.killWritten, true, "the pinned descriptor must be signalled");
+    assert.equal(report.dockerIndependent, true, "kernel authority, not the daemon");
+    assert.equal(report.processTerminationConfirmed, true, "the kernel confirms no tasks remain");
+
+    // Terminate returns a report, never a grant.
+    assert.equal("killWritten" in report, true);
+    assert.equal("proof" in report, false, "termination must not mint a grant");
+
+    // The execution is now concluded; a subsequent disarm is refused, never granted.
+    const disarmResult = await harness.watchdog.disarm(
+      terminalRequest(EXECUTION, { outcome: "committed" }),
+      randomBytes(8).toString("hex"),
+      2,
+    );
+    assert.equal("code" in disarmResult, true, "disarm after termination must be refused");
+    if ("code" in disarmResult) {
+      assert.ok(
+        disarmResult.code === "TERMINATED" || disarmResult.code === "ALREADY_CONCLUDED",
+        `disarm must be refused, got ${disarmResult.code}`,
+      );
+    }
+    assert.deepEqual(harness.watchdog.state(EXECUTION).record?.issuedGrants?.size ?? 0, 0, "no grant minted");
+    assert.deepEqual(harness.watchdog.dueForTermination(), [], "no further termination owed");
+  } finally {
+    harness.cleanup();
+  }
+});

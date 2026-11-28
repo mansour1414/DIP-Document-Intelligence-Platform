@@ -198,7 +198,9 @@ export type ReservationRefusal =
   /** The supervisor is at its global reservation ceiling; no slot can be promised right now. */
   | "RESERVATION_GLOBAL_LIMIT"
   /** The supervisor is at capacity; a reservation would promise a slot it cannot deliver. */
-  | "BUSY";
+  | "BUSY"
+  /** The named reservation does not exist or does not belong to this caller. */
+  | "RESERVATION_NOT_HELD";
 
 export type ReservationGrant =
   | { ok: true; reservationId: string; expiresAt: number; idleExpiresAt: number; operation: IpcOperation }
@@ -282,6 +284,40 @@ export function reserveForWorker(
     sequence: state.reservationSequence,
   });
   return { ok: true, reservationId, expiresAt, idleExpiresAt, operation: input.operation };
+}
+
+/**
+ * Revoke a worker reservation before its TTL expires.
+ *
+ * Explicit revocation is distinct from passive expiration: a caller (or the supervisor on its
+ * behalf) can withdraw a reservation it no longer needs, freeing the caller's per-caller allowance
+ * and the global ceiling immediately rather than waiting for the TTL. Revocation is not admission —
+ * it does not release the executor slot, advance any sequence, or affect a live execution. It only
+ * withdraws the unspent authorization to ask.
+ *
+ * Revoking a reservation that does not exist, or that belongs to a different caller, is a refusal.
+ * Revoking an already-expired reservation is also a refusal: the reservation is already gone, and
+ * the sweep removed it; there is nothing left to revoke.
+ */
+export function revokeForWorker(
+  state: AdmissionState,
+  input: {
+    callerIdentity: string;
+    reservationId: string;
+    now: number;
+  },
+): { ok: true; revoked: boolean } | { ok: false; code: ReservationRefusal } {
+  // Sweep first, so an expired reservation is already gone and cannot be "revoked" twice.
+  for (const [id, record] of state.reservations) {
+    if (record.expiresAt <= input.now || record.idleExpiresAt <= input.now) state.reservations.delete(id);
+  }
+
+  const reservation = state.reservations.get(input.reservationId);
+  if (reservation === undefined) return { ok: false, code: "RESERVATION_NOT_HELD" };
+  if (reservation.callerIdentity !== input.callerIdentity) return { ok: false, code: "RESERVATION_NOT_HELD" };
+
+  state.reservations.delete(input.reservationId);
+  return { ok: true, revoked: true };
 }
 
 /**

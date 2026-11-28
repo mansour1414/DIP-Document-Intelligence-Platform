@@ -21,6 +21,7 @@ import {
   admit,
   newAdmissionState,
   reserveForWorker,
+  revokeForWorker,
   sequenceFor,
   WORKER_OPERATION_SEQUENCE,
   DEFAULT_CALLER_SEQUENCE_TTL_MS,
@@ -438,4 +439,98 @@ test("R7D.1-RES-15: per-caller limits keep reservations fair — one caller at i
   assert.equal(issue(state, { operation: "inspect", identity: "worker-b", now }).ok, true);
 });
 
+test("R7D.1-RES-16: explicit revocation cancels a reservation before its TTL and frees the caller's allowance", () => {
+  const state = newAdmissionState();
+  state.maxReservations = 10;
+  const now = 1_000;
 
+  // Caller-a holds two reservations (at its per-caller limit of 2). Same operation so the
+  // sequence check passes both times (issuance does not advance the sequence).
+  const g1 = issue(state, { operation: "inspect", identity: "worker-a", now });
+  assert.equal(g1.ok, true);
+  const g2 = issue(state, { operation: "inspect", identity: "worker-a", now });
+  assert.equal(g2.ok, true);
+
+  // A third is refused at the per-caller limit.
+  const over = issue(state, { operation: "inspect", identity: "worker-a", now });
+  assert.equal(over.ok, false);
+  assert.equal((over as { code: string }).code, "RESERVATION_LIMIT");
+
+  // Revoke the first reservation: the caller's allowance is freed immediately.
+  const revoked = revokeForWorker(state, { callerIdentity: "worker-a", reservationId: g1.reservationId, now });
+  assert.equal(revoked.ok, true);
+  assert.equal((revoked as { ok: true; revoked: boolean }).revoked, true);
+  assert.equal(state.reservations.has(g1.reservationId), false);
+  // The second reservation is untouched.
+  assert.equal(state.reservations.has(g2.reservationId), true);
+
+  // After revocation, the caller can issue again: the limit is on live reservations, not on
+  // lifetime issuance count.
+  const again = issue(state, { operation: "inspect", identity: "worker-a", now });
+  assert.equal(again.ok, true);
+  // Caller-b is unaffected by caller-a's reservations or revocation.
+  assert.equal(issue(state, { operation: "inspect", identity: "worker-b", now }).ok, true);
+});
+
+test("R7D.1-RES-17: a revoked reservation cannot be used at admission", () => {
+  const state = newAdmissionState();
+  const now = 2_000;
+
+  const grant = issue(state, { operation: "inspect", identity: "worker-a", now: 1_000 });
+  assert.equal(grant.ok, true);
+  if (!grant.ok) return;
+
+  // Revoke it before any admission attempt.
+  const revoked = revokeForWorker(state, { callerIdentity: "worker-a", reservationId: grant.reservationId, now });
+  assert.equal(revoked.ok, true);
+
+  // Admission with the revoked id is refused: the reservation no longer exists.
+  const decision = admit(state, {
+    role: "worker", operation: "inspect", requestId: "a".repeat(32),
+    reservationId: grant.reservationId, callerIdentity: "worker-a",
+  }, now, LIMITS);
+  assert.equal(decision.ok, false);
+  assert.equal((decision as { code: string }).code, "RESERVATION_REQUIRED");
+});
+
+test("R7D.1-RES-18: revocation of another caller's reservation is refused", () => {
+  const state = newAdmissionState();
+  const now = 1_000;
+
+  const grant = issue(state, { operation: "inspect", identity: "worker-a", now });
+  assert.equal(grant.ok, true);
+
+  // Caller-b cannot revoke caller-a's reservation: callerIdentity is binding.
+  const revoked = revokeForWorker(state, { callerIdentity: "worker-b", reservationId: grant.reservationId, now });
+  assert.equal(revoked.ok, false);
+  assert.equal((revoked as { code: string }).code, "RESERVATION_NOT_HELD");
+
+  // Caller-a's reservation is still valid.
+  assert.equal(state.reservations.has(grant.reservationId), true);
+  // Caller-a can still use it.
+  const decision = admit(state, {
+    role: "worker", operation: "inspect", requestId: "a".repeat(32),
+    reservationId: grant.reservationId, callerIdentity: "worker-a",
+  }, now, LIMITS);
+  assert.equal(decision.ok, true);
+});
+
+test("R7D.1-RES-19: revoking an already-expired reservation is refused (nothing to revoke)", () => {
+  const state = newAdmissionState();
+
+  // A 1 ms TTL: expires immediately.
+  const grant = issue(state, { operation: "inspect", identity: "worker-a", now: 1_000, ttlMs: 1, idleMs: 1 });
+  assert.equal(grant.ok, true);
+
+  // Advance past the TTL so the sweep removes it.
+  const late = 5_000;
+  const sweep = issue(state, { operation: "inspect", identity: "worker-b", now: late });
+  assert.equal(sweep.ok, true);
+  // The sweep on issuance removed worker-a's expired reservation.
+  assert.equal(state.reservations.has(grant.reservationId), false);
+
+  // Revoking it is a refusal: it is already gone.
+  const revoked = revokeForWorker(state, { callerIdentity: "worker-a", reservationId: grant.reservationId, now: late });
+  assert.equal(revoked.ok, false);
+  assert.equal((revoked as { code: string }).code, "RESERVATION_NOT_HELD");
+});
